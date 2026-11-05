@@ -18,7 +18,7 @@ export class FractionalPosition
     {
         if (before === null && after === null)
         {
-            return FractionalPosition.First;
+            return FractionalPosition.First.slice();
         }
         FractionalPosition.Validate(before);
         FractionalPosition.Validate(after);

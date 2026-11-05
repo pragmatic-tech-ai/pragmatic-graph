@@ -10,6 +10,13 @@ describe('FractionalPosition', () =>
         assert.deepEqual(FractionalPosition.Between(null, null), FractionalPosition.First);
     });
 
+    it('returns a copy of First so callers cannot mutate the shared instance', () =>
+    {
+        const copy = FractionalPosition.Between(null, null);
+        copy[0] = 0x01;
+        assert.deepEqual(FractionalPosition.First, Uint8Array.of(0x80));
+    });
+
     it('inserts before the first and after the last', () =>
     {
         const first = FractionalPosition.First;
