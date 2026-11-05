@@ -68,6 +68,27 @@ describe('FormatKeys', () =>
     it('keeps the two Ids key families disjoint', () =>
     {
         assert.notDeepEqual(FormatKeys.PublicToInternal('1'), FormatKeys.InternalToPublic(1n));
+    });
+
+    it('builds Meta keys from name and qualifiers', () =>
+    {
         assert.deepEqual(TupleCodec.Decode(FormatKeys.Meta('x', 5, 'q')), ['x', 5n, 'q']);
+    });
+
+    it('orders Column and Delta keys by chunk across byte-width boundaries', () =>
+    {
+        const chunks = [0n, 1n, 255n, 256n, 65535n, 65536n];
+        for (const build of [FormatKeys.Column, FormatKeys.Delta])
+        {
+            const keys = chunks.map(c => build(0, 4, 2, c));
+            assert.deepEqual([...keys].sort(TupleCodec.Compare), keys);
+        }
+    });
+
+    it('orders LogEntry keys by commit across byte-width boundaries', () =>
+    {
+        const commits = [1n, 255n, 256n, 65535n, 65536n];
+        const keys = commits.map(c => FormatKeys.LogEntry(c));
+        assert.deepEqual([...keys].sort(TupleCodec.Compare), keys);
     });
 });

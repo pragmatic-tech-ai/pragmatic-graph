@@ -4,8 +4,11 @@ This document is the contract between the TypeScript engine and the future Rust 
 
 ## Conventions
 
-- Every key is a flat tuple encoded with the FoundationDB tuple layer (`TupleCodec`): byte strings (`0x01`), UTF-8 strings (`0x02`), integers (`0x0b`-`0x1d`, up to 64-bit magnitude). Encoded keys order bytewise like their tuples.
-- Integers in key tuples are written as unsigned values. Ids and chunk/block numbers are 64-bit.
+- Every key is a flat tuple encoded with the FoundationDB tuple layer (`TupleCodec`). Encoded keys order bytewise like their tuples. Rules:
+  - Byte string: `0x01`, the bytes with each `0x00` escaped as `0x00 0xFF`, then terminator `0x00`.
+  - UTF-8 string: same as byte string with type code `0x02`.
+  - Integer, type codes `0x0C..0x1C`, `0x14` = zero. Positive n-byte value (n = 1..8): code `0x14 + n`, then the value big-endian in n bytes. Negative value whose magnitude needs n bytes: code `0x14 - n`, then the one's complement of the magnitude (big-endian, n bytes). Maximum 8 bytes (magnitude below 2^64); larger values are rejected.
+- Negative integers are supported by the codec, but v1 keys only use non-negative values. Ids and chunk/block numbers are 64-bit.
 - Values outside keys (row blocks, chunk headers, delta entries) are little-endian binary as specified below.
 - Format version: `1`. `SlotsPerChunk = 2048`. Id block size `4096`. Maximum public id length: 400 UTF-8 bytes.
 - Partition is always `0` in v1 but present in every location-bearing key (seam 3). Internal ids never encode location (seam 2).
@@ -16,7 +19,7 @@ This document is the contract between the TypeScript engine and the future Rust 
 | Keyspace | Key tuple | Value |
 |---|---|---|
 | `meta` | `(name: string, ...qualifiers)` | per name, see Meta |
-| `catalog` | `(1)` catalog root | defined by Task 6 (catalog snapshot) |
+| `catalog` | `(1)` catalog root | catalog snapshot; shape defined by Task 6, stored by Task 7 |
 | `ids` | `(1, publicId: string)` | internal id: tuple-encoded `(id: u64)` |
 | `ids` | `(2, id: u64)` | public id: UTF-8 bytes |
 | `rows` | `(partition, block: u64)` | row block |
@@ -30,8 +33,12 @@ This document is the contract between the TypeScript engine and the future Rust 
 Keys are `(name, ...qualifiers)`. Names defined so far:
 
 - `("format")`: the format version, stored as a tuple-encoded single integer `(1)`. `FormatMeta.Verify` throws `FormatVersionMismatchError` if absent or not `1`.
-- `("nextBlock")`: next unallocated id block number (Task 12 id allocator; value layout defined there).
-- Other names and their qualifiers are defined by the task that introduces them; this section is completed by that task.
+Names added by later tasks, each with its value layout completed by that task:
+
+- `("catalogVersion")`: Task 7.
+- `("nextBlock")`: next unallocated id block number; Task 8 (IdAllocator).
+- `("slots", typeId)`: Task 10.
+- `("commit")`: Task 12.
 
 ### Catalog
 
@@ -52,7 +59,7 @@ typeId : u32 little-endian
 slot   : u32 little-endian
 ```
 
-An entry of `0xFFFFFFFF` in `typeId` (with `slot` `0xFFFFFFFF`) means unassigned. A missing block means all 4,096 entries are unassigned. The row entry is an index only: it locates the node's cells; it never copies data. Edges point to internal ids, never slots.
+An entry is unassigned iff both `typeId` and `slot` are `0xFFFFFFFF`; therefore `0xFFFFFFFF` is reserved and is never a valid type id or slot. A missing block means all 4,096 entries are unassigned. The row entry is an index only: it locates the node's cells; it never copies data. Edges point to internal ids, never slots.
 
 ### Columns
 
