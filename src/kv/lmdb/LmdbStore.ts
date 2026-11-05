@@ -71,6 +71,7 @@ class LmdbReadTransaction implements IReadTransaction
     public constructor(
         protected readonly databases: Databases,
         protected readonly snapshot: Transaction,
+        private readonly onDispose?: () => void,
     )
     {
     }
@@ -86,6 +87,7 @@ class LmdbReadTransaction implements IReadTransaction
         this.EnsureLive();
         for (const pair of this.Entries(space, range, limit))
         {
+            this.EnsureLive();
             yield pair;
         }
     }
@@ -96,6 +98,7 @@ class LmdbReadTransaction implements IReadTransaction
         {
             this.disposed = true;
             this.snapshot.done();
+            this.onDispose?.();
         }
     }
 
@@ -173,6 +176,7 @@ class LmdbWriteTransaction extends LmdbReadTransaction implements IWriteTransact
         const count = limit === undefined ? merged.length : Math.min(limit, merged.length);
         for (let i = 0; i < count; i++)
         {
+            this.EnsureLive();
             const pair = merged[i] as [Uint8Array, Uint8Array];
             yield [pair[0].slice(), pair[1].slice()];
         }
@@ -232,6 +236,7 @@ export class LmdbStore implements IKeyValueStore
 
     private tail: Promise<unknown> = Promise.resolve();
     private disposed = false;
+    private readonly liveReads = new Set<LmdbReadTransaction>();
 
     private constructor(
         private readonly root: RootDatabase,
@@ -264,7 +269,9 @@ export class LmdbStore implements IKeyValueStore
     public async BeginRead(): Promise<IReadTransaction>
     {
         this.EnsureLive();
-        return new LmdbReadTransaction(this.databases, this.PinSnapshot());
+        const read = new LmdbReadTransaction(this.databases, this.PinSnapshot(), () => this.liveReads.delete(read));
+        this.liveReads.add(read);
+        return read;
     }
 
     public Write<T>(work: (txn: IWriteTransaction) => Promise<T>): Promise<T>
@@ -280,8 +287,16 @@ export class LmdbStore implements IKeyValueStore
 
     public async dispose(): Promise<void>
     {
+        if (this.disposed)
+        {
+            return;
+        }
         this.disposed = true;
         await this.tail;
+        for (const read of [...this.liveReads])
+        {
+            read.dispose();
+        }
         await this.root.close();
     }
 

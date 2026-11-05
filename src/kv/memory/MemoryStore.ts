@@ -73,15 +73,20 @@ class Sorted
 class MemoryReadTransaction implements IReadTransaction
 {
     protected static readonly ErrDisposed = 'Transaction has been disposed';
+    protected static readonly ErrEmptyKey = 'Empty keys are not supported';
     protected disposed = false;
 
-    public constructor(protected readonly snapshot: Snapshot)
+    public constructor(
+        protected readonly snapshot: Snapshot,
+        private readonly onDispose?: () => void,
+    )
     {
     }
 
     public async Get(space: Keyspace, key: Uint8Array): Promise<Uint8Array | undefined>
     {
         this.EnsureLive();
+        MemoryReadTransaction.RequireKey(key);
         const value = this.Lookup(space, key);
         return value === undefined ? undefined : value.slice();
     }
@@ -93,6 +98,7 @@ class MemoryReadTransaction implements IReadTransaction
         const count = limit === undefined ? entries.length : Math.min(limit, entries.length);
         for (let i = 0; i < count; i++)
         {
+            this.EnsureLive();
             const entry = entries[i] as IEntry;
             yield [entry.Key.slice(), entry.Value.slice()];
         }
@@ -101,6 +107,7 @@ class MemoryReadTransaction implements IReadTransaction
     public dispose(): void
     {
         this.disposed = true;
+        this.onDispose?.();
     }
 
     protected EnsureLive(): void
@@ -108,6 +115,14 @@ class MemoryReadTransaction implements IReadTransaction
         if (this.disposed)
         {
             throw new Error(MemoryReadTransaction.ErrDisposed);
+        }
+    }
+
+    protected static RequireKey(key: Uint8Array): void
+    {
+        if (key.length === 0)
+        {
+            throw new Error(MemoryReadTransaction.ErrEmptyKey);
         }
     }
 
@@ -137,6 +152,7 @@ class MemoryWriteTransaction extends MemoryReadTransaction implements IWriteTran
     public override async Get(space: Keyspace, key: Uint8Array): Promise<Uint8Array | undefined>
     {
         this.EnsureLive();
+        MemoryReadTransaction.RequireKey(key);
         const staged = this.pending.get(space)?.get(Sorted.Hex(key));
         if (staged !== undefined)
         {
@@ -160,6 +176,7 @@ class MemoryWriteTransaction extends MemoryReadTransaction implements IWriteTran
         const count = limit === undefined ? merged.length : Math.min(limit, merged.length);
         for (let i = 0; i < count; i++)
         {
+            this.EnsureLive();
             const entry = merged[i] as IEntry;
             yield [entry.Key.slice(), entry.Value.slice()];
         }
@@ -189,6 +206,7 @@ class MemoryWriteTransaction extends MemoryReadTransaction implements IWriteTran
     private Stage(space: Keyspace, key: Uint8Array, value: Uint8Array | null): void
     {
         this.EnsureLive();
+        MemoryReadTransaction.RequireKey(key);
         let bucket = this.pending.get(space);
         if (bucket === undefined)
         {
@@ -208,11 +226,14 @@ export class MemoryStore implements IKeyValueStore
     private committed: Snapshot = new Map();
     private tail: Promise<unknown> = Promise.resolve();
     private disposed = false;
+    private readonly liveReads = new Set<MemoryReadTransaction>();
 
     public async BeginRead(): Promise<IReadTransaction>
     {
         this.EnsureLive();
-        return new MemoryReadTransaction(this.committed);
+        const read = new MemoryReadTransaction(this.committed, () => this.liveReads.delete(read));
+        this.liveReads.add(read);
+        return read;
     }
 
     public Write<T>(work: (txn: IWriteTransaction) => Promise<T>): Promise<T>
@@ -228,8 +249,16 @@ export class MemoryStore implements IKeyValueStore
 
     public async dispose(): Promise<void>
     {
+        if (this.disposed)
+        {
+            return;
+        }
         this.disposed = true;
         await this.tail;
+        for (const read of [...this.liveReads])
+        {
+            read.dispose();
+        }
     }
 
     private async RunExclusive<T>(work: (txn: IWriteTransaction) => Promise<T>): Promise<T>

@@ -13,6 +13,7 @@ export class KeyValueConformance
     private static readonly SuiteSuffix = ' key-value conformance';
     private static readonly Boom = 'boom';
     private static readonly DisposedPattern = /disposed/i;
+    private static readonly EmptyKeyPattern = /empty key/i;
     private static readonly Space = Keyspace.Rows;
     private static readonly AllKeys: IKeyRange = {
         Start: Uint8Array.of(),
@@ -41,6 +42,10 @@ export class KeyValueConformance
             KeyValueConformance.Case('write transaction reads of staged values are copies', open, KeyValueConformance.StagedCopies);
             KeyValueConformance.Case('Put and Delete on a disposed transaction throw', open, KeyValueConformance.DisposedMutation);
             KeyValueConformance.Case('a synchronous throw from work rejects and leaves no trace', open, KeyValueConformance.SyncThrow);
+            KeyValueConformance.Case('empty key rejected', open, KeyValueConformance.EmptyKey);
+            KeyValueConformance.Case('dispose mid-scan makes the next step throw', open, KeyValueConformance.DisposeMidScan);
+            KeyValueConformance.OwnStoreCase('store dispose releases open transactions', open, KeyValueConformance.StoreDisposeReleasesReads);
+            KeyValueConformance.OwnStoreCase('double store dispose is a no-op', open, KeyValueConformance.DoubleDispose);
             KeyValueConformance.UseAfterDisposeCase('use after store dispose rejects', open);
             if (reopen !== undefined)
             {
@@ -62,6 +67,14 @@ export class KeyValueConformance
             {
                 await store.dispose();
             }
+        });
+    }
+
+    private static OwnStoreCase(title: string, open: Open, body: (store: IKeyValueStore) => Promise<void>): void
+    {
+        it(title, async () =>
+        {
+            await body(await open());
         });
     }
 
@@ -492,5 +505,53 @@ export class KeyValueConformance
         {
             txn.Put(space, KeyValueConformance.Key(2), KeyValueConformance.Val(2));
         });
+    }
+
+    private static async EmptyKey(store: IKeyValueStore): Promise<void>
+    {
+        const space = KeyValueConformance.Space;
+        const empty = Uint8Array.of();
+        const read = await store.BeginRead();
+        await assert.rejects(read.Get(space, empty), KeyValueConformance.EmptyKeyPattern);
+        read.dispose();
+        await store.Write(async txn =>
+        {
+            await assert.rejects(txn.Get(space, empty), KeyValueConformance.EmptyKeyPattern);
+            assert.throws(() => txn.Put(space, empty, KeyValueConformance.Val(1)), KeyValueConformance.EmptyKeyPattern);
+            assert.throws(() => txn.Delete(space, empty), KeyValueConformance.EmptyKeyPattern);
+        });
+    }
+
+    private static async DisposeMidScan(store: IKeyValueStore): Promise<void>
+    {
+        const space = KeyValueConformance.Space;
+        await KeyValueConformance.Seed(store, [1, 2, 3]);
+        const read = await store.BeginRead();
+        const iterator = read.Scan(space, KeyValueConformance.AllKeys)[Symbol.asyncIterator]();
+        const first = await iterator.next();
+        assert.equal(first.done, false);
+        read.dispose();
+        await assert.rejects(iterator.next(), KeyValueConformance.DisposedPattern);
+        await store.Write(async txn =>
+        {
+            const writeIterator = txn.Scan(space, KeyValueConformance.AllKeys)[Symbol.asyncIterator]();
+            assert.equal((await writeIterator.next()).done, false);
+            txn.dispose();
+            await assert.rejects(writeIterator.next(), KeyValueConformance.DisposedPattern);
+        });
+    }
+
+    private static async StoreDisposeReleasesReads(store: IKeyValueStore): Promise<void>
+    {
+        const read = await store.BeginRead();
+        await store.dispose();
+        await assert.rejects(read.Get(KeyValueConformance.Space, KeyValueConformance.Key(1)), KeyValueConformance.DisposedPattern);
+        read.dispose();
+    }
+
+    private static async DoubleDispose(store: IKeyValueStore): Promise<void>
+    {
+        await store.dispose();
+        await store.dispose();
     }
 }

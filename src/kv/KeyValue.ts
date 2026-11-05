@@ -7,7 +7,11 @@ export interface IKeyRange
     readonly End: Uint8Array;
 }
 
-/** Sees one immutable snapshot for its whole life. Returned buffers are always copies. */
+/**
+ * Sees one immutable snapshot for its whole life. Returned buffers are always copies.
+ * Keys must be non-empty: an empty key is rejected (Get rejects, Put/Delete throw).
+ * Store disposal releases every still-open transaction; later use throws.
+ */
 export interface IReadTransaction
 {
     Get(space: Keyspace, key: Uint8Array): Promise<Uint8Array | undefined>;
@@ -15,7 +19,7 @@ export interface IReadTransaction
     dispose(): void;
 }
 
-/** Reads see this transaction's own pending writes merged over its snapshot. */
+/** Reads see this transaction's own pending writes merged over its snapshot. Empty keys are rejected. */
 export interface IWriteTransaction extends IReadTransaction
 {
     Put(space: Keyspace, key: Uint8Array, value: Uint8Array): void;
