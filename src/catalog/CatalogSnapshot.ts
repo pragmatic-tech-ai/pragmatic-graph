@@ -77,7 +77,7 @@ export class CatalogSnapshot
         const isaSets = new Map<string, ReadonlySet<string>>();
         for (const [c, set] of carried)
         {
-            isaSets.set(c, Object.freeze(set) as ReadonlySet<string>);
+            isaSets.set(c, set);
         }
         return new CatalogSnapshot(version, defs, effective, isaSets);
     }

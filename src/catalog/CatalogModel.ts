@@ -7,7 +7,11 @@ export type { MemberDef, MemberInput, TypeDefinition } from './CatalogTypes.js';
 
 type MutableMemberDef = { -readonly [K in keyof MemberDef]: MemberDef[K] };
 
-/** Mutable catalog under construction. Define* only records; Seal() validates and yields an immutable snapshot. */
+/**
+ * Mutable catalog under construction. Define* only records; Seal() validates and yields an immutable snapshot.
+ * A failed Seal() leaves version and id counters untouched, but the offending definitions stay recorded:
+ * discard a model whose Seal() threw and rebuild from the last good snapshot via FromSnapshot.
+ */
 export class CatalogModel
 {
     private static readonly DuplicateTypeMessage = 'Type already defined: ';
@@ -104,7 +108,7 @@ export class CatalogModel
             const where = path + '.' + input.Name;
             if (seen.has(input.Name))
             {
-                throw new CatalogError(CatalogErrorCode.MemberRedeclared, CatalogModel.DuplicateMemberMessage + where);
+                throw new CatalogError(CatalogErrorCode.InvalidMember, CatalogModel.DuplicateMemberMessage + where);
             }
             seen.add(input.Name);
             result.push(this.ConvertMember(owner, where, input, edge));

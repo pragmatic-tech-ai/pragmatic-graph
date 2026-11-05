@@ -19,7 +19,7 @@ This document is the contract between the TypeScript engine and the future Rust 
 | Keyspace | Key tuple | Value |
 |---|---|---|
 | `meta` | `(name: string, ...qualifiers)` | per name, see Meta |
-| `catalog` | `(1)` catalog root | catalog snapshot; shape defined by Task 6, stored by Task 7 |
+| `catalog` | `(1)` catalog root | catalog definitions: UTF-8 JSON, see Catalog |
 | `ids` | `(1, publicId: string)` | internal id: tuple-encoded `(id: u64)` |
 | `ids` | `(2, id: u64)` | public id: UTF-8 bytes |
 | `rows` | `(partition, block: u64)` | row block |
@@ -33,16 +33,24 @@ This document is the contract between the TypeScript engine and the future Rust 
 Keys are `(name, ...qualifiers)`. Names defined so far:
 
 - `("format")`: the format version, stored as a tuple-encoded single integer `(1)`. `FormatMeta.Verify` throws `FormatVersionMismatchError` if absent or not `1`.
+- `("catalogVersion")`: the catalog version, a tuple-encoded single integer `(n)`; absent means `0` (empty catalog).
+
 Names added by later tasks, each with its value layout completed by that task:
 
-- `("catalogVersion")`: Task 7.
 - `("nextBlock")`: next unallocated id block number; Task 8 (IdAllocator).
 - `("slots", typeId)`: Task 10.
 - `("commit")`: Task 12.
 
 ### Catalog
 
-`(1)` is the catalog root. Further catalog key families (types, relationships, members) take the next tags; their layouts are defined by Task 6 and this section is completed by that task.
+`(1)` is the catalog root and the only catalog key in v1. Its value is the UTF-8 encoding of a JSON array of type definitions in definition order (the `TypeDefinition[]` returned by `CatalogSnapshot.Definitions()`):
+
+```
+{ Name, IsAspect, TypeId, Parent: string|null, Aspects: string[], Members: MemberDef[] }
+MemberDef = { Id, Name, Kind, Type?, Nullable, Targets?, Many?, Ordered?, EdgeProperties?: MemberDef[], DeclaredBy }
+```
+
+`Kind` is `1` Property or `2` Relationship; `Type` is `1` Boolean, `2` Int64, `3` Float64, `4` String, `5` Date, `6` DateTime, `7` Duration. Type ids and member ids are stored as assigned. The next-id counters are not stored: they are derived on load as one more than the largest stored type id and member id (including edge properties). The catalog version lives in `Meta("catalogVersion")`, not in the row, and is written in the same transaction. A save must carry exactly the stored version plus one, otherwise it is rejected as a version conflict.
 
 Member ids are catalog-global: one id space across all concepts and aspects, assigned once, stable, never reused, starting at `1`. An aspect-contributed member keeps its one id in every carrier concept. Member id `0` is reserved: it is the implicit node-id column (Int64, non-null) present on every concept.
 

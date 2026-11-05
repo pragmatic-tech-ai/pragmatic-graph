@@ -259,4 +259,94 @@ describe('CatalogModel', () =>
         assert.throws(() => members.push({}));
         assert.throws(() => { (s1.EffectiveMembers('C')[0] as { Name: string }).Name = 'y'; });
     });
+
+    it('aspect including itself throws InheritanceCycle', () =>
+    {
+        const m = new CatalogModel();
+        m.DefineAspect('A', ['A'], []);
+        assert.throws(() => m.Seal(), Fx.Code(CatalogErrorCode.InheritanceCycle));
+    });
+
+    it('a concept extending itself throws InheritanceCycle', () =>
+    {
+        const m = new CatalogModel();
+        m.DefineConcept('A', 'A', [], []);
+        assert.throws(() => m.Seal(), Fx.Code(CatalogErrorCode.InheritanceCycle));
+    });
+
+    it('a type outside a cycle that descends into it still throws InheritanceCycle', () =>
+    {
+        const m = new CatalogModel();
+        m.DefineConcept('Leaf', 'A', [], []);
+        m.DefineConcept('A', 'B', [], []);
+        m.DefineConcept('B', 'A', [], []);
+        assert.throws(() => m.Seal(), Fx.Code(CatalogErrorCode.InheritanceCycle));
+    });
+
+    it('a collision inside an aspect include chain throws MemberCollision', () =>
+    {
+        const m = new CatalogModel();
+        m.DefineAspect('B', [], [Fx.Prop('x')]);
+        m.DefineAspect('C', [], [Fx.Prop('x')]);
+        m.DefineAspect('A', ['B', 'C'], []);
+        assert.throws(() => m.Seal(), Fx.Code(CatalogErrorCode.MemberCollision));
+    });
+
+    it('a child listing an aspect already carried via the parent gets its members once', () =>
+    {
+        const m = new CatalogModel();
+        m.DefineAspect('Base', [], [Fx.Prop('b')]);
+        m.DefineAspect('Mid', ['Base'], [Fx.Prop('m')]);
+        m.DefineConcept('P', null, ['Base'], []);
+        m.DefineConcept('C', 'P', ['Mid'], []);
+        const s = m.Seal();
+        assert.deepEqual(Fx.Names(s, 'C'), ['b', 'm']);
+    });
+
+    it('ConceptsMatching(parent) is exactly the concepts within the parent interval', () =>
+    {
+        const m = new CatalogModel();
+        m.DefineConcept('Root', null, [], []);
+        m.DefineConcept('Kid', 'Root', [], []);
+        m.DefineConcept('Grand', 'Kid', [], []);
+        m.DefineConcept('Other', null, [], []);
+        m.DefineConcept('Kid2', 'Other', [], []);
+        const s = m.Seal();
+        for (const parent of ['Root', 'Kid', 'Other'])
+        {
+            const [lo, hi] = s.PreOrderInterval(parent);
+            const within = s.Definitions()
+                .filter(d => !d.IsAspect)
+                .filter(d => { const [l, h] = s.PreOrderInterval(d.Name); return l >= lo && h <= hi; })
+                .map(d => d.TypeId)
+                .sort((a, b) => a - b);
+            assert.deepEqual([...s.ConceptsMatching(parent)].sort((a, b) => a - b), within);
+        }
+    });
+
+    it('duplicate member names in one declaration throw InvalidMember', () =>
+    {
+        const m = new CatalogModel();
+        assert.throws(() => m.DefineConcept('C', null, [], [Fx.Prop('x'), Fx.Prop('x')]), Fx.Code(CatalogErrorCode.InvalidMember));
+        assert.throws(
+            () => m.DefineConcept('D', null, [], [Fx.Rel('r', ['D'], [Fx.Prop('p'), Fx.Prop('p')])]),
+            Fx.Code(CatalogErrorCode.InvalidMember));
+    });
+
+    it('a failed Seal leaves version and id counters untouched', () =>
+    {
+        const m = new CatalogModel();
+        m.DefineConcept('Ok', null, [], [Fx.Prop('x')]);
+        const first = m.Seal();
+        const fresh = CatalogModel.FromSnapshot(first);
+        fresh.DefineConcept('Bad', 'Missing', [], [Fx.Prop('y')]);
+        assert.throws(() => fresh.Seal(), Fx.Code(CatalogErrorCode.UnknownType));
+        assert.throws(() => fresh.Seal(), Fx.Code(CatalogErrorCode.UnknownType));
+        const again = CatalogModel.FromSnapshot(first);
+        again.DefineConcept('Good', null, [], [Fx.Prop('z')]);
+        const second = again.Seal();
+        assert.equal(second.Version, 2);
+        assert.equal(second.Member('Good', 'z').Id, 2);
+        assert.equal(second.TypeId('Good'), 2);
+    });
 });
