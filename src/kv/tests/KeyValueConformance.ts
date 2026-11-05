@@ -1,7 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { TupleCodec } from '../../format/TupleCodec.js';
-import { IKeyRange, IKeyValueStore, IReadTransaction } from '../KeyValue.js';
+import { IKeyRange, IKeyValueStore, IReadTransaction, IWriteTransaction } from '../KeyValue.js';
 import { Keyspace } from '../Keyspace.js';
 
 type Open = () => Promise<IKeyValueStore>;
@@ -37,6 +37,11 @@ export class KeyValueConformance
             KeyValueConformance.Case('Put copies key and value', open, KeyValueConformance.CopyOnPut);
             KeyValueConformance.Case('returned buffers are copies', open, KeyValueConformance.CopyOnRead);
             KeyValueConformance.Case('a disposed transaction throws', open, KeyValueConformance.DisposedTransaction);
+            KeyValueConformance.Case('a commit mid-scan does not change what the scan yields', open, KeyValueConformance.MidScanCommit);
+            KeyValueConformance.Case('write transaction reads of staged values are copies', open, KeyValueConformance.StagedCopies);
+            KeyValueConformance.Case('Put and Delete on a disposed transaction throw', open, KeyValueConformance.DisposedMutation);
+            KeyValueConformance.Case('a synchronous throw from work rejects and leaves no trace', open, KeyValueConformance.SyncThrow);
+            KeyValueConformance.UseAfterDisposeCase('use after store dispose rejects', open);
             if (reopen !== undefined)
             {
                 KeyValueConformance.ReopenCase('committed data survives reopen', open, reopen);
@@ -57,6 +62,20 @@ export class KeyValueConformance
             {
                 await store.dispose();
             }
+        });
+    }
+
+    private static UseAfterDisposeCase(title: string, open: Open): void
+    {
+        it(title, async () =>
+        {
+            const store = await open();
+            await store.dispose();
+            await assert.rejects(store.BeginRead(), KeyValueConformance.DisposedPattern);
+            await assert.rejects(
+                store.Write(async () => undefined),
+                KeyValueConformance.DisposedPattern,
+            );
         });
     }
 
@@ -399,5 +418,79 @@ export class KeyValueConformance
         });
         assert.ok(leaked !== undefined);
         await assert.rejects(leaked.Get(space, KeyValueConformance.Key(1)), KeyValueConformance.DisposedPattern);
+    }
+
+    private static async MidScanCommit(store: IKeyValueStore): Promise<void>
+    {
+        const space = KeyValueConformance.Space;
+        await KeyValueConformance.Seed(store, [1, 2, 3, 4]);
+        const read = await store.BeginRead();
+        const seen: Uint8Array[] = [];
+        for await (const [key] of read.Scan(space, KeyValueConformance.AllKeys))
+        {
+            seen.push(key);
+            if (seen.length === 1)
+            {
+                await store.Write(async txn =>
+                {
+                    txn.Delete(space, KeyValueConformance.Key(2));
+                    txn.Put(space, KeyValueConformance.Key(3), KeyValueConformance.Val(9));
+                    txn.Put(space, KeyValueConformance.Key(5), KeyValueConformance.Val(5));
+                });
+            }
+        }
+        read.dispose();
+        assert.deepEqual(seen, [1, 2, 3, 4].map(n => KeyValueConformance.Key(n)));
+    }
+
+    private static async StagedCopies(store: IKeyValueStore): Promise<void>
+    {
+        const space = KeyValueConformance.Space;
+        await store.Write(async txn =>
+        {
+            txn.Put(space, KeyValueConformance.Key(1), KeyValueConformance.Val(1));
+            const got = await txn.Get(space, KeyValueConformance.Key(1));
+            assert.ok(got !== undefined);
+            got.fill(0xaa);
+            const [pair] = await KeyValueConformance.Collect(txn.Scan(space, KeyValueConformance.AllKeys));
+            assert.ok(pair !== undefined);
+            assert.deepEqual(pair[1], KeyValueConformance.Val(1));
+            pair[0].fill(0xbb);
+            pair[1].fill(0xcc);
+            assert.deepEqual(await txn.Get(space, KeyValueConformance.Key(1)), KeyValueConformance.Val(1));
+            assert.deepEqual(await KeyValueConformance.Keys(txn, KeyValueConformance.AllKeys), [KeyValueConformance.Key(1)]);
+        });
+    }
+
+    private static async DisposedMutation(store: IKeyValueStore): Promise<void>
+    {
+        const space = KeyValueConformance.Space;
+        let leaked: IWriteTransaction | undefined;
+        await store.Write(async txn =>
+        {
+            leaked = txn;
+        });
+        const txn = leaked;
+        assert.ok(txn !== undefined);
+        assert.throws(() => txn.Put(space, KeyValueConformance.Key(1), KeyValueConformance.Val(1)), KeyValueConformance.DisposedPattern);
+        assert.throws(() => txn.Delete(space, KeyValueConformance.Key(1)), KeyValueConformance.DisposedPattern);
+    }
+
+    private static async SyncThrow(store: IKeyValueStore): Promise<void>
+    {
+        const space = KeyValueConformance.Space;
+        const work = ((txn: IWriteTransaction) =>
+        {
+            txn.Put(space, KeyValueConformance.Key(1), KeyValueConformance.Val(1));
+            throw new Error(KeyValueConformance.Boom);
+        }) as unknown as (txn: IWriteTransaction) => Promise<void>;
+        await assert.rejects(store.Write(work), new RegExp(KeyValueConformance.Boom));
+        const read = await store.BeginRead();
+        assert.equal(await read.Get(space, KeyValueConformance.Key(1)), undefined);
+        read.dispose();
+        await store.Write(async txn =>
+        {
+            txn.Put(space, KeyValueConformance.Key(2), KeyValueConformance.Val(2));
+        });
     }
 }

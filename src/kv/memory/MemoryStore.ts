@@ -217,7 +217,10 @@ export class MemoryStore implements IKeyValueStore
 
     public Write<T>(work: (txn: IWriteTransaction) => Promise<T>): Promise<T>
     {
-        this.EnsureLive();
+        if (this.disposed)
+        {
+            return Promise.reject(new Error(MemoryStore.ErrDisposed));
+        }
         const run = this.tail.then(() => this.RunExclusive(work));
         this.tail = run.catch(() => undefined);
         return run;
