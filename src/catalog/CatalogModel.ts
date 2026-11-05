@@ -30,6 +30,8 @@ export class CatalogModel
     {
         const model = new CatalogModel();
         model.version = snapshot.Version;
+        model.nextTypeId = Math.max(1, snapshot.NextTypeId);
+        model.nextMemberId = Math.max(1, snapshot.NextMemberId);
         for (const def of snapshot.Definitions())
         {
             model.definitions.set(def.Name, def);
@@ -71,7 +73,7 @@ export class CatalogModel
 
     public Seal(): CatalogSnapshot
     {
-        const snapshot = CatalogSnapshot.Build(this.version + 1, [...this.definitions.values()]);
+        const snapshot = CatalogSnapshot.Build(this.version + 1, [...this.definitions.values()], this.nextTypeId, this.nextMemberId);
         this.version += 1;
         return snapshot;
     }

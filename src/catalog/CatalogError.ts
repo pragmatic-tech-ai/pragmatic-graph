@@ -12,6 +12,7 @@ export enum CatalogErrorCode
     UnknownMember,
     InvalidMember,
     VersionConflict,
+    CorruptCatalog,
 }
 
 export class CatalogError extends Error

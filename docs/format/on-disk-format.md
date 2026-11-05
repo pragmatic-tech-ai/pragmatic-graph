@@ -43,14 +43,15 @@ Names added by later tasks, each with its value layout completed by that task:
 
 ### Catalog
 
-`(1)` is the catalog root and the only catalog key in v1. Its value is the UTF-8 encoding of a JSON array of type definitions in definition order (the `TypeDefinition[]` returned by `CatalogSnapshot.Definitions()`):
+`(1)` is the catalog root and the only catalog key in v1. Its value is the UTF-8 encoding of a JSON object:
 
 ```
-{ Name, IsAspect, TypeId, Parent: string|null, Aspects: string[], Members: MemberDef[] }
+{ NextTypeId: number, NextMemberId: number, Definitions: TypeDefinition[] }
+TypeDefinition = { Name, IsAspect, TypeId, Parent: string|null, Aspects: string[], Members: MemberDef[] }
 MemberDef = { Id, Name, Kind, Type?, Nullable, Targets?, Many?, Ordered?, EdgeProperties?: MemberDef[], DeclaredBy }
 ```
 
-`Kind` is `1` Property or `2` Relationship; `Type` is `1` Boolean, `2` Int64, `3` Float64, `4` String, `5` Date, `6` DateTime, `7` Duration. Type ids and member ids are stored as assigned. The next-id counters are not stored: they are derived on load as one more than the largest stored type id and member id (including edge properties). The catalog version lives in `Meta("catalogVersion")`, not in the row, and is written in the same transaction. A save must carry exactly the stored version plus one, otherwise it is rejected as a version conflict.
+`Definitions` are in definition order. `Kind` is `1` Property or `2` Relationship; `Type` is `1` Boolean, `2` Int64, `3` Float64, `4` String, `5` Date, `6` DateTime, `7` Duration. Type ids and member ids are stored as assigned. `NextTypeId` and `NextMemberId` are the persisted next-id counters, so ids are never reused; on load a counter is never below one more than the largest stored id of its kind. The catalog version lives in `Meta("catalogVersion")`, not in the row, and is written in the same transaction. A save must carry exactly the stored version plus one, otherwise it is rejected as a version conflict. A value that is not valid JSON of this shape, or that repeats a type id or member id (edge properties included), is rejected on load as a corrupt catalog.
 
 Member ids are catalog-global: one id space across all concepts and aspects, assigned once, stable, never reused, starting at `1`. An aspect-contributed member keeps its one id in every carrier concept. Member id `0` is reserved: it is the implicit node-id column (Int64, non-null) present on every concept.
 

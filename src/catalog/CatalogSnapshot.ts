@@ -25,6 +25,9 @@ export class CatalogSnapshot
     private static readonly NotInstantiableMessage = 'Aspect is not instantiable: ';
 
     public readonly Version: number;
+    /** Next unassigned type id and member id; persisted so ids are never reused. */
+    public readonly NextTypeId: number;
+    public readonly NextMemberId: number;
 
     private readonly defs: readonly TypeDefinition[];
     private readonly byName: ReadonlyMap<string, TypeDefinition>;
@@ -38,9 +41,13 @@ export class CatalogSnapshot
         version: number,
         defs: readonly TypeDefinition[],
         effective: Map<string, readonly MemberDef[]>,
-        isaSets: Map<string, ReadonlySet<string>>)
+        isaSets: Map<string, ReadonlySet<string>>,
+        nextTypeId: number,
+        nextMemberId: number)
     {
         this.Version = version;
+        this.NextTypeId = nextTypeId;
+        this.NextMemberId = nextMemberId;
         this.defs = Object.freeze([...defs]);
         this.byName = new Map(defs.map(d => [d.Name, d]));
         this.effective = effective;
@@ -56,7 +63,7 @@ export class CatalogSnapshot
     }
 
     /** Validates the definitions and builds a snapshot; throws CatalogError on any type-model violation. */
-    public static Build(version: number, defs: readonly TypeDefinition[]): CatalogSnapshot
+    public static Build(version: number, defs: readonly TypeDefinition[], nextTypeId = 1, nextMemberId = 1): CatalogSnapshot
     {
         const byName = new Map(defs.map(d => [d.Name, d]));
         CatalogSnapshot.CheckReferences(defs, byName);
@@ -79,7 +86,7 @@ export class CatalogSnapshot
         {
             isaSets.set(c, set);
         }
-        return new CatalogSnapshot(version, defs, effective, isaSets);
+        return new CatalogSnapshot(version, defs, effective, isaSets, nextTypeId, nextMemberId);
     }
 
     public Definitions(): readonly TypeDefinition[]

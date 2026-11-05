@@ -10,6 +10,8 @@ import { CatalogStore } from '../CatalogStore.js';
 import { MemberKind, ValueType } from '../ValueType.js';
 import type { IKeyValueStore } from '../../kv/KeyValue.js';
 import { LmdbStore } from '../../kv/lmdb/LmdbStore.js';
+import { Keyspace } from '../../kv/Keyspace.js';
+import { FormatKeys } from '../../format/FormatKeys.js';
 import { MemoryStore } from '../../kv/memory/MemoryStore.js';
 
 class CatalogFx
@@ -47,6 +49,21 @@ class CatalogFx
     public static async Save(store: IKeyValueStore, s: CatalogSnapshot): Promise<void>
     {
         await store.Write(txn => CatalogStore.Save(txn, s));
+    }
+
+    public static async PutRaw(store: IKeyValueStore, bytes: Uint8Array): Promise<void>
+    {
+        await store.Write(async txn => { txn.Put(Keyspace.Catalog, FormatKeys.CatalogRoot(), bytes); });
+    }
+
+    public static async PutObject(store: IKeyValueStore, value: unknown): Promise<void>
+    {
+        await CatalogFx.PutRaw(store, new TextEncoder().encode(JSON.stringify(value)));
+    }
+
+    public static Corrupt(e: unknown): boolean
+    {
+        return e instanceof CatalogError && e.Code === CatalogErrorCode.CorruptCatalog;
     }
 
     public static async Load(store: IKeyValueStore): Promise<CatalogSnapshot>
@@ -125,7 +142,7 @@ for (const [name, open] of backends)
             await store.dispose();
         });
 
-        it('next-id counters survive load: new ids exceed all old and old ids are unchanged', async () =>
+        it('derived floors: new ids exceed all old and old ids are unchanged', async () =>
         {
             const store = await open();
             const saved = CatalogFx.Sample();
@@ -142,6 +159,90 @@ for (const [name, open] of backends)
                 assert.equal(next.TypeId(d.Name), d.TypeId);
             }
             assert.deepEqual(next.EffectiveMembers('Person'), saved.EffectiveMembers('Person'));
+            await store.dispose();
+        });
+
+        it('stored counters beyond the max used id are honoured', async () =>
+        {
+            const store = await open();
+            await CatalogFx.PutObject(store, { NextTypeId: 50, NextMemberId: 100, Definitions: CatalogFx.Sample().Definitions() });
+            const loaded = await CatalogFx.Load(store);
+            assert.equal(loaded.NextTypeId, 50);
+            assert.equal(loaded.NextMemberId, 100);
+            const m = CatalogModel.FromSnapshot(loaded);
+            m.DefineConcept('Pet', null, [], [{ Name: 'tag', Kind: MemberKind.Property, Type: ValueType.String }]);
+            const next = m.Seal();
+            assert.ok(next.TypeId('Pet') >= 50);
+            assert.ok(next.Member('Pet', 'tag').Id >= 100);
+            await store.dispose();
+        });
+
+        it('saved counters round-trip through Save and Load', async () =>
+        {
+            const store = await open();
+            const m = new CatalogModel();
+            m.DefineConcept('Gone', null, [], [{ Name: 'g', Kind: MemberKind.Property, Type: ValueType.String }]);
+            const s1 = m.Seal();
+            const fresh = CatalogModel.FromSnapshot(s1);
+            const s2 = fresh.Seal();
+            await CatalogFx.Save(store, s1);
+            await CatalogFx.Save(store, s2);
+            const loaded = await CatalogFx.Load(store);
+            assert.equal(loaded.NextTypeId, s2.NextTypeId);
+            assert.equal(loaded.NextMemberId, s2.NextMemberId);
+            await store.dispose();
+        });
+
+        it('garbage or mis-shaped catalog bytes throw CorruptCatalog', async () =>
+        {
+            const cases: unknown[] = [
+                [1, 2, 3],
+                { NextTypeId: 'x', NextMemberId: 1, Definitions: [] },
+                { NextTypeId: 1, NextMemberId: 1 },
+                { NextTypeId: 1, NextMemberId: 1, Definitions: {} },
+                null,
+            ];
+            const store = await open();
+            await CatalogFx.PutRaw(store, new Uint8Array([0xff, 0x00, 0x7b]));
+            await assert.rejects(CatalogFx.Load(store), CatalogFx.Corrupt);
+            for (const c of cases)
+            {
+                await CatalogFx.PutObject(store, c);
+                await assert.rejects(CatalogFx.Load(store), CatalogFx.Corrupt);
+            }
+            await store.dispose();
+        });
+
+        it('duplicate type ids or member ids throw CorruptCatalog', async () =>
+        {
+            const defs = JSON.parse(JSON.stringify(CatalogFx.Sample().Definitions())) as { TypeId: number; Members: { Id: number; EdgeProperties?: { Id: number }[] }[] }[];
+            const store = await open();
+            const dupType = JSON.parse(JSON.stringify(defs)) as typeof defs;
+            dupType[1]!.TypeId = dupType[0]!.TypeId;
+            await CatalogFx.PutObject(store, { NextTypeId: 9, NextMemberId: 9, Definitions: dupType });
+            await assert.rejects(CatalogFx.Load(store), CatalogFx.Corrupt);
+            const dupEdge = JSON.parse(JSON.stringify(defs)) as typeof defs;
+            const person = dupEdge.find(d => d.Members.some(m => m.EdgeProperties !== undefined))!;
+            const rel = person.Members.find(m => m.EdgeProperties !== undefined)!;
+            rel.EdgeProperties![0]!.Id = rel.Id;
+            await CatalogFx.PutObject(store, { NextTypeId: 9, NextMemberId: 9, Definitions: dupEdge });
+            await assert.rejects(CatalogFx.Load(store), CatalogFx.Corrupt);
+            await store.dispose();
+        });
+
+        it('loaded definitions are deeply frozen', async () =>
+        {
+            const store = await open();
+            await CatalogFx.Save(store, CatalogFx.Sample());
+            const loaded = await CatalogFx.Load(store);
+            const defs = loaded.Definitions();
+            const person = defs.find(d => d.Name === 'Person')!;
+            assert.throws(() => { (person as { Name: string }).Name = 'x'; });
+            assert.throws(() => (person.Aspects as string[]).push('y'));
+            assert.throws(() => { (person.Members[0] as { Name: string }).Name = 'x'; });
+            assert.throws(() => { (person.Members[0]!.EdgeProperties![0] as { Name: string }).Name = 'x'; });
+            assert.throws(() => (person.Members[0]!.Targets as string[]).push('y'));
+            assert.equal(loaded.TypeId('Person'), person.TypeId);
             await store.dispose();
         });
     });
