@@ -111,7 +111,7 @@ class LmdbReadTransaction implements IReadTransaction
     protected Lookup(space: Keyspace, key: Uint8Array): Uint8Array | undefined
     {
         LmdbKeys.Require(key);
-        const value = this.Db(space).getBinary(Buffer.from(key), { transaction: this.snapshot });
+        const value = this.Db(space).get(Buffer.from(key), { transaction: this.snapshot });
         return value === undefined ? undefined : Uint8Array.from(value);
     }
 
