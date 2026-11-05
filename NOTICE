@@ -1,0 +1,12 @@
+pragmatic-graph (@pragmatic-tech-ai/graph)
+Copyright 2026 Pragmatic Tech AI
+
+Licensed under the Apache License, Version 2.0.
+
+Third-party attribution
+-----------------------
+Reserved for code adapted from Kuzu (MIT License),
+https://github.com/kuzudb/kuzu, reference commit
+89f0263cc7a1fd9c396d2c4953747a013556a7f9.
+Any adapted code must be listed here with its original copyright notice
+and the MIT license text. No Kuzu code has been adapted yet.
