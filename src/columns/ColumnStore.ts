@@ -34,7 +34,6 @@ class DeltaState
     }
 }
 
-/** A chunk whose delta this write transaction has written, with the delta's total entry count. */
 /** One live row of ScanColumn. */
 export interface IColumnRow
 {
@@ -44,6 +43,7 @@ export interface IColumnRow
     readonly NodeId: bigint;
 }
 
+/** A chunk whose delta this write transaction has written, with the delta's total entry count. */
 export interface ITouchedDelta
 {
     readonly Partition: number;

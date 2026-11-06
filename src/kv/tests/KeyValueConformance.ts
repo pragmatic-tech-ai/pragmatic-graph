@@ -1,7 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { TupleCodec } from '../../format/TupleCodec.js';
-import { IKeyRange, IKeyValueStore, IReadTransaction, IWriteTransaction } from '../KeyValue.js';
+import { IKeyRange, IKeyValueStore, IReadTransaction, IScanProbe, IWriteTransaction } from '../KeyValue.js';
 import { Keyspace } from '../Keyspace.js';
 
 type Open = () => Promise<IKeyValueStore>;
@@ -29,6 +29,8 @@ export class KeyValueConformance
             KeyValueConformance.Case('scans in Compare order', open, KeyValueConformance.ScanOrder);
             KeyValueConformance.Case('scan honors End exclusivity and Start inclusivity', open, KeyValueConformance.ScanBounds);
             KeyValueConformance.Case('scan honors limit', open, KeyValueConformance.ScanLimit);
+            KeyValueConformance.Case('write scan with limit 1 merges a staged delete or put at the start of the range', open, KeyValueConformance.LimitedOwnWrites);
+            KeyValueConformance.Case('a limited scan stops early: it reads a bounded number of stored entries over 10,000 keys', open, KeyValueConformance.ScanEarlyExit);
             KeyValueConformance.Case('read snapshot ignores later commits', open, KeyValueConformance.SnapshotIsolation);
             KeyValueConformance.Case('write reads see own pending writes in Get', open, KeyValueConformance.OwnWritesGet);
             KeyValueConformance.Case('write reads see own pending writes in Scan', open, KeyValueConformance.OwnWritesScan);
@@ -249,6 +251,55 @@ export class KeyValueConformance
         assert.deepEqual(two, [KeyValueConformance.Key(1), KeyValueConformance.Key(2)]);
         assert.equal(zero.length, 0);
         assert.equal(many.length, 5);
+    }
+
+    private static async LimitedOwnWrites(store: IKeyValueStore): Promise<void>
+    {
+        const space = KeyValueConformance.Space;
+        const key = KeyValueConformance.Key;
+        await KeyValueConformance.Seed(store, [10, 20, 30]);
+        await store.Write(async txn =>
+        {
+            txn.Delete(space, key(10));
+            assert.deepEqual(await KeyValueConformance.Keys(txn, KeyValueConformance.AllKeys, 1), [key(20)], 'a staged delete hides the first stored key');
+            txn.Put(space, key(5), KeyValueConformance.Val(5));
+            assert.deepEqual(await KeyValueConformance.Keys(txn, KeyValueConformance.AllKeys, 1), [key(5)], 'a staged put before the first stored key');
+            txn.Put(space, key(20), KeyValueConformance.Val(99));
+            const replaced = await KeyValueConformance.Collect(txn.Scan(space, KeyValueConformance.Range(11, 40), 1));
+            assert.deepEqual(replaced, [[key(20), KeyValueConformance.Val(99)]], 'a staged put over a stored key wins');
+            txn.Delete(space, key(5));
+            txn.Delete(space, key(20));
+            assert.deepEqual(await KeyValueConformance.Keys(txn, KeyValueConformance.AllKeys, 1), [key(30)], 'several staged deletes in a row');
+            assert.deepEqual(await KeyValueConformance.Keys(txn, KeyValueConformance.AllKeys, 0), []);
+        });
+    }
+
+    private static async ScanEarlyExit(store: IKeyValueStore): Promise<void>
+    {
+        const space = KeyValueConformance.Space;
+        const key = KeyValueConformance.Key;
+        const probe = store as unknown as Partial<IScanProbe>;
+        assert.equal(typeof probe.EntriesRead, 'number', 'backend implements IScanProbe');
+        const read = (): number => probe.EntriesRead as number;
+        const numbers = Array.from({ length: 10000 }, (_, i) => i + 1);
+        await KeyValueConformance.Seed(store, numbers);
+        const snapshot = await store.BeginRead();
+        let before = read();
+        assert.deepEqual(await KeyValueConformance.Keys(snapshot, KeyValueConformance.AllKeys, 2), [key(1), key(2)]);
+        assert.ok(read() - before <= 4, 'read scan pulled ' + (read() - before) + ' entries');
+        snapshot.dispose();
+        await store.Write(async txn =>
+        {
+            for (let i = 0; i < 3000; i++)
+            {
+                txn.Put(space, key(20000 + i), KeyValueConformance.Val(1));
+            }
+            txn.Put(space, key(0), KeyValueConformance.Val(0));
+            txn.Delete(space, key(1));
+            before = read();
+            assert.deepEqual(await KeyValueConformance.Keys(txn, KeyValueConformance.AllKeys, 2), [key(0), key(2)]);
+            assert.ok(read() - before <= 8, 'write scan pulled ' + (read() - before) + ' entries');
+        });
     }
 
     private static async SnapshotIsolation(store: IKeyValueStore): Promise<void>

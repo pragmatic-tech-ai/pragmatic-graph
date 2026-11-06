@@ -1,7 +1,7 @@
 import { open, RootDatabase, Database, Transaction } from 'lmdb';
-import { TupleCodec } from '../../format/TupleCodec.js';
-import { IKeyRange, IKeyValueStore, IReadTransaction, IWriteTransaction } from '../KeyValue.js';
+import { IKeyRange, IKeyValueStore, IReadTransaction, IScanProbe, IWriteTransaction, ScanCounter } from '../KeyValue.js';
 import { Keyspace } from '../Keyspace.js';
+import { PendingChanges } from '../PendingChanges.js';
 
 export interface ILmdbOptions
 {
@@ -9,12 +9,6 @@ export interface ILmdbOptions
 }
 
 type Databases = ReadonlyMap<Keyspace, Database<Buffer, Buffer>>;
-
-interface IChange
-{
-    readonly Key: Uint8Array;
-    readonly Value: Uint8Array | null;
-}
 
 class LmdbErrors
 {
@@ -25,42 +19,12 @@ class LmdbErrors
 
 class LmdbKeys
 {
-    private static readonly HexEncoding = 'hex';
-
-    public static Hex(key: Uint8Array): string
-    {
-        return Buffer.from(key).toString(LmdbKeys.HexEncoding);
-    }
-
     public static Require(key: Uint8Array): void
     {
         if (key.length === 0)
         {
             throw new Error(LmdbErrors.EmptyKey);
         }
-    }
-
-    /** Merges pending changes over base entries (both already restricted to one range), in key order. */
-    public static Merge(base: [Uint8Array, Uint8Array][], changes: Iterable<IChange>): [Uint8Array, Uint8Array][]
-    {
-        const merged = new Map<string, [Uint8Array, Uint8Array]>();
-        for (const pair of base)
-        {
-            merged.set(LmdbKeys.Hex(pair[0]), pair);
-        }
-        for (const change of changes)
-        {
-            const hex = LmdbKeys.Hex(change.Key);
-            if (change.Value === null)
-            {
-                merged.delete(hex);
-            }
-            else
-            {
-                merged.set(hex, [change.Key, change.Value]);
-            }
-        }
-        return [...merged.values()].sort((a, b) => TupleCodec.Compare(a[0], b[0]));
     }
 }
 
@@ -71,6 +35,7 @@ class LmdbReadTransaction implements IReadTransaction
     public constructor(
         protected readonly databases: Databases,
         protected readonly snapshot: Transaction,
+        protected readonly counter: ScanCounter,
         private readonly onDispose?: () => void,
     )
     {
@@ -87,6 +52,7 @@ class LmdbReadTransaction implements IReadTransaction
         this.EnsureLive();
         for (const pair of this.Entries(space, range, limit))
         {
+            this.counter.Count++;
             this.EnsureLive();
             yield pair;
         }
@@ -118,7 +84,7 @@ class LmdbReadTransaction implements IReadTransaction
         return value === undefined ? undefined : Uint8Array.from(value);
     }
 
-    /** Lazily reads copies of the snapshot entries in range, in key order. */
+    /** Lazily reads copies of the snapshot entries in range, in key order (getRange is a lazy cursor; closed on early exit). */
     protected *Entries(space: Keyspace, range: IKeyRange, limit?: number): Iterable<[Uint8Array, Uint8Array]>
     {
         if (limit !== undefined && limit <= 0)
@@ -145,14 +111,14 @@ class LmdbReadTransaction implements IReadTransaction
 
 class LmdbWriteTransaction extends LmdbReadTransaction implements IWriteTransaction
 {
-    /** Pending changes per keyspace, keyed by hex of the key; a null value is a delete. */
-    private readonly pending = new Map<Keyspace, Map<string, IChange>>();
+    /** Pending changes per keyspace, in key order; a null value is a delete. */
+    private readonly pending = new Map<Keyspace, PendingChanges>();
 
     public override async Get(space: Keyspace, key: Uint8Array): Promise<Uint8Array | undefined>
     {
         this.EnsureLive();
         LmdbKeys.Require(key);
-        const staged = this.pending.get(space)?.get(LmdbKeys.Hex(key));
+        const staged = this.pending.get(space)?.Get(key);
         if (staged !== undefined)
         {
             return staged.Value === null ? undefined : staged.Value.slice();
@@ -160,25 +126,18 @@ class LmdbWriteTransaction extends LmdbReadTransaction implements IWriteTransact
         return this.Lookup(space, key);
     }
 
+    /**
+     * Lazy merge of the snapshot cursor with this transaction's staged changes (staged deletes hide
+     * stored keys, so the cursor is read without a limit); stops as soon as `limit` entries were produced.
+     */
     public override async *Scan(space: Keyspace, range: IKeyRange, limit?: number): AsyncIterable<[Uint8Array, Uint8Array]>
     {
         this.EnsureLive();
-        const inRange: IChange[] = [];
-        for (const change of this.pending.get(space)?.values() ?? [])
-        {
-            if (TupleCodec.Compare(change.Key, range.Start) >= 0 && TupleCodec.Compare(change.Key, range.End) < 0)
-            {
-                inRange.push(change);
-            }
-        }
-        // A staged delete may hide base entries, so the base is read unlimited before merging.
-        const merged = LmdbKeys.Merge([...this.Entries(space, range)], inRange);
-        const count = limit === undefined ? merged.length : Math.min(limit, merged.length);
-        for (let i = 0; i < count; i++)
+        const staged = this.pending.get(space)?.InRange(range) ?? [];
+        for (const [key, value] of PendingChanges.Merge(this.Entries(space, range), staged, this.counter, limit))
         {
             this.EnsureLive();
-            const pair = merged[i] as [Uint8Array, Uint8Array];
-            yield [pair[0].slice(), pair[1].slice()];
+            yield [key.slice(), value.slice()];
         }
     }
 
@@ -198,7 +157,7 @@ class LmdbWriteTransaction extends LmdbReadTransaction implements IWriteTransact
         for (const [space, bucket] of this.pending)
         {
             const db = this.Db(space);
-            for (const change of bucket.values())
+            for (const change of bucket.Values())
             {
                 const key = Buffer.from(change.Key);
                 if (change.Value === null)
@@ -220,16 +179,15 @@ class LmdbWriteTransaction extends LmdbReadTransaction implements IWriteTransact
         let bucket = this.pending.get(space);
         if (bucket === undefined)
         {
-            bucket = new Map();
+            bucket = new PendingChanges();
             this.pending.set(space, bucket);
         }
-        const copy = key.slice();
-        bucket.set(LmdbKeys.Hex(copy), { Key: copy, Value: value });
+        bucket.Set(key.slice(), value);
     }
 }
 
 /** Durable ordered key-value store on one LMDB environment (one named database per keyspace). */
-export class LmdbStore implements IKeyValueStore
+export class LmdbStore implements IKeyValueStore, IScanProbe
 {
     private static readonly DefaultMapSizeBytes = 16 * 1024 * 1024 * 1024;
     private static readonly BinaryEncoding = 'binary';
@@ -237,6 +195,12 @@ export class LmdbStore implements IKeyValueStore
     private tail: Promise<unknown> = Promise.resolve();
     private disposed = false;
     private readonly liveReads = new Set<LmdbReadTransaction>();
+    private readonly counter = new ScanCounter();
+
+    public get EntriesRead(): number
+    {
+        return this.counter.Count;
+    }
 
     private constructor(
         private readonly root: RootDatabase,
@@ -269,7 +233,7 @@ export class LmdbStore implements IKeyValueStore
     public async BeginRead(): Promise<IReadTransaction>
     {
         this.EnsureLive();
-        const read = new LmdbReadTransaction(this.databases, this.PinSnapshot(), () => this.liveReads.delete(read));
+        const read = new LmdbReadTransaction(this.databases, this.PinSnapshot(), this.counter, () => this.liveReads.delete(read));
         this.liveReads.add(read);
         return read;
     }
@@ -309,7 +273,7 @@ export class LmdbStore implements IKeyValueStore
 
     private async RunExclusive<T>(work: (txn: IWriteTransaction) => Promise<T>): Promise<T>
     {
-        const txn = new LmdbWriteTransaction(this.databases, this.PinSnapshot());
+        const txn = new LmdbWriteTransaction(this.databases, this.PinSnapshot(), this.counter);
         try
         {
             const result = await work(txn);

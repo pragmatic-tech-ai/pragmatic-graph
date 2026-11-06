@@ -8,7 +8,7 @@ import type { MemberDef } from '../../catalog/CatalogTypes.js';
 import { CellValue } from '../../columns/CellValue.js';
 import { EdgeDirection, FormatKeys } from '../../format/FormatKeys.js';
 import { TupleCodec } from '../../format/TupleCodec.js';
-import type { IKeyRange, IKeyValueStore, IReadTransaction, IWriteTransaction } from '../../kv/KeyValue.js';
+import type { IKeyValueStore, IReadTransaction, IScanProbe } from '../../kv/KeyValue.js';
 import { Keyspace } from '../../kv/Keyspace.js';
 import { LmdbStore } from '../../kv/lmdb/LmdbStore.js';
 import { MemoryStore } from '../../kv/memory/MemoryStore.js';
@@ -20,46 +20,6 @@ interface INeighbor
     Node: bigint;
     Position: Uint8Array;
     Properties: ReadonlyMap<string, CellValue>;
-}
-
-/** Counts the entries a write transaction returned from Get and Scan. */
-class CountingTxn implements IWriteTransaction
-{
-    public Read = 0;
-
-    public constructor(private readonly inner: IWriteTransaction)
-    {
-    }
-
-    public async Get(space: Keyspace, key: Uint8Array): Promise<Uint8Array | undefined>
-    {
-        this.Read++;
-        return this.inner.Get(space, key);
-    }
-
-    public async *Scan(space: Keyspace, range: IKeyRange, limit?: number): AsyncIterable<[Uint8Array, Uint8Array]>
-    {
-        for await (const entry of this.inner.Scan(space, range, limit))
-        {
-            this.Read++;
-            yield entry;
-        }
-    }
-
-    public Put(space: Keyspace, key: Uint8Array, value: Uint8Array): void
-    {
-        this.inner.Put(space, key, value);
-    }
-
-    public Delete(space: Keyspace, key: Uint8Array): void
-    {
-        this.inner.Delete(space, key);
-    }
-
-    public dispose(): void
-    {
-        this.inner.dispose();
-    }
 }
 
 class EdgeFx
@@ -143,15 +103,45 @@ class EdgeFx
                     }
                 });
                 const middle = positions[150] as Uint8Array;
-                const after = await store.Write(async txn =>
+                const probe = store as unknown as IScanProbe;
+                assert.equal(typeof probe.EntriesRead, 'number');
+                const pulled = await store.Write(async txn =>
                 {
-                    const counting = new CountingTxn(txn);
-                    await es.Link(counting, rel, 1n, 5n, { After: middle });
-                    await es.Link(counting, rel, 1n, 6n, { After: middle, Before: await es.PositionOf(counting, rel, 1n, 5n) as Uint8Array });
-                    return counting.Read;
+                    const start = probe.EntriesRead;
+                    await es.Link(txn, rel, 1n, 5n, { After: middle });
+                    await es.Link(txn, rel, 1n, 6n, { After: middle, Before: await es.PositionOf(txn, rel, 1n, 5n) as Uint8Array });
+                    return probe.EntriesRead - start;
                 });
-                assert.ok(after <= 8, 'read ' + after + ' keys');
+                assert.ok(pulled <= 16, 'pulled ' + pulled + ' stored entries');
                 assert.deepEqual((await EdgeFx.Nodes(store, es, rel, 1n, EdgeDirection.Out)).slice(150, 154), [1150n, 6n, 5n, 1151n]);
+                await store.dispose();
+            });
+
+            it('a sibling with incoming edges from several sources resolves to the edge from the right source', async () =>
+            {
+                const store = await open();
+                const es = new EdgeStore();
+                const rel = EdgeFx.ManyOrdered;
+                const pos = await store.Write(async txn => ({
+                    a: await es.Link(txn, rel, 2n, 10n),
+                    b: await es.Link(txn, rel, 2n, 11n),
+                    c: await es.Link(txn, rel, 1n, 10n),
+                    d: await es.Link(txn, rel, 3n, 10n),
+                    e: await es.Link(txn, rel, 1n, 20n),
+                }));
+                const r = await store.BeginRead();
+                assert.deepEqual(await es.PositionOf(r, rel, 1n, 10n), pos.c);
+                assert.deepEqual(await es.PositionOf(r, rel, 2n, 10n), pos.a);
+                assert.deepEqual(await es.PositionOf(r, rel, 3n, 10n), pos.d);
+                assert.equal(await es.PositionOf(r, rel, 4n, 10n), undefined);
+                r.dispose();
+                await store.Write(async txn => es.Link(txn, rel, 1n, 30n, { After: pos.c }));
+                assert.deepEqual(await EdgeFx.Nodes(store, es, rel, 1n, EdgeDirection.Out), [10n, 30n, 20n]);
+                assert.deepEqual(await EdgeFx.Nodes(store, es, rel, 2n, EdgeDirection.Out), [10n, 11n]);
+                assert.equal(await EdgeFx.Code(store.Write(txn => es.Link(txn, rel, 3n, 10n))), EdgeErrorCode.DuplicateEdge);
+                await store.Write(txn => es.Unlink(txn, rel, 2n, 10n));
+                assert.deepEqual((await EdgeFx.Nodes(store, es, rel, 10n, EdgeDirection.In)).sort(), [1n, 3n]);
+                assert.deepEqual(await EdgeFx.Nodes(store, es, rel, 2n, EdgeDirection.Out), [11n]);
                 await store.dispose();
             });
 

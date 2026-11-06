@@ -26,6 +26,21 @@ export interface IWriteTransaction extends IReadTransaction
     Delete(space: Keyspace, key: Uint8Array): void;
 }
 
+/**
+ * Diagnostics a backend may offer: stored entries its Scans have pulled so far (committed entries read
+ * plus staged changes visited), across all transactions. Tests use it to prove scans stop early.
+ */
+export interface IScanProbe
+{
+    readonly EntriesRead: number;
+}
+
+/** Shared counter behind IScanProbe; a store hands one instance to each of its transactions. */
+export class ScanCounter
+{
+    public Count = 0;
+}
+
 export interface IKeyValueStore
 {
     BeginRead(): Promise<IReadTransaction>;
