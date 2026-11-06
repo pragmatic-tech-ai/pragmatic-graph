@@ -53,6 +53,7 @@ export class EdgeStore
     private static readonly ErrNotRelationship = 'Member is not a relationship: ';
     private static readonly ErrDuplicate = 'Edge already exists: ';
     private static readonly ErrNotOrdered = 'After/Before require an ordered relationship: ';
+    private static readonly ErrNotAdjacent = 'After and Before are not adjacent siblings';
     private static readonly ErrBounds = 'After position must sort before the Before position';
     private static readonly ErrRequired = 'Missing required edge property: ';
     private static readonly ArrowSeparator = '->';
@@ -206,7 +207,11 @@ export class EdgeStore
         {
             if (TupleCodec.Compare(after, before) >= 0)
             {
-                throw new RangeError(EdgeStore.ErrBounds);
+                throw new EdgeError(EdgeErrorCode.InvalidOrder, EdgeStore.ErrBounds);
+            }
+            if (siblings.some(x => TupleCodec.Compare(x.Position, after) > 0 && TupleCodec.Compare(x.Position, before) < 0))
+            {
+                throw new EdgeError(EdgeErrorCode.NotAdjacent, EdgeStore.ErrNotAdjacent);
             }
             return FractionalPosition.Between(after, before);
         }

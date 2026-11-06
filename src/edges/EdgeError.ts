@@ -8,6 +8,8 @@ export enum EdgeErrorCode
     NotARelationship,
     NotOrdered,
     CorruptEdge,
+    NotAdjacent,
+    InvalidOrder,
 }
 
 export class EdgeError extends Error

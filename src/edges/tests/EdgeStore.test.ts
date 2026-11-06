@@ -239,8 +239,8 @@ class EdgeFx
                 assert.equal(await EdgeFx.Code(store.Write(txn => es.Link(txn, EdgeFx.Many, 1n, 2n, { Before: some }))), EdgeErrorCode.NotOrdered);
                 const rel = EdgeFx.ManyOrdered;
                 const pos = await store.Write(async txn => ({ a: await es.Link(txn, rel, 1n, 10n), b: await es.Link(txn, rel, 1n, 20n) }));
-                await assert.rejects(store.Write(txn => es.Link(txn, rel, 1n, 30n, { After: pos.b, Before: pos.a })), RangeError);
-                await assert.rejects(store.Write(txn => es.Link(txn, rel, 1n, 30n, { After: pos.a, Before: pos.a })), RangeError);
+                assert.equal(await EdgeFx.Code(store.Write(txn => es.Link(txn, rel, 1n, 30n, { After: pos.b, Before: pos.a }))), EdgeErrorCode.InvalidOrder);
+                assert.equal(await EdgeFx.Code(store.Write(txn => es.Link(txn, rel, 1n, 30n, { After: pos.a, Before: pos.a }))), EdgeErrorCode.InvalidOrder);
                 await store.dispose();
             });
 
@@ -251,6 +251,36 @@ class EdgeFx
                 const rel = EdgeFx.WithProps;
                 const key = FormatKeys.Edge(0, rel.Id, EdgeDirection.Out, 1n, new Uint8Array(0), 2n);
                 for (const bytes of [Uint8Array.of(1, 2, 3), Uint8Array.of(99, 0, 0, 0, 1, 0, 0, 0, 7), Uint8Array.of(20, 0, 0, 0, 3, 0, 0, 0, 1, 2, 3)])
+                {
+                    await store.Write(async txn => txn.Put(Keyspace.Edges, key, bytes));
+                    const r = await store.BeginRead();
+                    assert.equal(await EdgeFx.Code(EdgeFx.List(es, r, rel, 1n, EdgeDirection.Out)), EdgeErrorCode.CorruptEdge);
+                    r.dispose();
+                }
+                await store.dispose();
+            });
+
+            it('After and Before that are not adjacent are NotAdjacent; adjacent ones work', async () =>
+            {
+                const store = await open();
+                const es = new EdgeStore();
+                const rel = EdgeFx.ManyOrdered;
+                const pos = await store.Write(async txn => ({ a: await es.Link(txn, rel, 1n, 10n), b: await es.Link(txn, rel, 1n, 20n), c: await es.Link(txn, rel, 1n, 30n) }));
+                assert.equal(await EdgeFx.Code(store.Write(txn => es.Link(txn, rel, 1n, 40n, { After: pos.a, Before: pos.c }))), EdgeErrorCode.NotAdjacent);
+                await store.Write(txn => es.Link(txn, rel, 1n, 40n, { After: pos.b, Before: pos.c }));
+                assert.deepEqual(await EdgeFx.Nodes(store, es, rel, 1n, EdgeDirection.Out), [10n, 20n, 40n, 30n]);
+                await store.dispose();
+            });
+
+            it('a valid member id with corrupt value bytes is CorruptEdge', async () =>
+            {
+                const store = await open();
+                const es = new EdgeStore();
+                const rel = EdgeFx.WithProps;
+                const key = FormatKeys.Edge(0, rel.Id, EdgeDirection.Out, 1n, new Uint8Array(0), 2n);
+                const weightShort = Uint8Array.of(20, 0, 0, 0, 3, 0, 0, 0, 1, 2, 3);
+                const labelBadUtf8 = Uint8Array.of(21, 0, 0, 0, 2, 0, 0, 0, 0xff, 0xfe);
+                for (const bytes of [weightShort, labelBadUtf8])
                 {
                     await store.Write(async txn => txn.Put(Keyspace.Edges, key, bytes));
                     const r = await store.BeginRead();
