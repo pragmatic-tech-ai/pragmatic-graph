@@ -15,7 +15,7 @@ import { TupleCodec } from '../../format/TupleCodec.js';
 import { IdAllocator } from '../../identity/IdAllocator.js';
 import { PublicIdIndex } from '../../identity/PublicIdIndex.js';
 import { RowIndex } from '../../identity/RowIndex.js';
-import type { IKeyRange, IKeyValueStore, IReadTransaction, IWriteTransaction } from '../../kv/KeyValue.js';
+import type { IKeyRange, IKeyValueStore, IReadTransaction, IScanOptions, IWriteTransaction } from '../../kv/KeyValue.js';
 import { Keyspace } from '../../kv/Keyspace.js';
 import { LmdbStore } from '../../kv/lmdb/LmdbStore.js';
 import { MemoryStore } from '../../kv/memory/MemoryStore.js';
@@ -42,9 +42,9 @@ class SpyTxn implements IWriteTransaction
         return this.inner.Get(space, key);
     }
 
-    public Scan(space: Keyspace, range: IKeyRange, limit?: number): AsyncIterable<[Uint8Array, Uint8Array]>
+    public Scan(space: Keyspace, range: IKeyRange, options?: IScanOptions): AsyncIterable<[Uint8Array, Uint8Array]>
     {
-        return this.inner.Scan(space, range, limit);
+        return this.inner.Scan(space, range, options);
     }
 
     public Put(space: Keyspace, key: Uint8Array, value: Uint8Array): void

@@ -1,5 +1,5 @@
 import { TupleCodec } from '../../format/TupleCodec.js';
-import { IKeyRange, IKeyValueStore, IReadTransaction, IScanProbe, IWriteTransaction, ScanCounter } from '../KeyValue.js';
+import { IKeyRange, IKeyValueStore, IReadTransaction, IScanOptions, IScanProbe, IWriteTransaction, KeyLimits, ScanCounter } from '../KeyValue.js';
 import { GraphError, GraphErrorCode } from '../../errors/GraphError.js';
 import { Keyspace } from '../Keyspace.js';
 import { type IPendingChange, PendingChanges } from '../PendingChanges.js';
@@ -56,7 +56,6 @@ class Sorted
 class MemoryReadTransaction implements IReadTransaction
 {
     protected static readonly ErrDisposed = 'Transaction has been disposed';
-    protected static readonly ErrEmptyKey = 'Empty keys are not supported';
     protected disposed = false;
 
     public constructor(
@@ -75,16 +74,17 @@ class MemoryReadTransaction implements IReadTransaction
         return value === undefined ? undefined : value.slice();
     }
 
-    public async *Scan(space: Keyspace, range: IKeyRange, limit?: number): AsyncIterable<[Uint8Array, Uint8Array]>
+    public async *Scan(space: Keyspace, range: IKeyRange, options?: IScanOptions): AsyncIterable<[Uint8Array, Uint8Array]>
     {
         this.EnsureLive();
+        KeyLimits.RequireRange(range);
         let produced = 0;
-        const max = limit ?? Number.POSITIVE_INFINITY;
+        const max = options?.Limit ?? Number.POSITIVE_INFINITY;
         if (max <= 0)
         {
             return;
         }
-        for (const [key, value] of this.Entries(space, range))
+        for (const [key, value] of this.Entries(space, range, options?.Reverse === true))
         {
             this.counter.Count++;
             this.EnsureLive();
@@ -112,10 +112,7 @@ class MemoryReadTransaction implements IReadTransaction
 
     protected static RequireKey(key: Uint8Array): void
     {
-        if (key.length === 0)
-        {
-            throw new GraphError(GraphErrorCode.InvalidArgument, MemoryReadTransaction.ErrEmptyKey);
-        }
+        KeyLimits.RequireKey(key);
     }
 
     /** Raw (uncopied) value lookup. */
@@ -126,10 +123,23 @@ class MemoryReadTransaction implements IReadTransaction
         return hit !== undefined && TupleCodec.Compare(hit.Key, key) === 0 ? hit.Value : undefined;
     }
 
-    /** Raw (uncopied) entries in range, in key order, produced lazily from the binary-searched start. */
-    protected *Entries(space: Keyspace, range: IKeyRange): Iterable<readonly [Uint8Array, Uint8Array]>
+    /** Raw (uncopied) entries in range, in key order (descending with reverse), produced lazily from the binary-searched bound. */
+    protected *Entries(space: Keyspace, range: IKeyRange, reverse: boolean): Iterable<readonly [Uint8Array, Uint8Array]>
     {
         const entries = this.snapshot.get(space) ?? [];
+        if (reverse)
+        {
+            for (let i = Sorted.LowerBound(entries, range.End) - 1; i >= 0; i--)
+            {
+                const entry = entries[i] as IEntry;
+                if (TupleCodec.Compare(entry.Key, range.Start) < 0)
+                {
+                    return;
+                }
+                yield [entry.Key, entry.Value];
+            }
+            return;
+        }
         for (let i = Sorted.LowerBound(entries, range.Start); i < entries.length; i++)
         {
             const entry = entries[i] as IEntry;
@@ -160,12 +170,14 @@ class MemoryWriteTransaction extends MemoryReadTransaction implements IWriteTran
     }
 
     /** Lazy merge of the snapshot with this transaction's staged changes; stops as soon as `limit` entries were produced. */
-    public override async *Scan(space: Keyspace, range: IKeyRange, limit?: number): AsyncIterable<[Uint8Array, Uint8Array]>
+    public override async *Scan(space: Keyspace, range: IKeyRange, options?: IScanOptions): AsyncIterable<[Uint8Array, Uint8Array]>
     {
         this.EnsureLive();
+        KeyLimits.RequireRange(range);
+        const reverse = options?.Reverse === true;
         const version = PendingChanges.VersionOf(this.pending.get(space));
-        const staged = this.pending.get(space)?.InRange(range) ?? PendingChanges.None;
-        for (const [key, value] of PendingChanges.Merge(this.Entries(space, range), staged, this.counter, limit))
+        const staged = this.pending.get(space)?.Range(range, reverse) ?? PendingChanges.None;
+        for (const [key, value] of PendingChanges.Merge(this.Entries(space, range, reverse), staged, this.counter, options?.Limit, reverse))
         {
             this.EnsureLive();
             PendingChanges.RequireVersion(this.pending.get(space), version);

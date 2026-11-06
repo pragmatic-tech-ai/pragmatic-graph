@@ -9,7 +9,7 @@ import type { MemberDef } from '../../catalog/CatalogTypes.js';
 import { FormatKeys } from '../../format/FormatKeys.js';
 import type { Location } from '../../identity/Location.js';
 import { InternalId } from '../../identity/InternalId.js';
-import type { IKeyRange, IKeyValueStore, IReadTransaction, IWriteTransaction } from '../../kv/KeyValue.js';
+import type { IKeyRange, IKeyValueStore, IReadTransaction, IScanOptions, IWriteTransaction } from '../../kv/KeyValue.js';
 import { Keyspace } from '../../kv/Keyspace.js';
 import { Linearity } from '../../kv/tests/Linearity.js';
 import { LmdbStore } from '../../kv/lmdb/LmdbStore.js';
@@ -31,9 +31,9 @@ class FlakyTxn implements IWriteTransaction
         return this.owner.TakeFailure() ? Promise.reject(new Error('flaky')) : this.inner.Get(space, key);
     }
 
-    public Scan(space: Keyspace, range: IKeyRange, limit?: number): AsyncIterable<[Uint8Array, Uint8Array]>
+    public Scan(space: Keyspace, range: IKeyRange, options?: IScanOptions): AsyncIterable<[Uint8Array, Uint8Array]>
     {
-        return this.inner.Scan(space, range, limit);
+        return this.inner.Scan(space, range, options);
     }
 
     public Put(space: Keyspace, key: Uint8Array, value: Uint8Array): void

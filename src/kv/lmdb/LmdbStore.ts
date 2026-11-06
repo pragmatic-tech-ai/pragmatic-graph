@@ -1,8 +1,9 @@
 import { open, RootDatabase, Database, Transaction, type RootDatabaseOptionsWithPath } from 'lmdb';
-import { IKeyRange, IKeyValueStore, IReadTransaction, IScanProbe, IWriteTransaction, ScanCounter } from '../KeyValue.js';
+import { IKeyRange, IKeyValueStore, IReadTransaction, IScanOptions, IScanProbe, IWriteTransaction, KeyLimits, ScanCounter } from '../KeyValue.js';
 import { GraphError, GraphErrorCode } from '../../errors/GraphError.js';
 import { Keyspace } from '../Keyspace.js';
 import { PendingChanges } from '../PendingChanges.js';
+import { TupleCodec } from '../../format/TupleCodec.js';
 
 export interface ILmdbOptions
 {
@@ -15,17 +16,13 @@ class LmdbErrors
 {
     public static readonly StoreDisposed = 'Store has been disposed';
     public static readonly TxnDisposed = 'Transaction has been disposed';
-    public static readonly EmptyKey = 'Empty keys are not supported';
 }
 
 class LmdbKeys
 {
     public static Require(key: Uint8Array): void
     {
-        if (key.length === 0)
-        {
-            throw new GraphError(GraphErrorCode.InvalidArgument, LmdbErrors.EmptyKey);
-        }
+        KeyLimits.RequireKey(key);
     }
 }
 
@@ -48,10 +45,11 @@ class LmdbReadTransaction implements IReadTransaction
         return this.Lookup(space, key);
     }
 
-    public async *Scan(space: Keyspace, range: IKeyRange, limit?: number): AsyncIterable<[Uint8Array, Uint8Array]>
+    public async *Scan(space: Keyspace, range: IKeyRange, options?: IScanOptions): AsyncIterable<[Uint8Array, Uint8Array]>
     {
         this.EnsureLive();
-        for (const pair of this.Entries(space, range, limit))
+        KeyLimits.RequireRange(range);
+        for (const pair of this.Entries(space, range, options?.Reverse === true, options?.Limit))
         {
             this.counter.Count++;
             this.EnsureLive();
@@ -85,11 +83,19 @@ class LmdbReadTransaction implements IReadTransaction
         return value === undefined ? undefined : Uint8Array.from(value);
     }
 
-    /** Lazily reads copies of the snapshot entries in range, in key order (getRange is a lazy cursor; closed on early exit). */
-    protected *Entries(space: Keyspace, range: IKeyRange, limit?: number): Iterable<[Uint8Array, Uint8Array]>
+    /**
+     * Lazily reads copies of the snapshot entries in range, in key order or descending with reverse
+     * (getRange is a lazy cursor; closed on early exit).
+     */
+    protected *Entries(space: Keyspace, range: IKeyRange, reverse: boolean, limit?: number): Iterable<[Uint8Array, Uint8Array]>
     {
         if (limit !== undefined && limit <= 0)
         {
+            return;
+        }
+        if (reverse)
+        {
+            yield* this.ReverseEntries(space, range, limit);
             return;
         }
         const options: Parameters<Database['getRange']>[0] = {
@@ -101,6 +107,33 @@ class LmdbReadTransaction implements IReadTransaction
         for (const entry of this.Db(space).getRange(options))
         {
             yield [Uint8Array.from(entry.key), Uint8Array.from(entry.value)];
+        }
+    }
+
+    /**
+     * Descending cursor from End: lmdb-js reverse ranges treat `start` (End here) as inclusive and `end`
+     * as exclusive, the opposite of IKeyRange, so the cursor is opened without an end bound, a key equal
+     * to End is skipped and the walk stops below Start; the limit is applied here.
+     */
+    private *ReverseEntries(space: Keyspace, range: IKeyRange, limit?: number): Iterable<[Uint8Array, Uint8Array]>
+    {
+        const max = limit ?? Number.POSITIVE_INFINITY;
+        let produced = 0;
+        for (const entry of this.Db(space).getRange({ start: Buffer.from(range.End), reverse: true, transaction: this.snapshot }))
+        {
+            if (TupleCodec.Compare(entry.key, range.End) >= 0)
+            {
+                continue;
+            }
+            if (TupleCodec.Compare(entry.key, range.Start) < 0)
+            {
+                return;
+            }
+            yield [Uint8Array.from(entry.key), Uint8Array.from(entry.value)];
+            if (++produced >= max)
+            {
+                return;
+            }
         }
     }
 
@@ -131,12 +164,14 @@ class LmdbWriteTransaction extends LmdbReadTransaction implements IWriteTransact
      * Lazy merge of the snapshot cursor with this transaction's staged changes (staged deletes hide
      * stored keys, so the cursor is read without a limit); stops as soon as `limit` entries were produced.
      */
-    public override async *Scan(space: Keyspace, range: IKeyRange, limit?: number): AsyncIterable<[Uint8Array, Uint8Array]>
+    public override async *Scan(space: Keyspace, range: IKeyRange, options?: IScanOptions): AsyncIterable<[Uint8Array, Uint8Array]>
     {
         this.EnsureLive();
+        KeyLimits.RequireRange(range);
+        const reverse = options?.Reverse === true;
         const version = PendingChanges.VersionOf(this.pending.get(space));
-        const staged = this.pending.get(space)?.InRange(range) ?? PendingChanges.None;
-        for (const [key, value] of PendingChanges.Merge(this.Entries(space, range), staged, this.counter, limit))
+        const staged = this.pending.get(space)?.Range(range, reverse) ?? PendingChanges.None;
+        for (const [key, value] of PendingChanges.Merge(this.Entries(space, range, reverse), staged, this.counter, options?.Limit, reverse))
         {
             this.EnsureLive();
             PendingChanges.RequireVersion(this.pending.get(space), version);

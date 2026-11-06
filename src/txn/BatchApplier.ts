@@ -57,7 +57,8 @@ export class BatchApplier
     private static readonly ErrRequired = 'Created node is missing a required property: ';
     private static readonly ErrEdge = 'Edge rejected: ';
     private static readonly ErrSibling = 'Sibling is not a target of this relationship from the source: ';
-    private static readonly ErrPublicId = 'Public id must be 1..400 UTF-8 bytes: ';
+    private static readonly ErrPublicId = 'Public id must be 1..400 UTF-8 bytes without U+0000: ';
+    private static readonly Nul = '\u0000';
     private static readonly ErrCorruptRow = 'Node has a public id but no stored row: ';
     private static readonly ErrIdsExhausted = 'Batch has more CreateNode operations than allocated ids';
     private static readonly Dot = '.';
@@ -234,6 +235,11 @@ export class BatchApplier
         }
         await BatchApplier.Edge(from, rel, to, () => this.edges.Link(txn, rel, from.Id, to.Id, options as ILinkOptions));
         BatchApplier.AddEdgeKeys(keys, rel, from.Id, to.Id);
+        // A renumbering (ruling F1) rewrote these edges' keys: they are writes of this batch too.
+        for (const moved of this.edges.TakeRenumbered(txn))
+        {
+            BatchApplier.AddEdgeKeys(keys, moved.Relationship, moved.From, moved.To);
+        }
     }
 
     private async Unlink(txn: IWriteTransaction, op: IUnlinkOp, keys: WriteKeySet): Promise<void>
@@ -375,7 +381,7 @@ export class BatchApplier
     private static RequirePublicId(publicId: string): void
     {
         const length = BatchApplier.Encoder.encode(publicId).length;
-        if (length === 0 || length > PublicIdIndex.MaxBytes)
+        if (length === 0 || length > PublicIdIndex.MaxBytes || publicId.includes(BatchApplier.Nul))
         {
             throw new CommitError(CommitErrorCode.InvalidPublicId, BatchApplier.ErrPublicId + publicId.slice(0, 40));
         }

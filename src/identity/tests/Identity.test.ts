@@ -210,6 +210,8 @@ class IdentityFx
                     await assert.rejects(idx.Bind(txn, 'a'.repeat(401), 2n), PublicIdTooLongError);
                     await assert.rejects(idx.Bind(txn, IdentityFx.AccentChar.repeat(201), 2n), PublicIdTooLongError);
                     await assert.rejects(idx.Bind(txn, '', 2n));
+                    await assert.rejects(idx.Bind(txn, 'a\u0000b', 2n), /U\+0000/);
+                    await assert.rejects(idx.Resolve(txn, '\u0000'), /U\+0000/);
                 });
                 await store.dispose();
             });

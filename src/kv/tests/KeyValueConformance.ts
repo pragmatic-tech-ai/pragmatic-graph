@@ -1,7 +1,8 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { TupleCodec } from '../../format/TupleCodec.js';
-import { IKeyRange, IKeyValueStore, IReadTransaction, IScanProbe, IWriteTransaction } from '../KeyValue.js';
+import { GraphError, GraphErrorCode } from '../../errors/GraphError.js';
+import { IKeyRange, IKeyValueStore, IReadTransaction, IScanProbe, IWriteTransaction, KeyLimits } from '../KeyValue.js';
 import { Keyspace } from '../Keyspace.js';
 import { Linearity } from './Linearity.js';
 
@@ -33,6 +34,10 @@ export class KeyValueConformance
             KeyValueConformance.Case('scans in Compare order', open, KeyValueConformance.ScanOrder);
             KeyValueConformance.Case('scan honors End exclusivity and Start inclusivity', open, KeyValueConformance.ScanBounds);
             KeyValueConformance.Case('scan honors limit', open, KeyValueConformance.ScanLimit);
+            KeyValueConformance.Case('reverse scan yields descending order with Start inclusive, End exclusive and limit', open, KeyValueConformance.ReverseScan);
+            KeyValueConformance.Case('reverse write scan merges own staged puts and deletes in descending order', open, KeyValueConformance.ReverseOwnWrites);
+            KeyValueConformance.Case('a reverse scan with limit 1 reads a bounded number of entries over 10,000 keys', open, KeyValueConformance.ReverseEarlyExit);
+            KeyValueConformance.Case('keys up to 511 bytes work; longer keys are rejected with KeyTooLong on Put, Delete, Get and scan bounds', open, KeyValueConformance.KeyLimit);
             KeyValueConformance.Case('write scan with limit 1 merges a staged delete or put at the start of the range', open, KeyValueConformance.LimitedOwnWrites);
             KeyValueConformance.Case('a limited scan stops early: it reads a bounded number of stored entries over 10,000 keys', open, KeyValueConformance.ScanEarlyExit);
             KeyValueConformance.Case('staging a new key in the keyspace while its scan is open makes the scan throw', open, KeyValueConformance.MutationDuringScan);
@@ -160,7 +165,7 @@ export class KeyValueConformance
 
     private static async Keys(read: IReadTransaction, range: IKeyRange, limit?: number): Promise<Uint8Array[]>
     {
-        const pairs = await KeyValueConformance.Collect(read.Scan(KeyValueConformance.Space, range, limit));
+        const pairs = await KeyValueConformance.Collect(read.Scan(KeyValueConformance.Space, range, limit === undefined ? undefined : { Limit: limit }));
         return pairs.map(p => p[0]);
     }
 
@@ -261,6 +266,99 @@ export class KeyValueConformance
         assert.equal(many.length, 5);
     }
 
+    private static async ReverseKeys(read: IReadTransaction, range: IKeyRange, limit?: number): Promise<Uint8Array[]>
+    {
+        const options = limit === undefined ? { Reverse: true } : { Reverse: true, Limit: limit };
+        const pairs = await KeyValueConformance.Collect(read.Scan(KeyValueConformance.Space, range, options));
+        return pairs.map(p => p[0]);
+    }
+
+    private static async ReverseScan(store: IKeyValueStore): Promise<void>
+    {
+        const key = KeyValueConformance.Key;
+        await KeyValueConformance.Seed(store, [1, 2, 3, 4, 5, 6]);
+        const read = await store.BeginRead();
+        try
+        {
+            assert.deepEqual(await KeyValueConformance.ReverseKeys(read, KeyValueConformance.AllKeys), [6, 5, 4, 3, 2, 1].map(key));
+            assert.deepEqual(await KeyValueConformance.ReverseKeys(read, KeyValueConformance.Range(2, 5)), [4, 3, 2].map(key), 'End exclusive, Start inclusive');
+            assert.deepEqual(await KeyValueConformance.ReverseKeys(read, KeyValueConformance.Range(2, 5), 2), [4, 3].map(key));
+            assert.deepEqual(await KeyValueConformance.ReverseKeys(read, KeyValueConformance.Range(0, 99), 1), [key(6)]);
+            assert.deepEqual(await KeyValueConformance.ReverseKeys(read, KeyValueConformance.Range(7, 99)), []);
+            assert.deepEqual(await KeyValueConformance.ReverseKeys(read, KeyValueConformance.AllKeys, 0), []);
+            const [pair] = await KeyValueConformance.Collect(read.Scan(KeyValueConformance.Space, KeyValueConformance.Range(3, 4), { Reverse: true }));
+            assert.deepEqual(pair, [key(3), KeyValueConformance.Val(3)], 'values come with their keys');
+        }
+        finally
+        {
+            read.dispose();
+        }
+    }
+
+    private static async ReverseOwnWrites(store: IKeyValueStore): Promise<void>
+    {
+        const space = KeyValueConformance.Space;
+        const key = KeyValueConformance.Key;
+        await KeyValueConformance.Seed(store, [10, 20, 30]);
+        await store.Write(async txn =>
+        {
+            txn.Delete(space, key(30));
+            assert.deepEqual(await KeyValueConformance.ReverseKeys(txn, KeyValueConformance.AllKeys, 1), [key(20)], 'a staged delete hides the last stored key');
+            txn.Put(space, key(40), KeyValueConformance.Val(40));
+            txn.Put(space, key(15), KeyValueConformance.Val(15));
+            txn.Put(space, key(20), KeyValueConformance.Val(99));
+            assert.deepEqual(await KeyValueConformance.ReverseKeys(txn, KeyValueConformance.AllKeys), [40, 20, 15, 10].map(key));
+            assert.deepEqual(await KeyValueConformance.ReverseKeys(txn, KeyValueConformance.Range(11, 40)), [20, 15].map(key));
+            const replaced = await KeyValueConformance.Collect(txn.Scan(space, KeyValueConformance.Range(16, 30), { Reverse: true, Limit: 1 }));
+            assert.deepEqual(replaced, [[key(20), KeyValueConformance.Val(99)]], 'a staged put over a stored key wins');
+        });
+    }
+
+    private static async ReverseEarlyExit(store: IKeyValueStore): Promise<void>
+    {
+        const probe = store as unknown as IScanProbe;
+        await KeyValueConformance.Seed(store, Array.from({ length: 10000 }, (_, i) => i + 1));
+        const read = await store.BeginRead();
+        let before = probe.EntriesRead;
+        assert.deepEqual(await KeyValueConformance.ReverseKeys(read, KeyValueConformance.AllKeys, 1), [KeyValueConformance.Key(10000)]);
+        assert.ok(probe.EntriesRead - before <= 3, 'read scan pulled ' + (probe.EntriesRead - before) + ' entries');
+        read.dispose();
+        await store.Write(async txn =>
+        {
+            txn.Put(KeyValueConformance.Space, KeyValueConformance.Key(5000), KeyValueConformance.Val(1));
+            before = probe.EntriesRead;
+            assert.deepEqual(await KeyValueConformance.ReverseKeys(txn, KeyValueConformance.Range(0, 6000), 1), [KeyValueConformance.Key(5999)]);
+            assert.ok(probe.EntriesRead - before <= 4, 'write scan pulled ' + (probe.EntriesRead - before) + ' entries');
+        });
+    }
+
+    private static async KeyLimit(store: IKeyValueStore): Promise<void>
+    {
+        const space = KeyValueConformance.Space;
+        const max = new Uint8Array(KeyLimits.MaxKeyBytes).fill(7);
+        const over = new Uint8Array(KeyLimits.MaxKeyBytes + 1).fill(7);
+        const tooLong = (error: unknown): boolean => error instanceof GraphError && error.GraphCode === GraphErrorCode.KeyTooLong;
+        await store.Write(async txn =>
+        {
+            txn.Put(space, max, KeyValueConformance.Val(1));
+            assert.throws(() => txn.Put(space, over, KeyValueConformance.Val(1)), tooLong);
+            assert.throws(() => txn.Delete(space, over), tooLong);
+            await assert.rejects(txn.Get(space, over), tooLong);
+        });
+        const read = await store.BeginRead();
+        try
+        {
+            assert.deepEqual(await read.Get(space, max), KeyValueConformance.Val(1));
+            await assert.rejects(read.Get(space, over), tooLong);
+            await assert.rejects(KeyValueConformance.Collect(read.Scan(space, { Start: Uint8Array.of(1), End: over })), tooLong);
+            assert.equal((await KeyValueConformance.Collect(read.Scan(space, KeyValueConformance.AllKeys))).length, 1);
+        }
+        finally
+        {
+            read.dispose();
+        }
+    }
+
     private static async LimitedOwnWrites(store: IKeyValueStore): Promise<void>
     {
         const space = KeyValueConformance.Space;
@@ -273,7 +371,7 @@ export class KeyValueConformance
             txn.Put(space, key(5), KeyValueConformance.Val(5));
             assert.deepEqual(await KeyValueConformance.Keys(txn, KeyValueConformance.AllKeys, 1), [key(5)], 'a staged put before the first stored key');
             txn.Put(space, key(20), KeyValueConformance.Val(99));
-            const replaced = await KeyValueConformance.Collect(txn.Scan(space, KeyValueConformance.Range(11, 40), 1));
+            const replaced = await KeyValueConformance.Collect(txn.Scan(space, KeyValueConformance.Range(11, 40), { Limit: 1 }));
             assert.deepEqual(replaced, [[key(20), KeyValueConformance.Val(99)]], 'a staged put over a stored key wins');
             txn.Delete(space, key(5));
             txn.Delete(space, key(20));

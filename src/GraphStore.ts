@@ -26,6 +26,7 @@ export class GraphStore
     private static readonly ErrDisposed = 'Graph store has been disposed';
     /** Covers every tuple-encoded key (type codes are below 0xFF). */
     private static readonly AnyKey = { Start: Uint8Array.of(0x00), End: Uint8Array.of(0xff) };
+    private static readonly FirstOnly = { Limit: 1 };
 
     /** Raised once per applied commit, in commit order, after the commit is durable. Subscribe-only. */
     public readonly CommitApplied: ISignal<ICommitApplied>;
@@ -124,7 +125,7 @@ export class GraphStore
     {
         for (const space of Object.values(Keyspace))
         {
-            for await (const _ of txn.Scan(space, GraphStore.AnyKey, 1))
+            for await (const _ of txn.Scan(space, GraphStore.AnyKey, GraphStore.FirstOnly))
             {
                 return false;
             }

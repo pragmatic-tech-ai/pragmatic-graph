@@ -119,6 +119,47 @@ export class PendingChanges
         }
     }
 
+    /**
+     * Changes with Start <= key < End in descending key order, walked lazily leaf by leaf from the
+     * binary-searched end. Throws ErrChanged if anything is Set while the iteration is open.
+     */
+    public *InRangeReverse(range: IKeyRange): Iterable<IPendingChange>
+    {
+        if (this.leaves.length === 0)
+        {
+            return;
+        }
+        const version = this.version;
+        let li = this.LeafFor(range.End);
+        let i = PendingChanges.LowerBound(this.leaves[li] as IPendingChange[], range.End) - 1;
+        while (li >= 0)
+        {
+            if (i < 0)
+            {
+                li--;
+                i = li >= 0 ? (this.leaves[li] as IPendingChange[]).length - 1 : -1;
+                continue;
+            }
+            const change = (this.leaves[li] as IPendingChange[])[i] as IPendingChange;
+            if (TupleCodec.Compare(change.Key, range.Start) < 0)
+            {
+                return;
+            }
+            yield change;
+            if (this.version !== version)
+            {
+                throw new GraphError(GraphErrorCode.InvalidArgument, PendingChanges.ErrChanged);
+            }
+            i--;
+        }
+    }
+
+    /** InRange or InRangeReverse. */
+    public Range(range: IKeyRange, reverse: boolean): Iterable<IPendingChange>
+    {
+        return reverse ? this.InRangeReverse(range) : this.InRange(range);
+    }
+
     /** Version of a keyspace's staged changes; 0 while it has none (the first Set makes it 1). */
     public static VersionOf(changes: PendingChanges | undefined): number
     {
@@ -135,7 +176,8 @@ export class PendingChanges
     }
 
     /**
-     * Lazily merges stored entries with staged changes (both in key order and restricted to one range):
+     * Lazily merges stored entries with staged changes (both in the same key order, ascending or with
+     * `reverse` descending, and restricted to one range):
      * a change replaces or (null value) hides the stored entry with the same key. Stops pulling from
      * either side as soon as `limit` entries were produced. Yields the source buffers uncopied; every
      * entry pulled from either side is counted.
@@ -145,8 +187,10 @@ export class PendingChanges
         changes: Iterable<IPendingChange>,
         counter: ScanCounter,
         limit?: number,
+        reverse = false,
     ): Iterable<readonly [Uint8Array, Uint8Array]>
     {
+        const sign = reverse ? -1 : 1;
         const max = limit ?? Number.POSITIVE_INFINITY;
         if (max <= 0)
         {
@@ -161,7 +205,7 @@ export class PendingChanges
             let c = PendingChanges.Pull(staged, counter);
             while (b !== undefined || c !== undefined)
             {
-                const order = b === undefined ? 1 : c === undefined ? -1 : TupleCodec.Compare(b[0], c.Key);
+                const order = b === undefined ? 1 : c === undefined ? -1 : sign * TupleCodec.Compare(b[0], c.Key);
                 if (order < 0)
                 {
                     yield b as readonly [Uint8Array, Uint8Array];

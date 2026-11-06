@@ -6,7 +6,7 @@ import { EdgeDirection, FormatKeys } from '../format/FormatKeys.js';
 import { FractionalPosition } from '../format/FractionalPosition.js';
 import { TupleCodec } from '../format/TupleCodec.js';
 import { InternalId } from '../identity/InternalId.js';
-import type { IReadTransaction, IWriteTransaction } from '../kv/KeyValue.js';
+import { KeyLimits, type IReadTransaction, type IWriteTransaction } from '../kv/KeyValue.js';
 import { Keyspace } from '../kv/Keyspace.js';
 import { EdgeError, EdgeErrorCode } from './EdgeError.js';
 
@@ -32,6 +32,20 @@ interface ISibling
     readonly Other: bigint;
 }
 
+/** A sibling with its Out value (edge properties), as a renumbering rewrites it. */
+interface IStoredSibling extends ISibling
+{
+    readonly Value: Uint8Array;
+}
+
+/** An edge whose position a renumbering rewrote (both its keys changed). */
+export interface IRenumberedEdge
+{
+    readonly Relationship: MemberDef;
+    readonly From: bigint;
+    readonly To: bigint;
+}
+
 /**
  * Bidirectional adjacency. Every link is two keys: Out on the source (value = edge properties) and In
  * on the target (empty value), both carrying the same position. See docs/format/on-disk-format.md.
@@ -43,15 +57,21 @@ interface ISibling
  * is directly addressable), a single-key scan for unordered one-valued relationships, and a scan of
  * the target's In range, O(in-degree of the target), for ordered relationships (In keys carry the
  * position; ruling R33; 1 for trees). An ordered insert After a sibling then reads the neighbour with
- * one bounded forward scan (limit 2) from that position. A plain append (no After/Before) and an
- * insert with only Before still scan the source's Out range, O(out-degree): finding the last or the
- * preceding sibling needs a tail index or a reverse scan, which a later plan adds.
+ * one bounded forward scan (limit 2) from that position; a plain append reads the last sibling and an
+ * insert with only Before the preceding one with one reverse scan of limit 1 (ruling F1), so no ordered
+ * insert depends on the out-degree.
+ *
+ * Positions are internal (ruling F1): when a between-insert would push an edge key past the portable
+ * key limit (KeyLimits.MaxKeyBytes), the (source, relationship) list is renumbered evenly inside the
+ * same transaction (every edge of it gets a new, short position). The rewritten edges are reported by
+ * TakeRenumbered so the committer can record their conflict keys.
  */
 export class EdgeStore
 {
     private static readonly Partition = 0;
     private static readonly U32Bytes = 4;
     private static readonly EmptyPosition: Uint8Array = new Uint8Array(0);
+    private static readonly LastOnly = { Reverse: true, Limit: 1 };
     private static readonly ErrNotRelationship = 'Member is not a relationship: ';
     private static readonly ErrDuplicate = 'Edge already exists: ';
     private static readonly ErrNotOrdered = 'After/Before require an ordered relationship: ';
@@ -67,6 +87,9 @@ export class EdgeStore
     private static readonly ErrInvalidValue = 'Invalid edge property value: ';
     private static readonly ErrNull = 'Edge property does not accept null: ';
     private static readonly ErrCorrupt = 'Corrupt edge property bytes';
+
+    /** Edges renumbered per write transaction, until TakeRenumbered collects them. */
+    private readonly renumbered = new WeakMap<object, IRenumberedEdge[]>();
 
     /** Creates the edge and returns its position (empty for unordered relationships). */
     public async Link(txn: IWriteTransaction, relationship: MemberDef, from: bigint, to: bigint, options?: ILinkOptions): Promise<Uint8Array>
@@ -92,7 +115,12 @@ export class EdgeStore
             {
                 EdgeStore.RequireNew(relationship, await this.Siblings(txn, relationship, from, 1), to, many, from);
             }
-            position = await this.OrderedPosition(txn, relationship, from, options);
+            position = await this.OrderedPosition(txn, relationship, from, options?.After ?? null, options?.Before ?? null);
+            if (EdgeStore.KeyLength(relationship, from, to, position) > KeyLimits.MaxKeyBytes)
+            {
+                const moved = await this.Renumber(txn, relationship, from);
+                position = await this.OrderedPosition(txn, relationship, from, EdgeStore.Moved(moved, options?.After ?? null), EdgeStore.Moved(moved, options?.Before ?? null));
+            }
         }
         else if (many)
         {
@@ -182,17 +210,34 @@ export class EdgeStore
         return first !== undefined && first.Other === to ? first.Position : undefined;
     }
 
+    /** The edges a renumbering in this write transaction rewrote since the last call; clears the record. */
+    public TakeRenumbered(txn: IWriteTransaction): IRenumberedEdge[]
+    {
+        const moved = this.renumbered.get(txn) ?? [];
+        this.renumbered.delete(txn);
+        return moved;
+    }
+
     /**
      * Position for a new edge of an ordered relationship. With After: one bounded scan (limit 2) from
      * that position gives the sibling itself and its neighbour; Before (when also given) must be that
-     * neighbour. Without After it falls back to scanning every sibling (see class comment).
+     * neighbour. With only Before: the preceding sibling by one reverse scan of limit 1. With neither: an
+     * append after the last sibling, also one reverse scan of limit 1.
      */
-    private async OrderedPosition(txn: IReadTransaction, relationship: MemberDef, from: bigint, options: ILinkOptions | undefined): Promise<Uint8Array>
+    private async OrderedPosition(txn: IReadTransaction, relationship: MemberDef, from: bigint, after: Uint8Array | null, before: Uint8Array | null): Promise<Uint8Array>
     {
-        const after = options?.After ?? null;
         if (after === null)
         {
-            return EdgeStore.ChoosePosition(await this.Siblings(txn, relationship, from), options);
+            if (before === null)
+            {
+                return FractionalPosition.Between((await this.Last(txn, relationship, from))?.Position ?? null, null);
+            }
+            const at = await this.Siblings(txn, relationship, from, 1, before);
+            if (at[0] === undefined || TupleCodec.Compare(at[0].Position, before) !== 0)
+            {
+                throw new EdgeError(EdgeErrorCode.UnknownSibling, EdgeStore.ErrSibling);
+            }
+            return FractionalPosition.Between((await this.Last(txn, relationship, from, before))?.Position ?? null, before);
         }
         const window = await this.Siblings(txn, relationship, from, 2, after);
         if (window[0] === undefined || TupleCodec.Compare(window[0].Position, after) !== 0)
@@ -200,7 +245,6 @@ export class EdgeStore
             throw new EdgeError(EdgeErrorCode.UnknownSibling, EdgeStore.ErrSibling);
         }
         const next = window[1]?.Position ?? null;
-        const before = options?.Before ?? null;
         if (before === null)
         {
             return FractionalPosition.Between(after, next);
@@ -221,13 +265,83 @@ export class EdgeStore
         return FractionalPosition.Between(after, before);
     }
 
+    /** The source's last Out edge (below position `below` when given), by one reverse scan of limit 1. */
+    private async Last(txn: IReadTransaction, relationship: MemberDef, from: bigint, below?: Uint8Array): Promise<ISibling | undefined>
+    {
+        const all = FormatKeys.EdgeRange(EdgeStore.Partition, relationship.Id, EdgeDirection.Out, from);
+        const range = below === undefined ? all : { Start: all.Start, End: FormatKeys.EdgeAt(EdgeStore.Partition, relationship.Id, EdgeDirection.Out, from, below) };
+        for await (const [key] of txn.Scan(Keyspace.Edges, range, EdgeStore.LastOnly))
+        {
+            const parts = TupleCodec.Decode(key);
+            return { Position: parts[4] as Uint8Array, Other: parts[5] as bigint };
+        }
+        return undefined;
+    }
+
+    /**
+     * Rewrites every Out/In key pair of the (source, relationship) list with evenly spaced short
+     * positions (FractionalPosition.Sequence), keeping order and edge values. Collects first, then
+     * mutates (no write while a scan of the keyspace is open). Returns old position (hex) to new position.
+     */
+    private async Renumber(txn: IWriteTransaction, relationship: MemberDef, from: bigint): Promise<Map<string, Uint8Array>>
+    {
+        const range = FormatKeys.EdgeRange(EdgeStore.Partition, relationship.Id, EdgeDirection.Out, from);
+        const siblings: IStoredSibling[] = [];
+        for await (const [key, value] of txn.Scan(Keyspace.Edges, range))
+        {
+            const parts = TupleCodec.Decode(key);
+            siblings.push({ Position: parts[4] as Uint8Array, Other: parts[5] as bigint, Value: value });
+        }
+        const positions = FractionalPosition.Sequence(siblings.length);
+        const moved = new Map<string, Uint8Array>();
+        for (const s of siblings)
+        {
+            txn.Delete(Keyspace.Edges, FormatKeys.Edge(EdgeStore.Partition, relationship.Id, EdgeDirection.Out, from, s.Position, s.Other));
+            txn.Delete(Keyspace.Edges, FormatKeys.Edge(EdgeStore.Partition, relationship.Id, EdgeDirection.In, s.Other, s.Position, from));
+        }
+        let record = this.renumbered.get(txn);
+        if (record === undefined)
+        {
+            record = [];
+            this.renumbered.set(txn, record);
+        }
+        siblings.forEach((s, i) =>
+        {
+            const position = positions[i] as Uint8Array;
+            txn.Put(Keyspace.Edges, FormatKeys.Edge(EdgeStore.Partition, relationship.Id, EdgeDirection.Out, from, position, s.Other), s.Value);
+            txn.Put(Keyspace.Edges, FormatKeys.Edge(EdgeStore.Partition, relationship.Id, EdgeDirection.In, s.Other, position, from), new Uint8Array(0));
+            moved.set(EdgeStore.Hex(s.Position), position);
+            record.push({ Relationship: relationship, From: from, To: s.Other });
+        });
+        return moved;
+    }
+
+    /** The renumbered position of a sibling position (null stays null). */
+    private static Moved(moved: ReadonlyMap<string, Uint8Array>, position: Uint8Array | null): Uint8Array | null
+    {
+        return position === null ? null : (moved.get(EdgeStore.Hex(position)) ?? position);
+    }
+
+    private static Hex(bytes: Uint8Array): string
+    {
+        return Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString('hex');
+    }
+
+    /** Encoded length of the longer of the edge's two keys. */
+    private static KeyLength(relationship: MemberDef, from: bigint, to: bigint, position: Uint8Array): number
+    {
+        return Math.max(
+            FormatKeys.Edge(EdgeStore.Partition, relationship.Id, EdgeDirection.Out, from, position, to).length,
+            FormatKeys.Edge(EdgeStore.Partition, relationship.Id, EdgeDirection.In, to, position, from).length);
+    }
+
     /** The source's Out edges in key order, starting at position `start` (inclusive) when given. */
     private async Siblings(txn: IReadTransaction, relationship: MemberDef, from: bigint, limit?: number, start?: Uint8Array): Promise<ISibling[]>
     {
         const all = FormatKeys.EdgeRange(EdgeStore.Partition, relationship.Id, EdgeDirection.Out, from);
         const range = start === undefined ? all : { Start: FormatKeys.EdgeAt(EdgeStore.Partition, relationship.Id, EdgeDirection.Out, from, start), End: all.End };
         const out: ISibling[] = [];
-        for await (const [key] of txn.Scan(Keyspace.Edges, range, limit))
+        for await (const [key] of txn.Scan(Keyspace.Edges, range, limit === undefined ? undefined : { Limit: limit }))
         {
             const parts = TupleCodec.Decode(key);
             out.push({ Position: parts[4] as Uint8Array, Other: parts[5] as bigint });
@@ -255,60 +369,6 @@ export class EdgeStore
     private static Duplicate(relationship: MemberDef, from: bigint, to: bigint): EdgeError
     {
         return new EdgeError(EdgeErrorCode.DuplicateEdge, EdgeStore.ErrDuplicate + EdgeStore.Label(relationship, from, to));
-    }
-
-    /** Position for a new edge among `siblings` (already in key order). */
-    private static ChoosePosition(siblings: readonly ISibling[], options: ILinkOptions | undefined): Uint8Array
-    {
-        const after = options?.After ?? null;
-        const before = options?.Before ?? null;
-        if (after !== null)
-        {
-            EdgeStore.RequireSibling(siblings, after);
-        }
-        if (before !== null)
-        {
-            EdgeStore.RequireSibling(siblings, before);
-        }
-        if (after !== null && before !== null)
-        {
-            if (TupleCodec.Compare(after, before) >= 0)
-            {
-                throw new EdgeError(EdgeErrorCode.InvalidOrder, EdgeStore.ErrBounds);
-            }
-            if (siblings.some(x => TupleCodec.Compare(x.Position, after) > 0 && TupleCodec.Compare(x.Position, before) < 0))
-            {
-                throw new EdgeError(EdgeErrorCode.NotAdjacent, EdgeStore.ErrNotAdjacent);
-            }
-            return FractionalPosition.Between(after, before);
-        }
-        if (after !== null)
-        {
-            const next = siblings.find(s => TupleCodec.Compare(s.Position, after) > 0);
-            return FractionalPosition.Between(after, next === undefined ? null : next.Position);
-        }
-        if (before !== null)
-        {
-            let prev: Uint8Array | null = null;
-            for (const s of siblings)
-            {
-                if (TupleCodec.Compare(s.Position, before) < 0)
-                {
-                    prev = s.Position;
-                }
-            }
-            return FractionalPosition.Between(prev, before);
-        }
-        const last = siblings.length === 0 ? null : (siblings[siblings.length - 1] as ISibling).Position;
-        return FractionalPosition.Between(last, null);
-    }
-
-    private static RequireSibling(siblings: readonly ISibling[], position: Uint8Array): void
-    {
-        if (!siblings.some(s => TupleCodec.Compare(s.Position, position) === 0))
-        {
-            throw new EdgeError(EdgeErrorCode.UnknownSibling, EdgeStore.ErrSibling);
-        }
     }
 
     private static RequireRelationship(member: MemberDef): void

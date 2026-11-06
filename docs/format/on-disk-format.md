@@ -11,6 +11,7 @@ This document is the contract between the TypeScript engine and the future Rust 
 - Negative integers are supported by the codec, but v1 keys only use non-negative values. Ids and chunk/block numbers are 64-bit. Internal ids are positive and at most 2^63-1 so that the node-id column (member 0, Int64) stores them as plain signed values.
 - Values outside keys (row blocks, chunk headers, delta entries) are little-endian binary as specified below.
 - Format version: `1`. `SlotsPerChunk = 2048`. Id block size `4096`. Maximum public id length: 400 UTF-8 bytes.
+- Maximum encoded key size: **511 bytes** in every keyspace (the portable limit; LMDB allows 1,978, heed's default is 511). Every backend rejects a longer key on Put, Delete and Get and as a Scan bound with a `KeyTooLong` error. The formats below are designed so that no valid write exceeds it: a public id has at most 400 UTF-8 bytes and contains no U+0000 (so its tuple string needs at most 400 + 2 bytes), and edge positions are kept short (see Edges, Positions).
 - Partition is always `0` in v1 but present in every location-bearing key (seam 3). Internal ids never encode location (seam 2).
 - Each key family lives in exactly one keyspace. Keyspaces that hold several families prefix the tuple with a small integer tag.
 
@@ -59,7 +60,7 @@ Member ids are catalog-global: one id space across all concepts and aspects, ass
 
 Both directions live in the `ids` keyspace, distinguished by tag: `1` = `PublicToInternal`, `2` = `InternalToPublic`. Internal ids are allocated in blocks of 4096 and never encode partition or location. Id `0` is never allocated: it is reserved to mean "no id" (the first block starts at id `1`). Block number is `id / 4096`.
 
-Values: `PublicToInternal` holds the internal id as a tuple-encoded single integer `(id)`; `InternalToPublic` holds the public id as raw UTF-8 bytes. A public id is non-empty and at most 400 UTF-8 bytes. The two directions are always written and deleted together; a public id is bound to at most one internal id and vice versa.
+Values: `PublicToInternal` holds the internal id as a tuple-encoded single integer `(id)`; `InternalToPublic` holds the public id as raw UTF-8 bytes. A public id is non-empty, at most 400 UTF-8 bytes and contains no U+0000 (rejected on read and write, so the `(1, publicId)` key always fits the key limit). The two directions are always written and deleted together; a public id is bound to at most one internal id and vice versa.
 
 ### Rows (row index)
 
@@ -153,13 +154,27 @@ The `value` bytes are the single-value layout defined under Columns (Single valu
 
 ### Edges
 
-Key `(partition, relationshipId, direction, node, position, other)` where `direction` is `0` = Out, `1` = In and `position` is a `FractionalPosition` byte string (tuple byte-string element). Every edge is written twice: once as Out under its source node and once as In under its target node. For one `(partition, relationshipId, direction, node)` prefix, keys sort by `position` then `other`. All edges of a node and direction form the range `[prefix, PrefixEnd(prefix))`, built by `FormatKeys.EdgeRange`.
+Key `(partition, relationshipId, direction, node, position, other)` where `direction` is `0` = Out, `1` = In and `position` is a position byte string (tuple byte-string element, see Positions). Every edge is written twice: once as Out under its source node and once as In under its target node. For one `(partition, relationshipId, direction, node)` prefix, keys sort by `position` then `other`. All edges of a node and direction form the range `[prefix, PrefixEnd(prefix))`, built by `FormatKeys.EdgeRange`.
 
-The Out key on the source is `(partition, relationshipId, 0, from, position, to)` and the In key on the target is `(partition, relationshipId, 1, to, position, from)`; both carry the same position. Unordered relationships use the empty position (zero-length byte string); ordered ones use a `FractionalPosition`. A `(from, relationship, to)` pair links at most once, and a relationship without `Many` allows one Out edge per source.
+The Out key on the source is `(partition, relationshipId, 0, from, position, to)` and the In key on the target is `(partition, relationshipId, 1, to, position, from)`; both carry the same position. Unordered relationships use the empty position (zero-length byte string); ordered ones use a valid position (see Positions). A `(from, relationship, to)` pair links at most once, and a relationship without `Many` allows one Out edge per source.
 
 **Out value** (edge properties): for each non-null property, sorted by member id ascending, `memberId: u32 LE`, `length: u32 LE`, then `length` bytes of single-value encoding (the Columns single value layout for the property type). Null and absent properties are not stored; an edge with no properties has an empty value. **In value**: empty; In-direction reads fetch properties from the matching Out key.
 
-Lookup cost by `(from, to)`: O(1) for unordered Many relationships (direct key), one single-key scan for unordered one-valued relationships, and O(in-degree of `to`) for ordered relationships: the In keys carry the position, so the target's In range is scanned (ruling R33; 1 for trees). An ordered insert after a sibling then finds the neighbour with one forward scan of at most 2 keys from that sibling's Out position. A plain append, and an insert with only a Before sibling, still scan the source's Out range, O(out-degree), to find the last or preceding sibling; a later tail index or reverse scan removes that. No format change.
+Lookup cost by `(from, to)`: O(1) for unordered Many relationships (direct key), one single-key scan for unordered one-valued relationships, and O(in-degree of `to`) for ordered relationships: the In keys carry the position, so the target's In range is scanned (ruling R33; 1 for trees). An ordered insert after a sibling then finds the neighbour with one forward scan of at most 2 keys from that sibling's Out position; a plain append finds the last sibling, and an insert with only a Before sibling the preceding one, with one reverse scan of limit 1 (ruling F1). No ordered insert costs O(out-degree).
+
+#### Positions
+
+A position is opaque to readers: only its bytewise order matters, and the engine may rewrite it (positions are internal; ruling F1). Layout: an integer part, then a fraction.
+
+```
+head   : u8      integer digit count n = head - 0x7F when head >= 0x80, else 0x80 - head (1..128)
+digits : n bytes the integer's digits, most significant first
+fraction: 0 or more bytes, a base-256 fraction 0.f1f2... (compared bytewise; shorter = smaller when a prefix)
+```
+
+A larger head is a larger integer; equal heads compare digit by digit, so the fixed-length integer part followed by the fraction orders bytewise. **Validity rule:** a valid position is non-empty, holds its whole integer part (`length >= 1 + n`) and does not end in `0x00`; readers treat any other position as corrupt input to placement. The first position of an empty list is `80 80`. Appending steps the integer up by one (on overflow of all digits the head moves up one and the digits restart at all `00`); prepending steps it down (the head moves down and digits restart at all `FF`); a stepped integer whose last digit would be `00` is skipped. So n appends or prepends need O(log n) bytes (100,000 appends: 4 bytes). An insert between two positions with different integer parts takes the next integer if it sorts below the upper bound, else the lower bound's integer plus the midpoint of its fraction and 1; between two positions with the same integer part it bisects the fractions (about one bit per insert at the same spot).
+
+**Renumbering.** When a between-insert would make the longer of the edge's two keys exceed 511 bytes, the committer renumbers that `(source, relationship)` list inside the same write transaction: every edge of the list is rewritten (Out and In keys, Out value unchanged) with consecutive integer positions starting at `80 80`, in the same order, and the insert is then placed between its renumbered neighbours. The rewritten edges are written conflict keys of the batch. No other code path ever changes a stored position.
 
 ### Log
 

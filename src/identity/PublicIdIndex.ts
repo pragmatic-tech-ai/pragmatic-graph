@@ -24,6 +24,8 @@ export class PublicIdIndex
     private static readonly Encoder = new TextEncoder();
     private static readonly Decoder = new TextDecoder('utf-8');
     private static readonly ErrEmpty = 'Public id must not be empty';
+    private static readonly ErrNul = 'Public id must not contain U+0000';
+    private static readonly Nul = '\u0000';
     private static readonly ErrBound = 'Public id is already bound to a different internal id: ';
     private static readonly ErrIdBound = 'Internal id is already bound to a different public id: ';
     private static readonly ErrMismatch = 'Unbind does not match the bound pair: ';
@@ -81,6 +83,11 @@ export class PublicIdIndex
         if (PublicIdIndex.Encoder.encode(publicId).length > PublicIdIndex.MaxBytes)
         {
             throw new PublicIdTooLongError();
+        }
+        // Rejected so a 400-byte id always fits the 511-byte key limit (tuple strings escape 0x00 as two bytes; ruling F1).
+        if (publicId.includes(PublicIdIndex.Nul))
+        {
+            throw new GraphError(GraphErrorCode.InvalidArgument, PublicIdIndex.ErrNul);
         }
     }
 }

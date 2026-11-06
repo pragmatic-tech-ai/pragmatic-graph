@@ -10,6 +10,7 @@ import { TupleCodec } from '../format/TupleCodec.js';
 import { Keyspace } from '../kv/Keyspace.js';
 import { LmdbStore } from '../kv/lmdb/LmdbStore.js';
 import type { GraphContext } from '../GraphContext.js';
+import { Linearity } from '../kv/tests/Linearity.js';
 import type { Committer } from '../txn/Committer.js';
 import * as Api from '../index.js';
 import {
@@ -420,6 +421,7 @@ class GraphFx
                     ['property followed as a relationship', GraphErrorCode.SchemaViolation, r => r.Neighbors('f1', 'path', EdgeDirection.Out), t => t.Link('f1', 'path', 'loc')],
                     ['public id over 400 bytes', GraphErrorCode.InvalidArgument, r => r.GetProperty(long, 'path'), t => t.SetProperty(long, 'path', 'x')],
                     ['empty public id', GraphErrorCode.InvalidArgument, r => r.GetProperty('', 'path'), t => t.SetProperty('', 'path', 'x')],
+                    ['public id with U+0000 (F1)', GraphErrorCode.InvalidArgument, r => r.GetProperty('a\u0000b', 'path'), t => t.CreateNode('a\u0000b', 'location')],
                 ];
                 for (const [label, code, read, write] of cases)
                 {
@@ -529,6 +531,34 @@ class GraphFx
                 }
                 await GraphFx.Read(g, async r => assert.deepEqual(await r.Neighbors('dir', 'items', EdgeDirection.Out), ['left', ...expected, 'right']));
                 await g.dispose();
+            });
+
+            it('one transaction appending 20,000 children to one ordered list commits in linear time (F1)', async () =>
+            {
+                await Linearity.Check('20k ordered appends in one batch on ' + name, 2000, async n =>
+                {
+                    const g = await GraphFx.Defined(open);
+                    try
+                    {
+                        await GraphFx.Commit(g, t =>
+                        {
+                            t.CreateNode('dir', 'folder');
+                            for (let i = 0; i < n; i++)
+                            {
+                                t.CreateNode('f' + i, 'file');
+                                t.SetProperty('f' + i, 'path', '/f' + i);
+                                t.Link('dir', 'items', 'f' + i);
+                            }
+                        });
+                        const children = await GraphFx.Read(g, r => r.Neighbors('dir', 'items', EdgeDirection.Out));
+                        assert.equal(children.length, n);
+                        assert.equal(children[n - 1], 'f' + (n - 1));
+                    }
+                    finally
+                    {
+                        await g.dispose();
+                    }
+                });
             });
 
             it('DeleteNode removes the node, its cells and its edges', async () =>

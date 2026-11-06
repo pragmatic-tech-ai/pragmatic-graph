@@ -8,7 +8,8 @@ import type { MemberDef } from '../../catalog/CatalogTypes.js';
 import { CellValue } from '../../columns/CellValue.js';
 import { EdgeDirection, FormatKeys } from '../../format/FormatKeys.js';
 import { TupleCodec } from '../../format/TupleCodec.js';
-import type { IKeyValueStore, IReadTransaction, IScanProbe } from '../../kv/KeyValue.js';
+import { KeyLimits, type IKeyValueStore, type IReadTransaction, type IScanProbe } from '../../kv/KeyValue.js';
+import { Linearity } from '../../kv/tests/Linearity.js';
 import { Keyspace } from '../../kv/Keyspace.js';
 import { LmdbStore } from '../../kv/lmdb/LmdbStore.js';
 import { MemoryStore } from '../../kv/memory/MemoryStore.js';
@@ -145,7 +146,104 @@ class EdgeFx
                 await store.dispose();
             });
 
-            it('1,000 inserts between the same two siblings keep order and never renumber an existing edge', async () =>
+            it('an append and a Before-only insert read a bounded number of keys, independent of out-degree (F1)', async () =>
+            {
+                const store = await open();
+                const es = new EdgeStore();
+                const rel = EdgeFx.ManyOrdered;
+                const positions: Uint8Array[] = [];
+                await store.Write(async txn =>
+                {
+                    for (let i = 0; i < 300; i++)
+                    {
+                        positions.push(await es.Link(txn, rel, 1n, 1000n + BigInt(i)));
+                    }
+                });
+                const probe = store as unknown as IScanProbe;
+                const pulled = await store.Write(async txn =>
+                {
+                    const start = probe.EntriesRead;
+                    await es.Link(txn, rel, 1n, 5n);
+                    await es.Link(txn, rel, 1n, 6n, { Before: positions[150] as Uint8Array });
+                    return probe.EntriesRead - start;
+                });
+                assert.ok(pulled <= 12, 'pulled ' + pulled + ' stored entries');
+                const nodes = await EdgeFx.Nodes(store, es, rel, 1n, EdgeDirection.Out);
+                assert.deepEqual(nodes.slice(149, 152), [1149n, 6n, 1150n]);
+                assert.equal(nodes[nodes.length - 1], 5n);
+                await store.dispose();
+            });
+
+            it('appending 20,000 edges to one list in one write scales linearly (F1)', async () =>
+            {
+                const es = new EdgeStore();
+                await Linearity.Check('ordered appends to one list', 2000, async n =>
+                {
+                    const store = await open();
+                    try
+                    {
+                        await store.Write(async txn =>
+                        {
+                            for (let i = 0; i < n; i++)
+                            {
+                                await es.Link(txn, EdgeFx.ManyOrdered, 1n, 10n + BigInt(i));
+                            }
+                        });
+                    }
+                    finally
+                    {
+                        await store.dispose();
+                    }
+                });
+            });
+
+            it('same-spot inserts past the key limit renumber the list in the same write: order kept, every key fits (F1)', async () =>
+            {
+                const store = await open();
+                const es = new EdgeStore();
+                const rel = EdgeFx.ManyOrdered;
+                const expected: bigint[] = [];
+                const ends = await store.Write(async txn => ({ left: await es.Link(txn, rel, 1n, 2n), right: await es.Link(txn, rel, 1n, 3n) }));
+                let renumbered = 0;
+                await store.Write(async txn =>
+                {
+                    let before = ends.right;
+                    let left = ends.left;
+                    for (let i = 0; i < 5000; i++)
+                    {
+                        const node = 100n + BigInt(i);
+                        before = await es.Link(txn, rel, 1n, node, { After: left, Before: before });
+                        const moved = es.TakeRenumbered(txn);
+                        if (moved.length > 0)
+                        {
+                            renumbered++;
+                            assert.equal(moved.length, i + 2, 'every existing edge of the list is rewritten');
+                            left = await es.PositionOf(txn, rel, 1n, 2n) as Uint8Array;
+                        }
+                        expected.unshift(node);
+                    }
+                });
+                assert.ok(renumbered >= 1, 'the list was renumbered');
+                const r = await store.BeginRead();
+                try
+                {
+                    assert.deepEqual(await EdgeFx.Nodes(store, es, rel, 1n, EdgeDirection.Out), [2n, ...expected, 3n]);
+                    let longest = 0;
+                    for await (const [key] of r.Scan(Keyspace.Edges, { Start: Uint8Array.of(0x00), End: Uint8Array.of(0xff) }))
+                    {
+                        longest = Math.max(longest, key.length);
+                    }
+                    assert.ok(longest <= KeyLimits.MaxKeyBytes, 'longest edge key ' + longest);
+                    assert.deepEqual((await EdgeFx.Nodes(store, es, rel, 2000n, EdgeDirection.In)), [1n]);
+                }
+                finally
+                {
+                    r.dispose();
+                }
+                await store.dispose();
+            });
+
+            it('1,000 inserts between the same two siblings keep order and, below the key limit, never renumber an existing edge', async () =>
             {
                 const store = await open();
                 const es = new EdgeStore();
