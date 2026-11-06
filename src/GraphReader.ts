@@ -99,7 +99,7 @@ export class GraphReader implements IGraphDisposable
         for (const rel of this.Relationships(node.Concept, relationship, direction))
         {
             this.Reads?.AddRange(ConflictKeys.EdgeSpace, ConflictKeys.Adjacency(rel.Id, direction, node.Id));
-            for await (const n of this.context.Edges.Neighbors(this.snapshot.Txn, rel, node.Id, direction))
+            for await (const n of this.context.Edges.Adjacent(this.snapshot.Txn, rel, node.Id, direction))
             {
                 out.push(await this.PublicIdOf(n.Node));
             }
@@ -186,7 +186,7 @@ export class GraphReader implements IGraphDisposable
             this.RequireOpen();
             const source = await this.PublicIdOf(row.NodeId);
             this.Reads?.AddRange(ConflictKeys.EdgeSpace, ConflictKeys.Adjacency(def.Id, EdgeDirection.Out, row.NodeId));
-            for await (const n of this.context.Edges.Neighbors(txn, def, row.NodeId, EdgeDirection.Out))
+            for await (const n of this.context.Edges.Adjacent(txn, def, row.NodeId, EdgeDirection.Out))
             {
                 this.RequireOpen();
                 const target = await this.PublicIdOf(n.Node);

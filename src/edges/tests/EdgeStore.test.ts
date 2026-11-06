@@ -520,6 +520,27 @@ class EdgeFx
                 await store.dispose();
             });
 
+            it('Adjacent lists neighbours and positions like Neighbors, without properties (F9)', async () =>
+            {
+                const store = await open();
+                const es = new EdgeStore();
+                await store.Write(async txn =>
+                {
+                    await es.Link(txn, EdgeFx.WithProps, 1n, 2n, { Properties: new Map<string, CellValue>([['label', 'x']]) });
+                    await es.Link(txn, EdgeFx.WithProps, 3n, 2n, { Properties: new Map<string, CellValue>([['label', 'y']]) });
+                });
+                const r = await store.BeginRead();
+                const full = await EdgeFx.List(es, r, EdgeFx.WithProps, 2n, EdgeDirection.In);
+                const bare: Array<{ Node: bigint; Position: Uint8Array }> = [];
+                for await (const a of es.Adjacent(r, EdgeFx.WithProps, 2n, EdgeDirection.In))
+                {
+                    bare.push(a);
+                }
+                r.dispose();
+                assert.deepEqual(bare, full.map(n => ({ Node: n.Node, Position: n.Position })));
+                await store.dispose();
+            });
+
             it('Neighbors streams: stopping early works', async () =>
             {
                 const store = await open();

@@ -7,7 +7,7 @@ import { ChunkCodecError } from '../columns/ChunkCodecError.js';
 import type { ColumnStore } from '../columns/ColumnStore.js';
 import { ValueCodec } from '../columns/ValueCodec.js';
 import { EdgeError, EdgeErrorCode } from '../edges/EdgeError.js';
-import type { EdgeStore, ILinkOptions } from '../edges/EdgeStore.js';
+import type { EdgeStore, IAdjacent, ILinkOptions } from '../edges/EdgeStore.js';
 import { EdgeDirection } from '../format/FormatKeys.js';
 import type { Location } from '../identity/Location.js';
 import { PublicIdIndex } from '../identity/PublicIdIndex.js';
@@ -182,21 +182,27 @@ export class BatchApplier
     {
         const node = await this.Locate(txn, op.PublicId);
         const members = this.index.Catalog.EffectiveMembers(node.Concept);
+        // Each edge is unlinked at the position its scan already found: no per-edge lookup (F9).
         for (const rel of members.filter(m => m.Kind === MemberKind.Relationship))
         {
-            for (const other of await this.Adjacent(txn, rel, node.Id, EdgeDirection.Out))
+            for (const edge of await this.Adjacent(txn, rel, node.Id, EdgeDirection.Out))
             {
-                await this.edges.Unlink(txn, rel, node.Id, other);
-                BatchApplier.AddEdgeKeys(keys, rel, node.Id, other);
+                await this.edges.UnlinkAt(txn, rel, node.Id, edge.Node, edge.Position);
+                BatchApplier.AddEdgeKeys(keys, rel, node.Id, edge.Node);
             }
         }
         for (const rel of this.index.IncomingRelationships(node.Concept))
         {
-            for (const other of await this.Adjacent(txn, rel, node.Id, EdgeDirection.In))
+            for (const edge of await this.Adjacent(txn, rel, node.Id, EdgeDirection.In))
             {
-                await this.edges.Unlink(txn, rel, other, node.Id);
-                BatchApplier.AddEdgeKeys(keys, rel, other, node.Id);
+                await this.edges.UnlinkAt(txn, rel, edge.Node, node.Id, edge.Position);
+                BatchApplier.AddEdgeKeys(keys, rel, edge.Node, node.Id);
             }
+        }
+        // Every property cell of the slot is nulled, not just the node id (F9); slots are not reused in v1.
+        for (const m of members.filter(x => x.Kind === MemberKind.Property))
+        {
+            await this.columns.WriteCell(txn, node.Location, BatchApplier.Erasable(m), null);
         }
         await this.columns.WriteCell(txn, node.Location, CatalogSnapshot.NodeIdMember, null);
         await this.rows.Clear(txn, node.Id);
@@ -274,14 +280,21 @@ export class BatchApplier
         throw new CommitError(CommitErrorCode.InvalidEdge, BatchApplier.ErrSibling + label, new EdgeError(EdgeErrorCode.UnknownSibling, BatchApplier.ErrSibling + label));
     }
 
-    private async Adjacent(txn: IWriteTransaction, rel: MemberDef, node: bigint, direction: EdgeDirection): Promise<bigint[]>
+    /** Collected first: the edges are deleted afterwards (no writes while a scan of the keyspace is open). */
+    private async Adjacent(txn: IWriteTransaction, rel: MemberDef, node: bigint, direction: EdgeDirection): Promise<IAdjacent[]>
     {
-        const out: bigint[] = [];
-        for await (const n of this.edges.Neighbors(txn, rel, node, direction))
+        const out: IAdjacent[] = [];
+        for await (const n of this.edges.Adjacent(txn, rel, node, direction))
         {
-            out.push(n.Node);
+            out.push(n);
         }
         return out;
+    }
+
+    /** The member as nullable, so DeleteNode may null a required property of the deleted slot. */
+    private static Erasable(member: MemberDef): MemberDef
+    {
+        return member.Nullable ? member : { ...member, Nullable: true };
     }
 
     /**

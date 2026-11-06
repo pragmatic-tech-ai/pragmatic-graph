@@ -19,10 +19,15 @@ export interface ILinkOptions
     readonly Properties?: ReadonlyMap<string, CellValue>;
 }
 
-export interface INeighbor
+/** A neighbour without its edge properties (Adjacent). */
+export interface IAdjacent
 {
     readonly Node: bigint;
     readonly Position: Uint8Array;
+}
+
+export interface INeighbor extends IAdjacent
+{
     readonly Properties: ReadonlyMap<string, CellValue>;
 }
 
@@ -154,8 +159,40 @@ export class EdgeStore
     }
 
     /**
+     * Removes both keys of the edge from -> to at a position the caller already knows (for example from
+     * Adjacent), without looking it up; MissingEdge when there is no such edge.
+     */
+    public async UnlinkAt(txn: IWriteTransaction, relationship: MemberDef, from: bigint, to: bigint, position: Uint8Array): Promise<void>
+    {
+        EdgeStore.RequireRelationship(relationship);
+        InternalId.Require(from);
+        InternalId.Require(to);
+        const out = FormatKeys.Edge(EdgeStore.Partition, relationship.Id, EdgeDirection.Out, from, position, to);
+        if ((await txn.Get(Keyspace.Edges, out)) === undefined)
+        {
+            throw new EdgeError(EdgeErrorCode.MissingEdge, EdgeStore.ErrMissing + EdgeStore.Label(relationship, from, to));
+        }
+        txn.Delete(Keyspace.Edges, out);
+        txn.Delete(Keyspace.Edges, FormatKeys.Edge(EdgeStore.Partition, relationship.Id, EdgeDirection.In, to, position, from));
+    }
+
+    /** Streams the node's neighbours and edge positions in key order, without properties: one key per edge, no Gets. */
+    public async *Adjacent(txn: IReadTransaction, relationship: MemberDef, node: bigint, direction: EdgeDirection): AsyncIterable<IAdjacent>
+    {
+        EdgeStore.RequireRelationship(relationship);
+        InternalId.Require(node);
+        const range = FormatKeys.EdgeRange(EdgeStore.Partition, relationship.Id, direction, node);
+        for await (const [key] of txn.Scan(Keyspace.Edges, range))
+        {
+            const parts = TupleCodec.Decode(key);
+            yield { Node: parts[5] as bigint, Position: parts[4] as Uint8Array };
+        }
+    }
+
+    /**
      * Streams the node's edges in key order (position, then other id). `Node` is the node at the far
-     * end. In direction costs one Get per neighbor to fetch the properties from the matching Out key.
+     * end. In direction costs one Get per neighbor to fetch the properties from the matching Out key;
+     * use Adjacent when the properties are not needed.
      */
     public async *Neighbors(txn: IReadTransaction, relationship: MemberDef, node: bigint, direction: EdgeDirection): AsyncIterable<INeighbor>
     {

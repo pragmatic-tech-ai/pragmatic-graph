@@ -13,6 +13,8 @@ import type { GraphContext } from '../GraphContext.js';
 import { Linearity } from '../kv/tests/Linearity.js';
 import type { Committer } from '../txn/Committer.js';
 import type { ReadSet } from '../txn/ReadSet.js';
+import type { IScanProbe } from '../kv/KeyValue.js';
+import type { Location } from '../identity/Location.js';
 import * as Api from '../index.js';
 import {
     CatalogError,
@@ -117,7 +119,13 @@ class GraphFx
     /** The store's committer (internal), for conflict-window assertions. */
     public static Committer(g: GraphStore): Committer
     {
-        return (g as unknown as { context: GraphContext }).context.Committer;
+        return GraphFx.Context(g).Committer;
+    }
+
+    /** The store's internal context. */
+    public static Context(g: GraphStore): GraphContext
+    {
+        return (g as unknown as { context: GraphContext }).context;
     }
 
     public static async Read<T>(g: GraphStore, work: (r: GraphReader) => Promise<T>): Promise<T>
@@ -668,6 +676,64 @@ class GraphFx
                     assert.deepEqual(await r.Neighbors('loc', 'in', EdgeDirection.In), ['c2']);
                     assert.deepEqual(await GraphFx.Scan(r, 'placed', 'in'), [['c2', 'loc']]);
                 });
+                await g.dispose();
+            });
+
+            it('DeleteNode of a node with high ordered in-degree reads each incoming edge a bounded number of times (F9)', async () =>
+            {
+                const g = await GraphFx.Defined(open);
+                const n = 1500;
+                await GraphFx.Commit(g, t =>
+                {
+                    t.CreateNode('shared', 'file');
+                    t.SetProperty('shared', 'path', '/shared');
+                    for (let i = 0; i < n; i++)
+                    {
+                        t.CreateNode('d' + i, 'folder');
+                        t.Link('d' + i, 'items', 'shared');
+                    }
+                });
+                const probe = GraphFx.Context(g).Store as unknown as IScanProbe;
+                const before = probe.EntriesRead;
+                await GraphFx.Commit(g, t => t.DeleteNode('shared'));
+                const pulled = probe.EntriesRead - before;
+                assert.ok(pulled <= 4 * n, 'deleting pulled ' + pulled + ' entries for ' + n + ' incoming edges');
+                await GraphFx.Read(g, async r => assert.deepEqual(await r.Neighbors('d7', 'items', EdgeDirection.Out), []));
+                await g.dispose();
+            });
+
+            it('DeleteNode nulls every property cell of the deleted slot, not just the node id (F9)', async () =>
+            {
+                const g = await GraphFx.Defined(open);
+                await GraphFx.Seed(g);
+                const context = GraphFx.Context(g);
+                const where = async (): Promise<Location> =>
+                {
+                    const txn = await context.Store.BeginRead();
+                    try
+                    {
+                        return await context.Rows.Locate(txn, await context.Ids.Resolve(txn, 'c1') as bigint) as Location;
+                    }
+                    finally
+                    {
+                        txn.dispose();
+                    }
+                };
+                const location = await where();
+                await GraphFx.Commit(g, t => t.DeleteNode('c1'));
+                const txn = await context.Store.BeginRead();
+                try
+                {
+                    const catalog = context.Committer.Catalog;
+                    for (const member of ['name', 'since'])
+                    {
+                        assert.equal(await context.Columns.ReadCell(txn, location, catalog.Member('component', member)), null, member);
+                    }
+                }
+                finally
+                {
+                    txn.dispose();
+                }
                 await g.dispose();
             });
 
