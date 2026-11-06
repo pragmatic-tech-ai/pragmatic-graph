@@ -52,6 +52,7 @@ class SeedFx
     private static readonly SeedName = 'seed';
     public static readonly Base = 'base';
     public static readonly Hosts = 'hosts';
+    public static readonly Uses = 'uses';
     public static readonly Abort = 'abort';
 
     public static Dir(): string
@@ -82,6 +83,7 @@ class SeedFx
                     SeedFx.Prop('name', ValueType.String),
                     SeedFx.Prop('port', ValueType.Int64),
                     { Name: SeedFx.Hosts, Kind: MemberKind.Relationship, Targets: ['App'], Many: true, Ordered: true },
+                    { Name: SeedFx.Uses, Kind: MemberKind.Relationship, Targets: ['App', 'Server'], Many: true },
                 ],
             },
             { Name: 'App', IsAspect: false, Parent: null, Aspects: [], Members: [SeedFx.Prop('label', ValueType.String)] },
@@ -386,7 +388,7 @@ class SeedFx
                     t.CreateNode('r1', 'App');
                     t.SetProperty('r1', 'label', 'mine');
                 });
-                await g.Upgrade(SeedFx.Desc('v2', SeedFx.With('a2')));
+                await g.Upgrade(SeedFx.Desc('v2', SeedFx.With('a2').map(n => n.PublicId !== 's1' ? n : SeedFx.Node('s1', 'Server', { name: 'alpha' }, SeedFx.Hosting('a1')))));
                 await SeedFx.Read(g, async r =>
                 {
                     assert.equal(await r.ConceptOf('a2'), undefined);
@@ -394,7 +396,7 @@ class SeedFx
                     assert.equal(await r.GetProperty('r1', 'label'), 'mine');
                     assert.equal(await r.IsSeeded('s1'), true);
                 });
-                assert.deepEqual(await SeedFx.Hosted(g, 's1'), ['a1'], 'the edge into the deleted node went with it');
+                assert.deepEqual(await SeedFx.Hosted(g, 's1'), ['a1']);
                 assert.deepEqual(await SeedFx.Markers(g), ['a1', 'b1', 's1']);
                 await g.dispose();
             });
@@ -476,21 +478,96 @@ class SeedFx
                 const again = await g.Upgrade(SeedFx.Desc('v3', SeedFx.With('b1'), noBox));
                 assert.notEqual(again.SeedCommit, undefined);
                 await SeedFx.Read(g, async r => assert.equal(await r.GetProperty('a1', 'label'), 'one'));
+                assert.deepEqual(await SeedFx.Hosted(g, 's1'), ['a1', 'a2'], 'the unchanged s1 re-links the recreated a1 (ruling R55)');
                 await g.dispose();
             });
 
-            it('a seed node whose concept changed is recreated', async () =>
+            it('a seed node whose concept changed is recreated and keeps its seeded incoming links', async () =>
             {
-                const g = await SeedFx.Ready(open);
-                await g.Upgrade(SeedFx.Desc('v2', [...SeedFx.With('a2'), SeedFx.Node('a2', 'Server', { name: 'was app' })]));
+                const g = await open();
+                const uses = (): ISeedNode => SeedFx.Node('s1', 'Server', { name: 'alpha' }, [...SeedFx.Hosting('a1'), { Relationship: SeedFx.Uses, To: 'a2' }]);
+                await g.Upgrade(SeedFx.Desc('v1', SeedFx.With('s1', uses())));
+                await g.Upgrade(SeedFx.Desc('v2', [...SeedFx.With('s1', uses()).filter(n => n.PublicId !== 'a2'), SeedFx.Node('a2', 'Server', { name: 'was app' })]));
                 await SeedFx.Read(g, async r =>
                 {
                     assert.equal(await r.ConceptOf('a2'), 'Server');
                     assert.equal(await r.GetProperty('a2', 'name'), 'was app');
                     assert.equal(await r.IsSeeded('a2'), true);
+                    assert.deepEqual(await r.Neighbors('s1', SeedFx.Uses, EdgeDirection.Out), ['a2'], 'the unchanged s1 re-links the recreated a2');
                 });
                 assert.deepEqual(await SeedFx.Hosted(g, 's1'), ['a1']);
+                // A differing owner is InvalidValue even when the concept changes too.
+                const before = await SeedFx.Snapshot(g);
+                await assert.rejects(g.Upgrade(SeedFx.Desc('v3', [...SeedFx.With('s1', uses()).filter(n => n.PublicId !== 'a2'), SeedFx.Node('a2', 'App', {}, [], 'other')])), SeedFx.IsCommit(CommitErrorCode.InvalidValue));
+                assert.deepEqual(await SeedFx.Snapshot(g), before);
                 await g.dispose();
+            });
+
+            it('a seed with a repeated or malformed public id is rejected', async () =>
+            {
+                const g = await open();
+                await assert.rejects(g.Upgrade(SeedFx.Desc('v1', [...SeedFx.Seed1(), SeedFx.Node('a1', 'App', {})])), SeedFx.IsCommit(CommitErrorCode.DuplicatePublicId));
+                await assert.rejects(g.Upgrade(SeedFx.Desc('v1', [...SeedFx.Seed1(), SeedFx.Node('', 'App', {})])), SeedFx.IsCommit(CommitErrorCode.InvalidPublicId));
+                await assert.rejects(g.Upgrade(SeedFx.Desc('v1', [...SeedFx.Seed1(), SeedFx.Node('a\u0000', 'App', {})])), SeedFx.IsCommit(CommitErrorCode.InvalidPublicId));
+                assert.equal(await g.SchemaVersion(), undefined);
+                await g.dispose();
+            });
+
+            it('a member hoisted to a parent: the seed restores the value the purge dropped from the losing sibling', async () =>
+            {
+                const g = await open();
+                const tool = (members: MemberInput[], parent: string | null): IDefinitionDescription => ({ Name: 'Tool', IsAspect: false, Parent: parent, Aspects: [], Members: members });
+                const label = SeedFx.Prop('label', ValueType.String);
+                const seed = [...SeedFx.Seed1(), SeedFx.Node('t1', 'Tool', { label: 'tee' })];
+                await g.Upgrade(SeedFx.Desc('v1', seed, SeedFx.Defs([tool([label], null)])));
+                const hoisted = SeedFx.Defs([tool([], 'Labeled'), { Name: 'Labeled', IsAspect: false, Parent: null, Aspects: [], Members: [label] }])
+                    .map(d => d.Name !== 'App' ? d : { ...d, Parent: 'Labeled', Members: [] });
+                const result = await g.Upgrade(SeedFx.Desc('v2', seed, hoisted));
+                assert.equal(result.Changed, true);
+                assert.notEqual(result.SeedCommit, undefined, 'the losing sibling was re-seeded');
+                await SeedFx.Read(g, async r =>
+                {
+                    assert.equal(await r.GetProperty('a1', 'label'), 'one');
+                    assert.equal(await r.GetProperty('a2', 'label'), 'two');
+                    assert.equal(await r.GetProperty('t1', 'label'), 'tee');
+                });
+                await g.dispose();
+            });
+
+            it('a relationship retargeted: the seed restores its edges, or fails when its target is no longer accepted', async () =>
+            {
+                const g = await SeedFx.Ready(open);
+                const retarget = (targets: string[], extra: IDefinitionDescription[]): IDefinitionDescription[] => SeedFx.Defs(extra).map(d => d.Name !== 'Server' ? d : {
+                    ...d, Members: d.Members.map(m => m.Name !== SeedFx.Hosts ? m : { ...m, Targets: targets }),
+                });
+                const extra: IDefinitionDescription = { Name: 'Extra', IsAspect: false, Parent: null, Aspects: [], Members: [] };
+                const before = await SeedFx.Snapshot(g);
+                await assert.rejects(g.Upgrade(SeedFx.Desc('v2', SeedFx.Seed1(), retarget(['Server'], []))), SeedFx.IsCommit(CommitErrorCode.TargetTypeMismatch));
+                assert.equal(await g.SchemaVersion(), 'v1');
+                assert.deepEqual(await SeedFx.Snapshot(g), before, 'store unchanged');
+                await g.Upgrade(SeedFx.Desc('v2', SeedFx.Seed1(), retarget(['App', 'Extra'], [extra])));
+                assert.deepEqual(await SeedFx.Hosted(g, 's1'), ['a1', 'a2']);
+                await g.dispose();
+            });
+
+            it('an unchanged seed setting a property the new catalog removed fails the upgrade atomically', async () =>
+            {
+                const withoutName = SeedFx.Defs().map(d => d.Name !== 'Server' ? d : { ...d, Members: d.Members.filter(m => m.Name !== 'name') });
+                // The purge dropped s1's value (s1 modified) ...
+                const g = await SeedFx.Ready(open);
+                const before = await SeedFx.Snapshot(g);
+                await assert.rejects(g.Upgrade(SeedFx.Desc('v2', SeedFx.Seed1(), withoutName)), SeedFx.IsCommit(CommitErrorCode.UnknownMember));
+                assert.deepEqual(await SeedFx.Snapshot(g), before);
+                await g.dispose();
+                // ... or the seed value was null, so the purge did not touch s1: validation against the new catalog catches it.
+                const h = await open();
+                const nullName = SeedFx.With('s1', SeedFx.Node('s1', 'Server', { name: null }, SeedFx.Hosting('a1', 'a2')));
+                await h.Upgrade(SeedFx.Desc('v1', nullName));
+                const hBefore = await SeedFx.Snapshot(h);
+                await assert.rejects(h.Upgrade(SeedFx.Desc('v2', nullName, withoutName)), SeedFx.IsCommit(CommitErrorCode.UnknownMember));
+                assert.equal(await h.SchemaVersion(), 'v1');
+                assert.deepEqual(await SeedFx.Snapshot(h), hBefore);
+                await h.dispose();
             });
 
             it('IsSeeded is a recorded read: a seed that rewrites the node conflicts the transaction', async () =>
@@ -514,6 +591,20 @@ class SeedFx
                 assert.equal(result.Changed, true);
                 assert.equal(result.SeedCommit, undefined, 'the retry saw a1 intact');
                 await SeedFx.Read(g, async r => assert.equal(await r.GetProperty('a1', 'label'), 'one'));
+                await g.dispose();
+            });
+
+            it('the retry succeeds only because it allocates the ids the first attempt missed', async () =>
+            {
+                const g = await SeedFx.Ready(open);
+                // Both attempts' purges remove a1: the fresh pre-pass alone (a1 present, same hash) would miss again.
+                const sabotage = SeedFx.Sabotage(g, ['a1', 'a1']);
+                const result = await g.Upgrade(SeedFx.Desc('v2', SeedFx.Seed1(), SeedFx.ExtraDefs()));
+                sabotage.Restore();
+                assert.equal(sabotage.Calls(), 2);
+                assert.notEqual(result.SeedCommit, undefined, 'a1 was recreated with the id allocated for the miss');
+                await SeedFx.Read(g, async r => assert.equal(await r.GetProperty('a1', 'label'), 'one'));
+                assert.deepEqual(await SeedFx.Hosted(g, 's1'), ['a1', 'a2']);
                 await g.dispose();
             });
 

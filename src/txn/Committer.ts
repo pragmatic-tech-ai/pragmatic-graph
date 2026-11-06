@@ -14,7 +14,7 @@ import { CatalogPlanner, type ICatalogPlan } from '../schema/CatalogPlanner.js';
 import { DataPurger } from '../schema/DataPurger.js';
 import type { ISchemaDescription, ISeedNode } from '../schema/SchemaDescription.js';
 import { SeedMarkers } from '../schema/SeedMarkers.js';
-import { SeedSynchronizer, TransactionSeedView } from '../schema/SeedSynchronizer.js';
+import { type ISeedCatalogChange, SeedSynchronizer, TransactionSeedView } from '../schema/SeedSynchronizer.js';
 import { BatchApplier } from './BatchApplier.js';
 import { CatalogIndex } from './CatalogIndex.js';
 import { CommitError } from './CommitError.js';
@@ -573,11 +573,13 @@ export class Committer
         const seed = await this.store.Write(async txn =>
         {
             await this.RequireCurrent(txn);
+            let change: ISeedCatalogChange | undefined;
             if (plan.Changed)
             {
-                await this.purger.Purge(txn, old, next, plan.Diff, keys);
+                const stats = await this.purger.Purge(txn, old, next, plan.Diff, keys);
+                change = { Modified: new Set(stats.ModifiedNodes) };
             }
-            const applied = await this.ApplySeed(txn, next, description.Seed, ids);
+            const applied = await this.ApplySeed(txn, next, description.Seed, ids, change);
             await this.Compact(txn, next);
             this.Flush(txn);
             if (upgradeCommit !== undefined)
@@ -637,10 +639,10 @@ export class Committer
      * marker change also writes the node's Node key (IsSeeded records it). Undefined when the seed
      * changes nothing (no op, no marker change): then there is no Batch entry.
      */
-    private async ApplySeed(txn: IWriteTransaction, index: CatalogIndex, seed: readonly ISeedNode[], ids: ReadonlyMap<string, bigint>): Promise<ISeedCommit | undefined>
+    private async ApplySeed(txn: IWriteTransaction, index: CatalogIndex, seed: readonly ISeedNode[], ids: ReadonlyMap<string, bigint>, change: ISeedCatalogChange | undefined): Promise<ISeedCommit | undefined>
     {
         const view = new TransactionSeedView(txn, index, this.rows, this.ids, this.edges);
-        const plan = await new SeedSynchronizer(index.Catalog).Build(view, seed, await SeedMarkers.ReadAll(txn));
+        const plan = await new SeedSynchronizer(index).Build(view, seed, await SeedMarkers.ReadAll(txn), change);
         if (plan.Batch.Count === 0 && plan.Hashes.size === 0 && plan.Removed.length === 0)
         {
             return undefined;

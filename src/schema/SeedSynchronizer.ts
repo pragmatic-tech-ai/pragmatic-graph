@@ -1,4 +1,3 @@
-import type { CatalogSnapshot } from '../catalog/CatalogSnapshot.js';
 import { MemberKind } from '../catalog/ValueType.js';
 import type { CellValue } from '../columns/CellValue.js';
 import type { EdgeStore } from '../edges/EdgeStore.js';
@@ -33,6 +32,13 @@ export interface ISeedPlan
     readonly Removed: readonly string[];
 }
 
+/** What the upgrade's purge did, when the catalog changed (ruling R55). */
+export interface ISeedCatalogChange
+{
+    /** Surviving nodes the purge modified (a value dropped, an edge removed): IPurgeStats.ModifiedNodes. */
+    readonly Modified: ReadonlySet<string>;
+}
+
 /** How one seed node is applied. */
 enum SeedAction
 {
@@ -49,7 +55,8 @@ enum SeedAction
 interface ISeedStep
 {
     readonly Node: ISeedNode;
-    readonly Action: SeedAction;
+    /** Keep may be promoted to Overwrite (ruling R55). */
+    Action: SeedAction;
     readonly Hash: Uint8Array;
 }
 
@@ -60,9 +67,15 @@ interface ISeedStep
  * alone; any other present node (a different hash, or a runtime node that has the seed's id) is
  * overwritten: every effective property set (absent ones to null; a non-nullable absent one is
  * MissingRequired), every out-edge removed and the seed links re-added in seed order. Its owner must
- * match (owner is create-time: InvalidValue otherwise); a node whose concept differs is deleted and
- * created again. Previously seeded ids missing from the seed are deleted. Creates come before property
- * sets and links, so links may point at seed nodes later in the array.
+ * match (owner is create-time: InvalidValue otherwise, checked first); a node whose concept differs is
+ * deleted and created again. Previously seeded ids missing from the seed are deleted. Creates come
+ * before property sets and links, so links may point at seed nodes later in the array.
+ *
+ * A node left alone is promoted to overwritten (ruling R55) when one of its seed links points at a node
+ * the batch creates, recreates or deletes, and, after a catalog change, when the purge modified it or
+ * its seed no longer fits the new catalog (unknown concept, a property that is not an effective
+ * property, a link whose relationship is not effective or does not accept the target): its seed is then
+ * re-applied, or the batch fails exactly as an edited seed would.
  */
 export class SeedSynchronizer
 {
@@ -71,13 +84,14 @@ export class SeedSynchronizer
     private static readonly ErrRequired = 'Seed lacks a value for a required property: ';
     private static readonly Dot = '.';
 
-    public constructor(private readonly catalog: CatalogSnapshot)
+    public constructor(private readonly index: CatalogIndex)
     {
     }
 
     /**
      * The read-only pre-pass (ruling R16: ids are allocated outside the write): the public ids of every
-     * seed node that may need a fresh internal id, i.e. absent from the view or not seeded with the same hash.
+     * seed node absent from the view or present but not seeded with the same hash. Only the ones Build
+     * then creates or recreates consume their id; an overwritten node keeps its own (the rest are wasted).
      */
     public static async IdsNeeded(view: ISeedView, seed: readonly ISeedNode[], storedHashes: ReadonlyMap<string, Uint8Array>): Promise<string[]>
     {
@@ -93,7 +107,8 @@ export class SeedSynchronizer
         return out;
     }
 
-    public async Build(view: ISeedView, seed: readonly ISeedNode[], storedHashes: ReadonlyMap<string, Uint8Array>): Promise<ISeedPlan>
+    /** `catalogChange`: given iff the upgrade changed the catalog (and purged). */
+    public async Build(view: ISeedView, seed: readonly ISeedNode[], storedHashes: ReadonlyMap<string, Uint8Array>, catalogChange?: ISeedCatalogChange): Promise<ISeedPlan>
     {
         const steps: ISeedStep[] = [];
         for (const node of SeedSynchronizer.Validated(seed))
@@ -102,6 +117,7 @@ export class SeedSynchronizer
         }
         const seeded = new Set(seed.map(n => n.PublicId));
         const removed = [...storedHashes.keys()].filter(id => !seeded.has(id));
+        await this.Promote(view, steps, new Set(removed), catalogChange);
         const batch = new WriteBatch();
         for (const step of steps.filter(s => s.Action === SeedAction.Overwrite))
         {
@@ -158,15 +174,58 @@ export class SeedSynchronizer
         {
             return { Node: node, Action: SeedAction.Keep, Hash: hash };
         }
-        if (present.Concept !== node.Concept)
-        {
-            return { Node: node, Action: SeedAction.Recreate, Hash: hash };
-        }
         if (present.Owner !== node.Owner)
         {
             throw new CommitError(CommitErrorCode.InvalidValue, SeedSynchronizer.ErrOwner + node.PublicId);
         }
-        return { Node: node, Action: SeedAction.Overwrite, Hash: hash };
+        return { Node: node, Action: present.Concept !== node.Concept ? SeedAction.Recreate : SeedAction.Overwrite, Hash: hash };
+    }
+
+    /** Ruling R55: Keep becomes Overwrite when leaving the node alone would lose or skip part of its seed. */
+    private async Promote(view: ISeedView, steps: readonly ISeedStep[], removed: ReadonlySet<string>, catalogChange: ISeedCatalogChange | undefined): Promise<void>
+    {
+        const byId = new Map(steps.map(s => [s.Node.PublicId, s] as const));
+        const replaced = new Set(steps.filter(s => s.Action === SeedAction.Create || s.Action === SeedAction.Recreate).map(s => s.Node.PublicId));
+        for (const step of steps.filter(s => s.Action === SeedAction.Keep))
+        {
+            const node = step.Node;
+            if (node.Links.some(l => replaced.has(l.To) || removed.has(l.To)))
+            {
+                step.Action = SeedAction.Overwrite;
+            }
+            else if (catalogChange !== undefined && (catalogChange.Modified.has(node.PublicId) || !(await this.Fits(view, node, byId))))
+            {
+                step.Action = SeedAction.Overwrite;
+            }
+        }
+    }
+
+    /** True iff the seed node is valid against the catalog: concept, property names, link relationships and targets. */
+    private async Fits(view: ISeedView, node: ISeedNode, byId: ReadonlyMap<string, ISeedStep>): Promise<boolean>
+    {
+        const catalog = this.index.Catalog;
+        if (!catalog.Definitions().some(d => d.Name === node.Concept && !d.IsAspect))
+        {
+            return false;
+        }
+        const members = catalog.EffectiveMembers(node.Concept);
+        const properties = new Set(members.filter(m => m.Kind === MemberKind.Property).map(m => m.Name));
+        if (Object.keys(node.Properties).some(name => !properties.has(name)))
+        {
+            return false;
+        }
+        for (const link of node.Links)
+        {
+            const rel = members.find(m => m.Kind === MemberKind.Relationship && m.Name === link.Relationship);
+            const target = byId.get(link.To);
+            const created = target !== undefined && (target.Action === SeedAction.Create || target.Action === SeedAction.Recreate);
+            const concept = created ? target.Node.Concept : (await view.Resolve(link.To))?.Concept;
+            if (rel === undefined || concept === undefined || !this.index.Accepts(rel, concept))
+            {
+                return false;
+            }
+        }
+        return true;
     }
 
     /** The seed's properties; an overwritten node also has every other effective property nulled. */
@@ -181,7 +240,7 @@ export class SeedSynchronizer
         {
             return;
         }
-        for (const member of this.catalog.EffectiveMembers(node.Concept))
+        for (const member of this.index.Catalog.EffectiveMembers(node.Concept))
         {
             if (member.Kind !== MemberKind.Property || Object.hasOwn(node.Properties, member.Name))
             {

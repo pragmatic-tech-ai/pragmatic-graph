@@ -20,9 +20,10 @@ enum SeedValueTag
 /**
  * The content hash of one seed node (spec 4.3): SHA-256 over a canonical encoding, stored as the node's
  * seed marker. The encoding is a sequence of TupleCodec tuples (each self-delimiting):
- * (PublicId, Concept, Owner, propertyCount, linkCount), then per property sorted by name
- * (name, tag, ...value), then per link in the given order (Relationship, To, edgePropertyCount) followed
- * by its edge properties sorted by name, encoded like node properties. Floats are their IEEE-754 bytes.
+ * (PublicId, Concept, Owner, propertyCount, linkCount), then per property sorted by the UTF-8 bytes of
+ * its name (name, tag, ...value), then per link in the given order (Relationship, To, edgePropertyCount)
+ * followed by its edge properties sorted the same way, encoded like node properties. Floats are their
+ * big-endian IEEE-754 bytes.
  */
 export class SeedHash
 {
@@ -62,10 +63,10 @@ export class SeedHash
         }
     }
 
-    /** Entries sorted by name (code-unit order: deterministic, which is all a hash needs). */
+    /** Entries sorted by the UTF-8 bytes of the name (TupleCodec's string order, not UTF-16 code units). */
     private static Sorted(record: Readonly<Record<string, CellValue>>): Array<readonly [string, CellValue]>
     {
-        return Object.keys(record).sort().map(k => [k, record[k] as CellValue] as const);
+        return Object.keys(record).sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b))).map(k => [k, record[k] as CellValue] as const);
     }
 
     private static Value(value: CellValue): TupleElement[]

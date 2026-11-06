@@ -557,7 +557,8 @@ class UpgradeFx
                     throw new Error(UpgradeFx.Abort);
                 }), new RegExp(UpgradeFx.Abort));
                 // n1 and m1; n1.text, m1.body, m1.title, i1.size, i2.size; authored p1->n1, p1->d1 (retargeted), cites p1->m1.
-                assert.deepEqual(stats, { NodesRemoved: 2, ValuesRemoved: 5, EdgesRemoved: 3 });
+                // Modified survivors: i1, i2 (size dropped), p1 (edges from it), d1 (edge into it).
+                assert.deepEqual(stats, { NodesRemoved: 2, ValuesRemoved: 5, EdgesRemoved: 3, ModifiedNodes: ['d1', 'i1', 'i2', 'p1'] });
                 assert.deepEqual(await UpgradeFx.Nodes(g, 'Note'), ['n1']);
                 await g.dispose();
             });

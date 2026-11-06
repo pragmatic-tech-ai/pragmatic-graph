@@ -21,6 +21,11 @@ export interface IPurgeStats
     readonly NodesRemoved: number;
     readonly ValuesRemoved: number;
     readonly EdgesRemoved: number;
+    /**
+     * Public ids (sorted) of the surviving nodes the purge modified: a non-null value of theirs dropped, or
+     * an edge from or to them removed. Seed synchronization re-applies seeded ones (ruling R55).
+     */
+    readonly ModifiedNodes: readonly string[];
 }
 
 /** A live node of a concept, from its node-id column. */
@@ -70,6 +75,8 @@ class PurgeRun
     private readonly doomed = new Map<bigint, IDoomedNode>();
     private readonly doomedEdges = new Map<string, IDoomedEdge>();
     private readonly droppedColumns: IDroppedColumn[] = [];
+    /** Internal ids of nodes that lose a value or an edge (doomed ones included; filtered at the end). */
+    private readonly touched = new Set<bigint>();
     private readonly removedTypes: TypeDefinition[];
     private readonly keptConcepts: TypeDefinition[];
     private values = 0;
@@ -100,6 +107,7 @@ class PurgeRun
         }
         await this.CollectRemovedMembers();
         await this.CollectRejectedTargets();
+        const modified = await this.ModifiedNodes();
 
         for (const edge of this.doomedEdges.values())
         {
@@ -117,7 +125,27 @@ class PurgeRun
         {
             await this.columns.DropType(this.txn, PurgeRun.Partition, type.TypeId);
         }
-        return { NodesRemoved: this.doomed.size, ValuesRemoved: this.values, EdgesRemoved: this.doomedEdges.size };
+        return { NodesRemoved: this.doomed.size, ValuesRemoved: this.values, EdgesRemoved: this.doomedEdges.size, ModifiedNodes: modified };
+    }
+
+    /** Public ids of the touched nodes that survive, read before anything is removed. */
+    private async ModifiedNodes(): Promise<string[]>
+    {
+        const out: string[] = [];
+        for (const id of this.touched)
+        {
+            if (this.doomed.has(id))
+            {
+                continue;
+            }
+            const publicId = await this.ids.PublicIdOf(this.txn, id);
+            if (publicId === undefined)
+            {
+                throw new GraphError(GraphErrorCode.Corrupt, PurgeRun.ErrNoPublicId + id);
+            }
+            out.push(publicId);
+        }
+        return out.sort();
     }
 
     /** Every node of a removed concept goes; its values are counted here, its columns go wholesale (DropType). */
@@ -279,6 +307,7 @@ class PurgeRun
             if (row.Value !== null)
             {
                 this.values += 1;
+                this.touched.add(row.NodeId);
             }
         }
     }
@@ -295,6 +324,8 @@ class PurgeRun
             if (!this.doomedEdges.has(id))
             {
                 this.doomedEdges.set(id, { Relationship: rel, From: from, To: to, Position: edge.Position.slice() });
+                this.touched.add(from);
+                this.touched.add(to);
                 this.keys.Add(ConflictKeys.EdgeSpace, ConflictKeys.Edge(rel.Id, EdgeDirection.Out, from, to));
                 this.keys.Add(ConflictKeys.EdgeSpace, ConflictKeys.Edge(rel.Id, EdgeDirection.In, to, from));
             }
