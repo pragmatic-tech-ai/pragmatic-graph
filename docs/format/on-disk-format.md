@@ -12,8 +12,11 @@ This document is the contract between the TypeScript engine and the future Rust 
 - Values outside keys (row blocks, chunk headers, delta entries) are little-endian binary as specified below.
 - Format version: `1`. `SlotsPerChunk = 2048`. Id block size `4096`. Maximum public id length: 400 UTF-8 bytes.
 - Maximum encoded key size: **511 bytes** in every keyspace (the portable limit; LMDB allows 1,978, heed's default is 511). Every backend rejects a longer key on Put, Delete and Get and as a Scan bound with a `KeyTooLong` error. The formats below are designed so that no valid write exceeds it: a public id has at most 400 UTF-8 bytes and contains no U+0000 (so its tuple string needs at most 400 + 2 bytes), and edge positions are kept short (see Edges, Positions).
-- Partition is always `0` in v1 but present in every location-bearing key (seam 3). Internal ids never encode location (seam 2).
+- Partition is always `0` in v1 but present in every location-bearing key (seam 3). Internal ids never encode location (seam 2). Intentionally partition-free (global) keys: `meta` names `format`, `catalogVersion`, `nextBlock` and `commit`; the whole `catalog` keyspace (the schema is global; placement is per concept inside it); the `ids` keyspace (identity is location-free); the `rows` keyspace (the row index maps every id to a location that itself carries the partition); and the `log` keyspace (one commit order per store). Every key that addresses node data (`columns`, `deltas`, `edges`, `meta` `slots`) carries the partition.
 - Each key family lives in exactly one keyspace. Keyspaces that hold several families prefix the tuple with a small integer tag.
+- Each keyspace is its own ordered map: in LMDB one named database per keyspace (named by the keyspace's string, e.g. `meta`, `edges`) with the default key comparison, which is `memcmp` (unsigned bytewise, a shorter key that is a prefix of a longer one sorts first). The tuple encoding is designed for exactly that order; a Rust core must use the same named databases and the default comparator (no custom comparators, no dup-sort).
+- The LMDB environment directory also holds `graph.lock`: the decimal process id of the store that has it open for writing (one writer per directory; a lock whose process no longer exists is stale and may be taken over). It is not part of the data and is removed on a clean close. Commits are synchronous (`overlappingSync` off): a commit is on disk when it is reported.
+- **Encoders must be canonical** (note for the Rust implementation): for every value there is exactly one valid encoding, and readers may compare encoded bytes for equality. Integers use the minimal byte count (no leading zero bytes; zero is the single byte `0x14`); strings are well-formed UTF-8 with no normalization applied; positions follow the validity rule (Edges, Positions); edge-property and delta entries are sorted as specified with no duplicates; JSON catalogs are written by the engine and only parsed (never compared) by readers. A Rust encoder must produce byte-identical output for identical input.
 
 ## Keyspaces and keys
 
@@ -141,14 +144,14 @@ One non-null value, self-delimiting (used by delta entries and edge properties; 
 | String | `byteLength u32`, UTF-8 bytes |
 | DateTime | `micros i64`, `zoneLength u16`, zone UTF-8 bytes |
 
-Member id `0` of every type is the node-id column. A slot is live iff its member-0 cell is non-null; deleted slots have a null node id.
+Member id `0` of every type is the node-id column. A slot is live iff its member-0 cell is non-null; deleted slots have a null node id. Deleting a node nulls every property cell of its slot, not only member 0 (ruling F9), so no value of a deleted node remains readable at its old location. Slot reuse is a documented follow-up: in v1 a deleted slot stays allocated (null) forever and `Meta("slots", ...)` only grows; reusing slots later needs a free-slot list per type and partition and is additive (a new `meta` name), not a change of these layouts.
 
 ### Deltas
 
 Same key tuple as the column chunk it overlays, stored in the `deltas` keyspace. Value is a list of entries, concatenated with no count or padding, in ascending `slot` order; readers overlay them on the chunk:
 
 ```
-slot    : u16 LE
+slot    : u16 LE    the slot within the chunk (0..2047), i.e. node slot % 2048, not the node's type-wide slot
 present : u8        0 = cell is null, 1 = value follows
 value   : present = 1 only; one cell encoded as defined by ChunkCodec (Task 9)
 ```
