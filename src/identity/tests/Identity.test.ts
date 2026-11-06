@@ -19,6 +19,7 @@ class IdentityFx
     private static readonly Accented = 'user:é';
     private static readonly AccentChar = 'é';
     public static readonly BlockSize = 4096n;
+    public static readonly SmallBound = 4;
 
     public static async OpenLmdb(): Promise<IKeyValueStore>
     {
@@ -108,15 +109,60 @@ class IdentityFx
                 await store.dispose();
             });
 
-            it('bounds open hinted blocks', async () =>
+            it('bounds open hinted blocks and evicts least recently used', async () =>
             {
                 const store = await open();
-                const alloc = await IdAllocator.Open(store);
-                for (let i = 0; i < IdAllocator.MaxOpenHints + 5; i++)
+                const alloc = await IdAllocator.Open(store, { MaxOpenHints: IdentityFx.SmallBound });
+                const first = new Map<string, bigint>();
+                for (const h of ['a', 'b', 'c', 'd'])
                 {
-                    await alloc.Next(IdentityFx.Hint + i);
+                    first.set(h, await alloc.Next(h));
                 }
-                assert.ok(alloc.OpenHintCount <= IdAllocator.MaxOpenHints);
+                await alloc.Next('a');
+                await alloc.Next('e');
+                assert.equal(alloc.OpenHintCount, IdentityFx.SmallBound);
+                const a = await alloc.Next('a');
+                assert.equal(a / IdentityFx.BlockSize, (first.get('a') as bigint) / IdentityFx.BlockSize);
+                const b = await alloc.Next('b');
+                assert.notEqual(b / IdentityFx.BlockSize, (first.get('b') as bigint) / IdentityFx.BlockSize);
+                assert.ok(alloc.OpenHintCount <= IdentityFx.SmallBound);
+                await store.dispose();
+            });
+
+            it('rejects invalid public ids on Resolve and Unbind', async () =>
+            {
+                const store = await open();
+                const idx = new PublicIdIndex();
+                const r = await store.BeginRead();
+                await assert.rejects(idx.Resolve(r, 'a'.repeat(401)), PublicIdTooLongError);
+                await assert.rejects(idx.Resolve(r, ''));
+                r.dispose();
+                await store.Write(async txn =>
+                {
+                    await assert.rejects(idx.Unbind(txn, 'a'.repeat(401), 1n), PublicIdTooLongError);
+                    await assert.rejects(idx.Unbind(txn, '', 1n));
+                });
+                await store.dispose();
+            });
+
+            it('rejects internal ids outside 1..2^64-1', async () =>
+            {
+                const store = await open();
+                const idx = new PublicIdIndex();
+                const rows = new RowIndex();
+                const max = (1n << 64n) - 1n;
+                await store.Write(async txn =>
+                {
+                    for (const bad of [0n, -1n, 1n << 64n])
+                    {
+                        await assert.rejects(idx.Bind(txn, 'x', bad), RangeError);
+                        await assert.rejects(rows.Assign(txn, bad, IdentityFx.Loc(1, 1)), RangeError);
+                        await assert.rejects(rows.Locate(txn, bad), RangeError);
+                    }
+                    await idx.Bind(txn, 'x', max);
+                    await rows.Assign(txn, max, IdentityFx.Loc(1, 1));
+                    assert.deepEqual(await rows.Locate(txn, max), IdentityFx.Loc(1, 1));
+                });
                 await store.dispose();
             });
 

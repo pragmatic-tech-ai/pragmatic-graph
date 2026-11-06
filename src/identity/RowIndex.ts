@@ -1,6 +1,7 @@
 import type { IReadTransaction, IWriteTransaction } from '../kv/KeyValue.js';
 import { Keyspace } from '../kv/Keyspace.js';
 import { FormatKeys } from '../format/FormatKeys.js';
+import { PublicIdIndex } from './PublicIdIndex.js';
 import type { Location } from './Location.js';
 
 /**
@@ -15,7 +16,6 @@ export class RowIndex
     private static readonly EntryBytes = 8;
     private static readonly Unassigned = 0xffffffff;
     private static readonly Partition = 0;
-    private static readonly ErrId = 'Internal id must be a positive value: ';
     private static readonly ErrLocation = 'Invalid location (partition must be 0; type id and slot must be below 0xFFFFFFFF)';
 
     private readonly cache = new WeakMap<object, Map<bigint, Uint8Array>>();
@@ -106,9 +106,6 @@ export class RowIndex
 
     private static RequireId(id: bigint): void
     {
-        if (id <= 0n)
-        {
-            throw new Error(RowIndex.ErrId + id);
-        }
+        PublicIdIndex.RequireId(id);
     }
 }

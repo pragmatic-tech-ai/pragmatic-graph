@@ -21,6 +21,11 @@ interface IOpenBlock
  * block while it has room; unhinted ids share a default block. Open hinted blocks are bounded
  * by MaxOpenHints (least recently used hint is forgotten; its next id opens a fresh block).
  */
+export interface IIdAllocatorOptions
+{
+    readonly MaxOpenHints?: number;
+}
+
 export class IdAllocator
 {
     public static readonly BlockSize = 4096;
@@ -32,13 +37,16 @@ export class IdAllocator
     private defaultBlock: IOpenBlock | undefined;
     private chain: Promise<unknown> = Promise.resolve();
 
-    private constructor(private readonly store: IKeyValueStore)
+    private constructor(
+        private readonly store: IKeyValueStore,
+        private readonly maxOpenHints: number,
+    )
     {
     }
 
-    public static async Open(store: IKeyValueStore): Promise<IdAllocator>
+    public static async Open(store: IKeyValueStore, options?: IIdAllocatorOptions): Promise<IdAllocator>
     {
-        return new IdAllocator(store);
+        return new IdAllocator(store, options?.MaxOpenHints ?? IdAllocator.MaxOpenHints);
     }
 
     /** Number of hinted blocks currently held open. */
@@ -91,7 +99,7 @@ export class IdAllocator
         }
         this.hints.delete(clusterHint);
         this.hints.set(clusterHint, open);
-        while (this.hints.size > IdAllocator.MaxOpenHints)
+        while (this.hints.size > this.maxOpenHints)
         {
             const oldest = this.hints.keys().next().value as string;
             this.hints.delete(oldest);
