@@ -83,7 +83,59 @@ nullBitmap: ceil(slotCount / 8) bytes, bit i = byte i/8, bit (i % 8) (LSB first)
 payload   : encoding-specific cell bytes
 ```
 
-The payload layout per encoding is defined by `ChunkCodec` in Task 9; this section is completed by that task. Columns read by traversal use only random-access encodings (0, 1, 2).
+Columns read by traversal use only random-access encodings (0, 1, 2). A reader reads one cell from the header, its null bit and the bytes of that cell alone. Cell count is 1..2048; a chunk whose header says otherwise, whose encoding id is unknown, or whose payload is too short for the cell read is corrupt and rejected.
+
+Null cells still occupy their slot in the payload (zero bytes, or code 0 / delta 0), so slot positions never shift. Value domains: Boolean; Int64 signed 64-bit; Float64 IEEE-754 binary64 (-0 and infinities are preserved; NaN is stored as the bits JS produces and payloads are not guaranteed); String is well-formed Unicode stored as UTF-8 (a lone surrogate is rejected on encode, invalid UTF-8 is corrupt on read); Date is `i32` days since 1970-01-01; DateTime is `i64` UTC microseconds plus a non-empty IANA zone name of at most 65,535 UTF-8 bytes; Duration is `i32 months, i32 days, i64 microseconds`. All integers little-endian.
+
+Which encodings apply: Plain for every type. BitPacked for Boolean, Int64, Date. Dictionary for every type except Boolean. Requesting an inapplicable encoding is an error. The encoder picks the smallest payload among the applicable encodings (ties go to the lower id); BitPacked on Int64/Date is applicable only when `max - min` fits in 63 bits, otherwise Plain is chosen.
+
+#### Plain payload (encoding 0), `n = slotCount`
+
+| Type | Layout |
+|---|---|
+| Boolean | `ceil(n/8)` bytes, bit i = byte i/8 bit (i % 8), LSB first, 1 = true |
+| Int64 | `n` x `i64` |
+| Float64 | `n` x `f64` |
+| Date | `n` x `i32` |
+| Duration | `n` x 16 bytes: `months i32, days i32, micros i64` |
+| String | `end[n]`: `n` x `u32`, the cumulative end offset of each slot's UTF-8 bytes in the heap; then the heap. Slot i spans `[end[i-1], end[i])` (start 0 for slot 0). A null slot has `end[i] = end[i-1]` |
+| DateTime | `micros[n]`: `n` x `i64`; `zoneIndex[n]`: `n` x `u16`; `zoneCount u16`; `zoneEnd[zoneCount]`: `zoneCount` x `u32` cumulative end offsets; zone heap (UTF-8). Zones are listed in order of first appearance; a null slot has micros 0 and zone index 0 |
+
+#### BitPacked payload (encoding 1)
+
+Boolean: identical to the Plain Boolean layout. Int64 and Date (frame of reference):
+
+```
+base  : i64   minimum non-null value (0 when every cell is null)
+width : u8    bits per slot, 0..63; width 0 when all non-null values are equal
+data  : ceil(n * width / 8) bytes; slot i holds (value - base) as an unsigned width-bit
+        integer starting at bit i * width, LSB first across bytes. Null slots hold 0.
+```
+
+#### Dictionary payload (encoding 2)
+
+```
+dictCount : u16   number of distinct non-null values, in order of first appearance
+width     : u8    bits per code, 0..11; 0 when dictCount <= 1, else bitlength(dictCount - 1)
+codes     : ceil(n * width / 8) bytes, one code per slot packed LSB first as in BitPacked; null slots hold 0
+dictionary: the Plain payload of the type for dictCount slots (no header, no nulls)
+```
+
+A code at or above `dictCount` is corrupt. Float64 values are distinct by bit pattern (0 and -0 are different entries).
+
+#### Single value bytes
+
+One non-null value, self-delimiting (used by delta entries and edge properties; null is expressed by the surrounding `present = 0`, never by value bytes). `ChunkCodec.EncodeValue(type, value)` / `DecodeValue(type, bytes)`:
+
+| Type | Bytes |
+|---|---|
+| Boolean | 1 byte, 0 or 1 (anything else is corrupt) |
+| Int64 | `i64` |
+| Float64 | `f64` |
+| Date | `i32` |
+| Duration | `months i32, days i32, micros i64` |
+| String | `byteLength u32`, UTF-8 bytes |
+| DateTime | `micros i64`, `zoneLength u16`, zone UTF-8 bytes |
 
 Member id `0` of every type is the node-id column. A slot is live iff its member-0 cell is non-null; deleted slots have a null node id.
 
@@ -97,7 +149,7 @@ present : u8        0 = cell is null, 1 = value follows
 value   : present = 1 only; one cell encoded as defined by ChunkCodec (Task 9)
 ```
 
-The byte layout of a cell value inside a delta is defined by `ChunkCodec` in Task 9; this section is completed by that task.
+The `value` bytes are the single-value layout defined under Columns (Single value bytes); they are self-delimiting, so entries parse without a length field.
 
 ### Edges
 
