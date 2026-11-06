@@ -204,7 +204,8 @@ export class CatalogStore
         return new CatalogError(CatalogErrorCode.CorruptCatalog, CatalogStore.CorruptMessage + detail);
     }
 
-    private static async StoredVersion(txn: IReadTransaction): Promise<number>
+    /** The stored catalog version (0 when no catalog was ever saved). */
+    public static async StoredVersion(txn: IReadTransaction): Promise<number>
     {
         const raw = await txn.Get(Keyspace.Meta, FormatKeys.Meta(CatalogStore.VersionKeyName));
         if (raw === undefined)

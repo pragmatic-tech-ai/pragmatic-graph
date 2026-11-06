@@ -1,0 +1,249 @@
+import { CatalogError, CatalogErrorCode } from './catalog/CatalogError.js';
+import type { MemberDef } from './catalog/CatalogTypes.js';
+import { CatalogSnapshot } from './catalog/CatalogSnapshot.js';
+import { MemberKind } from './catalog/ValueType.js';
+import type { CellValue } from './columns/CellValue.js';
+import { EdgeDirection } from './format/FormatKeys.js';
+import type { Location } from './identity/Location.js';
+import type { GraphContext, IGraphDisposable, ReadSnapshot } from './GraphContext.js';
+import { ConflictKeys } from './txn/ConflictKeys.js';
+import type { ReadSet } from './txn/ReadSet.js';
+
+/** One row of ScanConcept: the node's public id and the member's value (for a relationship, a target's public id). */
+export interface IScanRow
+{
+    readonly PublicId: string;
+    readonly Value: CellValue;
+}
+
+/** A live node resolved inside the reader's snapshot. */
+interface IReadNode
+{
+    readonly Id: bigint;
+    readonly Location: Location;
+    readonly Concept: string;
+}
+
+/**
+ * A consistent, read-only view of the graph at one commit (snapshot isolation): commits made after
+ * the reader opened are not visible. Created by GraphStore.BeginRead; end it with dispose() (the store
+ * disposes readers still open when it is disposed). Values returned are copies, never live storage.
+ */
+export class GraphReader implements IGraphDisposable
+{
+    private static readonly ErrDisposed = 'Reader has been disposed';
+    private static readonly ErrNotProperty = 'Member is not a property: ';
+    private static readonly ErrNotRelationship = 'Member is not a relationship: ';
+    private static readonly ErrNoIncoming = 'No relationship of this name targets the concept: ';
+    private static readonly ErrDirection = 'Unknown edge direction: ';
+    private static readonly ErrCorrupt = 'Corrupt graph: node has no stored row or public id: ';
+    private static readonly Dot = '.';
+    private static readonly Partition = 0;
+
+    private disposed = false;
+
+    /** Internal: use GraphStore.BeginRead or GraphStore.Begin. */
+    public constructor(protected readonly context: GraphContext, protected readonly snapshot: ReadSnapshot)
+    {
+        context.Track(this);
+    }
+
+    /** The commit this reader sees (every commit up to and including it). */
+    public get SnapshotCommit(): bigint
+    {
+        return this.snapshot.Commit;
+    }
+
+    /**
+     * The property's value (null for an unset nullable property), or undefined when no node has the
+     * public id. Unknown members are a CatalogError; relationship members a RangeError; public ids over
+     * 400 UTF-8 bytes a PublicIdTooLongError.
+     */
+    public async GetProperty(publicId: string, member: string): Promise<CellValue | undefined>
+    {
+        this.RequireOpen();
+        const node = await this.Locate(publicId);
+        if (node === undefined)
+        {
+            return undefined;
+        }
+        const def = this.snapshot.Index.Catalog.Member(node.Concept, member);
+        if (def.Kind !== MemberKind.Property)
+        {
+            throw new RangeError(GraphReader.ErrNotProperty + node.Concept + GraphReader.Dot + member);
+        }
+        this.Reads?.AddKey(ConflictKeys.CellSpace, ConflictKeys.Cell(node.Id, def.Id));
+        return this.context.Columns.ReadCell(this.snapshot.Txn, node.Location, def);
+    }
+
+    /**
+     * Public ids of the nodes at the far end of the node's `relationship` edges, in edge order (ordered
+     * relationships keep their insertion order). Out follows the node's own relationship; In follows
+     * every relationship of that name whose targets admit the node's concept. A missing node has none.
+     */
+    public async Neighbors(publicId: string, relationship: string, direction: EdgeDirection): Promise<string[]>
+    {
+        this.RequireOpen();
+        if (direction !== EdgeDirection.Out && direction !== EdgeDirection.In)
+        {
+            throw new RangeError(GraphReader.ErrDirection + String(direction));
+        }
+        const node = await this.Locate(publicId);
+        if (node === undefined)
+        {
+            return [];
+        }
+        const out: string[] = [];
+        for (const rel of this.Relationships(node.Concept, relationship, direction))
+        {
+            this.Reads?.AddRange(ConflictKeys.EdgeSpace, ConflictKeys.Adjacency(rel.Id, direction, node.Id));
+            for await (const n of this.context.Edges.Neighbors(this.snapshot.Txn, rel, node.Id, direction))
+            {
+                out.push(await this.PublicIdOf(n.Node));
+            }
+        }
+        return out;
+    }
+
+    /**
+     * Every live node whose concept is, inherits from, or carries `conceptOrAspect`, with its `member`
+     * value: one row per node for a property, one row per outgoing edge (Value = target public id) for a
+     * relationship. Rows come per matching concept, then in storage (slot) order.
+     */
+    public async *ScanConcept(conceptOrAspect: string, member: string): AsyncIterable<IScanRow>
+    {
+        this.RequireOpen();
+        const index = this.snapshot.Index;
+        for (const typeId of index.Catalog.ConceptsMatching(conceptOrAspect))
+        {
+            const concept = index.ConceptOf(typeId) as string;
+            const def = index.Catalog.Member(concept, member);
+            this.Reads?.AddKey(ConflictKeys.ExtentSpace, ConflictKeys.Extent(typeId));
+            if (def.Kind === MemberKind.Property)
+            {
+                yield* this.ScanProperty(typeId, def);
+            }
+            else
+            {
+                yield* this.ScanRelationship(typeId, def);
+            }
+        }
+    }
+
+    /** Releases the snapshot. Idempotent; later reads reject. */
+    public dispose(): void
+    {
+        if (this.disposed)
+        {
+            return;
+        }
+        this.disposed = true;
+        this.context.Forget(this);
+        this.snapshot.dispose();
+    }
+
+    /** Where reads are recorded for conflict detection; only a GraphTransaction records (ruling R31). */
+    protected get Reads(): ReadSet | undefined
+    {
+        return undefined;
+    }
+
+    protected RequireOpen(): void
+    {
+        if (this.disposed)
+        {
+            throw new Error(GraphReader.ErrDisposed);
+        }
+    }
+
+    /** Live slots of the type in slot order: the member column zipped with the node-id column (both skip deleted slots). */
+    private async *ScanProperty(typeId: number, def: MemberDef): AsyncIterable<IScanRow>
+    {
+        const txn = this.snapshot.Txn;
+        const values = this.context.Columns.ScanColumn(txn, GraphReader.Partition, typeId, def)[Symbol.asyncIterator]();
+        const ids = this.context.Columns.ScanColumn(txn, GraphReader.Partition, typeId, CatalogSnapshot.NodeIdMember)[Symbol.asyncIterator]();
+        try
+        {
+            for (;;)
+            {
+                const [value, id] = await Promise.all([values.next(), ids.next()]);
+                if (value.done === true || id.done === true)
+                {
+                    return;
+                }
+                const internal = id.value.Value as bigint;
+                this.Reads?.AddKey(ConflictKeys.CellSpace, ConflictKeys.Cell(internal, def.Id));
+                yield { PublicId: await this.PublicIdOf(internal), Value: value.value.Value };
+            }
+        }
+        finally
+        {
+            await values.return?.();
+            await ids.return?.();
+        }
+    }
+
+    private async *ScanRelationship(typeId: number, def: MemberDef): AsyncIterable<IScanRow>
+    {
+        const txn = this.snapshot.Txn;
+        for await (const row of this.context.Columns.ScanColumn(txn, GraphReader.Partition, typeId, CatalogSnapshot.NodeIdMember))
+        {
+            const internal = row.Value as bigint;
+            const source = await this.PublicIdOf(internal);
+            this.Reads?.AddRange(ConflictKeys.EdgeSpace, ConflictKeys.Adjacency(def.Id, EdgeDirection.Out, internal));
+            for await (const n of this.context.Edges.Neighbors(txn, def, internal, EdgeDirection.Out))
+            {
+                yield { PublicId: source, Value: await this.PublicIdOf(n.Node) };
+            }
+        }
+    }
+
+    private Relationships(concept: string, name: string, direction: EdgeDirection): readonly MemberDef[]
+    {
+        const index = this.snapshot.Index;
+        if (direction === EdgeDirection.Out)
+        {
+            const rel = index.Catalog.Member(concept, name);
+            if (rel.Kind !== MemberKind.Relationship)
+            {
+                throw new RangeError(GraphReader.ErrNotRelationship + concept + GraphReader.Dot + name);
+            }
+            return [rel];
+        }
+        const incoming = index.IncomingRelationships(concept).filter(r => r.Name === name);
+        if (incoming.length === 0)
+        {
+            throw new CatalogError(CatalogErrorCode.UnknownMember, GraphReader.ErrNoIncoming + concept + GraphReader.Dot + name);
+        }
+        return incoming;
+    }
+
+    /** Resolves the node, recording the public id's binding (also when missing, which catches a later create). */
+    private async Locate(publicId: string): Promise<IReadNode | undefined>
+    {
+        const txn = this.snapshot.Txn;
+        const id = await this.context.Ids.Resolve(txn, publicId);
+        this.Reads?.AddKey(ConflictKeys.NodeSpace, ConflictKeys.Node(publicId));
+        if (id === undefined)
+        {
+            return undefined;
+        }
+        const location = await this.context.Rows.Locate(txn, id);
+        const concept = location === undefined ? undefined : this.snapshot.Index.ConceptOf(location.TypeId);
+        if (location === undefined || concept === undefined)
+        {
+            throw new Error(GraphReader.ErrCorrupt + publicId);
+        }
+        return { Id: id, Location: location, Concept: concept };
+    }
+
+    private async PublicIdOf(id: bigint): Promise<string>
+    {
+        const publicId = await this.context.Ids.PublicIdOf(this.snapshot.Txn, id);
+        if (publicId === undefined)
+        {
+            throw new Error(GraphReader.ErrCorrupt + id);
+        }
+        return publicId;
+    }
+}
