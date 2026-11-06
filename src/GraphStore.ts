@@ -218,7 +218,7 @@ export class GraphStore
         }
         try
         {
-            this.context.ValidateScope(scope, snapshot.Index.Catalog);
+            this.context.ValidateScope(scope, snapshot.Index);
         }
         catch (error)
         {

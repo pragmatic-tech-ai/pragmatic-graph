@@ -10,10 +10,11 @@ import { EdgeDirection } from '../../format/FormatKeys.js';
 import type { GraphReader } from '../../GraphReader.js';
 import { GraphStore } from '../../GraphStore.js';
 import type { GraphTransaction } from '../../GraphTransaction.js';
-import { And, Compare, CompareOp, FalsePredicate, IdIn, Not, Or, OwnerIs, type Predicate, Reachable, Related, Seeded, TruePredicate } from '../../predicate/Predicate.js';
+import { And, Compare, CompareOp, FalsePredicate, IdIn, In, IsNull, Not, Or, OwnerIs, type Predicate, Reachable, Related, Seeded, TruePredicate } from '../../predicate/Predicate.js';
 import type { ISchemaDescription } from '../../schema/SchemaDescription.js';
 import { ConflictError } from '../../txn/ConflictError.js';
 import { AccessDefault, AccessScope } from '../AccessScope.js';
+import { ScopeEvaluator } from '../ScopeEvaluator.js';
 
 /**
  * Schema and helpers for the read-scope tests. Aspect Secret { level }; Person (carries Secret)
@@ -599,6 +600,91 @@ class ScopeFx
                     const cache = (r as unknown as { evaluator: { visible: Map<bigint, boolean> } }).evaluator.visible;
                     assert.equal(cache.size, 2, 'a node with no applicable entry is not cached');
                 });
+                await g.dispose();
+            });
+
+            it('Not(Related) over a complete graph finishes and fails closed', async () =>
+            {
+                const g = await ScopeFx.Ready(open);
+                const ids = Array.from({ length: 12 }, (_, i) => 'k' + i);
+                await ScopeFx.Commit(g, t =>
+                {
+                    for (const id of ids)
+                    {
+                        t.CreateNode(id, ScopeFx.Person);
+                    }
+                    for (const a of ids)
+                    {
+                        for (const b of ids)
+                        {
+                            if (a !== b)
+                            {
+                                t.Link(a, ScopeFx.Manages, b);
+                            }
+                        }
+                    }
+                });
+                const scope = ScopeFx.Rows([[ScopeFx.Person, new Not(new Related(ScopeFx.Manages, EdgeDirection.Out, TruePredicate.Instance))]]);
+                const started = Date.now();
+                await ScopeFx.Read(g, scope, async r => assert.deepEqual(await ScopeFx.Ids(r, ScopeFx.Person), []));
+                assert.ok(Date.now() - started < 10_000, 'decided in ' + (Date.now() - started) + ' ms');
+                await g.dispose();
+            });
+
+            it('the decision budget fails closed', async () =>
+            {
+                const g = await ScopeFx.Ready(open);
+                const chain = Array.from({ length: 6 }, (_, i) => 'c' + i);
+                await ScopeFx.Commit(g, t =>
+                {
+                    for (const id of chain)
+                    {
+                        t.CreateNode(id, ScopeFx.Person);
+                    }
+                    for (let i = 0; i + 1 < chain.length; i++)
+                    {
+                        t.Link('c' + i, ScopeFx.Manages, 'c' + (i + 1));
+                    }
+                });
+                // Visible iff it is the chain's end or manages a visible person: c0 needs six decisions.
+                const scope = ScopeFx.Rows([[ScopeFx.Person, new Or([new IdIn(new Set(['c5'])), new Related(ScopeFx.Manages, EdgeDirection.Out, TruePredicate.Instance)])]]);
+                const budget = ScopeEvaluator as unknown as { MaxDecisions: number };
+                const saved = budget.MaxDecisions;
+                budget.MaxDecisions = 3;
+                try
+                {
+                    await ScopeFx.Read(g, scope, async r => assert.equal(await r.ConceptOf('c0'), undefined));
+                }
+                finally
+                {
+                    budget.MaxDecisions = saved;
+                }
+                await ScopeFx.Read(g, scope, async r => assert.equal(await r.ConceptOf('c0'), ScopeFx.Person));
+                await g.dispose();
+            });
+
+            it('names a scope predicate reads are validated', async () =>
+            {
+                const g = await ScopeFx.Ready(open);
+                const rejects = async (scope: AccessScope, name: string): Promise<void> =>
+                {
+                    await assert.rejects(g.BeginRead(scope), (e: unknown) => e instanceof GraphError && e.GraphCode === GraphErrorCode.InvalidArgument && e.message.includes(name), name);
+                };
+                await rejects(ScopeFx.Rows([[ScopeFx.Person, new Compare('stauts', CompareOp.Eq, ScopeFx.Open)]]), 'Person.stauts');
+                await rejects(ScopeFx.Rows([[ScopeFx.Person, new Compare(ScopeFx.Manages, CompareOp.Eq, ScopeFx.Open)]]), 'Person.manages');
+                await rejects(ScopeFx.Rows([[ScopeFx.Secret, new IsNull(ScopeFx.Name)]]), 'Secret.name');
+                await rejects(ScopeFx.Rows([[ScopeFx.Ticket, new Related('abuot', EdgeDirection.Out, TruePredicate.Instance)]]), 'Ticket.abuot');
+                await rejects(ScopeFx.Rows([[ScopeFx.Ticket, new Related(ScopeFx.Status, EdgeDirection.Out, TruePredicate.Instance)]]), 'Ticket.status');
+                await rejects(ScopeFx.Rows([[ScopeFx.Ticket, new Related(ScopeFx.About, EdgeDirection.Out, new Compare(ScopeFx.Title, CompareOp.Eq, 'x'))]]), 'Ticket.about.title');
+                await rejects(ScopeFx.Rows([[ScopeFx.Ticket, new Related(ScopeFx.About, EdgeDirection.In, TruePredicate.Instance)]]), 'Ticket.about');
+                await rejects(ScopeFx.Rows([[ScopeFx.Person, new Reachable(new Set(['T']), [{ Relationship: 'membr', Direction: EdgeDirection.Out }], 1)]]), 'Person.membr');
+                await rejects(AccessScope.Build({ Default: AccessDefault.Allow, Writes: new Map([[ScopeFx.Ticket, { Update: new In('titel', ['x']) }]]) }), 'Ticket.titel');
+                // Valid: an aspect property on a carrier, a nested In step, and a Target property of the reached concept.
+                const valid = ScopeFx.Rows([
+                    [ScopeFx.Person, new And([new Compare(ScopeFx.Level, CompareOp.Le, 1n), new Related(ScopeFx.About, EdgeDirection.In, new Compare(ScopeFx.Status, CompareOp.Eq, ScopeFx.Open))])],
+                    [ScopeFx.Ticket, new Related(ScopeFx.About, EdgeDirection.Out, new Related(ScopeFx.Member, EdgeDirection.In, new Compare(ScopeFx.Name, CompareOp.Eq, 'x')))],
+                ]);
+                await ScopeFx.Read(g, valid, async r => assert.equal(await r.ConceptOf('nobody'), undefined));
                 await g.dispose();
             });
         });

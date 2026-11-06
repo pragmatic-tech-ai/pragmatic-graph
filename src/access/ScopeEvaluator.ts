@@ -19,13 +19,16 @@ class NodeFacts
 
 /**
  * One top-level visibility decision (one public read asking about one node): the nodes it is deciding
- * (its cycle guard) and how often the guard was hit. Never shared between decisions, so concurrent
- * reads on one reader cannot see each other's in-progress nodes.
+ * (its cycle guard), how often the guard was hit, the guard-dependent results it settled (decided at
+ * most once per Evaluation; discarded with it) and how many node decisions it has made (its budget).
+ * Never shared between decisions, so concurrent reads on one reader cannot see each other's state.
  */
 class Evaluation
 {
     public readonly Deciding = new Set<bigint>();
+    public readonly Memo = new Map<bigint, Truth>();
     public GuardHits = 0;
+    public Decisions = 0;
 }
 
 /**
@@ -41,13 +44,17 @@ class Evaluation
  * Unknown under Not and collapses to not visible at the top, so cyclic rules terminate and never grant
  * through the cycle. Reachable sets are computed once per evaluator (BFS through unscoped edges) and
  * cached, as are per-concept applicable entries and visibility results that did not depend on a guard
- * hit (only those are facts about the node rather than about one decision). The snapshot never changes
+ * hit (only those are facts about the node rather than about one decision); guard-dependent results
+ * are memoised within their Evaluation, so a node is decided at most once per top-level decision (work
+ * linear in the nodes and edges reached), with a MaxDecisions budget as a fail-closed backstop. The snapshot never changes
  * under a reader (R30), so cached results stay correct for its lifetime; the cache holds one boolean
  * per node actually decided.
  */
 export class ScopeEvaluator
 {
     private static readonly ErrKind = 'Unknown predicate kind in an access scope: ';
+    /** Node decisions one top-level decision may make; beyond it the rest is Unknown (fail closed, R66). */
+    private static readonly MaxDecisions = 10_000;
     private static readonly NoHidden: ReadonlySet<string> = new Set();
 
     private readonly rows = new Map<string, readonly Predicate[]>();
@@ -123,11 +130,13 @@ export class ScopeEvaluator
         return out;
     }
 
-    /** A scope entry applies to the concept itself, its ancestors and its carried aspects; unknown names never apply. */
+    /**
+     * A scope entry applies to the concept itself, its ancestors and its carried aspects. Every key is a
+     * known concept or aspect: GraphStore validated the scope against this reader's catalog (R63).
+     */
     private Applies(concept: string, name: string): boolean
     {
-        const catalog = this.reads.Catalog;
-        return catalog.Has(name) && catalog.IsA(concept, name);
+        return this.reads.Catalog.IsA(concept, name);
     }
 
     /**
@@ -146,11 +155,14 @@ export class ScopeEvaluator
         {
             return known ? Truth.True : Truth.False;
         }
-        if (evaluation.Deciding.has(node.Id))
+        const memo = evaluation.Memo.get(node.Id);
+        // A memoised result depended on the guard, so whoever uses it does too; likewise a guard or budget hit.
+        if (memo !== undefined || evaluation.Deciding.has(node.Id) || evaluation.Decisions >= ScopeEvaluator.MaxDecisions)
         {
             evaluation.GuardHits += 1;
-            return Truth.Unknown;
+            return memo ?? Truth.Unknown;
         }
+        evaluation.Decisions += 1;
         const hitsBefore = evaluation.GuardHits;
         evaluation.Deciding.add(node.Id);
         let result = Truth.True;
@@ -177,6 +189,7 @@ export class ScopeEvaluator
         }
         if (evaluation.GuardHits !== hitsBefore)
         {
+            evaluation.Memo.set(node.Id, result);
             return result;
         }
         // Guard-free: an Unknown from null operands is a settled "not visible".

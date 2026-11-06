@@ -1,4 +1,5 @@
 import type { AccessScope } from './access/AccessScope.js';
+import { ScopeValidator } from './access/ScopeValidator.js';
 import type { CatalogSnapshot } from './catalog/CatalogSnapshot.js';
 import { CatalogStore } from './catalog/CatalogStore.js';
 import { ColumnStore } from './columns/ColumnStore.js';
@@ -111,15 +112,15 @@ export class GraphContext
         }
     }
 
-    /** Validates the scope's names against `catalog` once per (scope, catalog version); see AccessScope.Validate. */
-    public ValidateScope(scope: AccessScope, catalog: CatalogSnapshot): void
+    /** Validates the scope's names against `index` once per (scope, catalog version); see ScopeValidator. */
+    public ValidateScope(scope: AccessScope, index: CatalogIndex): void
     {
-        if (this.validated.get(scope) === catalog.Version)
+        if (this.validated.get(scope) === index.Catalog.Version)
         {
             return;
         }
-        scope.Validate(catalog);
-        this.validated.set(scope, catalog.Version);
+        ScopeValidator.Validate(scope, index);
+        this.validated.set(scope, index.Catalog.Version);
     }
 
     public Track(reader: IGraphDisposable): void
