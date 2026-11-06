@@ -17,9 +17,10 @@ export interface IGraphDisposable
 }
 
 /**
- * One reader's consistent view (ruling R30): a registered committer snapshot, the KV read transaction
- * opened after it, the last commit stored in that KV snapshot, and the catalog that snapshot holds.
- * dispose() releases the KV transaction and the registration; idempotent.
+ * One reader's consistent view: the KV read transaction, the last commit stored in that KV snapshot and
+ * the catalog that snapshot holds. A transaction's view also holds a committer snapshot registration,
+ * taken before the KV snapshot (rulings R30, F3); a plain reader's view has none, so long-lived readers
+ * never pin conflict history. dispose() releases the KV transaction and any registration; idempotent.
  */
 export class ReadSnapshot
 {
@@ -27,7 +28,7 @@ export class ReadSnapshot
 
     public constructor(
         public readonly Txn: IReadTransaction,
-        public readonly Handle: ISnapshotHandle,
+        public readonly Handle: ISnapshotHandle | undefined,
         public readonly Commit: bigint,
         public readonly Index: CatalogIndex,
     )
@@ -42,7 +43,7 @@ export class ReadSnapshot
         }
         this.disposed = true;
         this.Txn.dispose();
-        this.Handle.dispose();
+        this.Handle?.dispose();
     }
 }
 
@@ -83,10 +84,13 @@ export class GraphContext
         this.Committer.UpdateCatalog(snapshot);
     }
 
-    /** Ruling R30: register with the committer FIRST, then open the KV snapshot and read its last commit. */
-    public async OpenSnapshot(): Promise<ReadSnapshot>
+    /**
+     * Opens a view. `register` (transactions only, ruling F3): register with the committer FIRST, then
+     * open the KV snapshot and read its last commit (ruling R30). Readers open the KV snapshot only.
+     */
+    public async OpenSnapshot(register: boolean): Promise<ReadSnapshot>
     {
-        const handle = this.Committer.RegisterSnapshot();
+        const handle = register ? this.Committer.RegisterSnapshot() : undefined;
         let txn: IReadTransaction | undefined;
         try
         {
@@ -98,7 +102,7 @@ export class GraphContext
         catch (error)
         {
             txn?.dispose();
-            handle.dispose();
+            handle?.dispose();
             throw error;
         }
     }

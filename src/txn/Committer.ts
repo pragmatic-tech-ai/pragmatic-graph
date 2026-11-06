@@ -107,7 +107,8 @@ interface IGroupOutcome
  * rejects the whole group. Commit numbers follow submission order. CommitApplied is raised once per
  * commit, in order, after the store.Write resolved; a throwing subscriber does not affect the commit.
  *
- * Snapshots: a reader calls RegisterSnapshot() and only THEN opens its store read transaction, so the
+ * Snapshots: a transaction (never a plain reader, ruling F3) calls RegisterSnapshot() and only THEN
+ * opens its store read transaction, so the
  * data it reads is at least as new as the registered commit (validation is then conservative, never
  * lax). Dispose the handle when the transaction ends.
  */
@@ -165,6 +166,12 @@ export class Committer
     public LastCommit(): bigint
     {
         return this.history.Last;
+    }
+
+    /** Diagnostics: commits after this one still have their write sets retained for validation. */
+    public get HistoryFloor(): bigint
+    {
+        return this.history.Floor;
     }
 
     /** Pins conflict history back to the current last commit until the handle is disposed (ruling R24). */

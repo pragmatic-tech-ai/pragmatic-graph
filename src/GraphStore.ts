@@ -64,7 +64,7 @@ export class GraphStore
     public async BeginRead(): Promise<GraphReader>
     {
         this.RequireLive();
-        const reader = new GraphReader(this.context, await this.context.OpenSnapshot());
+        const reader = new GraphReader(this.context, await this.context.OpenSnapshot(false));
         return this.Handed(reader);
     }
 
@@ -72,7 +72,7 @@ export class GraphStore
     public async Begin(): Promise<GraphTransaction>
     {
         this.RequireLive();
-        const txn = new GraphTransaction(this.context, await this.context.OpenSnapshot());
+        const txn = new GraphTransaction(this.context, await this.context.OpenSnapshot(true));
         return this.Handed(txn);
     }
 

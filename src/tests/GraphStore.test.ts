@@ -9,6 +9,8 @@ import { FormatKeys } from '../format/FormatKeys.js';
 import { TupleCodec } from '../format/TupleCodec.js';
 import { Keyspace } from '../kv/Keyspace.js';
 import { LmdbStore } from '../kv/lmdb/LmdbStore.js';
+import type { GraphContext } from '../GraphContext.js';
+import type { Committer } from '../txn/Committer.js';
 import * as Api from '../index.js';
 import {
     CatalogError,
@@ -104,6 +106,12 @@ class GraphFx
             t.Link('c1', 'in', 'loc');
             t.Link('c2', 'in', 'loc');
         });
+    }
+
+    /** The store's committer (internal), for conflict-window assertions. */
+    public static Committer(g: GraphStore): Committer
+    {
+        return (g as unknown as { context: GraphContext }).context.Committer;
     }
 
     public static async Read<T>(g: GraphStore, work: (r: GraphReader) => Promise<T>): Promise<T>
@@ -327,6 +335,28 @@ class GraphFx
                 await assert.rejects(t.Commit());
                 assert.deepEqual(seen, []);
                 assert.equal(await GraphFx.Commit(g, x => x.SetProperty('f1', 'path', '/n')), 2n, 'no commit number was consumed');
+                await g.dispose();
+            });
+
+            it('a long-lived reader does not pin conflict history; an open transaction does (F3)', async () =>
+            {
+                const g = await GraphFx.Defined(open);
+                await GraphFx.Seed(g);
+                const committer = GraphFx.Committer(g);
+                const reader = await g.BeginRead();
+                for (let i = 0; i < 3; i++)
+                {
+                    await GraphFx.Commit(g, x => x.SetProperty('f1', 'path', '/r' + i));
+                }
+                assert.equal(committer.HistoryFloor, committer.LastCommit() - 1n, 'reader must not hold the window open');
+                const t = await g.Begin();
+                const pinned = committer.LastCommit();
+                await GraphFx.Commit(g, x => x.SetProperty('f1', 'path', '/pinned'));
+                await GraphFx.Commit(g, x => x.SetProperty('f1', 'path', '/pinned2'));
+                assert.equal(committer.HistoryFloor, pinned, 'a transaction pins the window to its snapshot');
+                t.dispose();
+                assert.equal(await reader.GetProperty('f1', 'path'), '/a.txt');
+                reader.dispose();
                 await g.dispose();
             });
 

@@ -2,6 +2,7 @@ import type { CellValue } from './columns/CellValue.js';
 import type { GraphContext, ReadSnapshot } from './GraphContext.js';
 import { GraphReader } from './GraphReader.js';
 import { ConflictError } from './txn/ConflictError.js';
+import type { ISnapshotHandle } from './txn/ConflictHistory.js';
 import { ReadSet } from './txn/ReadSet.js';
 import { type LinkOptions, WriteBatch } from './txn/WriteBatch.js';
 
@@ -103,7 +104,9 @@ export class GraphTransaction extends GraphReader
      */
     private ValidationCommit(): bigint
     {
-        return this.snapshot.Commit <= this.context.Committer.LastCommit() ? this.snapshot.Commit : this.snapshot.Handle.Commit;
+        // A transaction's snapshot always carries a registration (GraphStore.Begin opens it with register = true).
+        const registered = (this.snapshot.Handle as ISnapshotHandle).Commit;
+        return this.snapshot.Commit <= this.context.Committer.LastCommit() ? this.snapshot.Commit : registered;
     }
 
     private RequireActive(): void
