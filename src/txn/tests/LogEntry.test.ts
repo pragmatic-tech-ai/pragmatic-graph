@@ -21,7 +21,7 @@ describe('LogEntry (F4)', () =>
         const batch = new WriteBatch();
         batch.CreateNode('a', 'T');
         batch.SetProperty('a', 'x', 1n);
-        batch.CreateNode('b', 'T', 'hint');
+        batch.CreateNode('b', 'T', { ClusterHint: 'hint' });
         const bytes = LogEntry.EncodeBatch(7, [5n, 4097n], batch.Serialize());
         assert.deepEqual([...bytes.subarray(0, 5)], [1, 7, 0, 0, 0]);
         const decoded = LogEntry.Decode(3n, bytes);

@@ -10,7 +10,9 @@ class BatchFx
     {
         const b = new WriteBatch();
         b.CreateNode('p1', 'Person');
-        b.CreateNode('p2', 'Person', 'cluster-a');
+        b.CreateNode('p2', 'Person', { ClusterHint: 'cluster-a' });
+        b.CreateNode('p5', 'Person', { Owner: 'm1' });
+        b.CreateNode('p6', 'Person', { ClusterHint: 'cluster-b', Owner: 'm2' });
         b.SetProperty('p1', 'flag', true);
         b.SetProperty('p1', 'age', -42n);
         b.SetProperty('p1', 'score', -0.5);
@@ -35,13 +37,13 @@ describe('WriteBatch', () =>
     it('records operations in order with their fields', () =>
     {
         const b = new WriteBatch();
-        b.CreateNode('a', 'Person', 'h');
+        b.CreateNode('a', 'Person', { ClusterHint: 'h', Owner: 'm' });
         b.SetProperty('a', 'name', 'Ann');
         b.Link('a', 'knows', 'b', { AfterSibling: 'c' });
         b.Unlink('a', 'knows', 'b');
         b.DeleteNode('a');
         assert.deepEqual(b.Ops().map(o => o.Op), [WriteOp.CreateNode, WriteOp.SetProperty, WriteOp.Link, WriteOp.Unlink, WriteOp.DeleteNode]);
-        assert.deepEqual(b.Ops()[0], { Op: WriteOp.CreateNode, PublicId: 'a', Concept: 'Person', ClusterHint: 'h' });
+        assert.deepEqual(b.Ops()[0], { Op: WriteOp.CreateNode, PublicId: 'a', Concept: 'Person', ClusterHint: 'h', Owner: 'm' });
         assert.deepEqual(b.Ops()[2], { Op: WriteOp.Link, From: 'a', Relationship: 'knows', To: 'b', Options: { AfterSibling: 'c' } });
         assert.equal(b.Count, 5);
     });
@@ -87,9 +89,9 @@ describe('WriteBatch', () =>
         assert.throws(() => b.Link('a', 'r', 'b', { Properties: new Map([['w', {} as never]]) }), TypeError);
     });
 
-    it('rejects a CreateNode hasHint flag other than 0 or 1', () =>
+    it('rejects unknown CreateNode flags', () =>
     {
-        const bytes = Uint8Array.of(1, 1, 0, 0, 0, WriteOp.CreateNode, 1, 0, 0, 0, 0x61, 1, 0, 0, 0, 0x50, 2, 1, 0, 0, 0, 0x68);
+        const bytes = Uint8Array.of(1, 1, 0, 0, 0, WriteOp.CreateNode, 1, 0, 0, 0, 0x61, 1, 0, 0, 0, 0x50, 4, 1, 0, 0, 0, 0x68);
         assert.throws(() => WriteBatch.Deserialize(bytes), RangeError);
         bytes[16] = 1;
         assert.equal(WriteBatch.Deserialize(bytes).Ops()[0]?.Op, WriteOp.CreateNode);

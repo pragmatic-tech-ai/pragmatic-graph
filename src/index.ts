@@ -16,7 +16,7 @@ export { DateTimeValue, DateValue, DurationValue, type CellValue } from './colum
 export { EdgeDirection } from './format/FormatKeys.js';
 
 // Commits and change notification.
-export { WriteBatch, WriteOp, type BatchOp, type ICreateNodeOp, type IDeleteNodeOp, type ILinkOp, type ISetPropertyOp, type IUnlinkOp, type LinkOptions } from './txn/WriteBatch.js';
+export { WriteBatch, WriteOp, type BatchOp, type ICreateNodeOp, type ICreateNodeOptions, type IDeleteNodeOp, type ILinkOp, type ISetPropertyOp, type IUnlinkOp, type LinkOptions } from './txn/WriteBatch.js';
 export { CommitKind, type ICommitApplied } from './txn/LogEntry.js';
 export type { ISignal, ISubscription } from './txn/Signal.js';
 

@@ -135,6 +135,61 @@ export class GraphReader implements IGraphDisposable
         }
     }
 
+    /** The node's concept name, or undefined when no node has the public id. Records the node's binding. */
+    public async ConceptOf(publicId: string): Promise<string | undefined>
+    {
+        this.RequireOpen();
+        return (await this.Locate(publicId))?.Concept;
+    }
+
+    /**
+     * The name of the model that holds the node: '' when it was created without an owner, undefined when
+     * no node has the public id. Records the node's binding.
+     */
+    public async OwnerOf(publicId: string): Promise<string | undefined>
+    {
+        this.RequireOpen();
+        const node = await this.Locate(publicId);
+        return node === undefined ? undefined : this.context.Ids.OwnerOf(this.snapshot.Txn, node.Id);
+    }
+
+    /**
+     * Public ids of the live nodes whose concept is, inherits from, or carries `conceptOrAspect`, per
+     * matching concept then in slot order. Disposing the reader ends the scan: the next id rejects.
+     */
+    public async *ScanNodes(conceptOrAspect: string): AsyncIterable<string>
+    {
+        this.RequireOpen();
+        const index = this.snapshot.Index;
+        for (const typeId of index.Catalog.ConceptsMatching(conceptOrAspect))
+        {
+            this.RequireOpen();
+            this.Reads?.AddKey(ConflictKeys.ExtentSpace, ConflictKeys.Extent(typeId));
+            for await (const row of this.context.Columns.ScanColumn(this.snapshot.Txn, GraphReader.Partition, typeId, CatalogSnapshot.NodeIdMember))
+            {
+                this.RequireOpen();
+                const publicId = await this.PublicIdOf(row.NodeId);
+                this.RequireOpen();
+                yield publicId;
+            }
+        }
+    }
+
+    /**
+     * An upper bound of the live nodes matching `conceptOrAspect`: the sum of the matching concepts' slot
+     * counts, which still include deleted slots. Records nothing: the figure is advisory.
+     */
+    public async EstimateCount(conceptOrAspect: string): Promise<number>
+    {
+        this.RequireOpen();
+        let total = 0;
+        for (const typeId of this.snapshot.Index.Catalog.ConceptsMatching(conceptOrAspect))
+        {
+            total += await this.context.Columns.SlotCount(this.snapshot.Txn, GraphReader.Partition, typeId);
+        }
+        return total;
+    }
+
     /** Releases the snapshot. Idempotent; later reads reject. */
     public dispose(): void
     {

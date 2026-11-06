@@ -63,9 +63,11 @@ Member ids are catalog-global: one id space across all concepts and aspects, ass
 
 ### Ids
 
-Both directions live in the `ids` keyspace, distinguished by tag: `1` = `PublicToInternal`, `2` = `InternalToPublic`. Internal ids are allocated in blocks of 4096 and never encode partition or location. Id `0` is never allocated: it is reserved to mean "no id" (the first block starts at id `1`). Block number is `id / 4096`.
+Both directions and the node owner live in the `ids` keyspace, distinguished by tag: `1` = `PublicToInternal`, `2` = `InternalToPublic`, `3` = `Owner`. Internal ids are allocated in blocks of 4096 and never encode partition or location. Id `0` is never allocated: it is reserved to mean "no id" (the first block starts at id `1`). Block number is `id / 4096`.
 
 Values: `PublicToInternal` holds the internal id as a tuple-encoded single integer `(id)`; `InternalToPublic` holds the public id as raw UTF-8 bytes. A public id is non-empty, at most 400 UTF-8 bytes and contains no U+0000 (rejected on read and write, so the `(1, publicId)` key always fits the key limit). The two directions are always written and deleted together; a public id is bound to at most one internal id and vice versa.
+
+Owner: key `(3, id)` holds the name of the model that holds the node, as raw UTF-8 bytes. It is written when the node is created with a non-empty owner and deleted with the node (together with the two id directions); an absent entry means "no owner" (reads as the empty string). The owner is fixed at creation; changing it is not supported. It is covered by the node's logical `Node(publicId)` conflict key, so it adds no conflict key of its own.
 
 ### Rows (row index)
 
@@ -209,7 +211,7 @@ version : u8      1
 count   : u32     number of operations
 ops     : count x op
 op      : kind u8, then the fields of that kind
-  1 CreateNode  : publicId str, concept str, hasHint u8 (0|1), [clusterHint str]
+  1 CreateNode  : publicId str, concept str, flags u8 (bit 0 = hint, bit 1 = owner; other bits rejected), [clusterHint str], [owner str]
   2 SetProperty : publicId str, member str, value
   3 DeleteNode  : publicId str
   4 Link        : from str, relationship str, to str, flags u8, [afterSibling str], [beforeSibling str], [properties]

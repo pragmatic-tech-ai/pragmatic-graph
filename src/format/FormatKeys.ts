@@ -12,6 +12,7 @@ export enum IdsTag
 {
     PublicToInternal = 1,
     InternalToPublic = 2,
+    Owner = 3,
 }
 
 export enum CatalogTag
@@ -40,6 +41,12 @@ export class FormatKeys
     public static InternalToPublic(id: bigint): Uint8Array
     {
         return TupleCodec.Encode([IdsTag.InternalToPublic, id]);
+    }
+
+    /** The owner (model name, UTF-8) of the node; absent when the node was created without an owner. */
+    public static NodeOwner(id: bigint): Uint8Array
+    {
+        return TupleCodec.Encode([IdsTag.Owner, id]);
     }
 
     /** The row index is global (ruling F5): keyed by row block number only; entries carry the partition. */

@@ -23,6 +23,7 @@ export class PublicIdIndex
     public static readonly MaxBytes = 400;
     private static readonly Encoder = new TextEncoder();
     private static readonly Decoder = new TextDecoder('utf-8');
+    private static readonly NoOwner = '';
     private static readonly ErrEmpty = 'Public id must not be empty';
     private static readonly ErrNul = 'Public id must not contain U+0000';
     private static readonly Nul = '\u0000';
@@ -35,6 +36,24 @@ export class PublicIdIndex
         PublicIdIndex.Validate(publicId);
         const raw = await txn.Get(Keyspace.Ids, FormatKeys.PublicToInternal(publicId));
         return raw === undefined ? undefined : (TupleCodec.Decode(raw)[0] as bigint);
+    }
+
+    /** The node's owner: '' when it was created without one. Callers establish that the node exists. */
+    public async OwnerOf(txn: IReadTransaction, id: bigint): Promise<string>
+    {
+        InternalId.Require(id);
+        const raw = await txn.Get(Keyspace.Ids, FormatKeys.NodeOwner(id));
+        return raw === undefined ? PublicIdIndex.NoOwner : PublicIdIndex.Decoder.decode(raw);
+    }
+
+    /** Records the owner of a freshly bound node; an empty owner stores nothing. Create-time only. */
+    public SetOwner(txn: IWriteTransaction, id: bigint, owner: string): void
+    {
+        InternalId.Require(id);
+        if (owner.length > 0)
+        {
+            txn.Put(Keyspace.Ids, FormatKeys.NodeOwner(id), PublicIdIndex.Encoder.encode(owner));
+        }
     }
 
     public async PublicIdOf(txn: IReadTransaction, id: bigint): Promise<string | undefined>
@@ -72,6 +91,7 @@ export class PublicIdIndex
         }
         txn.Delete(Keyspace.Ids, FormatKeys.PublicToInternal(publicId));
         txn.Delete(Keyspace.Ids, FormatKeys.InternalToPublic(id));
+        txn.Delete(Keyspace.Ids, FormatKeys.NodeOwner(id));
     }
 
     private static Validate(publicId: string): void

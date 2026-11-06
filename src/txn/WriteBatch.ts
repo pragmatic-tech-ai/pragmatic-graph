@@ -19,12 +19,20 @@ export interface LinkOptions
     readonly Properties?: ReadonlyMap<string, CellValue>;
 }
 
+/** Optional placement and ownership of a new node. Owner (the holding model's name) is fixed at creation. */
+export interface ICreateNodeOptions
+{
+    readonly ClusterHint?: string;
+    readonly Owner?: string;
+}
+
 export interface ICreateNodeOp
 {
     readonly Op: WriteOp.CreateNode;
     readonly PublicId: string;
     readonly Concept: string;
     readonly ClusterHint?: string;
+    readonly Owner?: string;
 }
 
 export interface ISetPropertyOp
@@ -232,6 +240,9 @@ export class WriteBatch
     private static readonly FlagBefore = 4;
     private static readonly FlagProperties = 8;
     private static readonly KnownFlags = 15;
+    private static readonly FlagHint = 1;
+    private static readonly FlagOwner = 2;
+    private static readonly KnownCreateFlags = 3;
     private static readonly LoneSurrogate = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
     private static readonly ErrValueType = 'Unsupported cell value: ';
     private static readonly ErrValue = 'Invalid cell value: ';
@@ -240,7 +251,7 @@ export class WriteBatch
     private static readonly ErrOp = 'Corrupt write batch: unknown op ';
     private static readonly ErrTag = 'Corrupt write batch: unknown value tag ';
     private static readonly ErrFlags = 'Corrupt write batch: unknown link option flags ';
-    private static readonly ErrHasHint = 'Corrupt write batch: CreateNode hint flag must be 0 or 1, got ';
+    private static readonly ErrCreateFlags = 'Corrupt write batch: unknown CreateNode flags ';
     private static readonly ErrSealed = 'Write batch is sealed: no further operations can be recorded';
     private static readonly ErrDuplicateProperty = 'Corrupt write batch: duplicate edge property ';
     private static readonly ErrValueBytes = 'Corrupt write batch: invalid value bytes';
@@ -278,16 +289,21 @@ export class WriteBatch
         return this;
     }
 
-    public CreateNode(publicId: string, concept: string, clusterHint?: string): void
+    public CreateNode(publicId: string, concept: string, options?: ICreateNodeOptions): void
     {
         WriteBatch.RequireText(publicId, concept);
-        if (clusterHint === undefined)
+        const op: { -readonly [K in keyof ICreateNodeOp]: ICreateNodeOp[K] } = { Op: WriteOp.CreateNode, PublicId: publicId, Concept: concept };
+        if (options?.ClusterHint !== undefined)
         {
-            this.Push({ Op: WriteOp.CreateNode, PublicId: publicId, Concept: concept });
-            return;
+            WriteBatch.RequireText(options.ClusterHint);
+            op.ClusterHint = options.ClusterHint;
         }
-        WriteBatch.RequireText(clusterHint);
-        this.Push({ Op: WriteOp.CreateNode, PublicId: publicId, Concept: concept, ClusterHint: clusterHint });
+        if (options?.Owner !== undefined)
+        {
+            WriteBatch.RequireText(options.Owner);
+            op.Owner = options.Owner;
+        }
+        this.Push(op);
     }
 
     public SetProperty(publicId: string, member: string, value: CellValue): void
@@ -333,10 +349,14 @@ export class WriteBatch
                 case WriteOp.CreateNode:
                     w.Text(op.PublicId);
                     w.Text(op.Concept);
-                    w.U8(op.ClusterHint === undefined ? 0 : 1);
+                    w.U8((op.ClusterHint === undefined ? 0 : WriteBatch.FlagHint) | (op.Owner === undefined ? 0 : WriteBatch.FlagOwner));
                     if (op.ClusterHint !== undefined)
                     {
                         w.Text(op.ClusterHint);
+                    }
+                    if (op.Owner !== undefined)
+                    {
+                        w.Text(op.Owner);
                     }
                     break;
                 case WriteOp.SetProperty:
@@ -398,19 +418,21 @@ export class WriteBatch
             {
                 const publicId = r.Text();
                 const concept = r.Text();
-                const hasHint = r.U8();
-                if (hasHint === 0)
+                const flags = r.U8();
+                if ((flags & ~WriteBatch.KnownCreateFlags) !== 0)
                 {
-                    batch.CreateNode(publicId, concept);
+                    throw new RangeError(WriteBatch.ErrCreateFlags + flags);
                 }
-                else if (hasHint === 1)
+                const options: { ClusterHint?: string; Owner?: string } = {};
+                if ((flags & WriteBatch.FlagHint) !== 0)
                 {
-                    batch.CreateNode(publicId, concept, r.Text());
+                    options.ClusterHint = r.Text();
                 }
-                else
+                if ((flags & WriteBatch.FlagOwner) !== 0)
                 {
-                    throw new RangeError(WriteBatch.ErrHasHint + hasHint);
+                    options.Owner = r.Text();
                 }
+                batch.CreateNode(publicId, concept, options);
                 return;
             }
             case WriteOp.SetProperty:

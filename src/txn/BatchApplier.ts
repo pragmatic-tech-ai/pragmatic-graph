@@ -156,6 +156,7 @@ export class BatchApplier
         await this.rows.Assign(txn, id, location);
         await this.columns.WriteCell(txn, location, CatalogSnapshot.NodeIdMember, id);
         await this.ids.Bind(txn, op.PublicId, id);
+        this.ids.SetOwner(txn, id, op.Owner ?? '');
         keys.Add(ConflictKeys.NodeSpace, ConflictKeys.Node(op.PublicId));
         BatchApplier.AddCellKeys(keys, id, typeId, CatalogSnapshot.NodeIdMember.Id);
         keys.Add(ConflictKeys.ExtentSpace, ConflictKeys.Extent(typeId));

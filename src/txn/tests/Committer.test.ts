@@ -498,7 +498,7 @@ class TxnFx
                 const seen: Array<{ Commit: bigint; Batch: WriteBatch }> = [];
                 const sub = c.CommitApplied.Subscribe(e => seen.push(e));
                 const batches = [
-                    TxnFx.Batch(b => b.CreateNode('a', 'Person', 'h')),
+                    TxnFx.Batch(b => b.CreateNode('a', 'Person', { ClusterHint: 'h' })),
                     TxnFx.Batch(b => { b.CreateNode('b', 'Person'); b.SetProperty('b', 'name', 'Bo'); }),
                     TxnFx.Batch(b => b.Link('a', 'friends', 'b', { Properties: new Map([['weight', 3n]]) })),
                 ];

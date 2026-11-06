@@ -5,7 +5,7 @@ import { GraphReader } from './GraphReader.js';
 import { ConflictError } from './txn/ConflictError.js';
 import type { ISnapshotHandle } from './txn/ConflictHistory.js';
 import { ReadSet } from './txn/ReadSet.js';
-import { type LinkOptions, WriteBatch } from './txn/WriteBatch.js';
+import { type ICreateNodeOptions, type LinkOptions, WriteBatch } from './txn/WriteBatch.js';
 
 /**
  * An optimistic, serializable read-write transaction. Reads are snapshot reads at Begin and are
@@ -33,10 +33,10 @@ export class GraphTransaction extends GraphReader
         super(context, snapshot);
     }
 
-    public CreateNode(publicId: string, concept: string, clusterHint?: string): void
+    public CreateNode(publicId: string, concept: string, options?: ICreateNodeOptions): void
     {
         this.RequireActive();
-        this.batch.CreateNode(publicId, concept, clusterHint);
+        this.batch.CreateNode(publicId, concept, options);
     }
 
     public SetProperty(publicId: string, member: string, value: CellValue): void
