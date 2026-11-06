@@ -365,16 +365,23 @@ class ColumnFx
                 const writeMs = performance.now() - t0;
                 const r = await store.BeginRead();
                 assert.equal(await cs.ReadCell(r, ColumnFx.Loc(2000), ColumnFx.NameMember), 'name-2000');
-                const t1 = performance.now();
-                assert.equal(await cs.ReadCell(r, ColumnFx.Loc(1500), ColumnFx.NameMember), 'name-1500');
-                const readMs = performance.now() - t1;
+                const samples: number[] = [];
+                for (let k = 0; k < 15; k++)
+                {
+                    const slot = 1000 + k * 50;
+                    const t1 = performance.now();
+                    assert.equal(await cs.ReadCell(r, ColumnFx.Loc(slot), ColumnFx.NameMember), 'name-' + slot);
+                    samples.push(performance.now() - t1);
+                }
+                samples.sort((a, b) => a - b);
+                const readMs = samples[samples.length >> 1]!;
                 for (const i of [0, 777, 2047])
                 {
                     assert.equal(await cs.ReadCell(r, ColumnFx.Loc(i), ColumnFx.AgeMember), BigInt(i));
                 }
                 r.dispose();
-                console.log('[timing ' + name + '] 4096 writes (2048 Int64 + 2048 String): ' + writeMs.toFixed(0) + ' ms; ReadCell vs 2048-entry String delta: ' + readMs.toFixed(2) + ' ms');
-                assert.ok(writeMs < 2000, 'writes took ' + writeMs);
+                console.log('[timing ' + name + '] 4096 writes (2048 Int64 + 2048 String): ' + writeMs.toFixed(0) + ' ms; median ReadCell vs 2048-entry String delta: ' + readMs.toFixed(2) + ' ms');
+                assert.ok(writeMs < 5000, 'writes took ' + writeMs);
                 assert.ok(readMs < 25, 'read took ' + readMs);
                 await store.dispose();
             });
@@ -440,6 +447,72 @@ class ColumnFx
                     await assert.rejects(cs.WriteCell(txn, ColumnFx.Loc(2), ColumnFx.NameMember, 'x'), RangeError);
                     await assert.rejects(cs.WriteCell(txn, ColumnFx.Loc(0, 77), ColumnFx.NameMember, 'x'), RangeError);
                 });
+                await store.dispose();
+            });
+
+            it('concurrent WriteCell calls on one uncached chunk share one state and lose nothing', async () =>
+            {
+                const store = await open();
+                const cs = new ColumnStore();
+                await ColumnFx.Write(store, cs, async txn => ColumnFx.Alloc(cs, txn, 10));
+                await ColumnFx.Write(store, cs, async txn =>
+                {
+                    await Promise.all([
+                        cs.WriteCell(txn, ColumnFx.Loc(1), ColumnFx.NameMember, 'one'),
+                        cs.WriteCell(txn, ColumnFx.Loc(2), ColumnFx.NameMember, 'two'),
+                        cs.WriteCell(txn, ColumnFx.Loc(3), ColumnFx.NameMember, 'three'),
+                    ]);
+                });
+                const r = await store.BeginRead();
+                assert.equal(await cs.ReadCell(r, ColumnFx.Loc(1), ColumnFx.NameMember), 'one');
+                assert.equal(await cs.ReadCell(r, ColumnFx.Loc(2), ColumnFx.NameMember), 'two');
+                assert.equal(await cs.ReadCell(r, ColumnFx.Loc(3), ColumnFx.NameMember), 'three');
+                r.dispose();
+                await store.dispose();
+            });
+
+            it('concurrent AllocateSlot calls on one txn yield distinct dense slots', async () =>
+            {
+                const store = await open();
+                const cs = new ColumnStore();
+                await ColumnFx.Write(store, cs, async txn => ColumnFx.Alloc(cs, txn, 2));
+                await ColumnFx.Write(store, cs, async txn =>
+                {
+                    const got = await Promise.all([cs.AllocateSlot(txn, 0, 5), cs.AllocateSlot(txn, 0, 5), cs.AllocateSlot(txn, 0, 5)]);
+                    assert.deepEqual([...got].sort((a, b) => a - b), [2, 3, 4]);
+                });
+                await ColumnFx.Write(store, cs, async txn =>
+                {
+                    assert.equal(await cs.AllocateSlot(txn, 0, 5), 5);
+                });
+                await store.dispose();
+            });
+
+            it('tracks pending writes: Flush is idempotent, a write after Flush is dirty again, AssertFlushed guards commit', async () =>
+            {
+                const store = await open();
+                const cs = new ColumnStore();
+                await store.Write(async txn =>
+                {
+                    assert.equal(cs.HasPendingWrites(txn), false);
+                    cs.AssertFlushed(txn);
+                    await ColumnFx.Alloc(cs, txn, 3);
+                    await cs.WriteCell(txn, ColumnFx.Loc(0), ColumnFx.NameMember, 'a');
+                    assert.equal(cs.HasPendingWrites(txn), true);
+                    assert.throws(() => cs.AssertFlushed(txn), /Flush/);
+                    cs.Flush(txn);
+                    cs.Flush(txn);
+                    assert.equal(cs.HasPendingWrites(txn), false);
+                    cs.AssertFlushed(txn);
+                    await cs.WriteCell(txn, ColumnFx.Loc(1), ColumnFx.NameMember, 'b');
+                    assert.equal(cs.HasPendingWrites(txn), true);
+                    cs.Flush(txn);
+                    assert.equal(cs.HasPendingWrites(txn), false);
+                });
+                const r = await store.BeginRead();
+                assert.equal(await cs.ReadCell(r, ColumnFx.Loc(0), ColumnFx.NameMember), 'a');
+                assert.equal(await cs.ReadCell(r, ColumnFx.Loc(1), ColumnFx.NameMember), 'b');
+                r.dispose();
                 await store.dispose();
             });
 

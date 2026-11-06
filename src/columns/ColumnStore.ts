@@ -35,6 +35,8 @@ class TxnState
 {
     public readonly Deltas = new Map<string, DeltaState>();
     public readonly Slots = new Map<number, number>();
+    public readonly DeltaLoads = new Map<string, Promise<DeltaState>>();
+    public readonly SlotLoads = new Map<number, Promise<number>>();
 }
 
 /**
@@ -60,11 +62,13 @@ export class ColumnStore
     private static readonly ErrSlot = 'Slot must be an integer within 0..0xFFFFFFFE: ';
     private static readonly ErrUnallocated = 'Slot was never allocated for the type: ';
     private static readonly ErrMember = 'Only property members are stored in columns: ';
+    private static readonly ErrUnflushed = 'Column store has pending delta writes: call Flush(txn) before commit';
     private static readonly ErrNull = 'Member does not accept null: ';
     private static readonly ErrSlotsExhausted = 'Slot space exhausted for type ';
     private static readonly ErrTypeId = 'Type id must be a non-negative integer: ';
 
     private readonly states = new WeakMap<object, TxnState>();
+    private readonly slotKeys = new Map<number, Uint8Array>();
 
     /** Validates that the member is a stored property and returns its value type. */
     public static RequireType(member: MemberDef): ValueType
@@ -88,13 +92,16 @@ export class ColumnStore
     public async AllocateSlot(txn: IWriteTransaction, partition: number, typeId: number): Promise<number>
     {
         ColumnStore.RequirePartition(partition);
-        const next = await this.SlotCount(txn, partition, typeId);
+        await this.SlotCount(txn, partition, typeId);
+        // Synchronous from here on, so concurrent callers on one transaction get distinct slots.
+        const slots = (this.StateOf(txn) as TxnState).Slots;
+        const next = slots.get(typeId) as number;
         if (next >= ColumnStore.ReservedSlot)
         {
             throw new RangeError(ColumnStore.ErrSlotsExhausted + typeId);
         }
-        txn.Put(Keyspace.Meta, ColumnStore.SlotsKey(typeId), TupleCodec.Encode([BigInt(next + 1)]));
-        this.StateOf(txn)?.Slots.set(typeId, next + 1);
+        slots.set(typeId, next + 1);
+        txn.Put(Keyspace.Meta, this.SlotsKey(typeId), TupleCodec.Encode([BigInt(next + 1)]));
         return next;
     }
 
@@ -108,10 +115,25 @@ export class ColumnStore
         {
             return cached;
         }
-        const raw = await txn.Get(Keyspace.Meta, ColumnStore.SlotsKey(typeId));
-        const count = raw === undefined ? 0 : Number(TupleCodec.Decode(raw)[0] as bigint);
-        state?.Slots.set(typeId, count);
-        return count;
+        if (state === undefined)
+        {
+            return this.LoadSlotCount(txn, typeId);
+        }
+        let loading = state.SlotLoads.get(typeId);
+        if (loading === undefined)
+        {
+            loading = this.LoadSlotCount(txn, typeId).then(count =>
+            {
+                state.SlotLoads.delete(typeId);
+                if (!state.Slots.has(typeId))
+                {
+                    state.Slots.set(typeId, count);
+                }
+                return state.Slots.get(typeId) as number;
+            });
+            state.SlotLoads.set(typeId, loading);
+        }
+        return loading;
     }
 
     public async ReadCell(txn: IReadTransaction, location: Location, member: MemberDef): Promise<CellValue>
@@ -176,7 +198,34 @@ export class ColumnStore
         state.Dirty = true;
     }
 
-    /** Serializes every dirty delta of this transaction once. Call before the write transaction commits. */
+    /** True when this write transaction holds delta writes that Flush has not yet persisted. */
+    public HasPendingWrites(txn: IWriteTransaction): boolean
+    {
+        const state = this.states.get(txn);
+        if (state === undefined)
+        {
+            return false;
+        }
+        for (const delta of state.Deltas.values())
+        {
+            if (delta.Dirty)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** Throws unless every write of this transaction has been flushed; for the committer to call just before commit. */
+    public AssertFlushed(txn: IWriteTransaction): void
+    {
+        if (this.HasPendingWrites(txn))
+        {
+            throw new Error(ColumnStore.ErrUnflushed);
+        }
+    }
+
+    /** Serializes every dirty delta once. Idempotent; a write after Flush marks its delta dirty again and needs another Flush. Call before the write transaction commits. */
     public Flush(txn: IWriteTransaction): void
     {
         const state = this.states.get(txn);
@@ -295,23 +344,49 @@ export class ColumnStore
     {
         const state = this.StateOf(txn) as TxnState;
         const id = ColumnStore.DeltaId(partition, typeId, memberId, chunk);
-        let delta = state.Deltas.get(id);
-        if (delta === undefined)
+        const existing = state.Deltas.get(id);
+        if (existing !== undefined)
         {
-            const key = FormatKeys.Delta(partition, typeId, memberId, chunk);
-            const bytes = await txn.Get(Keyspace.Deltas, key);
-            const cells = new Map<number, CellValue>();
-            if (bytes !== undefined)
-            {
-                for (const e of ChunkDelta.Parse(type, bytes))
-                {
-                    cells.set(e.Slot, e.Value);
-                }
-            }
-            delta = new DeltaState(key, type, cells);
-            state.Deltas.set(id, delta);
+            return existing;
         }
-        return delta;
+        let loading = state.DeltaLoads.get(id);
+        if (loading === undefined)
+        {
+            loading = this.LoadDelta(txn, partition, typeId, memberId, type, chunk).then(loaded =>
+            {
+                state.DeltaLoads.delete(id);
+                const winner = state.Deltas.get(id);
+                if (winner !== undefined)
+                {
+                    return winner;
+                }
+                state.Deltas.set(id, loaded);
+                return loaded;
+            });
+            state.DeltaLoads.set(id, loading);
+        }
+        return loading;
+    }
+
+    private async LoadDelta(txn: IWriteTransaction, partition: number, typeId: number, memberId: number, type: ValueType, chunk: bigint): Promise<DeltaState>
+    {
+        const key = FormatKeys.Delta(partition, typeId, memberId, chunk);
+        const bytes = await txn.Get(Keyspace.Deltas, key);
+        const cells = new Map<number, CellValue>();
+        if (bytes !== undefined)
+        {
+            for (const e of ChunkDelta.Parse(type, bytes))
+            {
+                cells.set(e.Slot, e.Value);
+            }
+        }
+        return new DeltaState(key, type, cells);
+    }
+
+    private async LoadSlotCount(txn: IReadTransaction, typeId: number): Promise<number>
+    {
+        const raw = await txn.Get(Keyspace.Meta, this.SlotsKey(typeId));
+        return raw === undefined ? 0 : Number(TupleCodec.Decode(raw)[0] as bigint);
     }
 
     /** The per-transaction cache for write transactions (created on demand); undefined for read-only ones. */
@@ -336,13 +411,19 @@ export class ColumnStore
         return partition + s + typeId + s + memberId + s + chunk;
     }
 
-    private static SlotsKey(typeId: number): Uint8Array
+    private SlotsKey(typeId: number): Uint8Array
     {
-        if (!Number.isInteger(typeId) || typeId < 0)
+        let key = this.slotKeys.get(typeId);
+        if (key === undefined)
         {
-            throw new RangeError(ColumnStore.ErrTypeId + typeId);
+            if (!Number.isInteger(typeId) || typeId < 0)
+            {
+                throw new RangeError(ColumnStore.ErrTypeId + typeId);
+            }
+            key = FormatKeys.Meta(ColumnStore.SlotsName, typeId);
+            this.slotKeys.set(typeId, key);
         }
-        return FormatKeys.Meta(ColumnStore.SlotsName, typeId);
+        return key;
     }
 
     private static RequireSlot(slot: number): void
