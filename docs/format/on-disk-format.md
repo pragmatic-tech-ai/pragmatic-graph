@@ -8,7 +8,7 @@ This document is the contract between the TypeScript engine and the future Rust 
   - Byte string: `0x01`, the bytes with each `0x00` escaped as `0x00 0xFF`, then terminator `0x00`.
   - UTF-8 string: same as byte string with type code `0x02`.
   - Integer, type codes `0x0C..0x1C`, `0x14` = zero. Positive n-byte value (n = 1..8): code `0x14 + n`, then the value big-endian in n bytes. Negative value whose magnitude needs n bytes: code `0x14 - n`, then the one's complement of the magnitude (big-endian, n bytes). Maximum 8 bytes (magnitude below 2^64); larger values are rejected.
-- Negative integers are supported by the codec, but v1 keys only use non-negative values. Ids and chunk/block numbers are 64-bit.
+- Negative integers are supported by the codec, but v1 keys only use non-negative values. Ids and chunk/block numbers are 64-bit. Internal ids are positive and at most 2^63-1 so that the node-id column (member 0, Int64) stores them as plain signed values.
 - Values outside keys (row blocks, chunk headers, delta entries) are little-endian binary as specified below.
 - Format version: `1`. `SlotsPerChunk = 2048`. Id block size `4096`. Maximum public id length: 400 UTF-8 bytes.
 - Partition is always `0` in v1 but present in every location-bearing key (seam 3). Internal ids never encode location (seam 2).
@@ -38,7 +38,7 @@ Keys are `(name, ...qualifiers)`. Names defined so far:
 
 Names added by later tasks, each with its value layout completed by that task:
 
-- `("slots", typeId)`: Task 10.
+- `("slots", typeId)`: the number of slots ever allocated for the type (partition 0 in v1), a tuple-encoded single integer `(n)`; absent means `0`. Slots are allocated densely from 0 (`AllocateSlot` returns `n` and stores `n + 1`) inside the caller's write transaction; slot `0xFFFFFFFF` is reserved. Deleted slots are not reused in v1.
 - `("commit")`: Task 12.
 
 ### Catalog

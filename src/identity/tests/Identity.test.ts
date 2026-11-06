@@ -142,7 +142,7 @@ class IdentityFx
 
             it('InternalId bounds', async () =>
             {
-                assert.equal(InternalId.Max, (1n << 64n) - 1n);
+                assert.equal(InternalId.Max, (1n << 63n) - 1n);
                 InternalId.Require(1n);
                 InternalId.Require(InternalId.Max);
                 assert.throws(() => InternalId.Require(0n), RangeError);
@@ -165,15 +165,15 @@ class IdentityFx
                 await store.dispose();
             });
 
-            it('rejects internal ids outside 1..2^64-1', async () =>
+            it('rejects internal ids outside 1..2^63-1', async () =>
             {
                 const store = await open();
                 const idx = new PublicIdIndex();
                 const rows = new RowIndex();
-                const max = (1n << 64n) - 1n;
+                const max = (1n << 63n) - 1n;
                 await store.Write(async txn =>
                 {
-                    for (const bad of [0n, -1n, 1n << 64n])
+                    for (const bad of [0n, -1n, 1n << 63n])
                     {
                         await assert.rejects(idx.Bind(txn, 'x', bad), RangeError);
                         await assert.rejects(rows.Assign(txn, bad, IdentityFx.Loc(1, 1)), RangeError);
