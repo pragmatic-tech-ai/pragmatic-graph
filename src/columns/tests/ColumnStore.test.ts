@@ -444,15 +444,26 @@ class ColumnFx
                     await ColumnFx.Alloc(cs, txn, large);
                     await ColumnFx.Alloc(cs, txn, small, ColumnFx.Type + 1);
                 });
-                const [, writeMs] = await Linearity.Check('[' + name + '] ColumnStore delta writes (Int64 + String)', small, n => ColumnFx.Write(store, cs, async txn =>
+                // One delta caps n at 2,040, so each measured run rewrites its cells Passes times: the small run
+                // then takes well over 30 ms and timer noise cannot fake superlinearity (F9).
+                const passes = 12;
+                const [smallMs, largeMs] = await Linearity.Check('[' + name + '] ColumnStore delta writes (Int64 + String)', small, async n =>
                 {
-                    const typeId = n === small ? ColumnFx.Type + 1 : ColumnFx.Type;
-                    for (let i = n - 1; i >= 0; i--)
+                    for (let pass = 0; pass < passes; pass++)
                     {
-                        await cs.WriteCell(txn, ColumnFx.Loc(i, typeId), ColumnFx.AgeMember, BigInt(i));
-                        await cs.WriteCell(txn, ColumnFx.Loc(i, typeId), ColumnFx.NameMember, 'name-' + i);
+                        await ColumnFx.Write(store, cs, async txn =>
+                        {
+                            const typeId = n === small ? ColumnFx.Type + 1 : ColumnFx.Type;
+                            for (let i = n - 1; i >= 0; i--)
+                            {
+                                await cs.WriteCell(txn, ColumnFx.Loc(i, typeId), ColumnFx.AgeMember, BigInt(i));
+                                await cs.WriteCell(txn, ColumnFx.Loc(i, typeId), ColumnFx.NameMember, 'name-' + i);
+                            }
+                        });
                     }
-                }), 5);
+                }, 3);
+                console.log('[timing ' + name + '] small run ' + smallMs.toFixed(0) + ' ms');
+                const writeMs = largeMs / passes;
                 const r = await store.BeginRead();
                 assert.equal(await cs.ReadCell(r, ColumnFx.Loc(2000), ColumnFx.NameMember), 'name-2000');
                 const samples: number[] = [];
