@@ -833,6 +833,18 @@ describe('GraphStore durability on LMDB', () =>
         await again.dispose();
     });
 
+    it('OpenLmdb takes MapSizeBytes and MaxReaders and locks the directory until dispose (F9)', async () =>
+    {
+        const dir = GraphFx.Dir();
+        const g = await GraphStore.OpenLmdb(dir, { MapSizeBytes: 32 * 1024 * 1024, MaxReaders: 150 });
+        const kv = GraphFx.Context(g).Store as LmdbStore;
+        assert.deepEqual(kv.Settings, { MapSizeBytes: 32 * 1024 * 1024, MaxReaders: 150 });
+        const second = await GraphFx.Settle(GraphStore.OpenLmdb(dir));
+        assert.ok(second instanceof GraphError && second.GraphCode === GraphErrorCode.Locked, String(second));
+        await g.dispose();
+        await (await GraphStore.OpenLmdb(dir)).dispose();
+    });
+
     it('a store with another format version is refused', async () =>
     {
         const dir = GraphFx.Dir();

@@ -3,11 +3,48 @@ import { IKeyRange, IKeyValueStore, IReadTransaction, IScanOptions, IScanProbe, 
 import { GraphError, GraphErrorCode } from '../../errors/GraphError.js';
 import { Keyspace } from '../Keyspace.js';
 import { PendingChanges } from '../PendingChanges.js';
+import { LmdbLock } from './LmdbLock.js';
 import { TupleCodec } from '../../format/TupleCodec.js';
 
 export interface ILmdbOptions
 {
-    MapSizeBytes?: number;
+    /** Maximum database size (default 16 GiB). */
+    readonly MapSizeBytes?: number;
+    /** Maximum concurrent read transactions across processes (default: LMDB's 126). */
+    readonly MaxReaders?: number;
+}
+
+/**
+ * One reference to a native read snapshot. Readers opened while no commit happened share one native
+ * transaction (ruling F9); each holds a lease, and the snapshot is released when its last lease ends.
+ */
+class SnapshotLease
+{
+    private ended = false;
+
+    public constructor(public readonly Txn: Transaction, private readonly shared: SharedSnapshot)
+    {
+    }
+
+    public dispose(): void
+    {
+        if (!this.ended)
+        {
+            this.ended = true;
+            this.Txn.done();
+            this.shared.Users--;
+        }
+    }
+}
+
+/** A native read transaction pinned at one commit generation, with the number of live leases on it. */
+class SharedSnapshot
+{
+    public Users = 0;
+
+    public constructor(public readonly Txn: Transaction, public readonly Generation: number)
+    {
+    }
 }
 
 type Databases = ReadonlyMap<Keyspace, Database<Buffer, Buffer>>;
@@ -30,13 +67,16 @@ class LmdbReadTransaction implements IReadTransaction
 {
     protected disposed = false;
 
+    protected readonly snapshot: Transaction;
+
     public constructor(
         protected readonly databases: Databases,
-        protected readonly snapshot: Transaction,
+        private readonly lease: SnapshotLease,
         protected readonly counter: ScanCounter,
         private readonly onDispose?: () => void,
     )
     {
+        this.snapshot = lease.Txn;
     }
 
     public async Get(space: Keyspace, key: Uint8Array): Promise<Uint8Array | undefined>
@@ -62,7 +102,7 @@ class LmdbReadTransaction implements IReadTransaction
         if (!this.disposed)
         {
             this.disposed = true;
-            this.snapshot.done();
+            this.lease.dispose();
             this.onDispose?.();
         }
     }
@@ -240,10 +280,27 @@ export class LmdbStore implements IKeyValueStore, IScanProbe
     private disposed = false;
     private readonly liveReads = new Set<LmdbReadTransaction>();
     private readonly counter = new ScanCounter();
+    /** Bumped by every commit; a shared snapshot of an older generation is never reused. */
+    private generation = 0;
+    private shared: SharedSnapshot | undefined;
+    private nativeSnapshots = 0;
 
     public get EntriesRead(): number
     {
         return this.counter.Count;
+    }
+
+    /** Diagnostics: native read snapshots opened so far (readers between two commits share one). */
+    public get NativeSnapshotsOpened(): number
+    {
+        return this.nativeSnapshots;
+    }
+
+    /** Diagnostics: the environment's map size and reader limit as LMDB reports them. */
+    public get Settings(): { readonly MapSizeBytes: number; readonly MaxReaders: number }
+    {
+        const stats = this.root.getStats() as { mapSize: number; maxReaders: number };
+        return { MapSizeBytes: stats.mapSize, MaxReaders: stats.maxReaders };
     }
 
     /** Diagnostics: whether the open environment syncs commits asynchronously (always false; see OpenOptions). */
@@ -255,6 +312,7 @@ export class LmdbStore implements IKeyValueStore, IScanProbe
     private constructor(
         private readonly root: RootDatabase,
         private readonly databases: Databases,
+        private readonly lock: LmdbLock,
     )
     {
     }
@@ -273,13 +331,29 @@ export class LmdbStore implements IKeyValueStore, IScanProbe
             keyEncoding: LmdbStore.BinaryEncoding,
             encoding: LmdbStore.BinaryEncoding,
             overlappingSync: false,
+            ...(options?.MaxReaders === undefined ? {} : { maxReaders: options.MaxReaders }),
         };
     }
 
+    /**
+     * Opens (creating when absent) the environment in directory `path`, taking its exclusive writer lock
+     * (LmdbLock): a second store on the same directory, in this or another live process, is refused with
+     * GraphError Locked until the first is disposed.
+     */
     public static async Open(path: string, options?: ILmdbOptions): Promise<LmdbStore>
     {
         const spaces = Object.values(Keyspace);
-        const root = open(LmdbStore.OpenOptions(path, options));
+        const lock = LmdbLock.Acquire(path);
+        let root: RootDatabase;
+        try
+        {
+            root = open(LmdbStore.OpenOptions(path, options));
+        }
+        catch (error)
+        {
+            lock.dispose();
+            throw error;
+        }
         const databases = new Map<Keyspace, Database<Buffer, Buffer>>();
         for (const space of spaces)
         {
@@ -288,13 +362,13 @@ export class LmdbStore implements IKeyValueStore, IScanProbe
                 encoding: LmdbStore.BinaryEncoding,
             }));
         }
-        return new LmdbStore(root, databases);
+        return new LmdbStore(root, databases, lock);
     }
 
     public async BeginRead(): Promise<IReadTransaction>
     {
         this.EnsureLive();
-        const read = new LmdbReadTransaction(this.databases, this.PinSnapshot(), this.counter, () => this.liveReads.delete(read));
+        const read = new LmdbReadTransaction(this.databases, this.Lease(), this.counter, () => this.liveReads.delete(read));
         this.liveReads.add(read);
         return read;
     }
@@ -323,22 +397,40 @@ export class LmdbStore implements IKeyValueStore, IScanProbe
             read.dispose();
         }
         await this.root.close();
+        this.lock.dispose();
     }
 
-    /** Pins the latest committed state; only the single writer commits, so it is current. */
-    private PinSnapshot(): Transaction
+    /**
+     * A lease on the latest committed state; only the single (locked) writer commits, so it is current.
+     * While no commit happened since the shared snapshot was opened and it still has live leases, the
+     * same native transaction is reused (ruling F9); otherwise a fresh one is pinned.
+     */
+    private Lease(): SnapshotLease
     {
+        const shared = this.shared;
+        if (shared !== undefined && shared.Users > 0 && shared.Generation === this.generation)
+        {
+            // lmdb-js read transactions are reference counted: use() adds one, done() releases one (untyped in its .d.ts).
+            (shared.Txn as unknown as { use(): void }).use();
+            shared.Users++;
+            return new SnapshotLease(shared.Txn, shared);
+        }
         this.root.resetReadTxn();
-        return this.root.useReadTransaction();
+        const fresh = new SharedSnapshot(this.root.useReadTransaction(), this.generation);
+        fresh.Users = 1;
+        this.nativeSnapshots++;
+        this.shared = fresh;
+        return new SnapshotLease(fresh.Txn, fresh);
     }
 
     private async RunExclusive<T>(work: (txn: IWriteTransaction) => Promise<T>): Promise<T>
     {
-        const txn = new LmdbWriteTransaction(this.databases, this.PinSnapshot(), this.counter);
+        const txn = new LmdbWriteTransaction(this.databases, this.Lease(), this.counter);
         try
         {
             const result = await work(txn);
             this.root.transactionSync(() => txn.Apply());
+            this.generation++;
             return result;
         }
         finally

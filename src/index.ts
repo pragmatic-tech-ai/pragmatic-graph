@@ -2,6 +2,7 @@
 // stores, identity indexes, the committer) are deliberately not exported.
 
 export { GraphStore } from './GraphStore.js';
+export type { ILmdbOptions } from './kv/lmdb/LmdbStore.js';
 export { GraphReader, type IScanRow } from './GraphReader.js';
 export { GraphTransaction } from './GraphTransaction.js';
 

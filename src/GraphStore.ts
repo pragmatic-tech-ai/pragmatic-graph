@@ -8,7 +8,7 @@ import { GraphReader } from './GraphReader.js';
 import { GraphTransaction } from './GraphTransaction.js';
 import type { IKeyValueStore, IReadTransaction, IWriteTransaction } from './kv/KeyValue.js';
 import { Keyspace } from './kv/Keyspace.js';
-import { LmdbStore } from './kv/lmdb/LmdbStore.js';
+import { type ILmdbOptions, LmdbStore } from './kv/lmdb/LmdbStore.js';
 import { MemoryStore } from './kv/memory/MemoryStore.js';
 import { CommitLog } from './txn/CommitLog.js';
 import { Committer, type ICommitApplied } from './txn/Committer.js';
@@ -40,10 +40,14 @@ export class GraphStore
         this.CommitApplied = new SignalView(context.Committer.CommitApplied);
     }
 
-    /** Opens (creating when absent) the LMDB environment in directory `path`. */
-    public static async OpenLmdb(path: string): Promise<GraphStore>
+    /**
+     * Opens (creating when absent) the LMDB environment in directory `path`, with optional MapSizeBytes
+     * and MaxReaders. The directory is locked for this store until dispose: opening it again (in this or
+     * another live process) fails with GraphError Locked.
+     */
+    public static async OpenLmdb(path: string, options?: ILmdbOptions): Promise<GraphStore>
     {
-        return GraphStore.Open(await LmdbStore.Open(path));
+        return GraphStore.Open(await LmdbStore.Open(path, options));
     }
 
     /** A fresh graph that lives only in memory. */

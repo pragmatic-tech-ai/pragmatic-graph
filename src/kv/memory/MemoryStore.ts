@@ -10,8 +10,159 @@ interface IEntry
     readonly Value: Uint8Array;
 }
 
-/** Committed state: one sorted, never-mutated array per keyspace. A snapshot is a reference to it. */
-type Snapshot = ReadonlyMap<Keyspace, readonly IEntry[]>;
+/** Commit statistics for the diagnostics counters. */
+class CommitStats
+{
+    public EntriesCopied = 0;
+}
+
+/**
+ * One keyspace's committed entries as an immutable chunked sorted list: never-mutated leaves of at most
+ * about LeafCapacity entries, in key order. A commit builds a new list that shares every leaf the
+ * transaction did not touch (copy-on-write per leaf, ruling F9): it copies only the touched leaves plus
+ * the leaf directory (one reference per leaf), not the whole keyspace.
+ */
+class LeafList
+{
+    public static readonly LeafCapacity = 512;
+    public static readonly Empty = new LeafList([]);
+
+    private constructor(private readonly leaves: ReadonlyArray<readonly IEntry[]>)
+    {
+    }
+
+    public get LeafCount(): number
+    {
+        return this.leaves.length;
+    }
+
+    public Get(key: Uint8Array): Uint8Array | undefined
+    {
+        const leaf = this.leaves[this.LeafFor(key)];
+        if (leaf === undefined)
+        {
+            return undefined;
+        }
+        const hit = leaf[Sorted.LowerBound(leaf, key)];
+        return hit !== undefined && TupleCodec.Compare(hit.Key, key) === 0 ? hit.Value : undefined;
+    }
+
+    /** Raw entries in range, ascending, lazily from the binary-searched start. */
+    public *Forward(range: IKeyRange): Iterable<readonly [Uint8Array, Uint8Array]>
+    {
+        const first = this.LeafFor(range.Start);
+        for (let li = first; li < this.leaves.length; li++)
+        {
+            const leaf = this.leaves[li] as readonly IEntry[];
+            for (let i = li === first ? Sorted.LowerBound(leaf, range.Start) : 0; i < leaf.length; i++)
+            {
+                const entry = leaf[i] as IEntry;
+                if (TupleCodec.Compare(entry.Key, range.End) >= 0)
+                {
+                    return;
+                }
+                yield [entry.Key, entry.Value];
+            }
+        }
+    }
+
+    /** Raw entries in range, descending, lazily from the binary-searched end. */
+    public *Reverse(range: IKeyRange): Iterable<readonly [Uint8Array, Uint8Array]>
+    {
+        const last = this.LeafFor(range.End);
+        for (let li = last; li >= 0; li--)
+        {
+            const leaf = this.leaves[li] as readonly IEntry[] | undefined;
+            if (leaf === undefined)
+            {
+                return;
+            }
+            for (let i = (li === last ? Sorted.LowerBound(leaf, range.End) : leaf.length) - 1; i >= 0; i--)
+            {
+                const entry = leaf[i] as IEntry;
+                if (TupleCodec.Compare(entry.Key, range.Start) < 0)
+                {
+                    return;
+                }
+                yield [entry.Key, entry.Value];
+            }
+        }
+    }
+
+    /** A new list with the sorted changes applied; leaves without changes are shared, touched ones rebuilt (and split when over capacity). */
+    public Apply(changes: readonly IPendingChange[], stats: CommitStats): LeafList
+    {
+        if (changes.length === 0)
+        {
+            return this;
+        }
+        const next: Array<readonly IEntry[]> = [];
+        if (this.leaves.length === 0)
+        {
+            LeafList.PushSplit(next, [...Sorted.Merge([], changes)], stats);
+            return new LeafList(next);
+        }
+        let j = 0;
+        for (let li = 0; li < this.leaves.length; li++)
+        {
+            const leaf = this.leaves[li] as readonly IEntry[];
+            const following = this.leaves[li + 1];
+            const bound = following === undefined ? undefined : (following[0] as IEntry).Key;
+            const start = j;
+            while (j < changes.length && (bound === undefined || TupleCodec.Compare((changes[j] as IPendingChange).Key, bound) < 0))
+            {
+                j++;
+            }
+            if (start === j)
+            {
+                next.push(leaf);
+                continue;
+            }
+            LeafList.PushSplit(next, [...Sorted.Merge(leaf, changes.slice(start, j))], stats);
+        }
+        return new LeafList(next);
+    }
+
+    private static PushSplit(into: Array<readonly IEntry[]>, entries: IEntry[], stats: CommitStats): void
+    {
+        stats.EntriesCopied += entries.length;
+        if (entries.length <= 2 * LeafList.LeafCapacity)
+        {
+            if (entries.length > 0)
+            {
+                into.push(entries);
+            }
+            return;
+        }
+        for (let i = 0; i < entries.length; i += LeafList.LeafCapacity)
+        {
+            into.push(entries.slice(i, i + LeafList.LeafCapacity));
+        }
+    }
+
+    /** Index of the last leaf whose first key is <= key (0 when key precedes every leaf). */
+    private LeafFor(key: Uint8Array): number
+    {
+        let lo = 0;
+        let hi = this.leaves.length - 1;
+        while (lo < hi)
+        {
+            const mid = (lo + hi + 1) >> 1;
+            if (TupleCodec.Compare(((this.leaves[mid] as readonly IEntry[])[0] as IEntry).Key, key) <= 0)
+            {
+                lo = mid;
+            }
+            else
+            {
+                hi = mid - 1;
+            }
+        }
+        return lo;
+    }
+}
+
+/** Committed state: one immutable LeafList per keyspace. A snapshot is a reference to it. */
+type Snapshot = ReadonlyMap<Keyspace, LeafList>;
 
 class Sorted
 {
@@ -118,37 +269,14 @@ class MemoryReadTransaction implements IReadTransaction
     /** Raw (uncopied) value lookup. */
     protected Lookup(space: Keyspace, key: Uint8Array): Uint8Array | undefined
     {
-        const entries = this.snapshot.get(space) ?? [];
-        const hit = entries[Sorted.LowerBound(entries, key)];
-        return hit !== undefined && TupleCodec.Compare(hit.Key, key) === 0 ? hit.Value : undefined;
+        return (this.snapshot.get(space) ?? LeafList.Empty).Get(key);
     }
 
     /** Raw (uncopied) entries in range, in key order (descending with reverse), produced lazily from the binary-searched bound. */
-    protected *Entries(space: Keyspace, range: IKeyRange, reverse: boolean): Iterable<readonly [Uint8Array, Uint8Array]>
+    protected Entries(space: Keyspace, range: IKeyRange, reverse: boolean): Iterable<readonly [Uint8Array, Uint8Array]>
     {
-        const entries = this.snapshot.get(space) ?? [];
-        if (reverse)
-        {
-            for (let i = Sorted.LowerBound(entries, range.End) - 1; i >= 0; i--)
-            {
-                const entry = entries[i] as IEntry;
-                if (TupleCodec.Compare(entry.Key, range.Start) < 0)
-                {
-                    return;
-                }
-                yield [entry.Key, entry.Value];
-            }
-            return;
-        }
-        for (let i = Sorted.LowerBound(entries, range.Start); i < entries.length; i++)
-        {
-            const entry = entries[i] as IEntry;
-            if (TupleCodec.Compare(entry.Key, range.End) >= 0)
-            {
-                return;
-            }
-            yield [entry.Key, entry.Value];
-        }
+        const list = this.snapshot.get(space) ?? LeafList.Empty;
+        return reverse ? list.Reverse(range) : list.Forward(range);
     }
 }
 
@@ -196,13 +324,13 @@ class MemoryWriteTransaction extends MemoryReadTransaction implements IWriteTran
         this.Stage(space, key, null);
     }
 
-    /** Builds the next committed state: untouched keyspaces are shared, touched ones are rebuilt. */
-    public BuildCommitted(): Snapshot
+    /** Builds the next committed state: untouched keyspaces and untouched leaves are shared, touched leaves rebuilt. */
+    public BuildCommitted(stats: CommitStats): Snapshot
     {
-        const next = new Map<Keyspace, readonly IEntry[]>(this.snapshot);
+        const next = new Map<Keyspace, LeafList>(this.snapshot);
         for (const [space, staged] of this.pending)
         {
-            next.set(space, [...Sorted.Merge(this.snapshot.get(space) ?? [], staged.Values())]);
+            next.set(space, (this.snapshot.get(space) ?? LeafList.Empty).Apply([...staged.Values()], stats));
         }
         return next;
     }
@@ -237,16 +365,26 @@ export class MemoryStore implements IKeyValueStore, IScanProbe
     private readonly liveReads = new Set<MemoryReadTransaction>();
     private readonly counter = new ScanCounter();
     private rebuilt = 0;
+    private readonly stats = new CommitStats();
 
     public get EntriesRead(): number
     {
         return this.counter.Count;
     }
 
-    /** Diagnostics: keyspaces whose committed array commits have rebuilt so far (untouched ones are shared). */
+    /**
+     * Diagnostics, not part of IKeyValueStore: keyspaces whose committed leaf list commits have rebuilt so
+     * far (untouched keyspaces are shared).
+     */
     public get KeyspacesRebuilt(): number
     {
         return this.rebuilt;
+    }
+
+    /** Diagnostics, not part of IKeyValueStore: entries commits have copied into rebuilt leaves so far. */
+    public get EntriesCopied(): number
+    {
+        return this.stats.EntriesCopied;
     }
 
     public async BeginRead(): Promise<IReadTransaction>
@@ -288,7 +426,7 @@ export class MemoryStore implements IKeyValueStore, IScanProbe
         try
         {
             const result = await work(txn);
-            const next = txn.BuildCommitted();
+            const next = txn.BuildCommitted(this.stats);
             for (const [space, entries] of next)
             {
                 if (this.committed.get(space) !== entries)
