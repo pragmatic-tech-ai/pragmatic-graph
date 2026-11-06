@@ -38,6 +38,12 @@ interface ISibling
  * Edge semantics are ruling R21: one edge per (from, relationship, to); non-Many relationships allow
  * one outgoing edge per source; unordered relationships use the empty position. Target type checking
  * belongs to the committer. Only partition 0 exists in v1.
+ *
+ * Cost: finding an existing edge by (from, to) is O(1) for unordered Many relationships (the pair key
+ * is directly addressable), a single-key scan for unordered one-valued relationships, and a scan of
+ * the source's Out range, O(out-degree), for ordered relationships (the position is part of the key).
+ * Appending to an ordered relationship also scans to find the last sibling. A future (from, to) to
+ * position pair index would make ordered lookups O(1).
  */
 export class EdgeStore
 {
@@ -46,6 +52,11 @@ export class EdgeStore
     private static readonly EmptyPosition: Uint8Array = new Uint8Array(0);
     private static readonly ErrNotRelationship = 'Member is not a relationship: ';
     private static readonly ErrDuplicate = 'Edge already exists: ';
+    private static readonly ErrNotOrdered = 'After/Before require an ordered relationship: ';
+    private static readonly ErrBounds = 'After position must sort before the Before position';
+    private static readonly ErrRequired = 'Missing required edge property: ';
+    private static readonly ArrowSeparator = '->';
+    private static readonly SpaceSeparator = ' ';
     private static readonly ErrCardinality = 'Relationship allows one outgoing edge per node: ';
     private static readonly ErrSibling = 'Position does not belong to an edge of this node and relationship';
     private static readonly ErrMissing = 'Edge does not exist: ';
@@ -62,6 +73,10 @@ export class EdgeStore
         InternalId.Require(to);
         const value = EdgeStore.EncodeProperties(relationship, options?.Properties);
         const ordered = relationship.Ordered === true;
+        if (!ordered && ((options?.After ?? null) !== null || (options?.Before ?? null) !== null))
+        {
+            throw new EdgeError(EdgeErrorCode.NotOrdered, EdgeStore.ErrNotOrdered + relationship.Name);
+        }
         const many = relationship.Many === true;
         let position = EdgeStore.EmptyPosition;
         if (ordered)
@@ -72,10 +87,9 @@ export class EdgeStore
         }
         else if (many)
         {
-            const key = FormatKeys.Edge(EdgeStore.Partition, relationship.Id, EdgeDirection.Out, from, position, to);
-            if ((await txn.Get(Keyspace.Edges, key)) !== undefined)
+            if ((await this.FindPosition(txn, relationship, from, to)) !== undefined)
             {
-                throw new EdgeError(EdgeErrorCode.DuplicateEdge, EdgeStore.ErrDuplicate + relationship.Name);
+                throw EdgeStore.Duplicate(relationship, from, to);
             }
         }
         else
@@ -93,13 +107,13 @@ export class EdgeStore
         EdgeStore.RequireRelationship(relationship);
         InternalId.Require(from);
         InternalId.Require(to);
-        const found = (await this.Siblings(txn, relationship, from)).find(s => s.Other === to);
-        if (found === undefined)
+        const position = await this.FindPosition(txn, relationship, from, to);
+        if (position === undefined)
         {
-            throw new EdgeError(EdgeErrorCode.MissingEdge, EdgeStore.ErrMissing + relationship.Name);
+            throw new EdgeError(EdgeErrorCode.MissingEdge, EdgeStore.ErrMissing + EdgeStore.Label(relationship, from, to));
         }
-        txn.Delete(Keyspace.Edges, FormatKeys.Edge(EdgeStore.Partition, relationship.Id, EdgeDirection.Out, from, found.Position, to));
-        txn.Delete(Keyspace.Edges, FormatKeys.Edge(EdgeStore.Partition, relationship.Id, EdgeDirection.In, to, found.Position, from));
+        txn.Delete(Keyspace.Edges, FormatKeys.Edge(EdgeStore.Partition, relationship.Id, EdgeDirection.Out, from, position, to));
+        txn.Delete(Keyspace.Edges, FormatKeys.Edge(EdgeStore.Partition, relationship.Id, EdgeDirection.In, to, position, from));
     }
 
     /**
@@ -125,6 +139,22 @@ export class EdgeStore
         }
     }
 
+    /** Position of the edge from -> to, or undefined. Cost depends on the relationship shape (see class comment). */
+    private async FindPosition(txn: IReadTransaction, relationship: MemberDef, from: bigint, to: bigint): Promise<Uint8Array | undefined>
+    {
+        if (relationship.Ordered === true)
+        {
+            return (await this.Siblings(txn, relationship, from)).find(s => s.Other === to)?.Position;
+        }
+        if (relationship.Many === true)
+        {
+            const key = FormatKeys.Edge(EdgeStore.Partition, relationship.Id, EdgeDirection.Out, from, EdgeStore.EmptyPosition, to);
+            return (await txn.Get(Keyspace.Edges, key)) === undefined ? undefined : EdgeStore.EmptyPosition;
+        }
+        const first = (await this.Siblings(txn, relationship, from, 1))[0];
+        return first !== undefined && first.Other === to ? first.Position : undefined;
+    }
+
     private async Siblings(txn: IReadTransaction, relationship: MemberDef, from: bigint, limit?: number): Promise<ISibling[]>
     {
         const range = FormatKeys.EdgeRange(EdgeStore.Partition, relationship.Id, EdgeDirection.Out, from);
@@ -139,15 +169,24 @@ export class EdgeStore
 
     private static RequireNew(relationship: MemberDef, siblings: readonly ISibling[], to: bigint, many: boolean, from: bigint): void
     {
-        const label = relationship.Name + ' ' + from + '->' + to;
         if (siblings.some(s => s.Other === to))
         {
-            throw new EdgeError(EdgeErrorCode.DuplicateEdge, EdgeStore.ErrDuplicate + label);
+            throw EdgeStore.Duplicate(relationship, from, to);
         }
         if (!many && siblings.length > 0)
         {
-            throw new EdgeError(EdgeErrorCode.CardinalityExceeded, EdgeStore.ErrCardinality + label);
+            throw new EdgeError(EdgeErrorCode.CardinalityExceeded, EdgeStore.ErrCardinality + EdgeStore.Label(relationship, from, to));
         }
+    }
+
+    private static Label(relationship: MemberDef, from: bigint, to: bigint): string
+    {
+        return relationship.Name + EdgeStore.SpaceSeparator + from + EdgeStore.ArrowSeparator + to;
+    }
+
+    private static Duplicate(relationship: MemberDef, from: bigint, to: bigint): EdgeError
+    {
+        return new EdgeError(EdgeErrorCode.DuplicateEdge, EdgeStore.ErrDuplicate + EdgeStore.Label(relationship, from, to));
     }
 
     /** Position for a new edge among `siblings` (already in key order). */
@@ -165,6 +204,10 @@ export class EdgeStore
         }
         if (after !== null && before !== null)
         {
+            if (TupleCodec.Compare(after, before) >= 0)
+            {
+                throw new RangeError(EdgeStore.ErrBounds);
+            }
             return FractionalPosition.Between(after, before);
         }
         if (after !== null)
@@ -207,11 +250,18 @@ export class EdgeStore
     /** Out value: for each non-null property sorted by member id, u32 LE id, u32 LE value length, single-value bytes. */
     private static EncodeProperties(relationship: MemberDef, properties: ReadonlyMap<string, CellValue> | undefined): Uint8Array
     {
+        const declared = relationship.EdgeProperties ?? [];
+        for (const member of declared)
+        {
+            if (!member.Nullable && (properties?.get(member.Name) ?? null) === null)
+            {
+                throw new EdgeError(EdgeErrorCode.InvalidProperty, EdgeStore.ErrRequired + member.Name);
+            }
+        }
         if (properties === undefined || properties.size === 0)
         {
             return new Uint8Array(0);
         }
-        const declared = relationship.EdgeProperties ?? [];
         const parts: Array<{ Id: number; Bytes: Uint8Array }> = [];
         for (const [name, value] of properties)
         {
@@ -268,7 +318,7 @@ export class EdgeStore
         {
             if (at + 2 * size > bytes.length)
             {
-                throw new EdgeError(EdgeErrorCode.InvalidProperty, EdgeStore.ErrCorrupt);
+                throw new EdgeError(EdgeErrorCode.CorruptEdge, EdgeStore.ErrCorrupt);
             }
             const id = view.getUint32(at, true);
             const length = view.getUint32(at + size, true);
@@ -276,9 +326,16 @@ export class EdgeStore
             const member = declared.find(m => m.Id === id);
             if (member === undefined || member.Type === undefined || start + length > bytes.length)
             {
-                throw new EdgeError(EdgeErrorCode.InvalidProperty, EdgeStore.ErrCorrupt);
+                throw new EdgeError(EdgeErrorCode.CorruptEdge, EdgeStore.ErrCorrupt);
             }
-            result.set(member.Name, ValueCodec.Decode(member.Type, bytes.slice(start, start + length)));
+            try
+            {
+                result.set(member.Name, ValueCodec.Decode(member.Type, bytes.slice(start, start + length)));
+            }
+            catch
+            {
+                throw new EdgeError(EdgeErrorCode.CorruptEdge, EdgeStore.ErrCorrupt);
+            }
             at = start + length;
         }
         return result;

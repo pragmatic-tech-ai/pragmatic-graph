@@ -159,6 +159,8 @@ The Out key on the source is `(partition, relationshipId, 0, from, position, to)
 
 **Out value** (edge properties): for each non-null property, sorted by member id ascending, `memberId: u32 LE`, `length: u32 LE`, then `length` bytes of single-value encoding (the Columns single value layout for the property type). Null and absent properties are not stored; an edge with no properties has an empty value. **In value**: empty; In-direction reads fetch properties from the matching Out key.
 
+Lookup cost by `(from, to)`: O(1) for unordered Many relationships (direct key), one single-key scan for unordered one-valued relationships, and O(out-degree) for ordered relationships (the position is part of the key, so the source's Out range is scanned; appending also scans to find the last sibling). A future `(from, to)` to position pair index would make ordered lookups O(1).
+
 ### Log
 
 Key `(commit: u64)`; commits are monotonic and gap-free from `1`. The value is the serialized `WriteBatch` defined in Task 12; this section is completed by that task.

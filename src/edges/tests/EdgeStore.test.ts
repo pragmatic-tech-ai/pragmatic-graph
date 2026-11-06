@@ -219,6 +219,73 @@ class EdgeFx
                 await store.dispose();
             });
 
+            it('requires every non-nullable edge property, even when no properties are given', async () =>
+            {
+                const store = await open();
+                const es = new EdgeStore();
+                const rel = EdgeFx.WithProps;
+                assert.equal(await EdgeFx.Code(store.Write(txn => es.Link(txn, rel, 1n, 2n))), EdgeErrorCode.InvalidProperty);
+                assert.equal(await EdgeFx.Code(store.Write(txn => es.Link(txn, rel, 1n, 2n, { Properties: new Map<string, CellValue>([['weight', 1n]]) }))), EdgeErrorCode.InvalidProperty);
+                await store.Write(txn => es.Link(txn, rel, 1n, 2n, { Properties: new Map<string, CellValue>([['label', 'ok']]) }));
+                await store.dispose();
+            });
+
+            it('After/Before on an unordered relationship is NotOrdered; After >= Before is rejected', async () =>
+            {
+                const store = await open();
+                const es = new EdgeStore();
+                const some = Uint8Array.of(0x80);
+                assert.equal(await EdgeFx.Code(store.Write(txn => es.Link(txn, EdgeFx.Many, 1n, 2n, { After: some }))), EdgeErrorCode.NotOrdered);
+                assert.equal(await EdgeFx.Code(store.Write(txn => es.Link(txn, EdgeFx.Many, 1n, 2n, { Before: some }))), EdgeErrorCode.NotOrdered);
+                const rel = EdgeFx.ManyOrdered;
+                const pos = await store.Write(async txn => ({ a: await es.Link(txn, rel, 1n, 10n), b: await es.Link(txn, rel, 1n, 20n) }));
+                await assert.rejects(store.Write(txn => es.Link(txn, rel, 1n, 30n, { After: pos.b, Before: pos.a })), RangeError);
+                await assert.rejects(store.Write(txn => es.Link(txn, rel, 1n, 30n, { After: pos.a, Before: pos.a })), RangeError);
+                await store.dispose();
+            });
+
+            it('garbage under an Out key is CorruptEdge', async () =>
+            {
+                const store = await open();
+                const es = new EdgeStore();
+                const rel = EdgeFx.WithProps;
+                const key = FormatKeys.Edge(0, rel.Id, EdgeDirection.Out, 1n, new Uint8Array(0), 2n);
+                for (const bytes of [Uint8Array.of(1, 2, 3), Uint8Array.of(99, 0, 0, 0, 1, 0, 0, 0, 7), Uint8Array.of(20, 0, 0, 0, 3, 0, 0, 0, 1, 2, 3)])
+                {
+                    await store.Write(async txn => txn.Put(Keyspace.Edges, key, bytes));
+                    const r = await store.BeginRead();
+                    assert.equal(await EdgeFx.Code(EdgeFx.List(es, r, rel, 1n, EdgeDirection.Out)), EdgeErrorCode.CorruptEdge);
+                    r.dispose();
+                }
+                await store.dispose();
+            });
+
+            it('duplicate messages are consistent and Unlink works on every relationship shape', async () =>
+            {
+                const store = await open();
+                const es = new EdgeStore();
+                const messages: string[] = [];
+                for (const rel of [EdgeFx.Many, EdgeFx.ManyOrdered, EdgeFx.One])
+                {
+                    await store.Write(txn => es.Link(txn, rel, 1n, 2n));
+                    try
+                    {
+                        await store.Write(txn => es.Link(txn, rel, 1n, 2n));
+                    }
+                    catch (e)
+                    {
+                        messages.push((e as Error).message.replace(rel.Name, 'REL'));
+                    }
+                    assert.equal(await EdgeFx.Code(store.Write(txn => es.Unlink(txn, rel, 1n, 3n))), EdgeErrorCode.MissingEdge);
+                    await store.Write(txn => es.Unlink(txn, rel, 1n, 2n));
+                    assert.deepEqual(await EdgeFx.Nodes(store, es, rel, 1n, EdgeDirection.Out), []);
+                    assert.deepEqual(await EdgeFx.Nodes(store, es, rel, 2n, EdgeDirection.In), []);
+                }
+                assert.equal(messages.length, 3);
+                assert.equal(new Set(messages).size, 1);
+                await store.dispose();
+            });
+
             it('neighbors never include other nodes or other relationships', async () =>
             {
                 const store = await open();

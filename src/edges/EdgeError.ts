@@ -6,6 +6,8 @@ export enum EdgeErrorCode
     MissingEdge,
     InvalidProperty,
     NotARelationship,
+    NotOrdered,
+    CorruptEdge,
 }
 
 export class EdgeError extends Error
