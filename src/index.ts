@@ -29,6 +29,12 @@ export { EdgeError, EdgeErrorCode } from './edges/EdgeError.js';
 export { PublicIdTooLongError } from './identity/PublicIdIndex.js';
 export { FormatVersionMismatchError } from './format/FormatMeta.js';
 
+// Predicate language and node-local evaluation.
+export { And, Compare, CompareOp, FalsePredicate, IdIn, In, IsNull, Not, Or, OwnerIs, Predicate, PredicateKind, Reachable, Related, Seeded, TruePredicate, type IPathStep } from './predicate/Predicate.js';
+export { PredicateCodec } from './predicate/PredicateCodec.js';
+export { PredicateError, PredicateErrorCode } from './predicate/PredicateError.js';
+export { NodeEvaluator } from './predicate/NodeEvaluator.js';
+
 export class EngineInfo
 {
     public static readonly FormatVersion = 1;
