@@ -279,7 +279,7 @@ class EdgeFx
                 const rel = EdgeFx.WithProps;
                 const key = FormatKeys.Edge(0, rel.Id, EdgeDirection.Out, 1n, new Uint8Array(0), 2n);
                 const weightShort = Uint8Array.of(20, 0, 0, 0, 3, 0, 0, 0, 1, 2, 3);
-                const labelBadUtf8 = Uint8Array.of(21, 0, 0, 0, 2, 0, 0, 0, 0xff, 0xfe);
+                const labelBadUtf8 = Uint8Array.of(21, 0, 0, 0, 5, 0, 0, 0, 1, 0, 0, 0, 0xff);
                 for (const bytes of [weightShort, labelBadUtf8])
                 {
                     await store.Write(async txn => txn.Put(Keyspace.Edges, key, bytes));
