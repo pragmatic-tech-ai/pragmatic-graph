@@ -34,10 +34,10 @@ Keys are `(name, ...qualifiers)`. Names defined so far:
 
 - `("format")`: the format version, stored as a tuple-encoded single integer `(1)`. `FormatMeta.Verify` throws `FormatVersionMismatchError` if absent or not `1`.
 - `("catalogVersion")`: the catalog version, a tuple-encoded single integer `(n)`; absent means `0` (empty catalog).
+- `("nextBlock")`: the next unallocated id block number, a tuple-encoded single integer `(n)`; absent means `0`. The allocator reserves a block by committing `(n + 1)` in its own write before handing out any id from block `n`, so a block is durable before use and a rolled-back caller can waste ids but never duplicate them.
 
 Names added by later tasks, each with its value layout completed by that task:
 
-- `("nextBlock")`: next unallocated id block number; Task 8 (IdAllocator).
 - `("slots", typeId)`: Task 10.
 - `("commit")`: Task 12.
 
@@ -57,7 +57,9 @@ Member ids are catalog-global: one id space across all concepts and aspects, ass
 
 ### Ids
 
-Both directions live in the `ids` keyspace, distinguished by tag: `1` = `PublicToInternal`, `2` = `InternalToPublic`. Internal ids are allocated in blocks of 4096 and never encode partition or location.
+Both directions live in the `ids` keyspace, distinguished by tag: `1` = `PublicToInternal`, `2` = `InternalToPublic`. Internal ids are allocated in blocks of 4096 and never encode partition or location. Id `0` is never allocated: it is reserved to mean "no id" (the first block starts at id `1`). Block number is `id / 4096`.
+
+Values: `PublicToInternal` holds the internal id as a tuple-encoded single integer `(id)`; `InternalToPublic` holds the public id as raw UTF-8 bytes. A public id is non-empty and at most 400 UTF-8 bytes. The two directions are always written and deleted together; a public id is bound to at most one internal id and vice versa.
 
 ### Rows (row index)
 
