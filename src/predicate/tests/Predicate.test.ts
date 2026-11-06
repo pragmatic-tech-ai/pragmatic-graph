@@ -237,3 +237,86 @@ describe('PredicateCodec', () =>
         }
     });
 });
+
+class Bad
+{
+    public static Malformed(json: unknown): void
+    {
+        assert.throws(
+            () => PredicateCodec.FromJson(json),
+            (e: unknown) => e instanceof PredicateError && e.Code === PredicateErrorCode.Malformed && e.GraphCode === GraphErrorCode.SchemaViolation,
+            typeof json);
+    }
+
+    public static Cmp(value: unknown): unknown
+    {
+        return { Kind: 3, Member: 'a', Op: 1, Value: value };
+    }
+}
+
+describe('PredicateCodec strictness and limits', () =>
+{
+    it('Float64 text must be a strict number literal', () =>
+    {
+        for (const t of ['', ' ', '0x10', '1 ', 'abc', '1e', '--1', '1_0', 'nan', 'infinity'])
+        {
+            Bad.Malformed(Bad.Cmp({ Float64: t }));
+        }
+        for (const t of ['1', '-1.5', '.5', '2.', '1e10', '-1.5E-3', 'NaN', 'Infinity', '-Infinity'])
+        {
+            const p = PredicateCodec.FromJson(Bad.Cmp({ Float64: t })) as Compare;
+            assert.ok(typeof p.Value === 'number');
+        }
+    });
+
+    it('Int64 and Micros must fit in signed 64 bits', () =>
+    {
+        const max = (1n << 63n) - 1n;
+        const min = -(1n << 63n);
+        assert.equal((PredicateCodec.FromJson(Bad.Cmp({ Int64: max.toString() })) as Compare).Value, max);
+        assert.equal((PredicateCodec.FromJson(Bad.Cmp({ Int64: min.toString() })) as Compare).Value, min);
+        Bad.Malformed(Bad.Cmp({ Int64: (max + 1n).toString() }));
+        Bad.Malformed(Bad.Cmp({ Int64: (min - 1n).toString() }));
+        Bad.Malformed(Bad.Cmp({ DateTime: { Micros: (max + 1n).toString(), Zone: 'UTC' } }));
+        Bad.Malformed(Bad.Cmp({ Duration: { Months: 0, Days: 0, Micros: (min - 1n).toString() } }));
+    });
+
+    it('Reachable validates MaxHops in the constructor', () =>
+    {
+        for (const hops of [0, -1, 1.5, NaN])
+        {
+            assert.throws(() => new Reachable(new Set(), [], hops), (e: unknown) => e instanceof PredicateError && e.Code === PredicateErrorCode.Malformed);
+        }
+        assert.equal(new Reachable(new Set(), [], 1).MaxHops, 1);
+    });
+
+    it('FromJson bounds nesting depth', () =>
+    {
+        let ok: unknown = { Kind: 1 };
+        for (let i = 0; i < 200; i++)
+        {
+            ok = { Kind: 8, Term: ok };
+        }
+        assert.doesNotThrow(() => PredicateCodec.FromJson(ok));
+        let deep: unknown = { Kind: 1 };
+        for (let i = 0; i < 100_000; i++)
+        {
+            deep = { Kind: 8, Term: deep };
+        }
+        Bad.Malformed(deep);
+    });
+
+    it('IsNodeLocal is a precomputed value on each node', () =>
+    {
+        const p = new And([new Compare('x', CompareOp.Eq, 1n), new Not(new Related('r', EdgeDirection.Out, Predicate.True))]);
+        assert.equal(Object.getOwnPropertyDescriptor(p, 'IsNodeLocal')?.value, false);
+        assert.equal(Object.getOwnPropertyDescriptor(new Compare('x', CompareOp.Eq, 1n), 'IsNodeLocal')?.value, true);
+    });
+
+    it('lone surrogates order as U+FFFD, matching TupleCodec UTF-8 encoding', () =>
+    {
+        const lone = String.fromCharCode(0xD800);
+        assert.equal(T.Matches(new Compare('s', CompareOp.Eq, String.fromCharCode(0xFFFD)), { s: lone }), true);
+        assert.equal(T.Matches(new Compare('s', CompareOp.Lt, String.fromCharCode(0xFFFE)), { s: lone }), true);
+    });
+});

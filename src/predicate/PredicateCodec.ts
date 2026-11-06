@@ -17,7 +17,9 @@ type Json = Record<string, unknown>;
  * Cell values: null, boolean and string are plain JSON; every other type is a single-key tagged
  * object so nothing is lossy: { Int64: "decimal" }, { Float64: "text" } (String(n): "NaN",
  * "Infinity", "-0" survive), { Date: days }, { DateTime: { Micros: "decimal", Zone } },
- * { Duration: { Months, Days, Micros: "decimal" } }.
+ * { Duration: { Months, Days, Micros: "decimal" } }. Int64 and Micros text must fit signed 64 bits;
+ * Float64 text must be a decimal/exponent literal or NaN, Infinity, -Infinity. Decoding rejects
+ * nesting deeper than 256 levels. Strings are not validated (lone surrogates are legal in JS).
  */
 export class PredicateCodec
 {
@@ -45,6 +47,14 @@ export class PredicateCodec
     private static readonly ZoneField = 'Zone';
     private static readonly MonthsField = 'Months';
     private static readonly DaysField = 'Days';
+    private static readonly NegativeZeroText = '-0';
+    private static readonly NanText = 'NaN';
+    private static readonly FloatPattern = /^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$|^NaN$|^[+-]?Infinity$/;
+    private static readonly MaxDepth = 256;
+    private static readonly TooDeep = 'nesting too deep';
+    private static readonly OutOfRange = 'integer outside signed 64-bit range';
+    private static readonly Int64Min = -(1n << 63n);
+    private static readonly Int64Max = (1n << 63n) - 1n;
     private static readonly IntegerPattern = /^-?\d+$/;
     private static readonly MalformedPrefix = 'Malformed predicate: ';
     private static readonly NotAnObject = 'expected an object';
@@ -62,42 +72,42 @@ export class PredicateCodec
             case PredicateKind.True:
             case PredicateKind.False:
             case PredicateKind.Seeded:
-                return { Kind: kind };
+                return { [PredicateCodec.KindField]: kind };
             case PredicateKind.Compare:
             {
                 const c = p as Compare;
-                return { Kind: kind, Member: c.Member, Op: c.Op, Value: PredicateCodec.ValueToJson(c.Value) };
+                return { [PredicateCodec.KindField]: kind, [PredicateCodec.MemberField]: c.Member, [PredicateCodec.OpField]: c.Op, [PredicateCodec.ValueField]: PredicateCodec.ValueToJson(c.Value) };
             }
             case PredicateKind.In:
             {
                 const i = p as In;
-                return { Kind: kind, Member: i.Member, Values: i.Values.map(v => PredicateCodec.ValueToJson(v)) };
+                return { [PredicateCodec.KindField]: kind, [PredicateCodec.MemberField]: i.Member, [PredicateCodec.ValuesField]: i.Values.map(v => PredicateCodec.ValueToJson(v)) };
             }
             case PredicateKind.IsNull:
-                return { Kind: kind, Member: (p as IsNull).Member };
+                return { [PredicateCodec.KindField]: kind, [PredicateCodec.MemberField]: (p as IsNull).Member };
             case PredicateKind.And:
-                return { Kind: kind, Terms: (p as And).Terms.map(t => PredicateCodec.ToJson(t)) };
+                return { [PredicateCodec.KindField]: kind, [PredicateCodec.TermsField]: (p as And).Terms.map(t => PredicateCodec.ToJson(t)) };
             case PredicateKind.Or:
-                return { Kind: kind, Terms: (p as Or).Terms.map(t => PredicateCodec.ToJson(t)) };
+                return { [PredicateCodec.KindField]: kind, [PredicateCodec.TermsField]: (p as Or).Terms.map(t => PredicateCodec.ToJson(t)) };
             case PredicateKind.Not:
-                return { Kind: kind, Term: PredicateCodec.ToJson((p as Not).Term) };
+                return { [PredicateCodec.KindField]: kind, [PredicateCodec.TermField]: PredicateCodec.ToJson((p as Not).Term) };
             case PredicateKind.IdIn:
-                return { Kind: kind, Ids: PredicateCodec.Sorted((p as IdIn).Ids) };
+                return { [PredicateCodec.KindField]: kind, [PredicateCodec.IdsField]: PredicateCodec.Sorted((p as IdIn).Ids) };
             case PredicateKind.OwnerIs:
-                return { Kind: kind, Owners: PredicateCodec.Sorted((p as OwnerIs).Owners) };
+                return { [PredicateCodec.KindField]: kind, [PredicateCodec.OwnersField]: PredicateCodec.Sorted((p as OwnerIs).Owners) };
             case PredicateKind.Related:
             {
                 const r = p as Related;
-                return { Kind: kind, Relationship: r.Relationship, Direction: r.Direction, Target: PredicateCodec.ToJson(r.Target) };
+                return { [PredicateCodec.KindField]: kind, [PredicateCodec.RelationshipField]: r.Relationship, [PredicateCodec.DirectionField]: r.Direction, [PredicateCodec.TargetField]: PredicateCodec.ToJson(r.Target) };
             }
             case PredicateKind.Reachable:
             {
                 const r = p as Reachable;
                 return {
-                    Kind: kind,
-                    From: PredicateCodec.Sorted(r.From),
-                    Steps: r.Steps.map(s => ({ Relationship: s.Relationship, Direction: s.Direction })),
-                    MaxHops: r.MaxHops,
+                    [PredicateCodec.KindField]: kind,
+                    [PredicateCodec.FromField]: PredicateCodec.Sorted(r.From),
+                    [PredicateCodec.StepsField]: r.Steps.map(s => ({ [PredicateCodec.RelationshipField]: s.Relationship, [PredicateCodec.DirectionField]: s.Direction })),
+                    [PredicateCodec.MaxHopsField]: r.MaxHops,
                 };
             }
             default:
@@ -107,6 +117,16 @@ export class PredicateCodec
 
     public static FromJson(json: unknown): Predicate
     {
+        return PredicateCodec.Decode(json, 0);
+    }
+
+    private static Decode(json: unknown, depth: number): Predicate
+    {
+        if (depth > PredicateCodec.MaxDepth)
+        {
+            throw PredicateCodec.Fail(PredicateCodec.TooDeep);
+        }
+        const d = depth + 1;
         const o = PredicateCodec.AsObject(json);
         const kind = o[PredicateCodec.KindField];
         switch (kind)
@@ -129,11 +149,11 @@ export class PredicateCodec
             case PredicateKind.IsNull:
                 return new IsNull(PredicateCodec.Str(o, PredicateCodec.MemberField));
             case PredicateKind.And:
-                return new And(PredicateCodec.Arr(o, PredicateCodec.TermsField).map(t => PredicateCodec.FromJson(t)));
+                return new And(PredicateCodec.Arr(o, PredicateCodec.TermsField).map(t => PredicateCodec.Decode(t, d)));
             case PredicateKind.Or:
-                return new Or(PredicateCodec.Arr(o, PredicateCodec.TermsField).map(t => PredicateCodec.FromJson(t)));
+                return new Or(PredicateCodec.Arr(o, PredicateCodec.TermsField).map(t => PredicateCodec.Decode(t, d)));
             case PredicateKind.Not:
-                return new Not(PredicateCodec.FromJson(o[PredicateCodec.TermField]));
+                return new Not(PredicateCodec.Decode(o[PredicateCodec.TermField], d));
             case PredicateKind.IdIn:
                 return new IdIn(PredicateCodec.StrSet(o, PredicateCodec.IdsField));
             case PredicateKind.OwnerIs:
@@ -142,7 +162,7 @@ export class PredicateCodec
                 return new Related(
                     PredicateCodec.Str(o, PredicateCodec.RelationshipField),
                     PredicateCodec.Direction(o[PredicateCodec.DirectionField]),
-                    PredicateCodec.FromJson(o[PredicateCodec.TargetField]));
+                    PredicateCodec.Decode(o[PredicateCodec.TargetField], d));
             case PredicateKind.Reachable:
                 return new Reachable(
                     PredicateCodec.StrSet(o, PredicateCodec.FromField),
@@ -161,21 +181,21 @@ export class PredicateCodec
         }
         if (typeof v === 'bigint')
         {
-            return { Int64: v.toString() };
+            return { [PredicateCodec.Int64Tag]: v.toString() };
         }
         if (typeof v === 'number')
         {
-            return { Float64: Object.is(v, -0) ? '-0' : String(v) };
+            return { [PredicateCodec.Float64Tag]: Object.is(v, -0) ? PredicateCodec.NegativeZeroText : String(v) };
         }
         if (v instanceof DateValue)
         {
-            return { Date: v.Days };
+            return { [PredicateCodec.DateTag]: v.Days };
         }
         if (v instanceof DateTimeValue)
         {
-            return { DateTime: { Micros: v.Micros.toString(), Zone: v.Zone } };
+            return { [PredicateCodec.DateTimeTag]: { [PredicateCodec.MicrosField]: v.Micros.toString(), [PredicateCodec.ZoneField]: v.Zone } };
         }
-        return { Duration: { Months: v.Months, Days: v.Days, Micros: v.Micros.toString() } };
+        return { [PredicateCodec.DurationTag]: { [PredicateCodec.MonthsField]: v.Months, [PredicateCodec.DaysField]: v.Days, [PredicateCodec.MicrosField]: v.Micros.toString() } };
     }
 
     private static ValueFromJson(json: unknown): CellValue
@@ -224,7 +244,12 @@ export class PredicateCodec
         {
             throw PredicateCodec.Fail(PredicateCodec.BadInteger);
         }
-        return BigInt(v);
+        const n = BigInt(v);
+        if (n < PredicateCodec.Int64Min || n > PredicateCodec.Int64Max)
+        {
+            throw PredicateCodec.Fail(PredicateCodec.OutOfRange);
+        }
+        return n;
     }
 
     private static FloatText(v: unknown): number
@@ -233,12 +258,11 @@ export class PredicateCodec
         {
             throw PredicateCodec.Fail(PredicateCodec.BadNumber);
         }
-        const n = Number(v);
-        if (Number.isNaN(n) && v !== 'NaN')
+        if (!PredicateCodec.FloatPattern.test(v))
         {
             throw PredicateCodec.Fail(PredicateCodec.BadNumber);
         }
-        return n;
+        return Number(v);
     }
 
     private static Int(v: unknown, field: string): number

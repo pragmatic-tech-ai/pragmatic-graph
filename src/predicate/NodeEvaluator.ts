@@ -16,7 +16,8 @@ enum Tri
  * logic) and collapsed to false only at the top of Matches. A comparison across value types, or
  * involving NaN, is plainly false. Int64 vs Float64 compare numerically; strings by UTF-8 byte
  * order; DateTimes by Micros (zone ignored); Date and DateTime are distinct types; Durations
- * support only Eq/Ne.
+ * support only Eq/Ne. Strings are encoded as TupleCodec does (UTF-8 via TextEncoder), so a lone
+ * surrogate becomes U+FFFD and compares equal to a literal U+FFFD.
  */
 export class NodeEvaluator
 {
