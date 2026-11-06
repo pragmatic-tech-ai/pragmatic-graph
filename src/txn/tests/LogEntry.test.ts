@@ -49,12 +49,47 @@ describe('LogEntry (F4)', () =>
         batch.CreateNode('a', 'T');
         const good = LogEntry.EncodeBatch(1, [9n], batch.Serialize());
         const unknown = good.slice();
-        unknown[0] = 3;
+        unknown[0] = 4;
         assert.throws(() => LogEntry.Decode(1n, unknown), LogEntryFx.Corrupt);
         assert.throws(() => LogEntry.Decode(1n, good.subarray(0, 7)), LogEntryFx.Corrupt);
         assert.throws(() => LogEntry.Decode(1n, LogEntry.EncodeBatch(1, [], batch.Serialize())), LogEntryFx.Corrupt);
         assert.throws(() => LogEntry.Decode(1n, LogEntry.EncodeBatch(1, [0n], batch.Serialize())), LogEntryFx.Corrupt);
         assert.throws(() => LogEntry.Decode(1n, LogEntry.EncodeBatch(1, [], Uint8Array.of(9))), LogEntryFx.Corrupt);
         assert.throws(() => LogEntry.Decode(1n, Uint8Array.of(2, 1, 0, 0, 0, 0x7b)), LogEntryFx.Corrupt);
+    });
+
+    it('round-trips an upgrade with its schema version and catalog', () =>
+    {
+        const m = new CatalogModel();
+        m.DefineConcept('T', null, [], [{ Name: 'x', Kind: MemberKind.Property, Type: ValueType.Int64 }]);
+        const catalog = m.Seal();
+        const bytes = LogEntry.EncodeUpgrade(catalog, 'hé');
+        assert.deepEqual([...bytes.subarray(0, 12)], [3, 1, 0, 0, 0, 3, 0, 0, 0, 0x68, 0xc3, 0xa9]);
+        const decoded = LogEntry.Decode(5n, bytes);
+        assert.equal(decoded.Kind, CommitKind.Upgrade);
+        assert.equal(decoded.Commit, 5n);
+        assert.equal(decoded.CatalogVersion, 1);
+        assert.equal(decoded.SchemaVersion, 'hé');
+        assert.deepEqual(decoded.CreatedIds, []);
+        assert.equal(decoded.Batch.Count, 0);
+        assert.deepEqual(decoded.Catalog?.Definitions(), catalog.Definitions());
+        assert.equal(LogEntry.Decode(6n, LogEntry.EncodeUpgrade(catalog, '')).SchemaVersion, '');
+        assert.equal(LogEntry.Decode(6n, LogEntry.EncodeSchema(catalog)).SchemaVersion, undefined);
+    });
+
+    it('rejects corrupt upgrade entries: truncated length or version, invalid UTF-8, bad catalog', () =>
+    {
+        const m = new CatalogModel();
+        m.DefineConcept('T', null, [], []);
+        const good = LogEntry.EncodeUpgrade(m.Seal(), 'v1');
+        assert.throws(() => LogEntry.Decode(1n, good.subarray(0, 8)), LogEntryFx.Corrupt);
+        assert.throws(() => LogEntry.Decode(1n, good.subarray(0, 10)), LogEntryFx.Corrupt);
+        const long = good.slice();
+        long[5] = 0xff;
+        assert.throws(() => LogEntry.Decode(1n, long), LogEntryFx.Corrupt);
+        const badUtf8 = good.slice();
+        badUtf8[9] = 0xff;
+        assert.throws(() => LogEntry.Decode(1n, badUtf8), LogEntryFx.Corrupt);
+        assert.throws(() => LogEntry.Decode(1n, Uint8Array.of(3, 1, 0, 0, 0, 0, 0, 0, 0, 0x7b)), LogEntryFx.Corrupt);
     });
 });

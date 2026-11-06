@@ -9,6 +9,10 @@ import { PublicIdIndex } from '../identity/PublicIdIndex.js';
 import { RowIndex } from '../identity/RowIndex.js';
 import type { IKeyValueStore, IWriteTransaction } from '../kv/KeyValue.js';
 import { GraphError, GraphErrorCode } from '../errors/GraphError.js';
+import { FormatMeta } from '../format/FormatMeta.js';
+import { CatalogPlanner } from '../schema/CatalogPlanner.js';
+import { DataPurger } from '../schema/DataPurger.js';
+import type { ISchemaDescription } from '../schema/SchemaDescription.js';
 import { BatchApplier } from './BatchApplier.js';
 import { CatalogIndex } from './CatalogIndex.js';
 import { CommitError } from './CommitError.js';
@@ -16,7 +20,7 @@ import { CommitLog } from './CommitLog.js';
 import { ConflictError } from './ConflictError.js';
 import { ConflictHistory, type ISnapshotHandle } from './ConflictHistory.js';
 import { CommitKind, type ICommitApplied, LogEntry } from './LogEntry.js';
-import { ReadSet } from './ReadSet.js';
+import type { ReadSet } from './ReadSet.js';
 import { Signal } from './Signal.js';
 import { WriteBatch } from './WriteBatch.js';
 import { WriteKeySet } from './WriteKeySet.js';
@@ -28,6 +32,17 @@ export interface ISchemaCommit
 {
     readonly Commit: bigint;
     readonly Catalog: CatalogSnapshot;
+}
+
+/** The outcome of an upgrade (SubmitUpgrade). */
+export interface IUpgradeCommit
+{
+    /** The Upgrade entry's commit number; LastCommit() at the upgrade's turn when nothing changed. */
+    readonly Commit: bigint;
+    /** The catalog in force after the upgrade (the unchanged one when Changed is false). */
+    readonly Catalog: CatalogSnapshot;
+    /** True iff a new catalog was saved and logged (ICatalogPlan.Changed). */
+    readonly Changed: boolean;
 }
 
 export interface ICommitterOptions
@@ -49,8 +64,7 @@ class PendingCommit
 
     /**
      * `CatalogVersion`: the version the submitter's transaction began with; checked inside the group
-     * against the group's catalog (ruling F4). Undefined: no check. `Define`: set for a schema change
-     * (then Bytes/Batch are empty and the commit runs alone in its own group).
+     * against the group's catalog (ruling F4). Undefined: no check.
      */
     public constructor(
         public readonly Bytes: Uint8Array,
@@ -60,14 +74,8 @@ class PendingCommit
         private readonly resolve: (commit: bigint) => void,
         private readonly reject: (error: unknown) => void,
         public readonly CatalogVersion?: number,
-        public readonly Define?: (model: CatalogModel) => void,
     )
     {
-    }
-
-    public get IsSchema(): boolean
-    {
-        return this.Define !== undefined;
     }
 
     public Resolve(commit: bigint): void
@@ -76,6 +84,59 @@ class PendingCommit
         {
             this.settled = true;
             this.resolve(commit);
+        }
+    }
+
+    public Reject(error: unknown): void
+    {
+        if (!this.settled)
+        {
+            this.settled = true;
+            this.reject(error);
+        }
+    }
+}
+
+/** Queued work that runs alone in its own group (a schema change or an upgrade). */
+interface IExclusiveCommit
+{
+    /** Runs the work and settles with its result or error. */
+    Run(): Promise<void>;
+    Reject(error: unknown): void;
+}
+
+/**
+ * Work that runs alone in its own group when its turn comes, i.e. after every commit submitted before it
+ * has been applied. Settles once with the work's result or error.
+ */
+class ExclusiveCommit<T> implements IExclusiveCommit
+{
+    private settled = false;
+
+    public constructor(
+        private readonly work: () => Promise<T>,
+        private readonly resolve: (value: T) => void,
+        private readonly reject: (error: unknown) => void,
+    )
+    {
+    }
+
+    public async Run(): Promise<void>
+    {
+        let result: T;
+        try
+        {
+            result = await this.work();
+        }
+        catch (error)
+        {
+            this.Reject(error);
+            return;
+        }
+        if (!this.settled)
+        {
+            this.settled = true;
+            this.resolve(result);
         }
     }
 
@@ -146,7 +207,10 @@ export class Committer
     private static readonly ErrCompactMember = 'Delta for a member the catalog does not know: ';
     private static readonly ErrSchema = 'The schema changed after the transaction began: catalog version ';
     private static readonly ErrSchemaNow = ', now ';
+    private static readonly ErrSchemaVersion = 'Schema version must be well-formed UTF-16 (no lone surrogates)';
     private static readonly EmptyBatch = new WriteBatch().Seal();
+    private static readonly Encoder = new TextEncoder();
+    private static readonly Decoder = new TextDecoder();
 
     public readonly CommitApplied = new Signal<ICommitApplied>();
 
@@ -157,7 +221,8 @@ export class Committer
     private readonly ids = new PublicIdIndex();
     private readonly log = new CommitLog();
     private readonly history: ConflictHistory;
-    private readonly queue: PendingCommit[] = [];
+    private readonly purger = new DataPurger(this.columns, this.edges, this.rows, this.ids);
+    private readonly queue: Array<PendingCommit | IExclusiveCommit> = [];
     private index: CatalogIndex;
     private allocator: Promise<IdAllocator> | undefined;
     /** The running Pump (undefined when idle); dispose() awaits it. */
@@ -264,13 +329,30 @@ export class Committer
         {
             return Promise.reject(new GraphError(GraphErrorCode.Disposed, Committer.ErrDisposed));
         }
-        return new Promise<ISchemaCommit>((resolve, reject) =>
+        return this.Enqueue(() => this.RunSchema(define));
+    }
+
+    /**
+     * Upgrades the schema to a description (spec 4.3): when its turn comes (alone in its group, like
+     * SubmitSchema) the description is planned against the committer's current catalog. When the plan
+     * changes the catalog, ONE store.Write purges the data that no longer fits (DataPurger), saves the
+     * catalog, writes Meta("schemaVersion"), appends an Upgrade log entry and raises CommitApplied; the
+     * purge's write keys conflict open transactions, which also fail on the catalog version. When the
+     * catalog is unchanged only a differing Meta("schemaVersion") is rewritten: no commit, no entry, no
+     * signal (ruling R48). A planning error (CatalogError) rejects only this upgrade and changes nothing;
+     * a version that is not well-formed UTF-16 is GraphError InvalidArgument.
+     */
+    public SubmitUpgrade(description: ISchemaDescription): Promise<IUpgradeCommit>
+    {
+        if (this.disposed)
         {
-            const pending = new PendingCommit(new Uint8Array(0), Committer.EmptyBatch, new ReadSet(), this.history.Last,
-                commit => resolve({ Commit: commit, Catalog: this.index.Catalog }), reject, undefined, define);
-            this.queue.push(pending);
-            this.pump ??= this.Pump();
-        });
+            return Promise.reject(new GraphError(GraphErrorCode.Disposed, Committer.ErrDisposed));
+        }
+        if (Committer.Decoder.decode(Committer.Encoder.encode(description.Version)) !== description.Version)
+        {
+            return Promise.reject(new GraphError(GraphErrorCode.InvalidArgument, Committer.ErrSchemaVersion));
+        }
+        return this.Enqueue(() => this.RunUpgrade(description));
     }
 
     /**
@@ -316,13 +398,14 @@ export class Committer
                 const group = this.queue.splice(0, Committer.GroupLength(this.queue));
                 try
                 {
-                    if ((group[0] as PendingCommit).IsSchema)
+                    const head = group[0];
+                    if (head instanceof PendingCommit)
                     {
-                        await this.RunSchema(group[0] as PendingCommit);
+                        await this.RunGroup(group as PendingCommit[]);
                     }
                     else
                     {
-                        await this.RunGroup(group);
+                        await (head as IExclusiveCommit).Run();
                     }
                 }
                 catch (error)
@@ -337,53 +420,116 @@ export class Committer
         }
     }
 
-    /** A schema change forms a group alone; otherwise the leading run of batches up to the next schema change. */
-    private static GroupLength(queue: readonly PendingCommit[]): number
+    /** Queues work that runs alone in its own group. */
+    private Enqueue<T>(work: () => Promise<T>): Promise<T>
     {
-        if ((queue[0] as PendingCommit).IsSchema)
+        return new Promise<T>((resolve, reject) =>
+        {
+            this.queue.push(new ExclusiveCommit(work, resolve, reject));
+            this.pump ??= this.Pump();
+        });
+    }
+
+    /** Exclusive work forms a group alone; otherwise the leading run of batches up to the next exclusive work. */
+    private static GroupLength(queue: ReadonlyArray<PendingCommit | IExclusiveCommit>): number
+    {
+        if (!(queue[0] instanceof PendingCommit))
         {
             return 1;
         }
-        const schema = queue.findIndex(p => p.IsSchema);
-        return schema < 0 ? queue.length : schema;
+        const exclusive = queue.findIndex(p => !(p instanceof PendingCommit));
+        return exclusive < 0 ? queue.length : exclusive;
     }
 
     /** Seals the change against the current catalog, then saves and logs it in one Write. */
-    private async RunSchema(p: PendingCommit): Promise<void>
+    private async RunSchema(define: (model: CatalogModel) => void): Promise<ISchemaCommit>
     {
-        let sealed: CatalogSnapshot;
-        try
-        {
-            const model = CatalogModel.FromSnapshot(this.index.Catalog);
-            (p.Define as (model: CatalogModel) => void)(model);
-            sealed = model.Seal();
-        }
-        catch (error)
-        {
-            p.Reject(error);
-            return;
-        }
+        const model = CatalogModel.FromSnapshot(this.index.Catalog);
+        define(model);
+        const sealed = model.Seal();
         const commit = this.history.Last + 1n;
-        try
+        await this.store.Write(async txn =>
         {
-            await this.store.Write(async txn =>
-            {
-                await this.RequireCurrent(txn);
-                await CatalogStore.Save(txn, sealed);
-                this.log.Append(txn, commit, LogEntry.EncodeSchema(sealed));
-                this.log.WriteLastCommit(txn, commit);
-            });
-        }
-        catch (error)
-        {
-            p.Reject(error);
-            return;
-        }
+            await this.RequireCurrent(txn);
+            await CatalogStore.Save(txn, sealed);
+            this.log.Append(txn, commit, LogEntry.EncodeSchema(sealed));
+            this.log.WriteLastCommit(txn, commit);
+        });
         this.history.Record(commit, new WriteKeySet());
         this.history.Prune();
         this.index = new CatalogIndex(sealed);
         this.RaiseApplied({ Commit: commit, Kind: CommitKind.SchemaChange, CatalogVersion: sealed.Version, Batch: Committer.EmptyBatch, CreatedIds: Object.freeze([]), Catalog: sealed });
-        p.Resolve(commit);
+        return { Commit: commit, Catalog: sealed };
+    }
+
+    /** Plans against the current catalog; purges, saves and logs in one Write when the catalog changes. */
+    private async RunUpgrade(description: ISchemaDescription): Promise<IUpgradeCommit>
+    {
+        const old = this.index;
+        const plan = CatalogPlanner.Plan(old.Catalog, description);
+        if (!plan.Changed)
+        {
+            // The committer is the only writer and this work runs alone: a read decides, so an unchanged
+            // upgrade (every load of an unchanged schema) costs no write transaction.
+            if ((await this.StoredSchemaVersion()) !== description.Version)
+            {
+                await this.store.Write(async txn =>
+                {
+                    await this.RequireCurrent(txn);
+                    FormatMeta.WriteSchemaVersion(txn, description.Version);
+                });
+            }
+            return { Commit: this.history.Last, Catalog: old.Catalog, Changed: false };
+        }
+        const next = new CatalogIndex(plan.Catalog);
+        const commit = this.history.Last + 1n;
+        const keys = new WriteKeySet();
+        await this.store.Write(async txn =>
+        {
+            await this.RequireCurrent(txn);
+            await this.purger.Purge(txn, old, next, plan.Diff, keys);
+            await this.Compact(txn, next);
+            this.Flush(txn);
+            await CatalogStore.Save(txn, plan.Catalog);
+            FormatMeta.WriteSchemaVersion(txn, description.Version);
+            this.log.Append(txn, commit, LogEntry.EncodeUpgrade(plan.Catalog, description.Version));
+            this.log.WriteLastCommit(txn, commit);
+        });
+        this.history.Record(commit, keys);
+        this.history.Prune();
+        this.index = next;
+        this.RaiseApplied({
+            Commit: commit,
+            Kind: CommitKind.Upgrade,
+            CatalogVersion: plan.Catalog.Version,
+            Batch: Committer.EmptyBatch,
+            CreatedIds: Object.freeze([]),
+            Catalog: plan.Catalog,
+            SchemaVersion: description.Version,
+        });
+        return { Commit: commit, Catalog: plan.Catalog, Changed: true };
+    }
+
+    private async StoredSchemaVersion(): Promise<string | undefined>
+    {
+        const txn = await this.store.BeginRead();
+        try
+        {
+            return await FormatMeta.ReadSchemaVersion(txn);
+        }
+        finally
+        {
+            txn.dispose();
+        }
+    }
+
+    /** Persists the column store's dirty deltas and the row index's dirty blocks, each once (rulings R20, F6). */
+    private Flush(txn: IWriteTransaction): void
+    {
+        this.columns.Flush(txn);
+        this.columns.AssertFlushed(txn);
+        this.rows.Flush(txn);
+        this.rows.AssertFlushed(txn);
     }
 
     private async RequireCurrent(txn: IWriteTransaction): Promise<void>
@@ -534,10 +680,7 @@ export class Committer
             accepted.push({ Pending: p, Keys: keys });
         }
         await this.Compact(txn, index);
-        this.columns.Flush(txn);
-        this.columns.AssertFlushed(txn);
-        this.rows.Flush(txn);
-        this.rows.AssertFlushed(txn);
+        this.Flush(txn);
         let commit = this.history.Last;
         for (const a of accepted)
         {

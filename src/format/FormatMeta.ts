@@ -18,11 +18,16 @@ export class FormatVersionMismatchError extends GraphError
     }
 }
 
-/** Writes and checks the format version stored under Meta("format") as a TupleCodec-encoded integer. */
+/**
+ * Global Meta values outside the catalog: the format version under Meta("format") (a TupleCodec-encoded
+ * integer) and the schema version under Meta("schemaVersion") (a TupleCodec-encoded string).
+ */
 export class FormatMeta
 {
     public static readonly CurrentVersion = 1n;
     private static readonly FormatKeyName = 'format';
+    private static readonly SchemaVersionKeyName = 'schemaVersion';
+    private static readonly ErrSchemaVersion = 'Corrupt Meta("schemaVersion"): not a single string';
 
     public static async Initialize(txn: IWriteTransaction): Promise<void>
     {
@@ -42,5 +47,35 @@ export class FormatMeta
         {
             throw new FormatVersionMismatchError(found, FormatMeta.CurrentVersion);
         }
+    }
+
+    /** The opaque version of the schema description last applied by an upgrade; undefined before the first. */
+    public static async ReadSchemaVersion(txn: IReadTransaction): Promise<string | undefined>
+    {
+        const raw = await txn.Get(Keyspace.Meta, FormatKeys.Meta(FormatMeta.SchemaVersionKeyName));
+        if (raw === undefined)
+        {
+            return undefined;
+        }
+        let decoded: unknown[];
+        try
+        {
+            decoded = TupleCodec.Decode(raw);
+        }
+        catch (error)
+        {
+            throw new GraphError(GraphErrorCode.Corrupt, FormatMeta.ErrSchemaVersion, error);
+        }
+        if (decoded.length !== 1 || typeof decoded[0] !== 'string')
+        {
+            throw new GraphError(GraphErrorCode.Corrupt, FormatMeta.ErrSchemaVersion);
+        }
+        return decoded[0];
+    }
+
+    /** Written only by the committer, in the write transaction of the upgrade it belongs to. */
+    public static WriteSchemaVersion(txn: IWriteTransaction, version: string): void
+    {
+        txn.Put(Keyspace.Meta, FormatKeys.Meta(FormatMeta.SchemaVersionKeyName), TupleCodec.Encode([version]));
     }
 }

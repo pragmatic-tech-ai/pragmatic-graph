@@ -5,7 +5,7 @@ import { GraphError, GraphErrorCode } from '../errors/GraphError.js';
 import { FormatKeys } from '../format/FormatKeys.js';
 import { TupleCodec } from '../format/TupleCodec.js';
 import type { Location } from '../identity/Location.js';
-import type { IReadTransaction, IWriteTransaction } from '../kv/KeyValue.js';
+import type { IKeyRange, IReadTransaction, IWriteTransaction } from '../kv/KeyValue.js';
 import { Keyspace } from '../kv/Keyspace.js';
 import { CellValue } from './CellValue.js';
 import { ChunkCodec } from './ChunkCodec.js';
@@ -71,6 +71,7 @@ class TxnState
  * written through the caller's write transaction, so it commits or rolls back with it.
  * Only properties (and the node-id member 0) are stored here; relationships are rejected.
  * Deleting a node nulls every property cell and member 0 (BatchApplier); its slot is not reused in v1.
+ * A schema upgrade drops whole columns (DropColumn) and whole types (DropType) instead (DataPurger).
  *
  * Within a write transaction, WriteCell mutates a parsed in-memory delta (one parse per chunk per
  * transaction); reads in that transaction see it. The caller MUST call Flush(txn) before the
@@ -316,6 +317,30 @@ export class ColumnStore
         return ChunkDelta.Parse(type, bytes);
     }
 
+    /**
+     * Deletes every stored chunk and delta of the (type, member) column and forgets this transaction's
+     * pending delta of it, so the column reads as all null and Flush writes nothing for it.
+     */
+    public async DropColumn(txn: IWriteTransaction, partition: number, typeId: number, memberId: number): Promise<void>
+    {
+        ColumnStore.RequirePartition(partition);
+        await this.DropRange(txn, FormatKeys.MemberCellsRange(partition, typeId, memberId));
+        this.Evict(txn, d => d.Partition === partition && d.TypeId === typeId && d.MemberId === memberId);
+    }
+
+    /**
+     * Deletes every chunk and delta of every column of the type and its slot counter Meta("slots",
+     * partition, typeId), and forgets this transaction's pending state of the type: no trace remains.
+     */
+    public async DropType(txn: IWriteTransaction, partition: number, typeId: number): Promise<void>
+    {
+        ColumnStore.RequirePartition(partition);
+        await this.DropRange(txn, FormatKeys.TypeCellsRange(partition, typeId));
+        this.Evict(txn, d => d.Partition === partition && d.TypeId === typeId);
+        this.StateOf(txn)?.Slots.delete(typeId);
+        txn.Delete(Keyspace.Meta, this.SlotsKey(partition, typeId));
+    }
+
     /** Live slots (member-0 cell non-null after overlay) in slot order, with this member's value and the slot's node id (member 0). */
     public async *ScanColumn(txn: IReadTransaction, partition: number, typeId: number, member: MemberDef): AsyncIterable<IColumnRow>
     {
@@ -337,6 +362,35 @@ export class ColumnStore
                 {
                     yield { Slot: start + i, Value: values[i] as CellValue, NodeId: id as bigint };
                 }
+            }
+        }
+    }
+
+    /** Deletes the range in Columns and in Deltas; keys are collected first (no writes while a scan is open). */
+    private async DropRange(txn: IWriteTransaction, range: IKeyRange): Promise<void>
+    {
+        for (const space of [Keyspace.Columns, Keyspace.Deltas])
+        {
+            const keys: Uint8Array[] = [];
+            for await (const [key] of txn.Scan(space, range))
+            {
+                keys.push(key.slice());
+            }
+            for (const key of keys)
+            {
+                txn.Delete(space, key);
+            }
+        }
+    }
+
+    private Evict(txn: IWriteTransaction, matches: (delta: DeltaState) => boolean): void
+    {
+        const deltas = this.StateOf(txn)?.Deltas;
+        for (const [id, delta] of deltas ?? [])
+        {
+            if (matches(delta))
+            {
+                deltas!.delete(id);
             }
         }
     }

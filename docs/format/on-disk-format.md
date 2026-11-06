@@ -12,7 +12,7 @@ This document is the contract between the TypeScript engine and the future Rust 
 - Values outside keys (row blocks, chunk headers, delta entries) are little-endian binary as specified below.
 - Format version: `1` (not yet frozen: this wave changed layouts without a version bump). `SlotsPerChunk = 2048`. Id block size `4096`. Row block size `512` entries. Maximum public id length: 400 UTF-8 bytes.
 - Maximum encoded key size: **511 bytes** in every keyspace (the portable limit; LMDB allows 1,978, heed's default is 511). Every backend rejects a longer key on Put, Delete and Get and as a Scan bound with a `KeyTooLong` error. The formats below are designed so that no valid write exceeds it: a public id has at most 400 UTF-8 bytes and contains no U+0000 (so its tuple string needs at most 400 + 2 bytes), and edge positions are kept short (see Edges, Positions).
-- Partition is always `0` in v1 but present in every location-bearing key (seam 3). Internal ids never encode location (seam 2). Intentionally partition-free (global) keys: `meta` names `format`, `catalogVersion`, `nextBlock` and `commit`; the whole `catalog` keyspace (the schema is global; placement is per concept inside it); the `ids` keyspace (identity is location-free); the `rows` keyspace (the row index maps every id to a location that itself carries the partition); and the `log` keyspace (one commit order per store). Every key that addresses node data (`columns`, `deltas`, `edges`, `meta` `slots`) carries the partition.
+- Partition is always `0` in v1 but present in every location-bearing key (seam 3). Internal ids never encode location (seam 2). Intentionally partition-free (global) keys: `meta` names `format`, `catalogVersion`, `schemaVersion`, `nextBlock` and `commit`; the whole `catalog` keyspace (the schema is global; placement is per concept inside it); the `ids` keyspace (identity is location-free); the `rows` keyspace (the row index maps every id to a location that itself carries the partition); and the `log` keyspace (one commit order per store). Every key that addresses node data (`columns`, `deltas`, `edges`, `meta` `slots`) carries the partition.
 - Each key family lives in exactly one keyspace. Keyspaces that hold several families prefix the tuple with a small integer tag.
 - Each keyspace is its own ordered map: in LMDB one named database per keyspace (named by the keyspace's string, e.g. `meta`, `edges`) with the default key comparison, which is `memcmp` (unsigned bytewise, a shorter key that is a prefix of a longer one sorts first). The tuple encoding is designed for exactly that order; a Rust core must use the same named databases and the default comparator (no custom comparators, no dup-sort).
 - The LMDB environment directory also holds `graph.lock`: the decimal process id of the store that has it open for writing (one writer per directory). It is created exclusively and the pid fsynced before use; a lock whose process no longer exists is stale and may be taken over, and an empty or non-numeric lock file counts as held for 10 s after its last modification, then as stale. It is not part of the data and is removed on a clean close. Commits are synchronous (`overlappingSync` off): a commit is on disk when it is reported.
@@ -43,6 +43,7 @@ Keys are `(name, ...qualifiers)`. Names defined so far:
 Names added by later tasks, each with its value layout completed by that task:
 
 - `("slots", partition, typeId)`: the number of slots ever allocated for the type in that partition (only partition 0 in v1), a tuple-encoded single integer `(n)`; absent means `0`. Slots are allocated densely from 0 (`AllocateSlot` returns `n` and stores `n + 1`) inside the caller's write transaction; slot `0xFFFFFFFF` is reserved. Deleted slots are not reused in v1.
+- `("schemaVersion")`: the opaque `Version` string of the schema description the last upgrade applied (`GraphStore.Upgrade`), a tuple-encoded single UTF-8 string `(version)` (well-formed; the engine only stores and compares it); absent until the first upgrade. Written only by the committer: in the Upgrade commit's write transaction when the catalog changes, or alone (no commit, no log entry) when an upgrade leaves the catalog unchanged but carries another version. A value that is not a single string is corrupt.
 - `("commit")`: the last commit number, a tuple-encoded single integer `(n)`; absent means `0` (no commits). Written only by the committer, in the same write transaction as the log entries it covers, so it always equals the highest `log` key.
 
 ### Catalog
@@ -149,7 +150,7 @@ One non-null value, self-delimiting (used by delta entries and edge properties; 
 | String | `byteLength u32`, UTF-8 bytes |
 | DateTime | `micros i64`, `zoneLength u16`, zone UTF-8 bytes |
 
-Member id `0` of every type is the node-id column. A slot is live iff its member-0 cell is non-null; deleted slots have a null node id. Deleting a node nulls every property cell of its slot, not only member 0 (ruling F9), so no value of a deleted node remains readable at its old location. Slot reuse is a documented follow-up: in v1 a deleted slot stays allocated (null) forever and `Meta("slots", ...)` only grows; reusing slots later needs a free-slot list per type and partition and is additive (a new `meta` name), not a change of these layouts.
+Member id `0` of every type is the node-id column. A slot is live iff its member-0 cell is non-null; deleted slots have a null node id. Deleting a node nulls every property cell of its slot, not only member 0 (ruling F9), so no value of a deleted node remains readable at its old location. A schema upgrade (see Log, Upgrade) removes data differently: a removed concept's whole key range `(partition, typeId)` is deleted in `columns` and `deltas` together with its `Meta("slots", partition, typeId)`, a member a surviving concept no longer has has its range `(partition, typeId, memberId)` deleted in both keyspaces, and a node of a surviving concept that the upgrade removes is nulled like a deleted node. Slot reuse is a documented follow-up: in v1 a deleted slot stays allocated (null) forever and `Meta("slots", ...)` only grows; reusing slots later needs a free-slot list per type and partition and is additive (a new `meta` name), not a change of these layouts.
 
 ### Deltas
 
@@ -194,7 +195,7 @@ Key `(commit: u64)`; commits are monotonic and gap-free from `1`, and `Meta("com
 The value is a log entry. All integers little-endian:
 
 ```
-kind : u8   1 = Batch, 2 = SchemaChange
+kind : u8   1 = Batch, 2 = SchemaChange, 3 = Upgrade
 Batch:
   catalogVersion : u32      the catalog version the batch was validated and applied against
   idCount        : u32      number of CreateNode ops in the batch
@@ -203,9 +204,16 @@ Batch:
 SchemaChange:
   catalogVersion : u32      the catalog version the change produced
   catalog        : the rest: the complete catalog root value after the change (UTF-8 JSON, see Catalog)
+Upgrade:
+  catalogVersion : u32      the catalog version the upgrade produced
+  versionLength  : u32      byte length of the schema version
+  version        : versionLength bytes, UTF-8: the description's Version (also stored in Meta("schemaVersion"))
+  catalog        : the rest: the complete catalog root value after the upgrade (UTF-8 JSON, see Catalog)
 ```
 
-A schema change is committed alone (never grouped with batches); it writes the catalog root, `Meta("catalogVersion")`, its log entry and `Meta("commit")` in one write transaction. A batch whose transaction began on another catalog version than the one its group applies against is rejected with a conflict before it writes anything. A reader rejects an unknown kind, a truncated entry, an `idCount` that differs from the batch's CreateNode count, an id `0`, and a batch or catalog that fails its own validation.
+An upgrade is committed alone, like a schema change, and only when it changes the catalog. Its one write transaction purges the data that no longer fits the new catalog (the discard rules of `DataPurger`, ruling R49: nodes of removed concepts, columns of members a surviving concept no longer has, edges whose relationship, source or target no longer fits, and nodes of surviving concepts lacking a value for a newly effective non-nullable property), then writes the catalog root, `Meta("catalogVersion")`, `Meta("schemaVersion")`, the Upgrade entry and `Meta("commit")`. The entry does not list the discarded data: it is a deterministic function of the previous catalog and the entry's catalog, so a replay re-derives it by running the same purge.
+
+A schema change is committed alone (never grouped with batches); it writes the catalog root, `Meta("catalogVersion")`, its log entry and `Meta("commit")` in one write transaction. A batch whose transaction began on another catalog version than the one its group applies against is rejected with a conflict before it writes anything. A reader rejects an unknown kind, a truncated entry (an Upgrade whose `versionLength` runs past the end included), a version that is not valid UTF-8, an `idCount` that differs from the batch's CreateNode count, an id `0`, and a batch or catalog that fails its own validation.
 
 The serialized `WriteBatch` holds logical operations addressed by public id, in the order they were applied:
 

@@ -11,7 +11,8 @@ import { Keyspace } from './kv/Keyspace.js';
 import { type ILmdbOptions, LmdbStore } from './kv/lmdb/LmdbStore.js';
 import { MemoryStore } from './kv/memory/MemoryStore.js';
 import { CommitLog } from './txn/CommitLog.js';
-import { Committer, type ICommitApplied } from './txn/Committer.js';
+import { Committer, type ICommitApplied, type IUpgradeCommit } from './txn/Committer.js';
+import type { ISchemaDescription } from './schema/SchemaDescription.js';
 import { type ISignal, SignalView } from './txn/Signal.js';
 
 /**
@@ -72,10 +73,42 @@ export class GraphStore
     }
 
     /**
+     * Internal (the schema-description loader is its caller): upgrades the stored schema to `description`.
+     * The catalog is planned against the current one (CatalogPlanner); data that no longer fits is
+     * discarded in the same commit, which is logged as an Upgrade entry and raised on CommitApplied. An
+     * unchanged catalog with a new Version only records the version (Changed false, no commit). A planning
+     * failure (CatalogError) leaves the store unchanged. Transactions begun before a changing upgrade fail
+     * Commit with ConflictError.
+     */
+    public async Upgrade(description: ISchemaDescription): Promise<IUpgradeCommit>
+    {
+        this.RequireLive();
+        const result = await this.context.Committer.SubmitUpgrade(description);
+        this.context.SetCatalog(result.Catalog);
+        return result;
+    }
+
+    /** The Version of the description the last upgrade applied (Meta("schemaVersion")); undefined before any. */
+    public async SchemaVersion(): Promise<string | undefined>
+    {
+        this.RequireLive();
+        const txn = await this.context.Store.BeginRead();
+        try
+        {
+            return await FormatMeta.ReadSchemaVersion(txn);
+        }
+        finally
+        {
+            txn.dispose();
+        }
+    }
+
+    /**
      * The changefeed (seam 7, ruling F4): every commit after `afterCommit`, in commit order, read from the
      * log in one snapshot taken when iteration starts. Each entry is self-sufficient for replay: batches
      * carry the catalog version they were applied against and their created internal ids; schema changes
-     * carry the complete resulting catalog. Ending the iteration early releases the snapshot.
+     * carry the complete resulting catalog; upgrades also carry the schema version (their discard follows
+     * from the previous and the resulting catalog, ruling R51). Ending the iteration early releases the snapshot.
      */
     public async *ReadChanges(afterCommit: bigint): AsyncIterable<ICommitApplied>
     {

@@ -65,6 +65,18 @@ export class FormatKeys
         return TupleCodec.Encode([partition, typeId, memberId, chunk]);
     }
 
+    /** Every column chunk key (Columns) or delta key (Deltas) of one type, all members: same tuple prefix in both keyspaces. */
+    public static TypeCellsRange(partition: number, typeId: number): IKeyRange
+    {
+        return FormatKeys.PrefixRange(TupleCodec.Encode([partition, typeId]));
+    }
+
+    /** Every column chunk key (Columns) or delta key (Deltas) of one (type, member) column. */
+    public static MemberCellsRange(partition: number, typeId: number, memberId: number): IKeyRange
+    {
+        return FormatKeys.PrefixRange(TupleCodec.Encode([partition, typeId, memberId]));
+    }
+
     public static Edge(
         partition: number,
         relationshipId: number,
@@ -90,12 +102,16 @@ export class FormatKeys
 
     public static EdgeRange(partition: number, relationshipId: number, direction: EdgeDirection, node: bigint): IKeyRange
     {
-        const prefix = FormatKeys.EdgePrefix(partition, relationshipId, direction, node);
-        return { Start: prefix, End: TupleCodec.PrefixEnd(prefix) };
+        return FormatKeys.PrefixRange(FormatKeys.EdgePrefix(partition, relationshipId, direction, node));
     }
 
     public static LogEntry(commit: bigint): Uint8Array
     {
         return TupleCodec.Encode([commit]);
+    }
+
+    private static PrefixRange(prefix: Uint8Array): IKeyRange
+    {
+        return { Start: prefix, End: TupleCodec.PrefixEnd(prefix) };
     }
 }
