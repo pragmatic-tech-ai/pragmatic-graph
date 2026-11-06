@@ -36,6 +36,8 @@ class UpgradeFx
     private static readonly Dirs: string[] = [];
     private static readonly AnyKey = { Start: Uint8Array.of(0x00), End: Uint8Array.of(0xff) };
     public static readonly Abort = 'abort purge';
+    private static readonly Equals = '=';
+    private static readonly Probe = 'probe';
 
     public static Dir(): string
     {
@@ -108,7 +110,7 @@ class UpgradeFx
         return UpgradeFx.Desc(version, defs);
     }
 
-    /** V1 data: p1 (Person), d1 (Doc), n1 (Note, owner 'm'), m1 (Memo), i1/i2 (Item); p1 authored n1, d1; p1 cites d1, m1. */
+    /** V1 data: p1 (Person), d1 (Doc), n1 (Note, owner 'm'), m1 (Memo, with title), i1/i2 (Item); p1 authored n1, d1; p1 cites d1, m1. */
     public static async Seed(g: GraphStore): Promise<void>
     {
         await UpgradeFx.Commit(g, t =>
@@ -121,6 +123,7 @@ class UpgradeFx
             t.SetProperty('n1', 'text', 'hello');
             t.CreateNode('m1', 'Memo');
             t.SetProperty('m1', 'body', 'memo');
+            t.SetProperty('m1', 'title', 'Inherited');
             t.CreateNode('i1', 'Item');
             t.SetProperty('i1', 'size', 10n);
             t.CreateNode('i2', 'Item');
@@ -245,6 +248,53 @@ class UpgradeFx
         assert.ok(ids.some(k => k[0] === BigInt(IdsTag.Owner) && k[1] === id), 'owner key (create with an owner)');
         assert.equal(await UpgradeFx.Located(g, id), true);
         assert.ok((await UpgradeFx.RawKeys(g, Keyspace.Edges)).some(k => k[3] === id || k[5] === id));
+    }
+
+    /** Every key and value of every keyspace, hex-encoded, for before/after equality. */
+    public static async Snapshot(g: GraphStore): Promise<Record<string, string[]>>
+    {
+        const txn = await UpgradeFx.Context(g).Store.BeginRead();
+        try
+        {
+            const out: Record<string, string[]> = {};
+            for (const space of Object.values(Keyspace))
+            {
+                const rows: string[] = [];
+                for await (const [key, value] of txn.Scan(space, UpgradeFx.AnyKey))
+                {
+                    rows.push(ConflictKeys.Hex(key) + UpgradeFx.Equals + ConflictKeys.Hex(value));
+                }
+                out[space] = rows;
+            }
+            return out;
+        }
+        finally
+        {
+            txn.dispose();
+        }
+    }
+
+    /**
+     * Each (space, key) is in the write set of a commit after `snapshot`: a batch that read only that key
+     * conflicts. A batch that read an untouched key (d1's binding) still commits.
+     */
+    public static async AssertWritten(g: GraphStore, snapshot: bigint, reads: Array<[Keyspace, Uint8Array]>): Promise<void>
+    {
+        const committer = UpgradeFx.Context(g).Committer;
+        let n = 0;
+        for (const [space, key] of reads)
+        {
+            const set = new ReadSet();
+            set.AddKey(space, key);
+            const batch = new WriteBatch();
+            batch.CreateNode(UpgradeFx.Probe + n++, 'Doc');
+            await assert.rejects(committer.Submit(batch, set, snapshot), ConflictError, space + UpgradeFx.Equals + ConflictKeys.Hex(key));
+        }
+        const untouched = new ReadSet();
+        untouched.AddKey(ConflictKeys.NodeSpace, ConflictKeys.Node('d1'));
+        const batch = new WriteBatch();
+        batch.CreateNode(UpgradeFx.Probe + n, 'Doc');
+        await committer.Submit(batch, untouched, snapshot);
     }
 
     public static Capture(g: GraphStore): ICommitApplied[]
@@ -383,7 +433,22 @@ class UpgradeFx
             it('changed hierarchy keeps the nodes but drops edges whose targets no longer accept them', async () =>
             {
                 const g = await UpgradeFx.Ready(open);
-                const before = UpgradeFx.Context(g).Committer.Catalog.Member('Person', 'cites').Id;
+                const catalog = UpgradeFx.Context(g).Committer.Catalog;
+                const before = catalog.Member('Person', 'cites').Id;
+                const memo = BigInt(catalog.TypeId('Memo'));
+                const titleId = BigInt(catalog.Member('Memo', 'title').Id);
+                const titleKeys = async (): Promise<boolean> =>
+                {
+                    for (const space of [Keyspace.Columns, Keyspace.Deltas])
+                    {
+                        if ((await UpgradeFx.RawKeys(g, space)).some(k => k[1] === memo && k[2] === titleId))
+                        {
+                            return true;
+                        }
+                    }
+                    return false;
+                };
+                assert.equal(await titleKeys(), true, 'probe: Memo.title cells before');
                 const result = await g.Upgrade(UpgradeFx.Replace('v2', 'Memo', UpgradeFx.Concept('Memo', [UpgradeFx.Prop('body', ValueType.String)])));
                 assert.ok(result.Catalog.Definitions().some(d => d.Name === 'Memo'));
                 assert.equal(result.Catalog.Member('Person', 'cites').Id, before, 'cites kept its id: only the target rule removes the edge');
@@ -398,6 +463,7 @@ class UpgradeFx
                 });
                 const m1 = await UpgradeFx.InternalId(g, 'm1');
                 assert.ok(!(await UpgradeFx.RawKeys(g, Keyspace.Edges)).some(k => k[3] === m1 || k[5] === m1), 'no edge key of m1 left');
+                assert.equal(await titleKeys(), false, 'the no longer inherited Memo.title column is dropped');
                 await g.dispose();
             });
 
@@ -490,8 +556,8 @@ class UpgradeFx
                     stats = await purger.Purge(txn, old, new CatalogIndex(plan.Catalog), plan.Diff, new WriteKeySet());
                     throw new Error(UpgradeFx.Abort);
                 }), new RegExp(UpgradeFx.Abort));
-                // n1 and m1; n1.text, m1.body, i1.size, i2.size; authored p1->n1, p1->d1 (retargeted), cites p1->m1.
-                assert.deepEqual(stats, { NodesRemoved: 2, ValuesRemoved: 4, EdgesRemoved: 3 });
+                // n1 and m1; n1.text, m1.body, m1.title, i1.size, i2.size; authored p1->n1, p1->d1 (retargeted), cites p1->m1.
+                assert.deepEqual(stats, { NodesRemoved: 2, ValuesRemoved: 5, EdgesRemoved: 3 });
                 assert.deepEqual(await UpgradeFx.Nodes(g, 'Note'), ['n1']);
                 await g.dispose();
             });
@@ -540,28 +606,85 @@ class UpgradeFx
                 const sizeId = old.Member('Item', 'size').Id;
                 await g.Upgrade(UpgradeFx.Desc('v2', UpgradeFx.V1Defs().filter(d => d.Name !== 'Memo').map(d =>
                     d.Name === 'Item' ? UpgradeFx.Concept('Item', [UpgradeFx.Prop('size', ValueType.String)]) : d)));
-                const reads: Array<[Keyspace, Uint8Array]> = [
+                await UpgradeFx.AssertWritten(g, snapshot, [
                     [ConflictKeys.NodeSpace, ConflictKeys.Node('m1')],
                     [ConflictKeys.ExtentSpace, ConflictKeys.Extent(old.TypeId('Memo'))],
                     [ConflictKeys.EdgeSpace, ConflictKeys.Edge(cites, EdgeDirection.Out, p1, m1)],
+                    [ConflictKeys.EdgeSpace, ConflictKeys.Edge(cites, EdgeDirection.In, m1, p1)],
                     [ConflictKeys.CellSpace, ConflictKeys.Cell(i1, sizeId)],
                     [ConflictKeys.ColumnSpace, ConflictKeys.Column(old.TypeId('Item'), sizeId)],
-                ];
-                let n = 0;
-                for (const [space, key] of reads)
-                {
-                    const set = new ReadSet();
-                    set.AddKey(space, key);
-                    const batch = new WriteBatch();
-                    batch.CreateNode('x' + n++, 'Doc');
-                    await assert.rejects(committer.Submit(batch, set, snapshot), ConflictError, space);
-                }
-                const untouched = new ReadSet();
-                untouched.AddKey(ConflictKeys.NodeSpace, ConflictKeys.Node('d1'));
-                const batch = new WriteBatch();
-                batch.CreateNode('ok', 'Doc');
-                await committer.Submit(batch, untouched, snapshot);
+                ]);
                 handle.dispose();
+                await g.dispose();
+            });
+
+            it('purge records the write keys of rejected-target edges and of nodes removed from a surviving concept', async () =>
+            {
+                const g = await UpgradeFx.Ready(open);
+                const committer = UpgradeFx.Context(g).Committer;
+                const old = committer.Catalog;
+                const snapshot = committer.LastCommit();
+                const handle = committer.RegisterSnapshot();
+                const i1 = await UpgradeFx.InternalId(g, 'i1');
+                const p1 = await UpgradeFx.InternalId(g, 'p1');
+                const m1 = await UpgradeFx.InternalId(g, 'm1');
+                const cites = old.Member('Person', 'cites').Id;
+                const item = old.TypeId('Item');
+                const sizeId = old.Member('Item', 'size').Id;
+                // Memo leaves Doc (cites keeps its id but rejects Memo); Item gains a required member (i1, i2 go).
+                await g.Upgrade(UpgradeFx.Desc('v2', UpgradeFx.V1Defs().map(d =>
+                {
+                    if (d.Name === 'Memo')
+                    {
+                        return UpgradeFx.Concept('Memo', [UpgradeFx.Prop('body', ValueType.String)]);
+                    }
+                    return d.Name !== 'Item' ? d : UpgradeFx.Concept('Item', [UpgradeFx.Prop('size', ValueType.Int64), UpgradeFx.Prop('code', ValueType.String, false)]);
+                })));
+                assert.equal(committer.Catalog.Member('Person', 'cites').Id, cites);
+                await UpgradeFx.AssertWritten(g, snapshot, [
+                    [ConflictKeys.EdgeSpace, ConflictKeys.Edge(cites, EdgeDirection.Out, p1, m1)],
+                    [ConflictKeys.EdgeSpace, ConflictKeys.Edge(cites, EdgeDirection.In, m1, p1)],
+                    [ConflictKeys.NodeSpace, ConflictKeys.Node('i1')],
+                    [ConflictKeys.ExtentSpace, ConflictKeys.Extent(item)],
+                    [ConflictKeys.CellSpace, ConflictKeys.Cell(i1, 0)],
+                    [ConflictKeys.CellSpace, ConflictKeys.Cell(i1, sizeId)],
+                    [ConflictKeys.ColumnSpace, ConflictKeys.Column(item, sizeId)],
+                ]);
+                handle.dispose();
+                await g.dispose();
+            });
+
+            it('an upgrade whose write fails leaves the store, the catalog and the version unchanged', async () =>
+            {
+                const g = await UpgradeFx.Ready(open);
+                const committer = UpgradeFx.Context(g).Committer;
+                const last = committer.LastCommit();
+                const catalog = committer.Catalog;
+                const seen = UpgradeFx.Capture(g);
+                const before = await UpgradeFx.Snapshot(g);
+                // Test seam: the committer's private purger is replaced by one that purges, then fails,
+                // so the Write aborts after the purge has written into its transaction.
+                const host = committer as unknown as { purger: DataPurger };
+                const real = host.purger;
+                host.purger = {
+                    Purge: async (...args: Parameters<DataPurger['Purge']>): Promise<IPurgeStats> =>
+                    {
+                        await real.Purge(...args);
+                        throw new Error(UpgradeFx.Abort);
+                    },
+                } as unknown as DataPurger;
+                await assert.rejects(g.Upgrade(UpgradeFx.WithoutNote('v2')), new RegExp(UpgradeFx.Abort));
+                host.purger = real;
+                assert.equal(committer.LastCommit(), last);
+                assert.equal(committer.Catalog, catalog);
+                assert.equal(await g.SchemaVersion(), 'v1');
+                assert.equal(seen.length, 0);
+                assert.deepEqual(await UpgradeFx.Snapshot(g), before, 'every keyspace unchanged');
+                await UpgradeFx.Read(g, async r => assert.deepEqual((await r.Neighbors('p1', 'authored', EdgeDirection.Out)).sort(), ['d1', 'n1']));
+                // The committer is still usable: the same upgrade now succeeds.
+                const result = await g.Upgrade(UpgradeFx.WithoutNote('v2'));
+                assert.equal(result.Commit, last + 1n);
+                assert.deepEqual(await UpgradeFx.Nodes(g, 'Doc'), ['d1', 'm1']);
                 await g.dispose();
             });
 
