@@ -17,9 +17,10 @@ export interface IReadTransaction
     Get(space: Keyspace, key: Uint8Array): Promise<Uint8Array | undefined>;
     /**
      * Entries with Start <= key < End in key order, at most `limit`. Lazy: stops reading storage once
-     * `limit` entries were produced. In a write transaction, do not stage a key not yet staged (Put or
-     * Delete) in the same keyspace while a Scan of it is open: the scan's next step throws (collect
-     * first, then mutate). Replacing an already-staged key and writes to other keyspaces are allowed.
+     * `limit` entries were produced. In a write transaction, do not Put or Delete anything in the same
+     * keyspace while a Scan of it is open (not finished, broken out of or returned): the scan's next step
+     * throws (collect first, then mutate). This covers replacing or deleting an already-staged key and
+     * the keyspace's first staged change. Writes to other keyspaces are allowed.
      */
     Scan(space: Keyspace, range: IKeyRange, limit?: number): AsyncIterable<[Uint8Array, Uint8Array]>;
     dispose(): void;

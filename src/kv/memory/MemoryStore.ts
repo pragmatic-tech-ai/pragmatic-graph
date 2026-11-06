@@ -14,7 +14,6 @@ type Snapshot = ReadonlyMap<Keyspace, readonly IEntry[]>;
 
 class Sorted
 {
-
     /** Index of the first entry whose key is >= key. */
     public static LowerBound(entries: readonly IEntry[], key: Uint8Array): number
     {
@@ -36,15 +35,20 @@ class Sorted
     }
 
     /** Overlays sorted changes (null value = delete) on sorted entries in one linear merge (not a scan: uncounted); the result is in key order. */
-    public static Merge(entries: readonly IEntry[], changes: Iterable<IPendingChange>): IEntry[]
+    public static *Merge(entries: readonly IEntry[], changes: Iterable<IPendingChange>): Iterable<IEntry>
     {
-        const out: IEntry[] = [];
-        const base = entries.map(e => [e.Key, e.Value] as const);
-        for (const [key, value] of PendingChanges.Merge(base, changes, new ScanCounter()))
+        for (const [key, value] of PendingChanges.Merge(Sorted.Pairs(entries), changes, new ScanCounter()))
         {
-            out.push({ Key: key, Value: value });
+            yield { Key: key, Value: value };
         }
-        return out;
+    }
+
+    private static *Pairs(entries: readonly IEntry[]): Iterable<readonly [Uint8Array, Uint8Array]>
+    {
+        for (const entry of entries)
+        {
+            yield [entry.Key, entry.Value];
+        }
     }
 }
 
@@ -158,15 +162,15 @@ class MemoryWriteTransaction extends MemoryReadTransaction implements IWriteTran
     public override async *Scan(space: Keyspace, range: IKeyRange, limit?: number): AsyncIterable<[Uint8Array, Uint8Array]>
     {
         this.EnsureLive();
-        const bucket = this.Bucket(space);
-        const version = bucket.Version;
-        for (const [key, value] of PendingChanges.Merge(this.Entries(space, range), bucket.InRange(range), this.counter, limit))
+        const version = PendingChanges.VersionOf(this.pending.get(space));
+        const staged = this.pending.get(space)?.InRange(range) ?? PendingChanges.None;
+        for (const [key, value] of PendingChanges.Merge(this.Entries(space, range), staged, this.counter, limit))
         {
             this.EnsureLive();
-            bucket.RequireVersion(version);
+            PendingChanges.RequireVersion(this.pending.get(space), version);
             yield [key.slice(), value.slice()];
         }
-        bucket.RequireVersion(version);
+        PendingChanges.RequireVersion(this.pending.get(space), version);
     }
 
     public Put(space: Keyspace, key: Uint8Array, value: Uint8Array): void
@@ -185,7 +189,7 @@ class MemoryWriteTransaction extends MemoryReadTransaction implements IWriteTran
         const next = new Map<Keyspace, readonly IEntry[]>(this.snapshot);
         for (const [space, staged] of this.pending)
         {
-            next.set(space, Sorted.Merge(this.snapshot.get(space) ?? [], staged.Values()));
+            next.set(space, [...Sorted.Merge(this.snapshot.get(space) ?? [], staged.Values())]);
         }
         return next;
     }
@@ -219,10 +223,17 @@ export class MemoryStore implements IKeyValueStore, IScanProbe
     private disposed = false;
     private readonly liveReads = new Set<MemoryReadTransaction>();
     private readonly counter = new ScanCounter();
+    private rebuilt = 0;
 
     public get EntriesRead(): number
     {
         return this.counter.Count;
+    }
+
+    /** Diagnostics: keyspaces whose committed array commits have rebuilt so far (untouched ones are shared). */
+    public get KeyspacesRebuilt(): number
+    {
+        return this.rebuilt;
     }
 
     public async BeginRead(): Promise<IReadTransaction>
@@ -264,7 +275,15 @@ export class MemoryStore implements IKeyValueStore, IScanProbe
         try
         {
             const result = await work(txn);
-            this.committed = txn.BuildCommitted();
+            const next = txn.BuildCommitted();
+            for (const [space, entries] of next)
+            {
+                if (this.committed.get(space) !== entries)
+                {
+                    this.rebuilt++;
+                }
+            }
+            this.committed = next;
             return result;
         }
         finally

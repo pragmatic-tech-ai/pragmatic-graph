@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { TupleCodec } from '../../format/TupleCodec.js';
 import { IKeyRange, IKeyValueStore, IReadTransaction, IScanProbe, IWriteTransaction } from '../KeyValue.js';
 import { Keyspace } from '../Keyspace.js';
+import { Linearity } from './Linearity.js';
 
 type Open = () => Promise<IKeyValueStore>;
 type Reopen = (store: IKeyValueStore) => Promise<IKeyValueStore>;
@@ -15,8 +16,8 @@ export class KeyValueConformance
     private static readonly DisposedPattern = /disposed/i;
     private static readonly EmptyKeyPattern = /empty key/i;
     private static readonly ChangedPattern = /changed during the scan/i;
-    private static readonly BulkKeys = 200000;
-    private static readonly BulkBoundMs = 5000;
+    private static readonly BulkKeys = 20000;
+    private static readonly BulkLabel = 'random-order bulk stage + commit';
     private static readonly Space = Keyspace.Rows;
     private static readonly AllKeys: IKeyRange = {
         Start: Uint8Array.of(),
@@ -35,7 +36,9 @@ export class KeyValueConformance
             KeyValueConformance.Case('write scan with limit 1 merges a staged delete or put at the start of the range', open, KeyValueConformance.LimitedOwnWrites);
             KeyValueConformance.Case('a limited scan stops early: it reads a bounded number of stored entries over 10,000 keys', open, KeyValueConformance.ScanEarlyExit);
             KeyValueConformance.Case('staging a new key in the keyspace while its scan is open makes the scan throw', open, KeyValueConformance.MutationDuringScan);
-            KeyValueConformance.Case('200,000 new keys in random order stage and commit in one write within 5 s', open, KeyValueConformance.BulkRandomPuts);
+            KeyValueConformance.Case('replacing or deleting an already-staged key while its scan is open makes the scan throw', open, KeyValueConformance.ReplaceDuringScan);
+            KeyValueConformance.Case('the first staged change of a keyspace while its scan is open makes the scan throw', open, KeyValueConformance.FirstStageDuringScan);
+            KeyValueConformance.Case('staging and committing new keys in random order in one write scales linearly up to 200,000', open, KeyValueConformance.BulkRandomPuts);
             KeyValueConformance.Case('read snapshot ignores later commits', open, KeyValueConformance.SnapshotIsolation);
             KeyValueConformance.Case('write reads see own pending writes in Get', open, KeyValueConformance.OwnWritesGet);
             KeyValueConformance.Case('write reads see own pending writes in Scan', open, KeyValueConformance.OwnWritesScan);
@@ -329,29 +332,68 @@ export class KeyValueConformance
         });
     }
 
+    private static async ReplaceDuringScan(store: IKeyValueStore): Promise<void>
+    {
+        const space = KeyValueConformance.Space;
+        const key = KeyValueConformance.Key;
+        await KeyValueConformance.Seed(store, [1, 2, 3, 4]);
+        await store.Write(async txn =>
+        {
+            txn.Put(space, key(2), KeyValueConformance.Val(9));
+            txn.Put(space, key(3), KeyValueConformance.Val(9));
+            const rows = txn.Scan(space, KeyValueConformance.AllKeys)[Symbol.asyncIterator]();
+            assert.deepEqual((await rows.next()).value?.[0], key(1));
+            txn.Put(space, key(2), KeyValueConformance.Val(8));
+            await assert.rejects(rows.next(), KeyValueConformance.ChangedPattern, 'replacing a staged put');
+            const again = txn.Scan(space, KeyValueConformance.AllKeys)[Symbol.asyncIterator]();
+            assert.deepEqual((await again.next()).value?.[0], key(1));
+            txn.Delete(space, key(3));
+            await assert.rejects(again.next(), KeyValueConformance.ChangedPattern, 'deleting a staged key');
+            const rest = await KeyValueConformance.Collect(txn.Scan(space, KeyValueConformance.AllKeys));
+            assert.deepEqual(rest.map(p => p[0]), [1, 2, 4].map(n => key(n)), 'a scan opened afterwards sees the final state');
+            assert.deepEqual(rest[1]?.[1], KeyValueConformance.Val(8));
+        });
+    }
+
+    private static async FirstStageDuringScan(store: IKeyValueStore): Promise<void>
+    {
+        const space = KeyValueConformance.Space;
+        const key = KeyValueConformance.Key;
+        await KeyValueConformance.Seed(store, [1, 2, 3]);
+        await store.Write(async txn =>
+        {
+            const rows = txn.Scan(space, KeyValueConformance.AllKeys)[Symbol.asyncIterator]();
+            assert.deepEqual((await rows.next()).value?.[0], key(1));
+            txn.Put(space, key(9), KeyValueConformance.Val(9));
+            await assert.rejects(rows.next(), KeyValueConformance.ChangedPattern);
+        });
+    }
+
     private static async BulkRandomPuts(store: IKeyValueStore): Promise<void>
     {
         const space = KeyValueConformance.Space;
-        const n = KeyValueConformance.BulkKeys;
-        const started = Date.now();
-        await store.Write(async txn =>
+        const small = KeyValueConformance.BulkKeys;
+        const large = small * Linearity.Factor;
+        // Each run writes its own key block [base, base + n): the small run above the large run's keys.
+        await Linearity.Check(KeyValueConformance.BulkLabel, small, n => store.Write(async txn =>
         {
-            // A full-period LCG over 0..n-1 (n = 200,000 = 2^6 * 5^5; multiplier - 1 divisible by 2*5*4): every key once, in scrambled order.
-            let x = 12345;
+            const base = n === small ? large : 0;
+            // A full-period LCG over 0..n-1 (n = 2^a * 5^b with a >= 2; multiplier - 1 divisible by 2*5*4): every key once, in scrambled order.
+            let x = 12345 % n;
             for (let i = 0; i < n; i++)
             {
                 x = (x * 400001 + 7) % n;
-                txn.Put(space, KeyValueConformance.Key(x), KeyValueConformance.Val(1));
+                txn.Put(space, KeyValueConformance.Key(base + x), KeyValueConformance.Val(1));
             }
-            assert.deepEqual(await KeyValueConformance.Keys(txn, KeyValueConformance.AllKeys, 3), [0, 1, 2].map(k => KeyValueConformance.Key(k)));
-        });
-        const elapsed = Date.now() - started;
-        assert.ok(elapsed < KeyValueConformance.BulkBoundMs, 'staging and committing took ' + elapsed + ' ms');
+            assert.deepEqual(await KeyValueConformance.Keys(txn, KeyValueConformance.Range(base, base + n), 3), [0, 1, 2].map(k => KeyValueConformance.Key(base + k)));
+        }));
         const read = await store.BeginRead();
-        const all = await KeyValueConformance.Keys(read, KeyValueConformance.AllKeys);
+        const all = await KeyValueConformance.Keys(read, KeyValueConformance.Range(0, large));
+        const others = await KeyValueConformance.Keys(read, KeyValueConformance.Range(large, large + small));
         read.dispose();
-        assert.equal(all.length, n);
-        assert.deepEqual(all[n - 1], KeyValueConformance.Key(n - 1));
+        assert.equal(all.length, large);
+        assert.deepEqual(all[large - 1], KeyValueConformance.Key(large - 1));
+        assert.equal(others.length, small);
     }
 
     private static async SnapshotIsolation(store: IKeyValueStore): Promise<void>

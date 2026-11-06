@@ -11,6 +11,7 @@ import type { Location } from '../../identity/Location.js';
 import { InternalId } from '../../identity/InternalId.js';
 import type { IKeyRange, IKeyValueStore, IReadTransaction, IWriteTransaction } from '../../kv/KeyValue.js';
 import { Keyspace } from '../../kv/Keyspace.js';
+import { Linearity } from '../../kv/tests/Linearity.js';
 import { LmdbStore } from '../../kv/lmdb/LmdbStore.js';
 import { MemoryStore } from '../../kv/memory/MemoryStore.js';
 import { CellValue, DateTimeValue } from '../CellValue.js';
@@ -425,21 +426,27 @@ class ColumnFx
                 await store.dispose();
             });
 
-            it('2,048 writes into one delta in one txn are fast (Int64 and String), and every value survives', async () =>
+            it('writes into one delta in one txn scale linearly up to 2,040 (Int64 and String), and every value survives', async () =>
             {
                 const store = await open();
                 const cs = new ColumnStore();
-                await ColumnFx.Write(store, cs, async txn => ColumnFx.Alloc(cs, txn, 2048));
-                const t0 = performance.now();
+                const small = 204;
+                const large = small * Linearity.Factor;
+                // The small run writes a second type so the two sizes use separate deltas; repeats rewrite the same cells.
                 await ColumnFx.Write(store, cs, async txn =>
                 {
-                    for (let i = 2047; i >= 0; i--)
-                    {
-                        await cs.WriteCell(txn, ColumnFx.Loc(i), ColumnFx.AgeMember, BigInt(i));
-                        await cs.WriteCell(txn, ColumnFx.Loc(i), ColumnFx.NameMember, 'name-' + i);
-                    }
+                    await ColumnFx.Alloc(cs, txn, large);
+                    await ColumnFx.Alloc(cs, txn, small, ColumnFx.Type + 1);
                 });
-                const writeMs = performance.now() - t0;
+                const [, writeMs] = await Linearity.Check('[' + name + '] ColumnStore delta writes (Int64 + String)', small, n => ColumnFx.Write(store, cs, async txn =>
+                {
+                    const typeId = n === small ? ColumnFx.Type + 1 : ColumnFx.Type;
+                    for (let i = n - 1; i >= 0; i--)
+                    {
+                        await cs.WriteCell(txn, ColumnFx.Loc(i, typeId), ColumnFx.AgeMember, BigInt(i));
+                        await cs.WriteCell(txn, ColumnFx.Loc(i, typeId), ColumnFx.NameMember, 'name-' + i);
+                    }
+                }), 5);
                 const r = await store.BeginRead();
                 assert.equal(await cs.ReadCell(r, ColumnFx.Loc(2000), ColumnFx.NameMember), 'name-2000');
                 const samples: number[] = [];
@@ -452,13 +459,14 @@ class ColumnFx
                 }
                 samples.sort((a, b) => a - b);
                 const readMs = samples[samples.length >> 1]!;
-                for (const i of [0, 777, 2047])
+                for (const i of [0, 777, large - 1])
                 {
                     assert.equal(await cs.ReadCell(r, ColumnFx.Loc(i), ColumnFx.AgeMember), BigInt(i));
                 }
+                assert.equal(await cs.ReadCell(r, ColumnFx.Loc(small - 1, ColumnFx.Type + 1), ColumnFx.NameMember), 'name-' + (small - 1));
                 r.dispose();
-                console.log('[timing ' + name + '] 4096 writes (2048 Int64 + 2048 String): ' + writeMs.toFixed(0) + ' ms; median ReadCell vs 2048-entry String delta: ' + readMs.toFixed(2) + ' ms');
-                assert.ok(writeMs < 5000, 'writes took ' + writeMs);
+                console.log('[timing ' + name + '] ' + 2 * large + ' writes: ' + writeMs.toFixed(0) + ' ms; median ReadCell vs ' + large + '-entry String delta: ' + readMs.toFixed(2) + ' ms');
+                // A median of single reads: an absolute bound (generous; the measured median is far below it).
                 assert.ok(readMs < 25, 'read took ' + readMs);
                 await store.dispose();
             });

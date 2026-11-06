@@ -13,17 +13,19 @@ export interface IPendingChange
  * sorted leaves of at most LeafCapacity changes, located by binary search on their first keys, so a
  * new key costs O(log n + LeafCapacity) and a scan merges them lazily from the binary-searched start.
  *
- * Structural changes (staging a key not staged yet) bump Version; an InRange iteration that observes
- * a new Version throws instead of skipping or repeating entries. Replacing an already-staged key keeps
- * the structure and is allowed during iteration.
+ * Every Set (a new key, a replacement or a delete) bumps the version (VersionOf); an InRange iteration that observes
+ * a new Version throws instead of yielding a stale, skipped or repeated change.
  */
 export class PendingChanges
 {
     public static readonly LeafCapacity = 512;
-    public static readonly ErrChanged = 'Staged changes of this keyspace changed during the scan: finish or abandon the scan before staging new keys';
+    public static readonly ErrChanged = 'Staged changes of this keyspace changed during the scan: finish or abandon the scan before a Put or Delete in its keyspace';
+    /** No staged changes, for a keyspace without a PendingChanges. */
+    public static readonly None: readonly IPendingChange[] = [];
 
     private readonly leaves: IPendingChange[][] = [];
     private size = 0;
+    /** Bumped by every Set; read through VersionOf. */
     private version = 0;
 
     public get Size(): number
@@ -31,20 +33,15 @@ export class PendingChanges
         return this.size;
     }
 
-    /** Bumped whenever a key not staged before is staged. */
-    public get Version(): number
-    {
-        return this.version;
-    }
-
     /** Stages the change; `key` and `value` must already be private copies. A later change to the same key replaces it. */
     public Set(key: Uint8Array, value: Uint8Array | null): void
     {
         const change: IPendingChange = { Key: key, Value: value };
+        this.version++;
         if (this.leaves.length === 0)
         {
             this.leaves.push([change]);
-            this.Grew();
+            this.size++;
             return;
         }
         const li = this.LeafFor(key);
@@ -62,7 +59,7 @@ export class PendingChanges
             const half = leaf.length >> 1;
             this.leaves.splice(li, 1, leaf.slice(0, half), leaf.slice(half));
         }
-        this.Grew();
+        this.size++;
     }
 
     public Get(key: Uint8Array): IPendingChange | undefined
@@ -76,7 +73,7 @@ export class PendingChanges
         return hit !== undefined && TupleCodec.Compare(hit.Key, key) === 0 ? hit : undefined;
     }
 
-    /** Every change, in key order. Do not stage new keys while iterating. */
+    /** Every change, in key order. Do not Set while iterating. */
     public *Values(): Iterable<IPendingChange>
     {
         for (const leaf of this.leaves)
@@ -87,7 +84,7 @@ export class PendingChanges
 
     /**
      * Changes with Start <= key < End, in key order, walked lazily leaf by leaf from the
-     * binary-searched start. Throws ErrChanged if a new key is staged while the iteration is open.
+     * binary-searched start. Throws ErrChanged if anything is Set while the iteration is open.
      */
     public *InRange(range: IKeyRange): Iterable<IPendingChange>
     {
@@ -121,10 +118,16 @@ export class PendingChanges
         }
     }
 
-    /** Throws ErrChanged unless Version still equals `version`. */
-    public RequireVersion(version: number): void
+    /** Version of a keyspace's staged changes; 0 while it has none (the first Set makes it 1). */
+    public static VersionOf(changes: PendingChanges | undefined): number
     {
-        if (this.version !== version)
+        return changes === undefined ? 0 : changes.version;
+    }
+
+    /** Throws ErrChanged unless VersionOf(changes) still equals `version`. */
+    public static RequireVersion(changes: PendingChanges | undefined, version: number): void
+    {
+        if (PendingChanges.VersionOf(changes) !== version)
         {
             throw new Error(PendingChanges.ErrChanged);
         }
@@ -200,12 +203,6 @@ export class PendingChanges
         }
         counter.Count++;
         return next.value;
-    }
-
-    private Grew(): void
-    {
-        this.size++;
-        this.version++;
     }
 
     /** Index of the last leaf whose first key is <= key (leaf 0 when key precedes every leaf). */

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { TupleCodec } from '../../format/TupleCodec.js';
 import { ScanCounter } from '../KeyValue.js';
 import { PendingChanges } from '../PendingChanges.js';
+import { Linearity } from './Linearity.js';
 
 /** Seeded generator (mulberry32) so failures reproduce. */
 class Rng
@@ -118,7 +119,7 @@ describe('PendingChanges', () =>
         }
     });
 
-    it('InRange throws a clear error when a new key is staged during iteration; replacing a staged key does not', () =>
+    it('InRange throws a clear error on any Set during iteration: a new key, a replacement or a delete', () =>
     {
         const pending = new PendingChanges();
         for (const k of [1, 2, 3])
@@ -126,31 +127,35 @@ describe('PendingChanges', () =>
             pending.Set(PendingFx.Key(k), Uint8Array.of(k));
         }
         const all = { Start: PendingFx.Key(0), End: PendingFx.Key(100) };
-        const it1 = pending.InRange(all)[Symbol.iterator]();
-        it1.next();
-        pending.Set(PendingFx.Key(2), Uint8Array.of(9));
-        assert.equal(it1.next().value?.Value?.[0], 9);
-        pending.Set(PendingFx.Key(50), null);
-        assert.throws(() => it1.next(), /changed during the scan/);
+        for (const change of [[2, 9], [3, null], [50, 5]] as const)
+        {
+            const rows = pending.InRange(all)[Symbol.iterator]();
+            rows.next();
+            const before = PendingChanges.VersionOf(pending);
+            pending.Set(PendingFx.Key(change[0]), change[1] === null ? null : Uint8Array.of(change[1]));
+            assert.equal(PendingChanges.VersionOf(pending), before + 1);
+            assert.throws(() => rows.next(), /changed during the scan/, 'Set of ' + change[0]);
+        }
+        assert.equal(PendingChanges.VersionOf(undefined), 0);
     });
 
-    it('stays fast for many keys in random order and for alternating Set and bounded scans', () =>
+    it('stays linear for many keys in random order and for alternating Set and bounded scans', async () =>
     {
-        const pending = new PendingChanges();
-        const rng = new Rng(5);
-        const started = Date.now();
-        for (let i = 0; i < 200000; i++)
+        await Linearity.Check('PendingChanges random Set + alternating Set/InRange', 20000, n =>
         {
-            pending.Set(PendingFx.Key(rng.Int(1_000_000_000)), Uint8Array.of(1));
-        }
-        for (let i = 0; i < 20000; i++)
-        {
-            const k = rng.Int(1_000_000_000);
-            pending.Set(PendingFx.Key(k), Uint8Array.of(2));
-            const first = pending.InRange({ Start: PendingFx.Key(k), End: PendingFx.Key(k + 1_000_000) })[Symbol.iterator]().next();
-            assert.equal(first.done, false);
-        }
-        const elapsed = Date.now() - started;
-        assert.ok(elapsed < 3000, 'took ' + elapsed + ' ms');
+            const pending = new PendingChanges();
+            const rng = new Rng(5);
+            for (let i = 0; i < n; i++)
+            {
+                pending.Set(PendingFx.Key(rng.Int(1_000_000_000)), Uint8Array.of(1));
+            }
+            for (let i = 0; i < n / 10; i++)
+            {
+                const k = rng.Int(1_000_000_000);
+                pending.Set(PendingFx.Key(k), Uint8Array.of(2));
+                const first = pending.InRange({ Start: PendingFx.Key(k), End: PendingFx.Key(k + 1_000_000) })[Symbol.iterator]().next();
+                assert.equal(first.done, false);
+            }
+        }, 3);
     });
 });

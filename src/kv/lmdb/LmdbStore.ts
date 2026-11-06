@@ -133,15 +133,15 @@ class LmdbWriteTransaction extends LmdbReadTransaction implements IWriteTransact
     public override async *Scan(space: Keyspace, range: IKeyRange, limit?: number): AsyncIterable<[Uint8Array, Uint8Array]>
     {
         this.EnsureLive();
-        const bucket = this.Bucket(space);
-        const version = bucket.Version;
-        for (const [key, value] of PendingChanges.Merge(this.Entries(space, range), bucket.InRange(range), this.counter, limit))
+        const version = PendingChanges.VersionOf(this.pending.get(space));
+        const staged = this.pending.get(space)?.InRange(range) ?? PendingChanges.None;
+        for (const [key, value] of PendingChanges.Merge(this.Entries(space, range), staged, this.counter, limit))
         {
             this.EnsureLive();
-            bucket.RequireVersion(version);
+            PendingChanges.RequireVersion(this.pending.get(space), version);
             yield [key.slice(), value.slice()];
         }
-        bucket.RequireVersion(version);
+        PendingChanges.RequireVersion(this.pending.get(space), version);
     }
 
     public Put(space: Keyspace, key: Uint8Array, value: Uint8Array): void
