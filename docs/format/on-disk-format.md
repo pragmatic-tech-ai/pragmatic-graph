@@ -39,7 +39,7 @@ Keys are `(name, ...qualifiers)`. Names defined so far:
 Names added by later tasks, each with its value layout completed by that task:
 
 - `("slots", typeId)`: the number of slots ever allocated for the type (partition 0 in v1), a tuple-encoded single integer `(n)`; absent means `0`. Slots are allocated densely from 0 (`AllocateSlot` returns `n` and stores `n + 1`) inside the caller's write transaction; slot `0xFFFFFFFF` is reserved. Deleted slots are not reused in v1.
-- `("commit")`: Task 12.
+- `("commit")`: the last commit number, a tuple-encoded single integer `(n)`; absent means `0` (no commits). Written only by the committer, in the same write transaction as the log entries it covers, so it always equals the highest `log` key.
 
 ### Catalog
 
@@ -163,4 +163,26 @@ Lookup cost by `(from, to)`: O(1) for unordered Many relationships (direct key),
 
 ### Log
 
-Key `(commit: u64)`; commits are monotonic and gap-free from `1`. The value is the serialized `WriteBatch` defined in Task 12; this section is completed by that task.
+Key `(commit: u64)`; commits are monotonic and gap-free from `1`, and `Meta("commit")` is the highest one. The log is the changefeed and the record of every committed write batch; the committer appends one entry per accepted batch inside the same write transaction that applies it.
+
+The value is the serialized `WriteBatch`: logical operations addressed by public id, in the order they were applied. All integers little-endian.
+
+```
+version : u8      1
+count   : u32     number of operations
+ops     : count x op
+op      : kind u8, then the fields of that kind
+  1 CreateNode  : publicId str, concept str, hasHint u8 (0|1), [clusterHint str]
+  2 SetProperty : publicId str, member str, value
+  3 DeleteNode  : publicId str
+  4 Link        : from str, relationship str, to str, flags u8, [afterSibling str], [beforeSibling str], [properties]
+  5 Unlink      : from str, relationship str, to str
+str        : byteLength u32, UTF-8 bytes (well-formed Unicode)
+value      : tag u8; 0 = null (no bytes follow), else the ValueType (1 Boolean .. 7 Duration)
+             followed by that type's single value bytes (see Columns, Single value bytes)
+flags      : bit 0 = options present, bit 1 = afterSibling, bit 2 = beforeSibling, bit 3 = properties;
+             0 = no options; any other bit set, or a field bit without bit 0, is corrupt
+properties : count u32, then count x (name str, value); names are distinct
+```
+
+`afterSibling` / `beforeSibling` are public ids of existing targets of the same `(from, relationship)`; the committer resolves them to those edges' positions. A value's tag is the value's own type (a bigint is Int64, a JS number Float64); the member's declared type is checked when the batch is applied. A reader rejects an unknown version, kind, tag or flag, a truncated entry, invalid UTF-8, and trailing bytes.

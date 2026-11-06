@@ -486,6 +486,31 @@ class ColumnFx
                 await store.dispose();
             });
 
+            it('TouchedDeltas reports each written chunk with its total delta entry count (stored plus pending)', async () =>
+            {
+                const store = await open();
+                const cs = new ColumnStore();
+                await ColumnFx.Write(store, cs, async txn =>
+                {
+                    await ColumnFx.Alloc(cs, txn, 3);
+                    await cs.WriteCell(txn, ColumnFx.Loc(0), ColumnFx.NameMember, 'a');
+                    await cs.WriteCell(txn, ColumnFx.Loc(1), ColumnFx.NameMember, 'b');
+                });
+                await ColumnFx.Write(store, cs, async txn =>
+                {
+                    assert.deepEqual(cs.TouchedDeltas(txn), []);
+                    await cs.ReadCell(txn, ColumnFx.Loc(0), ColumnFx.AgeMember);
+                    await cs.WriteCell(txn, ColumnFx.Loc(2), ColumnFx.NameMember, 'c');
+                    await cs.WriteCell(txn, ColumnFx.Loc(0), ColumnFx.NameMember, 'z');
+                    assert.deepEqual(cs.TouchedDeltas(txn), [
+                        { Partition: 0, TypeId: ColumnFx.Type, MemberId: ColumnFx.NameMember.Id, Chunk: 0n, Entries: 3 },
+                    ]);
+                    await new Compactor(cs).CompactChunk(txn, 0, ColumnFx.Type, ColumnFx.NameMember, 0n);
+                    assert.deepEqual(cs.TouchedDeltas(txn), []);
+                });
+                await store.dispose();
+            });
+
             it('Flush is what persists pending deltas', async () =>
             {
                 const store = await open();

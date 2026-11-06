@@ -20,6 +20,10 @@ class DeltaState
         public readonly Key: Uint8Array,
         public readonly Type: ValueType,
         public readonly Cells: Map<number, CellValue>,
+        public readonly Partition: number,
+        public readonly TypeId: number,
+        public readonly MemberId: number,
+        public readonly Chunk: bigint,
     )
     {
     }
@@ -28,6 +32,17 @@ class DeltaState
     {
         return [...this.Cells.keys()].sort((a, b) => a - b).map(slot => ({ Slot: slot, Value: this.Cells.get(slot) as CellValue }));
     }
+}
+
+/** A chunk whose delta this write transaction has written, with the delta's total entry count. */
+export interface ITouchedDelta
+{
+    readonly Partition: number;
+    readonly TypeId: number;
+    readonly MemberId: number;
+    readonly Chunk: bigint;
+    /** Entries the chunk's delta holds (stored entries plus this transaction's), one per slot. */
+    readonly Entries: number;
 }
 
 /** Everything ColumnStore caches for one write transaction. */
@@ -229,6 +244,23 @@ export class ColumnStore
         }
     }
 
+    /** Chunks whose delta this write transaction has written (and not yet compacted), for the compaction policy. */
+    public TouchedDeltas(txn: IWriteTransaction): ITouchedDelta[]
+    {
+        const state = this.states.get(txn);
+        if (state === undefined)
+        {
+            return [];
+        }
+        return [...state.Deltas.values()].map(d => ({
+            Partition: d.Partition,
+            TypeId: d.TypeId,
+            MemberId: d.MemberId,
+            Chunk: d.Chunk,
+            Entries: d.Cells.size,
+        }));
+    }
+
     /** Serializes every dirty delta once. Idempotent; a write after Flush marks its delta dirty again and needs another Flush. Call before the write transaction commits. */
     public Flush(txn: IWriteTransaction): void
     {
@@ -388,7 +420,7 @@ export class ColumnStore
                 cells.set(e.Slot, e.Value);
             }
         }
-        return new DeltaState(key, type, cells);
+        return new DeltaState(key, type, cells, partition, typeId, memberId, chunk);
     }
 
     private async LoadSlotCount(txn: IReadTransaction, typeId: number): Promise<number>
