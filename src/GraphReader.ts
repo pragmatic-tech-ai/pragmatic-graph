@@ -44,6 +44,8 @@ export class GraphReader implements IGraphDisposable
     private readonly recorded: RecordedReads;
     /** Undefined when the scope restricts no read (System): the hot path then does no evaluator work. */
     private readonly evaluator: ScopeEvaluator | undefined;
+    /** Only for a scope that restricts writes but not reads (WriteEvaluator). */
+    private writeEvaluator: ScopeEvaluator | undefined;
     private disposed = false;
 
     /** @internal Created by GraphStore.BeginRead and GraphStore.Begin; `reads` only for a transaction. */
@@ -323,6 +325,15 @@ export class GraphReader implements IGraphDisposable
     protected get Reads(): ReadSet | undefined
     {
         return this.recorded.Reads;
+    }
+
+    /**
+     * The evaluator the WriteGate checks this reader's writes with: the read evaluator when the scope
+     * restricts reads (sharing its caches), else one made on first use over the same recorded reads.
+     */
+    protected WriteEvaluator(): ScopeEvaluator
+    {
+        return this.evaluator ?? (this.writeEvaluator ??= new ScopeEvaluator(this.scope, this.recorded));
     }
 
     protected RequireOpen(): void

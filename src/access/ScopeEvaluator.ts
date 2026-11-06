@@ -5,7 +5,7 @@ import { GraphError, GraphErrorCode } from '../errors/GraphError.js';
 import { NodeEvaluator, Truth } from '../predicate/NodeEvaluator.js';
 import { type And, type Not, type Or, type OwnerIs, Predicate, PredicateKind, type Reachable, type Related } from '../predicate/Predicate.js';
 import type { IReadNode, RecordedReads } from '../RecordedReads.js';
-import { AccessDefault, type AccessScope } from './AccessScope.js';
+import { AccessDefault, type AccessScope, type IWriteRules } from './AccessScope.js';
 
 /** One node under evaluation, with the property values read so far (absent = not a property of the node). */
 class NodeFacts
@@ -58,6 +58,7 @@ export class ScopeEvaluator
     private static readonly NoHidden: ReadonlySet<string> = new Set();
 
     private readonly rows = new Map<string, readonly Predicate[]>();
+    private readonly writes = new Map<string, readonly IWriteRules[]>();
     private readonly hidden = new Map<string, ReadonlySet<string>>();
     private readonly properties = new Map<string, ReadonlyMap<string, MemberDef>>();
     private readonly memberNames = new Map<Predicate, ReadonlySet<string>>();
@@ -86,6 +87,48 @@ export class ScopeEvaluator
     {
         const node = await this.reads.NodeById(id);
         return (await this.IsVisible(node)) ? node : undefined;
+    }
+
+    /** The scope this evaluator enforces. */
+    public get Scope(): AccessScope
+    {
+        return this.scope;
+    }
+
+    /** The node with the public id in the snapshot, visible or not; records its binding (also when missing). */
+    public Locate(publicId: string): Promise<IReadNode | undefined>
+    {
+        return this.reads.Locate(publicId);
+    }
+
+    /**
+     * True iff `p` is True on the node's snapshot values under this scope (Kleene logic, Unknown
+     * collapsed to false at the top; graph predicates allowed): how the WriteGate decides an Update or
+     * Delete rule. A top-level decision of its own; records the reads it makes.
+     */
+    public async Holds(p: Predicate, node: IReadNode): Promise<boolean>
+    {
+        return (await this.Eval(p, new NodeFacts(node), new Evaluation())) === Truth.True;
+    }
+
+    /** Write rules of every Writes entry applicable to `concept` (keyed by it, an ancestor or a carried aspect). */
+    public ApplicableWrites(concept: string): readonly IWriteRules[]
+    {
+        let out = this.writes.get(concept);
+        if (out === undefined)
+        {
+            const list: IWriteRules[] = [];
+            for (const [name, rules] of this.scope.Writes)
+            {
+                if (this.Applies(concept, name))
+                {
+                    list.push(rules);
+                }
+            }
+            out = list;
+            this.writes.set(concept, out);
+        }
+        return out;
     }
 
     /** Members hidden on instances of `concept`: the union of every applicable Hidden entry. */

@@ -87,4 +87,13 @@ export class AccessScope
     {
         return this.Default === AccessDefault.Allow && this.Rows.size === 0 && this.Hidden.size === 0;
     }
+
+    /**
+     * @internal True iff no write needs checking: reads are unrestricted (every node visible, nothing
+     * hidden) and there are no Writes entries. GraphTransaction.Commit then skips the WriteGate entirely.
+     */
+    public get WritesUnrestricted(): boolean
+    {
+        return this.ReadsUnrestricted && this.Writes.size === 0;
+    }
 }

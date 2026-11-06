@@ -1,4 +1,5 @@
 import type { AccessScope } from './access/AccessScope.js';
+import { WriteGate } from './access/WriteGate.js';
 import type { CellValue } from './columns/CellValue.js';
 import type { GraphContext, ReadSnapshot } from './GraphContext.js';
 import { GraphError, GraphErrorCode } from './errors/GraphError.js';
@@ -16,8 +17,10 @@ import { type ICreateNodeOptions, type LinkOptions, WriteBatch } from './txn/Wri
  * Reads do NOT see the transaction's own pending writes (no read-your-own-writes, as in the flow
  * language): every read answers from the snapshot taken at Begin. Commit fails with ConflictError when
  * anything read was changed by a commit after the snapshot, or the schema changed since Begin; with
- * CommitError when the writes are semantically invalid. Commit always ends the transaction, whatever
- * its outcome; retry on a new transaction. dispose() without Commit discards the writes.
+ * AccessError when the transaction's AccessScope does not allow a write (checked first, nothing is
+ * submitted; WriteGate); with CommitError when the writes are semantically invalid. Commit always ends
+ * the transaction, whatever its outcome; retry on a new transaction. dispose() without Commit discards
+ * the writes.
  */
 export class GraphTransaction extends GraphReader
 {
@@ -77,21 +80,37 @@ export class GraphTransaction extends GraphReader
         try
         {
             const began = this.snapshot.Index.Catalog.Version;
+            // Early check, so the gate never judges writes against a schema that has since changed; the
+            // authoritative check is still inside the commit group against the group's catalog (ruling F4).
+            if (began !== this.context.CatalogVersion)
+            {
+                throw new ConflictError(GraphTransaction.ErrSchema + began + GraphTransaction.ErrSchemaNow + this.context.CatalogVersion);
+            }
             if (this.batch.Count === 0)
             {
-                if (began !== this.context.CatalogVersion)
-                {
-                    throw new ConflictError(GraphTransaction.ErrSchema + began + GraphTransaction.ErrSchemaNow + this.context.CatalogVersion);
-                }
                 return this.SnapshotCommit;
             }
-            // The catalog version is checked inside the commit group against the group's catalog (ruling F4).
+            await this.Authorize();
             return await this.context.Committer.Submit(this.batch, this.Reads, this.ValidationCommit(), began);
         }
         finally
         {
             // Only now: the registered snapshot must pin conflict history until the batch was validated.
             this.dispose();
+        }
+    }
+
+    /**
+     * The write gate (ruling R68): throws AccessError when the scope does not allow a recorded write.
+     * Runs before anything leaves the transaction (Submit now, Prepare later), so a denied commit consumes
+     * no commit number and raises no CommitApplied. Its reads land in this transaction's ReadSet. A scope
+     * that restricts nothing (System) skips it at no cost.
+     */
+    private async Authorize(): Promise<void>
+    {
+        if (!this.Scope.WritesUnrestricted)
+        {
+            await WriteGate.Check(this.WriteEvaluator(), this.batch, this.snapshot.Index.Catalog);
         }
     }
 

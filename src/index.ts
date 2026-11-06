@@ -26,6 +26,7 @@ export type { ISignal, ISubscription } from './txn/Signal.js';
 // Errors: every error the engine raises on purpose is a GraphError with a GraphErrorCode (ruling F8).
 export { GraphError, GraphErrorCode } from './errors/GraphError.js';
 export { ConflictError } from './txn/ConflictError.js';
+export { AccessError, AccessErrorCode } from './access/AccessError.js';
 export { CommitError, CommitErrorCode } from './txn/CommitError.js';
 export { CatalogError, CatalogErrorCode } from './catalog/CatalogError.js';
 export { EdgeError, EdgeErrorCode } from './edges/EdgeError.js';

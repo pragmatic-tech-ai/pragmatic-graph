@@ -27,6 +27,8 @@ export enum GraphErrorCode
     Locked = 10,
     /** An engine invariant failed (an engine bug or misuse of internal building blocks). */
     Internal = 11,
+    /** The transaction's AccessScope does not allow a write it recorded (AccessError). */
+    AccessDenied = 12,
 }
 
 /** Base class of every error the engine raises on purpose. `cause` carries an underlying error when there is one. */
