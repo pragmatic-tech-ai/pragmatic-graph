@@ -157,7 +157,7 @@ export class BatchApplier
         await this.columns.WriteCell(txn, location, CatalogSnapshot.NodeIdMember, id);
         await this.ids.Bind(txn, op.PublicId, id);
         keys.Add(ConflictKeys.NodeSpace, ConflictKeys.Node(op.PublicId));
-        keys.Add(ConflictKeys.CellSpace, ConflictKeys.Cell(id, CatalogSnapshot.NodeIdMember.Id));
+        BatchApplier.AddCellKeys(keys, id, typeId, CatalogSnapshot.NodeIdMember.Id);
         keys.Add(ConflictKeys.ExtentSpace, ConflictKeys.Extent(typeId));
         return op.Concept;
     }
@@ -173,7 +173,7 @@ export class BatchApplier
         }
         BatchApplier.RequireValue(node, member, op.Value);
         await this.columns.WriteCell(txn, node.Location, member, op.Value);
-        keys.Add(ConflictKeys.CellSpace, ConflictKeys.Cell(node.Id, member.Id));
+        BatchApplier.AddCellKeys(keys, node.Id, node.Location.TypeId, member.Id);
         return { Node: node.Id, Member: member.Id };
     }
 
@@ -203,10 +203,10 @@ export class BatchApplier
         await this.ids.Unbind(txn, node.PublicId, node.Id);
         keys.Add(ConflictKeys.NodeSpace, ConflictKeys.Node(node.PublicId));
         keys.Add(ConflictKeys.ExtentSpace, ConflictKeys.Extent(node.Location.TypeId));
-        keys.Add(ConflictKeys.CellSpace, ConflictKeys.Cell(node.Id, CatalogSnapshot.NodeIdMember.Id));
+        BatchApplier.AddCellKeys(keys, node.Id, node.Location.TypeId, CatalogSnapshot.NodeIdMember.Id);
         for (const m of members.filter(x => x.Kind === MemberKind.Property))
         {
-            keys.Add(ConflictKeys.CellSpace, ConflictKeys.Cell(node.Id, m.Id));
+            BatchApplier.AddCellKeys(keys, node.Id, node.Location.TypeId, m.Id);
         }
         return node.Id;
     }
@@ -329,6 +329,13 @@ export class BatchApplier
             throw new GraphError(GraphErrorCode.Corrupt, BatchApplier.ErrCorruptRow + publicId);
         }
         return { PublicId: publicId, Id: id, Location: location, Concept: concept };
+    }
+
+    /** A cell write: its Cell key and the coarse Column key of the node's type (ruling F7). */
+    private static AddCellKeys(keys: WriteKeySet, node: bigint, typeId: number, memberId: number): void
+    {
+        keys.Add(ConflictKeys.CellSpace, ConflictKeys.Cell(node, memberId));
+        keys.Add(ConflictKeys.ColumnSpace, ConflictKeys.Column(typeId, memberId));
     }
 
     private static AddEdgeKeys(keys: WriteKeySet, rel: MemberDef, from: bigint, to: bigint): void

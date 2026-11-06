@@ -12,6 +12,7 @@ import { LmdbStore } from '../kv/lmdb/LmdbStore.js';
 import type { GraphContext } from '../GraphContext.js';
 import { Linearity } from '../kv/tests/Linearity.js';
 import type { Committer } from '../txn/Committer.js';
+import type { ReadSet } from '../txn/ReadSet.js';
 import * as Api from '../index.js';
 import {
     CatalogError,
@@ -245,6 +246,37 @@ class GraphFx
                     assert.equal(await r.GetProperty('f1', 'path'), '/d1');
                     assert.equal(await r.GetProperty('s1', 'path'), '/d2');
                 });
+                await g.dispose();
+            });
+
+            it('a property scan records one coarse Column key, not a key per row; a write to that column conflicts, other columns do not (F7)', async () =>
+            {
+                const g = await GraphFx.Defined(open);
+                await GraphFx.Commit(g, t =>
+                {
+                    for (let i = 0; i < 500; i++)
+                    {
+                        t.CreateNode('p' + i, 'file');
+                        t.SetProperty('p' + i, 'path', '/p' + i);
+                    }
+                    t.CreateNode('c1', 'component');
+                });
+                const scan = await g.Begin();
+                const other = await g.Begin();
+                assert.equal((await GraphFx.Scan(scan, 'file', 'path')).length, 500);
+                await GraphFx.Scan(other, 'file', 'path');
+                const reads = (scan as unknown as { reads: ReadSet }).reads;
+                assert.ok(reads.KeyCount <= 5, 'scan recorded ' + reads.KeyCount + ' keys');
+                scan.SetProperty('c1', 'name', 'a');
+                other.SetProperty('c1', 'name', 'b');
+                await GraphFx.Commit(g, t => t.SetProperty('p42', 'path', '/changed'));
+                assert.ok((await GraphFx.Settle(scan.Commit())) instanceof ConflictError);
+                const unrelated = await g.Begin();
+                await GraphFx.Scan(unrelated, 'file', 'path');
+                unrelated.SetProperty('c1', 'name', 'c');
+                await GraphFx.Commit(g, t => t.SetProperty('c1', 'since', new DateValue(1)));
+                assert.equal(typeof await unrelated.Commit(), 'bigint');
+                other.dispose();
                 await g.dispose();
             });
 

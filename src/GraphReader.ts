@@ -161,13 +161,17 @@ export class GraphReader implements IGraphDisposable
         }
     }
 
-    /** Live slots of the type in slot order; each column row carries its node id, so one pass suffices. */
+    /**
+     * Live slots of the type in slot order; each column row carries its node id, so one pass suffices.
+     * Records one coarse Column key for the whole column (ruling F7), not a Cell key per row; the
+     * node-id column is covered by the Extent key.
+     */
     private async *ScanProperty(typeId: number, def: MemberDef): AsyncIterable<IScanRow>
     {
+        this.Reads?.AddKey(ConflictKeys.ColumnSpace, ConflictKeys.Column(typeId, def.Id));
         for await (const row of this.context.Columns.ScanColumn(this.snapshot.Txn, GraphReader.Partition, typeId, def))
         {
             this.RequireOpen();
-            this.Reads?.AddKey(ConflictKeys.CellSpace, ConflictKeys.Cell(row.NodeId, def.Id));
             const publicId = await this.PublicIdOf(row.NodeId);
             this.RequireOpen();
             yield { PublicId: publicId, Value: row.Value };

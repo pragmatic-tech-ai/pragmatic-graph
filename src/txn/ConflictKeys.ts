@@ -16,6 +16,9 @@ import { Keyspace } from '../kv/Keyspace.js';
  *   direction, for readers that enumerate neighbors (phantom protection).
  * - Extent(typeId) in Keyspace.Rows: the set of nodes of one concept; written by CreateNode and
  *   DeleteNode so readers that scan a concept's nodes see inserted or removed members as a conflict.
+ * - Column(typeId, memberId) in Keyspace.Deltas (used here only as the family's namespace): one whole
+ *   property column of a concept. A full-column scan records this one coarse key instead of a Cell key
+ *   per row (ruling F7); every writer of a Cell also writes the Column key of the node's type.
  */
 export class ConflictKeys
 {
@@ -23,6 +26,7 @@ export class ConflictKeys
     public static readonly NodeSpace = Keyspace.Ids;
     public static readonly EdgeSpace = Keyspace.Edges;
     public static readonly ExtentSpace = Keyspace.Rows;
+    public static readonly ColumnSpace = Keyspace.Deltas;
 
     public static Cell(internalId: bigint, memberId: number): Uint8Array
     {
@@ -42,6 +46,11 @@ export class ConflictKeys
     public static Adjacency(relationshipId: number, direction: EdgeDirection, node: bigint): IKeyRange
     {
         return ConflictKeys.PrefixRange(TupleCodec.Encode([relationshipId, direction, node]));
+    }
+
+    public static Column(typeId: number, memberId: number): Uint8Array
+    {
+        return TupleCodec.Encode([typeId, memberId]);
     }
 
     public static Extent(typeId: number): Uint8Array

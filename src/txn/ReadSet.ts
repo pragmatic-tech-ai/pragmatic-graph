@@ -3,7 +3,10 @@ import type { IKeyRange } from '../kv/KeyValue.js';
 import type { Keyspace } from '../kv/Keyspace.js';
 import { ConflictKeys } from './ConflictKeys.js';
 
-/** The keys and ranges one keyspace's reads covered. */
+/**
+ * The keys and ranges one keyspace's reads covered. Ranges are kept sorted by Start, disjoint and
+ * coalesced (overlapping or touching ranges merge; ruling F7), so a key is checked by binary search.
+ */
 class SpaceReads
 {
     public readonly Keys = new Set<string>();
@@ -19,12 +22,82 @@ class SpaceReads
         copy.Ranges.push(...this.Ranges);
         return copy;
     }
+
+    /** Inserts the range, merging it with every range it overlaps or touches. Ranges added in key order cost O(log n). */
+    public AddRange(range: IKeyRange): void
+    {
+        if (TupleCodec.Compare(range.Start, range.End) >= 0)
+        {
+            return;
+        }
+        let start = range.Start;
+        let end = range.End;
+        // First range whose End >= start: everything before it ends strictly before the new range.
+        let lo = this.FirstEndingAtOrAfter(start);
+        let hi = lo;
+        while (hi < this.Ranges.length && TupleCodec.Compare((this.Ranges[hi] as IKeyRange).Start, end) <= 0)
+        {
+            const r = this.Ranges[hi] as IKeyRange;
+            if (TupleCodec.Compare(r.Start, start) < 0)
+            {
+                start = r.Start;
+            }
+            if (TupleCodec.Compare(r.End, end) > 0)
+            {
+                end = r.End;
+            }
+            hi++;
+        }
+        this.Ranges.splice(lo, hi - lo, { Start: start, End: end });
+    }
+
+    /** True when the key lies inside one of the ranges (Start inclusive, End exclusive). */
+    public InRange(key: Uint8Array): boolean
+    {
+        // Last range with Start <= key.
+        let lo = 0;
+        let hi = this.Ranges.length;
+        while (lo < hi)
+        {
+            const mid = (lo + hi) >> 1;
+            if (TupleCodec.Compare((this.Ranges[mid] as IKeyRange).Start, key) <= 0)
+            {
+                lo = mid + 1;
+            }
+            else
+            {
+                hi = mid;
+            }
+        }
+        const candidate = this.Ranges[lo - 1];
+        return candidate !== undefined && TupleCodec.Compare(key, candidate.End) < 0;
+    }
+
+    private FirstEndingAtOrAfter(key: Uint8Array): number
+    {
+        let lo = 0;
+        let hi = this.Ranges.length;
+        while (lo < hi)
+        {
+            const mid = (lo + hi) >> 1;
+            if (TupleCodec.Compare((this.Ranges[mid] as IKeyRange).End, key) < 0)
+            {
+                lo = mid + 1;
+            }
+            else
+            {
+                hi = mid;
+            }
+        }
+        return lo;
+    }
 }
 
 /**
  * What a transaction read, as logical conflict keys and half-open key ranges (see ConflictKeys).
  * Filled by readers; the committer checks it against write sets committed after the reader's snapshot.
- * Keys and ranges are copied on add, so later mutation of the caller's buffers has no effect.
+ * Keys and ranges are copied on add, so later mutation of the caller's buffers has no effect. A write key
+ * is checked in O(1) against the keys and O(log ranges) against the sorted, coalesced ranges.
  */
 export class ReadSet
 {
@@ -35,6 +108,28 @@ export class ReadSet
         return this.spaces.size === 0;
     }
 
+    /** Diagnostics: distinct keys recorded, over all keyspaces. */
+    public get KeyCount(): number
+    {
+        let n = 0;
+        for (const reads of this.spaces.values())
+        {
+            n += reads.Keys.size;
+        }
+        return n;
+    }
+
+    /** Diagnostics: disjoint ranges held after coalescing, over all keyspaces. */
+    public get RangeCount(): number
+    {
+        let n = 0;
+        for (const reads of this.spaces.values())
+        {
+            n += reads.Ranges.length;
+        }
+        return n;
+    }
+
     public AddKey(space: Keyspace, key: Uint8Array): void
     {
         this.For(space).Keys.add(ConflictKeys.Hex(key));
@@ -42,7 +137,7 @@ export class ReadSet
 
     public AddRange(space: Keyspace, range: IKeyRange): void
     {
-        this.For(space).Ranges.push({ Start: range.Start.slice(), End: range.End.slice() });
+        this.For(space).AddRange({ Start: range.Start.slice(), End: range.End.slice() });
     }
 
     /** True when the key was read directly or lies inside a read range (Start inclusive, End exclusive). */
@@ -59,18 +154,7 @@ export class ReadSet
         {
             return false;
         }
-        if (reads.Keys.has(hex))
-        {
-            return true;
-        }
-        for (const r of reads.Ranges)
-        {
-            if (TupleCodec.Compare(r.Start, key) <= 0 && TupleCodec.Compare(key, r.End) < 0)
-            {
-                return true;
-            }
-        }
-        return false;
+        return reads.Keys.has(hex) || reads.InRange(key);
     }
 
     public Clone(): ReadSet
