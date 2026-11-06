@@ -22,6 +22,7 @@ import { MemoryStore } from '../../kv/memory/MemoryStore.js';
 import { GraphError, GraphErrorCode } from '../../errors/GraphError.js';
 import { CommitError, CommitErrorCode } from '../CommitError.js';
 import { CommitLog } from '../CommitLog.js';
+import { CommitKind, LogEntry } from '../LogEntry.js';
 import { Committer } from '../Committer.js';
 import { ConflictError } from '../ConflictError.js';
 import { ConflictKeys } from '../ConflictKeys.js';
@@ -542,8 +543,13 @@ class TxnFx
                 const probe = new Probe(store, TxnFx.Catalog());
                 await probe.Read(async txn =>
                 {
-                    assert.deepEqual(await log.Read(txn, 1n), one);
-                    assert.deepEqual(await log.Read(txn, 2n), two);
+                    const first = await log.Read(txn, 1n);
+                    assert.deepEqual(first?.Batch, one);
+                    assert.equal(first?.Kind, CommitKind.Batch);
+                    assert.equal(first?.CatalogVersion, TxnFx.Catalog().Version);
+                    assert.equal(first?.CreatedIds.length, 1);
+                    assert.deepEqual(first?.CreatedIds, [await probe.RequireId('a')], 'the log records the allocated id');
+                    assert.deepEqual((await log.Read(txn, 2n))?.Batch, two);
                     assert.equal(await log.Read(txn, 3n), undefined);
                     assert.equal(await CommitLog.ReadLastCommit(txn), 2n);
                     const scanned: bigint[] = [];
@@ -551,11 +557,12 @@ class TxnFx
                     {
                         scanned.push(e.Commit);
                         assert.deepEqual(e.Batch, two);
+                        assert.deepEqual(e.CreatedIds, []);
                     }
                     assert.deepEqual(scanned, [2n]);
                 });
                 const raw = await probe.Get(Keyspace.Log, FormatKeys.LogEntry(2n));
-                assert.deepEqual(raw, two.Serialize());
+                assert.deepEqual(raw, LogEntry.EncodeBatch(TxnFx.Catalog().Version, [], two.Serialize()));
                 assert.deepEqual(await probe.Get(Keyspace.Meta, FormatKeys.Meta('commit')), TupleCodec.Encode([2n]));
                 await store.dispose();
             });
@@ -626,9 +633,9 @@ class TxnFx
                 const log = new CommitLog();
                 await probe.Read(async txn =>
                 {
-                    assert.deepEqual(await log.Read(txn, s + 1n), good1);
-                    assert.deepEqual(await log.Read(txn, s + 2n), reader);
-                    assert.deepEqual(await log.Read(txn, s + 3n), good2);
+                    assert.deepEqual((await log.Read(txn, s + 1n))?.Batch, good1);
+                    assert.deepEqual((await log.Read(txn, s + 2n))?.Batch, reader);
+                    assert.deepEqual((await log.Read(txn, s + 3n))?.Batch, good2);
                     assert.equal(await log.Read(txn, s + 4n), undefined);
                 });
                 await store.dispose();

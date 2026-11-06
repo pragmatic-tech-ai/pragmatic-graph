@@ -1,4 +1,6 @@
+import { CatalogModel } from '../catalog/CatalogModel.js';
 import { CatalogSnapshot } from '../catalog/CatalogSnapshot.js';
+import { CatalogStore } from '../catalog/CatalogStore.js';
 import { ColumnStore } from '../columns/ColumnStore.js';
 import { Compactor } from '../columns/Compactor.js';
 import { EdgeStore } from '../edges/EdgeStore.js';
@@ -13,15 +15,19 @@ import { CommitError } from './CommitError.js';
 import { CommitLog } from './CommitLog.js';
 import { ConflictError } from './ConflictError.js';
 import { ConflictHistory, type ISnapshotHandle } from './ConflictHistory.js';
-import type { ReadSet } from './ReadSet.js';
+import { CommitKind, type ICommitApplied, LogEntry } from './LogEntry.js';
+import { ReadSet } from './ReadSet.js';
 import { Signal } from './Signal.js';
 import { WriteBatch } from './WriteBatch.js';
 import { WriteKeySet } from './WriteKeySet.js';
 
-export interface ICommitApplied
+export { CommitKind, type ICommitApplied } from './LogEntry.js';
+
+/** A committed schema change: its commit number and the resulting catalog. */
+export interface ISchemaCommit
 {
     readonly Commit: bigint;
-    readonly Batch: WriteBatch;
+    readonly Catalog: CatalogSnapshot;
 }
 
 export interface ICommitterOptions
@@ -41,6 +47,11 @@ class PendingCommit
     /** Resolve/Reject settle once; later calls are no-ops, so a failing group can reject whatever is left. */
     private settled = false;
 
+    /**
+     * `CatalogVersion`: the version the submitter's transaction began with; checked inside the group
+     * against the group's catalog (ruling F4). Undefined: no check. `Define`: set for a schema change
+     * (then Bytes/Batch are empty and the commit runs alone in its own group).
+     */
     public constructor(
         public readonly Bytes: Uint8Array,
         public readonly Batch: WriteBatch,
@@ -48,8 +59,15 @@ class PendingCommit
         public readonly Snapshot: bigint,
         private readonly resolve: (commit: bigint) => void,
         private readonly reject: (error: unknown) => void,
+        public readonly CatalogVersion?: number,
+        public readonly Define?: (model: CatalogModel) => void,
     )
     {
+    }
+
+    public get IsSchema(): boolean
+    {
+        return this.Define !== undefined;
     }
 
     public Resolve(commit: bigint): void
@@ -92,6 +110,8 @@ interface IGroupOutcome
 {
     readonly Accepted: readonly IAccepted[];
     readonly Conflicts: ReadonlyArray<readonly [PendingCommit, Error]>;
+    /** The catalog version the group was validated and applied against. */
+    readonly CatalogVersion: number;
 }
 
 /**
@@ -124,6 +144,9 @@ export class Committer
     private static readonly ErrDisposed = 'Committer has been disposed';
     private static readonly ErrInGroup = 'Read set conflicts with an earlier batch of the same commit group';
     private static readonly ErrCompactMember = 'Delta for a member the catalog does not know: ';
+    private static readonly ErrSchema = 'The schema changed after the transaction began: catalog version ';
+    private static readonly ErrSchemaNow = ', now ';
+    private static readonly EmptyBatch = new WriteBatch().Seal();
 
     public readonly CommitApplied = new Signal<ICommitApplied>();
 
@@ -181,7 +204,16 @@ export class Committer
         return this.history.Register();
     }
 
-    /** Later groups apply batches against this catalog (a group already running keeps its catalog). */
+    /** The catalog later groups validate and apply against. */
+    public get Catalog(): CatalogSnapshot
+    {
+        return this.index.Catalog;
+    }
+
+    /**
+     * Low-level: later groups apply batches against this catalog (a group already running keeps its
+     * catalog). Bypasses the log; GraphStore changes the schema through SubmitSchema instead.
+     */
     public UpdateCatalog(snapshot: CatalogSnapshot): void
     {
         this.index = new CatalogIndex(snapshot);
@@ -193,7 +225,7 @@ export class Committer
      * snapshot older than the retained window), CommitError when the batch is semantically invalid, and
      * GraphError InvalidArgument when snapshotCommit is after LastCommit(). The batch and read set are captured now.
      */
-    public Submit(batch: WriteBatch, readSet: ReadSet, snapshotCommit: bigint): Promise<bigint>
+    public Submit(batch: WriteBatch, readSet: ReadSet, snapshotCommit: bigint, catalogVersion?: number): Promise<bigint>
     {
         if (this.disposed)
         {
@@ -214,7 +246,29 @@ export class Committer
         }
         return new Promise<bigint>((resolve, reject) =>
         {
-            this.queue.push(new PendingCommit(bytes, WriteBatch.Deserialize(bytes).Seal(), readSet.Clone(), snapshotCommit, resolve, reject));
+            this.queue.push(new PendingCommit(bytes, WriteBatch.Deserialize(bytes).Seal(), readSet.Clone(), snapshotCommit, resolve, reject, catalogVersion));
+            this.pump ??= this.Pump();
+        });
+    }
+
+    /**
+     * Commits a schema change (ruling F4): `define` extends a model of the catalog current when the
+     * change's turn comes (every commit submitted before it has been applied), the sealed result is
+     * saved, logged as a SchemaChange entry with its own commit number and raised on CommitApplied. A
+     * schema change runs alone in its group. Batches of transactions that began on an older catalog
+     * fail with ConflictError. A definition error (CatalogError) rejects only this change.
+     */
+    public SubmitSchema(define: (model: CatalogModel) => void): Promise<ISchemaCommit>
+    {
+        if (this.disposed)
+        {
+            return Promise.reject(new GraphError(GraphErrorCode.Disposed, Committer.ErrDisposed));
+        }
+        return new Promise<ISchemaCommit>((resolve, reject) =>
+        {
+            const pending = new PendingCommit(new Uint8Array(0), Committer.EmptyBatch, new ReadSet(), this.history.Last,
+                commit => resolve({ Commit: commit, Catalog: this.index.Catalog }), reject, undefined, define);
+            this.queue.push(pending);
             this.pump ??= this.Pump();
         });
     }
@@ -259,10 +313,17 @@ export class Committer
             await Promise.resolve();
             while (this.queue.length > 0)
             {
-                const group = this.queue.splice(0, this.queue.length);
+                const group = this.queue.splice(0, Committer.GroupLength(this.queue));
                 try
                 {
-                    await this.RunGroup(group);
+                    if ((group[0] as PendingCommit).IsSchema)
+                    {
+                        await this.RunSchema(group[0] as PendingCommit);
+                    }
+                    else
+                    {
+                        await this.RunGroup(group);
+                    }
                 }
                 catch (error)
                 {
@@ -273,6 +334,76 @@ export class Committer
         finally
         {
             this.pump = undefined;
+        }
+    }
+
+    /** A schema change forms a group alone; otherwise the leading run of batches up to the next schema change. */
+    private static GroupLength(queue: readonly PendingCommit[]): number
+    {
+        if ((queue[0] as PendingCommit).IsSchema)
+        {
+            return 1;
+        }
+        const schema = queue.findIndex(p => p.IsSchema);
+        return schema < 0 ? queue.length : schema;
+    }
+
+    /** Seals the change against the current catalog, then saves and logs it in one Write. */
+    private async RunSchema(p: PendingCommit): Promise<void>
+    {
+        let sealed: CatalogSnapshot;
+        try
+        {
+            const model = CatalogModel.FromSnapshot(this.index.Catalog);
+            (p.Define as (model: CatalogModel) => void)(model);
+            sealed = model.Seal();
+        }
+        catch (error)
+        {
+            p.Reject(error);
+            return;
+        }
+        const commit = this.history.Last + 1n;
+        try
+        {
+            await this.store.Write(async txn =>
+            {
+                await this.RequireCurrent(txn);
+                await CatalogStore.Save(txn, sealed);
+                this.log.Append(txn, commit, LogEntry.EncodeSchema(sealed));
+                this.log.WriteLastCommit(txn, commit);
+            });
+        }
+        catch (error)
+        {
+            p.Reject(error);
+            return;
+        }
+        this.history.Record(commit, new WriteKeySet());
+        this.history.Prune();
+        this.index = new CatalogIndex(sealed);
+        this.RaiseApplied({ Commit: commit, Kind: CommitKind.SchemaChange, CatalogVersion: sealed.Version, Batch: Committer.EmptyBatch, CreatedIds: Object.freeze([]), Catalog: sealed });
+        p.Resolve(commit);
+    }
+
+    private async RequireCurrent(txn: IWriteTransaction): Promise<void>
+    {
+        const stored = await CommitLog.ReadLastCommit(txn);
+        if (stored !== this.history.Last)
+        {
+            throw new GraphError(GraphErrorCode.Internal, Committer.ErrStale + stored + Committer.ErrExpected + this.history.Last);
+        }
+    }
+
+    private RaiseApplied(applied: ICommitApplied): void
+    {
+        try
+        {
+            this.CommitApplied.Raise(Object.freeze(applied));
+        }
+        catch
+        {
+            // Subscriber failures cannot undo a durable commit; Signal already ran every handler.
         }
     }
 
@@ -368,17 +499,19 @@ export class Committer
 
     private async ApplyGroup(txn: IWriteTransaction, index: CatalogIndex, candidates: readonly PendingCommit[]): Promise<IGroupOutcome>
     {
-        const stored = await CommitLog.ReadLastCommit(txn);
-        if (stored !== this.history.Last)
-        {
-            throw new GraphError(GraphErrorCode.Internal, Committer.ErrStale + stored + Committer.ErrExpected + this.history.Last);
-        }
+        await this.RequireCurrent(txn);
         const applier = new BatchApplier(index, this.columns, this.edges, this.rows, this.ids);
         const groupKeys = new WriteKeySet();
         const accepted: IAccepted[] = [];
         const conflicts: Array<readonly [PendingCommit, Error]> = [];
+        const version = index.Catalog.Version;
         for (const p of candidates)
         {
+            if (p.CatalogVersion !== undefined && p.CatalogVersion !== version)
+            {
+                conflicts.push([p, new ConflictError(Committer.ErrSchema + p.CatalogVersion + Committer.ErrSchemaNow + version)]);
+                continue;
+            }
             if (groupKeys.Intersects(p.Reads))
             {
                 conflicts.push([p, new ConflictError(Committer.ErrInGroup)]);
@@ -409,13 +542,13 @@ export class Committer
         for (const a of accepted)
         {
             commit += 1n;
-            this.log.Append(txn, commit, a.Pending.Bytes);
+            this.log.Append(txn, commit, LogEntry.EncodeBatch(version, a.Pending.Ids ?? [], a.Pending.Bytes));
         }
         if (accepted.length > 0)
         {
             this.log.WriteLastCommit(txn, commit);
         }
-        return { Accepted: accepted, Conflicts: conflicts };
+        return { Accepted: accepted, Conflicts: conflicts, CatalogVersion: version };
     }
 
     /** Folds every touched chunk delta over CompactThreshold entries into its chunk (ruling R28). */
@@ -455,15 +588,8 @@ export class Committer
         outcome.Accepted.forEach((a, i) =>
         {
             const n = commits[i] as bigint;
-            try
-            {
-                // One sealed, frozen batch: no subscriber can change what the others (or the submitter's copy) see.
-                this.CommitApplied.Raise({ Commit: n, Batch: a.Pending.Batch });
-            }
-            catch
-            {
-                // Subscriber failures cannot undo a durable commit; Signal already ran every handler.
-            }
+            // One sealed, frozen batch: no subscriber can change what the others (or the submitter's copy) see.
+            this.RaiseApplied({ Commit: n, Kind: CommitKind.Batch, CatalogVersion: outcome.CatalogVersion, Batch: a.Pending.Batch, CreatedIds: Object.freeze([...(a.Pending.Ids ?? [])]) });
             a.Pending.Resolve(n);
         });
     }

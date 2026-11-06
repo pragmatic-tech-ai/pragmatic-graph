@@ -35,6 +35,23 @@ export class CatalogStore
         {
             return CatalogSnapshot.Build(version, [], 1, 1);
         }
+        return CatalogStore.Decode(version, raw);
+    }
+
+    /** The catalog root value (UTF-8 JSON) of a snapshot; also the payload of a SchemaChange log entry. */
+    public static Serialize(snapshot: CatalogSnapshot): Uint8Array
+    {
+        const payload: IStoredCatalog = {
+            NextTypeId: snapshot.NextTypeId,
+            NextMemberId: snapshot.NextMemberId,
+            Definitions: [...snapshot.Definitions()],
+        };
+        return new TextEncoder().encode(JSON.stringify(payload));
+    }
+
+    /** Parses and validates a catalog root value as the snapshot of `version`; CatalogError on bad input. */
+    public static Decode(version: number, raw: Uint8Array): CatalogSnapshot
+    {
         const stored = CatalogStore.Parse(raw);
         CatalogStore.CheckIds(stored);
         return CatalogSnapshot.Build(
@@ -54,13 +71,7 @@ export class CatalogStore
                 CatalogErrorCode.VersionConflict,
                 CatalogStore.VersionConflictMessage + stored + CatalogStore.SavingMessage + snapshot.Version);
         }
-        const payload: IStoredCatalog = {
-            NextTypeId: snapshot.NextTypeId,
-            NextMemberId: snapshot.NextMemberId,
-            Definitions: [...snapshot.Definitions()],
-        };
-        const json = JSON.stringify(payload);
-        txn.Put(Keyspace.Catalog, FormatKeys.CatalogRoot(), new TextEncoder().encode(json));
+        txn.Put(Keyspace.Catalog, FormatKeys.CatalogRoot(), CatalogStore.Serialize(snapshot));
         txn.Put(Keyspace.Meta, FormatKeys.Meta(CatalogStore.VersionKeyName), TupleCodec.Encode([BigInt(snapshot.Version)]));
     }
 

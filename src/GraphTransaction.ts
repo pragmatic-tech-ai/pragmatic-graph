@@ -76,15 +76,16 @@ export class GraphTransaction extends GraphReader
         try
         {
             const began = this.snapshot.Index.Catalog.Version;
-            if (began !== this.context.CatalogVersion)
-            {
-                throw new ConflictError(GraphTransaction.ErrSchema + began + GraphTransaction.ErrSchemaNow + this.context.CatalogVersion);
-            }
             if (this.batch.Count === 0)
             {
+                if (began !== this.context.CatalogVersion)
+                {
+                    throw new ConflictError(GraphTransaction.ErrSchema + began + GraphTransaction.ErrSchemaNow + this.context.CatalogVersion);
+                }
                 return this.SnapshotCommit;
             }
-            return await this.context.Committer.Submit(this.batch, this.reads, this.ValidationCommit());
+            // The catalog version is checked inside the commit group against the group's catalog (ruling F4).
+            return await this.context.Committer.Submit(this.batch, this.reads, this.ValidationCommit(), began);
         }
         finally
         {

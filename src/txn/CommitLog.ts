@@ -3,18 +3,13 @@ import { FormatKeys } from '../format/FormatKeys.js';
 import { TupleCodec } from '../format/TupleCodec.js';
 import type { IReadTransaction, IWriteTransaction } from '../kv/KeyValue.js';
 import { Keyspace } from '../kv/Keyspace.js';
-import { WriteBatch } from './WriteBatch.js';
-
-export interface ILogEntry
-{
-    readonly Commit: bigint;
-    readonly Batch: WriteBatch;
-}
+import { type ICommitApplied, LogEntry } from './LogEntry.js';
 
 /**
- * The commit log: Log(commit) = serialized WriteBatch, commits gap-free from 1, and Meta("commit") =
- * the last commit number (absent = 0). Written only by the Committer inside its group Write; readable
- * from any snapshot as an ordered changefeed.
+ * The commit log: Log(commit) = a LogEntry (a batch with its catalog version and created ids, or a
+ * schema change with the resulting catalog), commits gap-free from 1, and Meta("commit") = the last
+ * commit number (absent = 0). Written only by the Committer inside its Writes; readable from any
+ * snapshot as an ordered, self-sufficient changefeed (ruling F4).
  */
 export class CommitLog
 {
@@ -39,10 +34,10 @@ export class CommitLog
         return value;
     }
 
-    /** Appends the entry. The caller writes commits consecutively and then calls WriteLastCommit once. */
-    public Append(txn: IWriteTransaction, commit: bigint, serializedBatch: Uint8Array): void
+    /** Appends an encoded LogEntry. The caller writes commits consecutively and then calls WriteLastCommit once. */
+    public Append(txn: IWriteTransaction, commit: bigint, entry: Uint8Array): void
     {
-        txn.Put(Keyspace.Log, FormatKeys.LogEntry(commit), serializedBatch);
+        txn.Put(Keyspace.Log, FormatKeys.LogEntry(commit), entry);
     }
 
     public WriteLastCommit(txn: IWriteTransaction, commit: bigint): void
@@ -50,19 +45,19 @@ export class CommitLog
         txn.Put(Keyspace.Meta, FormatKeys.Meta(CommitLog.CommitName), TupleCodec.Encode([commit]));
     }
 
-    public async Read(txn: IReadTransaction, commit: bigint): Promise<WriteBatch | undefined>
+    public async Read(txn: IReadTransaction, commit: bigint): Promise<ICommitApplied | undefined>
     {
         const raw = await txn.Get(Keyspace.Log, FormatKeys.LogEntry(commit));
-        return raw === undefined ? undefined : WriteBatch.Deserialize(raw);
+        return raw === undefined ? undefined : LogEntry.Decode(commit, raw);
     }
 
     /** Entries with Commit > after, in commit order. */
-    public async *Scan(txn: IReadTransaction, after: bigint): AsyncIterable<ILogEntry>
+    public async *Scan(txn: IReadTransaction, after: bigint): AsyncIterable<ICommitApplied>
     {
         const range = { Start: FormatKeys.LogEntry(after + 1n), End: CommitLog.LogEnd };
         for await (const [key, value] of txn.Scan(Keyspace.Log, range))
         {
-            yield { Commit: TupleCodec.Decode(key)[0] as bigint, Batch: WriteBatch.Deserialize(value) };
+            yield LogEntry.Decode(TupleCodec.Decode(key)[0] as bigint, value);
         }
     }
 }

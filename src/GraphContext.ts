@@ -73,7 +73,7 @@ export class GraphContext
         return this.index.Catalog.Version;
     }
 
-    /** Makes a newly saved catalog current for later readers and later commit groups. Older versions are ignored. */
+    /** Makes a newly committed catalog current for later readers (the committer already applies it). Older versions are ignored. */
     public SetCatalog(snapshot: CatalogSnapshot): void
     {
         if (snapshot.Version <= this.index.Catalog.Version)
@@ -81,7 +81,6 @@ export class GraphContext
             return;
         }
         this.index = new CatalogIndex(snapshot);
-        this.Committer.UpdateCatalog(snapshot);
     }
 
     /**

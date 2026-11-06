@@ -10,6 +10,7 @@ import type { IKeyValueStore, IReadTransaction, IWriteTransaction } from './kv/K
 import { Keyspace } from './kv/Keyspace.js';
 import { LmdbStore } from './kv/lmdb/LmdbStore.js';
 import { MemoryStore } from './kv/memory/MemoryStore.js';
+import { CommitLog } from './txn/CommitLog.js';
 import { Committer, type ICommitApplied } from './txn/Committer.js';
 import { type ISignal, SignalView } from './txn/Signal.js';
 
@@ -24,6 +25,7 @@ import { type ISignal, SignalView } from './txn/Signal.js';
 export class GraphStore
 {
     private static readonly ErrDisposed = 'Graph store has been disposed';
+    private static readonly ErrAfterCommit = 'afterCommit must be non-negative: ';
     /** Covers every tuple-encoded key (type codes are below 0xFF). */
     private static readonly AnyKey = { Start: Uint8Array.of(0x00), End: Uint8Array.of(0xff) };
     private static readonly FirstOnly = { Limit: 1 };
@@ -52,14 +54,41 @@ export class GraphStore
 
     /**
      * Extends the stored schema: `define` receives a model holding every existing definition (with its
-     * stable ids) and adds new ones. Validated and saved atomically; a failure (CatalogError) leaves the
-     * schema unchanged. Transactions begun before the change fail Commit with ConflictError.
+     * stable ids) and adds new ones. The change is a commit (ruling F4): it runs after every commit
+     * submitted before it, gets a commit number, is logged and raised on CommitApplied, and resolves with
+     * that number. A failure (CatalogError) leaves the schema unchanged. Transactions begun before the
+     * change fail Commit with ConflictError.
      */
-    public async DefineSchema(define: (model: CatalogModel) => void): Promise<void>
+    public async DefineSchema(define: (model: CatalogModel) => void): Promise<bigint>
     {
         this.RequireLive();
-        const snapshot = await this.context.Store.Write(async txn => GraphStore.Evolve(txn, define));
-        this.context.SetCatalog(snapshot);
+        const result = await this.context.Committer.SubmitSchema(define);
+        this.context.SetCatalog(result.Catalog);
+        return result.Commit;
+    }
+
+    /**
+     * The changefeed (seam 7, ruling F4): every commit after `afterCommit`, in commit order, read from the
+     * log in one snapshot taken when iteration starts. Each entry is self-sufficient for replay: batches
+     * carry the catalog version they were applied against and their created internal ids; schema changes
+     * carry the complete resulting catalog. Ending the iteration early releases the snapshot.
+     */
+    public async *ReadChanges(afterCommit: bigint): AsyncIterable<ICommitApplied>
+    {
+        this.RequireLive();
+        if (afterCommit < 0n)
+        {
+            throw new GraphError(GraphErrorCode.InvalidArgument, GraphStore.ErrAfterCommit + afterCommit);
+        }
+        const txn = await this.context.Store.BeginRead();
+        try
+        {
+            yield* new CommitLog().Scan(txn, afterCommit);
+        }
+        finally
+        {
+            txn.dispose();
+        }
     }
 
     /** A read-only snapshot of the latest commit. */
@@ -131,15 +160,6 @@ export class GraphStore
             }
         }
         return true;
-    }
-
-    private static async Evolve(txn: IWriteTransaction, define: (model: CatalogModel) => void): Promise<CatalogSnapshot>
-    {
-        const model = CatalogModel.FromSnapshot(await CatalogStore.Load(txn));
-        define(model);
-        const sealed = model.Seal();
-        await CatalogStore.Save(txn, sealed);
-        return sealed;
     }
 
     /** A reader created while dispose() started is ended at once rather than handed out. */

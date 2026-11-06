@@ -34,7 +34,7 @@ This document is the contract between the TypeScript engine and the future Rust 
 Keys are `(name, ...qualifiers)`. Names defined so far:
 
 - `("format")`: the format version, stored as a tuple-encoded single integer `(1)`. `FormatMeta.Verify` throws `FormatVersionMismatchError` if absent or not `1`.
-- `("catalogVersion")`: the catalog version, a tuple-encoded single integer `(n)`; absent means `0` (empty catalog).
+- `("catalogVersion")`: the catalog version, a tuple-encoded single integer `(n)`; absent means `0` (empty catalog). Every schema change bumps it by one, through the committer (it is a commit with a SchemaChange log entry).
 - `("nextBlock")`: the next unreserved id block number, a tuple-encoded single integer `(n)`; absent means `0`. The allocator reserves 16 blocks at a time by committing `(n + 16)` in its own write before handing out any id from blocks `n .. n + 15` (ruling F6), so a block is durable before use and a rolled-back caller (or a restart, which forgets unused reserved blocks) can waste ids but never duplicate them.
 
 Names added by later tasks, each with its value layout completed by that task:
@@ -53,6 +53,8 @@ MemberDef = { Id, Name, Kind, Type?, Nullable, Targets?, Many?, Ordered?, EdgePr
 ```
 
 `Definitions` are in definition order. `Placement` and `AggregateRoot` (seam 3, ruling F5) are concept-only and additive: `Placement` is `1` Replicated (ontology core, taxonomies: copied to every partition) or `2` Partitioned (instance data); a concept stored without it loads as Partitioned, and the engine always writes it for concepts. `AggregateRoot` is optional and names a concept (not an aspect, not undefined) whose instances this concept's instances are co-located with and conflict-partitioned by. An aspect with either field, or a `Placement` outside `1..2`, is a corrupt catalog; an `AggregateRoot` that does not name a concept is rejected as a schema error (`InvalidAggregateRoot`). `Kind` is `1` Property or `2` Relationship; `Type` is `1` Boolean, `2` Int64, `3` Float64, `4` String, `5` Date, `6` DateTime, `7` Duration. Type ids and member ids are stored as assigned. `NextTypeId` and `NextMemberId` are the persisted next-id counters, so ids are never reused; a counter must be at least `1` and at least one more than the largest stored id of its kind (edge properties included), else the catalog is corrupt. The catalog version lives in `Meta("catalogVersion")`, not in the row, and is written in the same transaction. A save must carry exactly the stored version plus one, otherwise it is rejected as a version conflict. A value that is not valid JSON of this shape, or that repeats a type id or member id (edge properties included), is rejected on load as a corrupt catalog.
+
+Cost note (F9): the catalog root is one value, so every schema change rewrites (and logs) the whole catalog: O(catalog size) per change, fine at thousands of concepts. Per-definition keys (one key per type definition, so a change writes only what it touches) are a deferred format change; the root key `(1)` and its tag leave room for them.
 
 Member ids are catalog-global: one id space across all concepts and aspects, assigned once, stable, never reused, starting at `1`. An aspect-contributed member keeps its one id in every carrier concept. Member id `0` is reserved: it is the implicit node-id column (Int64, non-null) present on every concept.
 
@@ -179,9 +181,25 @@ A larger head is a larger integer; equal heads compare digit by digit, so the fi
 
 ### Log
 
-Key `(commit: u64)`; commits are monotonic and gap-free from `1`, and `Meta("commit")` is the highest one. The log is the changefeed and the record of every committed write batch; the committer appends one entry per accepted batch inside the same write transaction that applies it.
+Key `(commit: u64)`; commits are monotonic and gap-free from `1`, and `Meta("commit")` is the highest one. The log is the changefeed (seam 7) and the record of every commit, batches and schema changes alike (ruling F4); the committer appends one entry per commit inside the same write transaction that applies it. Each entry is self-sufficient for deterministic replay: replaying the entries in order against an empty store reproduces the same catalog, the same internal ids and the same data. `GraphStore.ReadChanges(afterCommit)` reads it.
 
-The value is the serialized `WriteBatch`: logical operations addressed by public id, in the order they were applied. All integers little-endian.
+The value is a log entry. All integers little-endian:
+
+```
+kind : u8   1 = Batch, 2 = SchemaChange
+Batch:
+  catalogVersion : u32      the catalog version the batch was validated and applied against
+  idCount        : u32      number of CreateNode ops in the batch
+  ids            : idCount x u64   the internal ids allocated for the CreateNode ops, in op order (never 0)
+  batch          : the rest: the serialized WriteBatch (below)
+SchemaChange:
+  catalogVersion : u32      the catalog version the change produced
+  catalog        : the rest: the complete catalog root value after the change (UTF-8 JSON, see Catalog)
+```
+
+A schema change is committed alone (never grouped with batches); it writes the catalog root, `Meta("catalogVersion")`, its log entry and `Meta("commit")` in one write transaction. A batch whose transaction began on another catalog version than the one its group applies against is rejected with a conflict before it writes anything. A reader rejects an unknown kind, a truncated entry, an `idCount` that differs from the batch's CreateNode count, an id `0`, and a batch or catalog that fails its own validation.
+
+The serialized `WriteBatch` holds logical operations addressed by public id, in the order they were applied:
 
 ```
 version : u8      1

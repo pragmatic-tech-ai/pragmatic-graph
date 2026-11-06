@@ -24,8 +24,10 @@ import {
     DateValue,
     EdgeDirection,
     FormatVersionMismatchError,
+    CommitKind,
     GraphError,
     GraphErrorCode,
+    type ICommitApplied,
     GraphReader,
     GraphStore,
     GraphTransaction,
@@ -168,7 +170,7 @@ class GraphFx
             it('a new reader sees committed values, edges in both directions and nothing for unknown nodes', async () =>
             {
                 const g = await GraphFx.Defined(open);
-                assert.equal(await GraphFx.Seed(g), 1n);
+                assert.equal(await GraphFx.Seed(g), 2n, 'commit 1 is the schema (F4)');
                 await GraphFx.Read(g, async r =>
                 {
                     assert.equal(await r.GetProperty('f1', 'path'), '/a.txt');
@@ -206,7 +208,7 @@ class GraphFx
                 const g = await GraphFx.Defined(open);
                 await GraphFx.Seed(g);
                 const before = await g.BeginRead();
-                assert.equal(before.SnapshotCommit, 1n);
+                assert.equal(before.SnapshotCommit, 2n);
                 await GraphFx.Commit(g, t => t.SetProperty('f1', 'path', '/b.txt'));
                 assert.equal(await before.GetProperty('f1', 'path'), '/a.txt');
                 before.dispose();
@@ -329,6 +331,68 @@ class GraphFx
                 await g.dispose();
             });
 
+            it('DefineSchema is a commit: it gets a commit number, raises CommitApplied with the catalog and is in the log (F4)', async () =>
+            {
+                const g = await open();
+                const seen: ICommitApplied[] = [];
+                g.CommitApplied.Subscribe(e => seen.push(e));
+                await g.DefineSchema(m => GraphFx.Define(m));
+                assert.equal(seen.length, 1);
+                const schema = seen[0] as ICommitApplied;
+                assert.equal(schema.Commit, 1n);
+                assert.equal(schema.Kind, CommitKind.SchemaChange);
+                assert.equal(schema.CatalogVersion, 1);
+                assert.equal(schema.Batch.Count, 0);
+                assert.ok(schema.Catalog !== undefined && schema.Catalog.Definitions().some(d => d.Name === 'folder'));
+                assert.equal(await GraphFx.Seed(g), 2n);
+                await g.dispose();
+            });
+
+            it('ReadChanges replays every commit in order: schema changes with their catalog, batches with catalog version and created ids (F4)', async () =>
+            {
+                const g = await GraphFx.Defined(open);
+                await GraphFx.Seed(g);
+                await g.DefineSchema(m => m.DefineConcept('extra', null, [], []));
+                await GraphFx.Commit(g, t => t.CreateNode('x1', 'extra'));
+                const all: ICommitApplied[] = [];
+                for await (const e of g.ReadChanges(0n))
+                {
+                    all.push(e);
+                }
+                assert.deepEqual(all.map(e => [e.Commit, e.Kind, e.CatalogVersion]), [
+                    [1n, CommitKind.SchemaChange, 1],
+                    [2n, CommitKind.Batch, 1],
+                    [3n, CommitKind.SchemaChange, 2],
+                    [4n, CommitKind.Batch, 2],
+                ]);
+                const seed = all[1] as ICommitApplied;
+                assert.equal(seed.CreatedIds.length, seed.Batch.Ops().filter(op => op.Op === WriteOp.CreateNode).length);
+                assert.equal(new Set(seed.CreatedIds).size, seed.CreatedIds.length);
+                assert.ok(seed.CreatedIds.every(id => id > 0n));
+                assert.ok((all[2] as ICommitApplied).Catalog?.Definitions().some(d => d.Name === 'extra'));
+                const tail: bigint[] = [];
+                for await (const e of g.ReadChanges(3n))
+                {
+                    tail.push(e.Commit);
+                }
+                assert.deepEqual(tail, [4n]);
+                await g.dispose();
+            });
+
+            it('a schema change submitted before a transaction commits fails that transaction, even while still in flight (F4)', async () =>
+            {
+                const g = await GraphFx.Defined(open);
+                await GraphFx.Seed(g);
+                const t = await g.Begin();
+                t.SetProperty('f1', 'path', '/raced');
+                const schema = g.DefineSchema(m => m.DefineConcept('later', null, [], []));
+                const result = await GraphFx.Settle(t.Commit());
+                await schema;
+                assert.ok(result instanceof ConflictError, String(result));
+                await GraphFx.Read(g, async r => assert.equal(await r.GetProperty('f1', 'path'), '/a.txt'));
+                await g.dispose();
+            });
+
             it('CommitApplied is raised once per commit with its number and batch', async () =>
             {
                 const g = await GraphFx.Defined(open);
@@ -336,7 +400,7 @@ class GraphFx
                 const sub = g.CommitApplied.Subscribe(e => seen.push(e));
                 await GraphFx.Seed(g);
                 await GraphFx.Commit(g, t => t.SetProperty('f1', 'path', '/x'));
-                assert.deepEqual(seen.map(e => e.Commit), [1n, 2n]);
+                assert.deepEqual(seen.map(e => e.Commit), [2n, 3n]);
                 assert.deepEqual(seen[1]!.Batch.Ops(), [{ Op: WriteOp.SetProperty, PublicId: 'f1', Member: 'path', Value: '/x' }]);
                 sub.dispose();
                 await g.dispose();
@@ -353,7 +417,7 @@ class GraphFx
                 const seen: bigint[] = [];
                 g.CommitApplied.Subscribe(e => seen.push(e.Commit));
                 await GraphFx.Seed(g);
-                assert.deepEqual(seen, [1n]);
+                assert.deepEqual(seen, [2n]);
                 await g.dispose();
             });
 
@@ -366,10 +430,10 @@ class GraphFx
                 const t = await g.Begin();
                 await t.GetProperty('f1', 'path');
                 assert.equal(await t.Commit(), t.SnapshotCommit);
-                assert.equal(t.SnapshotCommit, 1n);
+                assert.equal(t.SnapshotCommit, 2n);
                 await assert.rejects(t.Commit());
                 assert.deepEqual(seen, []);
-                assert.equal(await GraphFx.Commit(g, x => x.SetProperty('f1', 'path', '/n')), 2n, 'no commit number was consumed');
+                assert.equal(await GraphFx.Commit(g, x => x.SetProperty('f1', 'path', '/n')), 3n, 'no commit number was consumed');
                 await g.dispose();
             });
 
@@ -657,7 +721,7 @@ describe('GraphStore durability on LMDB', () =>
             assert.equal(await r.GetProperty('ghost', 'path'), undefined);
             assert.deepEqual(await GraphFx.Scan(r, 'placed', 'in'), [['c1', 'loc'], ['c2', 'loc']]);
         });
-        assert.equal(await GraphFx.Commit(reopened, t => t.SetProperty('f1', 'path', '/next')), 3n, 'commit numbers resume');
+        assert.equal(await GraphFx.Commit(reopened, t => t.SetProperty('f1', 'path', '/next')), 4n, 'commit numbers resume');
         await assert.rejects(reopened.DefineSchema(m => GraphFx.Define(m)), CatalogError, 'the schema persisted');
         await reopened.dispose();
     });
