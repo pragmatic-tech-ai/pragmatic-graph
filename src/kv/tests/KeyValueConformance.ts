@@ -34,6 +34,7 @@ export class KeyValueConformance
             KeyValueConformance.Case('scans in Compare order', open, KeyValueConformance.ScanOrder);
             KeyValueConformance.Case('scan honors End exclusivity and Start inclusivity', open, KeyValueConformance.ScanBounds);
             KeyValueConformance.Case('scan honors limit', open, KeyValueConformance.ScanLimit);
+            KeyValueConformance.Case('empty ranges (End empty, or Start >= End) yield nothing and read nothing, in both directions', open, KeyValueConformance.EmptyRanges);
             KeyValueConformance.Case('reverse scan yields descending order with Start inclusive, End exclusive and limit', open, KeyValueConformance.ReverseScan);
             KeyValueConformance.Case('reverse write scan merges own staged puts and deletes in descending order', open, KeyValueConformance.ReverseOwnWrites);
             KeyValueConformance.Case('a reverse scan with limit 1 reads a bounded number of entries over 10,000 keys', open, KeyValueConformance.ReverseEarlyExit);
@@ -271,6 +272,45 @@ export class KeyValueConformance
         const options = limit === undefined ? { Reverse: true } : { Reverse: true, Limit: limit };
         const pairs = await KeyValueConformance.Collect(read.Scan(KeyValueConformance.Space, range, options));
         return pairs.map(p => p[0]);
+    }
+
+    private static async EmptyRanges(store: IKeyValueStore): Promise<void>
+    {
+        const probe = store as unknown as IScanProbe;
+        await KeyValueConformance.Seed(store, Array.from({ length: 10000 }, (_, i) => i + 1));
+        const ranges: IKeyRange[] = [
+            { Start: Uint8Array.of(), End: Uint8Array.of() },
+            { Start: KeyValueConformance.Key(5000), End: Uint8Array.of() },
+            { Start: KeyValueConformance.Key(5000), End: KeyValueConformance.Key(5000) },
+            { Start: KeyValueConformance.Key(6000), End: KeyValueConformance.Key(5000) },
+        ];
+        const read = await store.BeginRead();
+        try
+        {
+            for (const range of ranges)
+            {
+                for (const reverse of [false, true])
+                {
+                    const before = probe.EntriesRead;
+                    const got = await KeyValueConformance.Collect(read.Scan(KeyValueConformance.Space, range, { Reverse: reverse }));
+                    assert.equal(got.length, 0);
+                    assert.equal(probe.EntriesRead - before, 0, 'reverse ' + reverse + ' read ' + (probe.EntriesRead - before) + ' entries');
+                }
+            }
+        }
+        finally
+        {
+            read.dispose();
+        }
+        await store.Write(async txn =>
+        {
+            txn.Put(KeyValueConformance.Space, KeyValueConformance.Key(5500), KeyValueConformance.Val(1));
+            for (const range of ranges)
+            {
+                assert.equal((await KeyValueConformance.Collect(txn.Scan(KeyValueConformance.Space, range, { Reverse: true }))).length, 0);
+                assert.equal((await KeyValueConformance.Collect(txn.Scan(KeyValueConformance.Space, range))).length, 0);
+            }
+        });
     }
 
     private static async ReverseScan(store: IKeyValueStore): Promise<void>

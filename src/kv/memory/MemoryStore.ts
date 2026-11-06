@@ -1,5 +1,5 @@
 import { TupleCodec } from '../../format/TupleCodec.js';
-import { IKeyRange, IKeyValueStore, IReadTransaction, IScanOptions, IScanProbe, IWriteTransaction, KeyLimits, ScanCounter } from '../KeyValue.js';
+import { IKeyRange, IKeyValueStore, IReadTransaction, IScanOptions, IScanProbe, IWriteTransaction, KeyLimits, KeyRanges, ScanCounter } from '../KeyValue.js';
 import { GraphError, GraphErrorCode } from '../../errors/GraphError.js';
 import { Keyspace } from '../Keyspace.js';
 import { type IPendingChange, PendingChanges } from '../PendingChanges.js';
@@ -275,6 +275,10 @@ class MemoryReadTransaction implements IReadTransaction
     /** Raw (uncopied) entries in range, in key order (descending with reverse), produced lazily from the binary-searched bound. */
     protected Entries(space: Keyspace, range: IKeyRange, reverse: boolean): Iterable<readonly [Uint8Array, Uint8Array]>
     {
+        if (KeyRanges.IsEmpty(range))
+        {
+            return KeyRanges.None;
+        }
         const list = this.snapshot.get(space) ?? LeafList.Empty;
         return reverse ? list.Reverse(range) : list.Forward(range);
     }

@@ -1,4 +1,4 @@
-import { closeSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync, writeSync } from 'node:fs';
+import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, rmSync, statSync, writeSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { GraphError, GraphErrorCode } from '../../errors/GraphError.js';
 
@@ -7,19 +7,27 @@ import { GraphError, GraphErrorCode } from '../../errors/GraphError.js';
  * directory holds the owning process id. A second LmdbStore on the same directory, in this process or
  * another live one, is refused with GraphError Locked, so two single-writer committers can never
  * interleave commit numbers. A lock whose process is gone (a crash, or an exit without dispose) is
- * stale and is taken over. Taking over a stale lock is not atomic across two processes racing for it;
- * that window is accepted in v1.
+ * stale and is taken over. The file is created atomically (exclusive create, pid written and fsynced
+ * before close). A lock file that is empty or does not hold a pid (an opener between create and
+ * write, or a torn write) counts as held for GraceMs after its last modification, then as stale.
+ * Taking over a stale lock is not atomic across two processes racing for it; that window is accepted
+ * in v1.
  */
 export class LmdbLock
 {
     public static readonly FileName = 'graph.lock';
+    /** How long an unreadable (empty or non-numeric) lock file is treated as held. */
+    public static readonly GraceMs = 10000;
     private static readonly Held = new Set<string>();
     private static readonly ErrLocked = 'The graph store is already open for writing by process ';
     private static readonly ErrAt = ' at ';
     private static readonly ExclusiveCreate = 'wx';
+    private static readonly Overwrite = 'w';
     private static readonly AlreadyExists = 'EEXIST';
     private static readonly NoPermission = 'EPERM';
     private static readonly Utf8 = 'utf8';
+    private static readonly PidPattern = /^[1-9][0-9]*$/;
+    private static readonly UnknownOwner = 'unknown (lock file being written)';
 
     private released = false;
 
@@ -38,15 +46,7 @@ export class LmdbLock
         mkdirSync(dir, { recursive: true });
         try
         {
-            const fd = openSync(file, LmdbLock.ExclusiveCreate);
-            try
-            {
-                writeSync(fd, String(process.pid));
-            }
-            finally
-            {
-                closeSync(fd);
-            }
+            LmdbLock.WritePid(file, LmdbLock.ExclusiveCreate);
         }
         catch (error)
         {
@@ -54,12 +54,19 @@ export class LmdbLock
             {
                 throw error;
             }
-            const owner = Number.parseInt(readFileSync(file, LmdbLock.Utf8), 10);
-            if (Number.isInteger(owner) && owner !== process.pid && LmdbLock.IsAlive(owner))
+            const owner = LmdbLock.ReadPid(file);
+            if (owner === undefined)
+            {
+                if (Date.now() - statSync(file).mtimeMs < LmdbLock.GraceMs)
+                {
+                    throw LmdbLock.Locked(owner, dir);
+                }
+            }
+            else if (owner !== process.pid && LmdbLock.IsAlive(owner))
             {
                 throw LmdbLock.Locked(owner, dir);
             }
-            writeFileSync(file, String(process.pid));
+            LmdbLock.WritePid(file, LmdbLock.Overwrite);
         }
         LmdbLock.Held.add(dir);
         return new LmdbLock(dir, file);
@@ -76,7 +83,7 @@ export class LmdbLock
         LmdbLock.Held.delete(this.directory);
         try
         {
-            if (Number.parseInt(readFileSync(this.file, LmdbLock.Utf8), 10) === process.pid)
+            if (LmdbLock.ReadPid(this.file) === process.pid)
             {
                 rmSync(this.file, { force: true });
             }
@@ -85,6 +92,36 @@ export class LmdbLock
         {
             // Already gone: nothing to release.
         }
+    }
+
+    /** Opens the file with `flag`, writes this process id and fsyncs it before closing. */
+    private static WritePid(file: string, flag: string): void
+    {
+        const fd = openSync(file, flag);
+        try
+        {
+            writeSync(fd, String(process.pid));
+            fsyncSync(fd);
+        }
+        finally
+        {
+            closeSync(fd);
+        }
+    }
+
+    /** The pid the lock file holds, or undefined when it is empty, unreadable or not a positive integer. */
+    private static ReadPid(file: string): number | undefined
+    {
+        let text: string;
+        try
+        {
+            text = readFileSync(file, LmdbLock.Utf8).trim();
+        }
+        catch
+        {
+            return undefined;
+        }
+        return LmdbLock.PidPattern.test(text) ? Number(text) : undefined;
     }
 
     private static IsAlive(pid: number): boolean
@@ -100,8 +137,8 @@ export class LmdbLock
         }
     }
 
-    private static Locked(pid: number, dir: string): GraphError
+    private static Locked(pid: number | undefined, dir: string): GraphError
     {
-        return new GraphError(GraphErrorCode.Locked, LmdbLock.ErrLocked + pid + LmdbLock.ErrAt + dir);
+        return new GraphError(GraphErrorCode.Locked, LmdbLock.ErrLocked + (pid ?? LmdbLock.UnknownOwner) + LmdbLock.ErrAt + dir);
     }
 }

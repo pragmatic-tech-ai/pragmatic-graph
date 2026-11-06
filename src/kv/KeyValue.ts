@@ -16,6 +16,37 @@ export interface IScanOptions
     readonly Reverse?: boolean;
 }
 
+/** Range helpers shared by the backends. */
+export class KeyRanges
+{
+    private static readonly NoEntries: ReadonlyArray<readonly [Uint8Array, Uint8Array]> = Object.freeze([]);
+
+    /**
+     * True when the range holds no key: Start >= End bytewise (an empty End included). Backends
+     * short-circuit such ranges in both directions without touching storage (lmdb-js would read an empty
+     * end bound as "no bound").
+     */
+    public static IsEmpty(range: IKeyRange): boolean
+    {
+        const a = range.Start;
+        const b = range.End;
+        const n = Math.min(a.length, b.length);
+        for (let i = 0; i < n; i++)
+        {
+            if (a[i] !== b[i])
+            {
+                return (a[i] as number) > (b[i] as number);
+            }
+        }
+        return a.length >= b.length;
+    }
+
+    public static get None(): Iterable<readonly [Uint8Array, Uint8Array]>
+    {
+        return KeyRanges.NoEntries;
+    }
+}
+
 /**
  * The portable key rules every backend enforces identically: keys are non-empty and at most
  * MaxKeyBytes (511, the smallest common limit of the target stores, e.g. heed's default) long. Scan

@@ -1,7 +1,7 @@
 import { after, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { GraphError, GraphErrorCode } from '../../../errors/GraphError.js';
 import { Keyspace } from '../../Keyspace.js';
 import { LmdbLock } from '../LmdbLock.js';
@@ -123,6 +123,43 @@ describe('lmdb store open options, lock and snapshot reuse (F9)', () =>
         assert.equal(readFileSync(join(dir, LmdbLock.FileName), 'utf8'), String(process.pid));
         await store.dispose();
         assert.equal(existsSync(join(dir, LmdbLock.FileName)), false, 'dispose removes the lock');
+    });
+
+    it('a failure while opening the keyspace databases releases the lock, so the directory can be opened again (re-review 1)', async () =>
+    {
+        const dir = LmdbTestDirs.Make();
+        const hooks = LmdbStore as unknown as { OpenDatabase: (...args: unknown[]) => unknown };
+        const original = hooks.OpenDatabase;
+        hooks.OpenDatabase = () =>
+        {
+            throw new Error('injected openDB failure');
+        };
+        try
+        {
+            await assert.rejects(LmdbStore.Open(dir), /injected openDB failure/);
+        }
+        finally
+        {
+            hooks.OpenDatabase = original;
+        }
+        assert.equal(existsSync(join(dir, LmdbLock.FileName)), false, 'lock file released');
+        const store = await LmdbStore.Open(dir);
+        await store.dispose();
+    });
+
+    it('an empty or unreadable lock file is held during a grace period, then stale (re-review 2)', async () =>
+    {
+        const dir = LmdbTestDirs.Make();
+        const file = join(dir, LmdbLock.FileName);
+        writeFileSync(file, '');
+        await assert.rejects(LmdbStore.Open(dir), (e: unknown) => e instanceof GraphError && e.GraphCode === GraphErrorCode.Locked);
+        writeFileSync(file, 'garbage');
+        await assert.rejects(LmdbStore.Open(dir), (e: unknown) => e instanceof GraphError && e.GraphCode === GraphErrorCode.Locked);
+        const old = new Date(Date.now() - 2 * LmdbLock.GraceMs);
+        utimesSync(file, old, old);
+        const store = await LmdbStore.Open(dir);
+        assert.equal(readFileSync(file, 'utf8'), String(process.pid));
+        await store.dispose();
     });
 
     it('readers opened between two commits share one native snapshot; a commit makes the next reader pin a new one', async () =>

@@ -17,6 +17,7 @@ type MutableMemberDef = { -readonly [K in keyof MemberDef]: MemberDef[K] };
 export class CatalogModel
 {
     private static readonly DuplicateTypeMessage = 'Type already defined: ';
+    private static readonly MemberSeparator = '.';
     private static readonly ConflictingParentMessage = 'Concept redefined with a different parent: ';
     private static readonly DuplicateMemberMessage = 'Duplicate member name in one declaration: ';
     private static readonly PropertyNeedsTypeMessage = 'Property member requires a Type: ';
@@ -119,7 +120,7 @@ export class CatalogModel
         const result: MemberDef[] = [];
         for (const input of inputs)
         {
-            const where = path + '.' + input.Name;
+            const where = path + CatalogModel.MemberSeparator + input.Name;
             if (seen.has(input.Name))
             {
                 throw new CatalogError(CatalogErrorCode.InvalidMember, CatalogModel.DuplicateMemberMessage + where);

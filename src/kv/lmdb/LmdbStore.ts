@@ -1,5 +1,5 @@
 import { open, RootDatabase, Database, Transaction, type RootDatabaseOptionsWithPath } from 'lmdb';
-import { IKeyRange, IKeyValueStore, IReadTransaction, IScanOptions, IScanProbe, IWriteTransaction, KeyLimits, ScanCounter } from '../KeyValue.js';
+import { IKeyRange, IKeyValueStore, IReadTransaction, IScanOptions, IScanProbe, IWriteTransaction, KeyLimits, KeyRanges, ScanCounter } from '../KeyValue.js';
 import { GraphError, GraphErrorCode } from '../../errors/GraphError.js';
 import { Keyspace } from '../Keyspace.js';
 import { PendingChanges } from '../PendingChanges.js';
@@ -129,7 +129,7 @@ class LmdbReadTransaction implements IReadTransaction
      */
     protected *Entries(space: Keyspace, range: IKeyRange, reverse: boolean, limit?: number): Iterable<[Uint8Array, Uint8Array]>
     {
-        if (limit !== undefined && limit <= 0)
+        if ((limit !== undefined && limit <= 0) || KeyRanges.IsEmpty(range))
         {
             return;
         }
@@ -163,10 +163,13 @@ class LmdbReadTransaction implements IReadTransaction
         {
             if (TupleCodec.Compare(entry.key, range.End) >= 0)
             {
+                // Read from storage but outside the range: still counted, so IScanProbe reflects cursor work.
+                this.counter.Count++;
                 continue;
             }
             if (TupleCodec.Compare(entry.key, range.Start) < 0)
             {
+                this.counter.Count++;
                 return;
             }
             yield [Uint8Array.from(entry.key), Uint8Array.from(entry.value)];
@@ -344,25 +347,39 @@ export class LmdbStore implements IKeyValueStore, IScanProbe
     {
         const spaces = Object.values(Keyspace);
         const lock = LmdbLock.Acquire(path);
-        let root: RootDatabase;
+        let root: RootDatabase | undefined;
         try
         {
             root = open(LmdbStore.OpenOptions(path, options));
+            const databases = new Map<Keyspace, Database<Buffer, Buffer>>();
+            for (const space of spaces)
+            {
+                databases.set(space, LmdbStore.OpenDatabase(root, space));
+            }
+            return new LmdbStore(root, databases, lock);
         }
         catch (error)
         {
-            lock.dispose();
+            // Any failure releases everything taken so far, so the directory can be opened again.
+            try
+            {
+                await root?.close();
+            }
+            finally
+            {
+                lock.dispose();
+            }
             throw error;
         }
-        const databases = new Map<Keyspace, Database<Buffer, Buffer>>();
-        for (const space of spaces)
-        {
-            databases.set(space, root.openDB<Buffer, Buffer>(space, {
-                keyEncoding: LmdbStore.BinaryEncoding,
-                encoding: LmdbStore.BinaryEncoding,
-            }));
-        }
-        return new LmdbStore(root, databases, lock);
+    }
+
+    /** Opens one keyspace's named database (a static seam so tests can inject an open failure). */
+    private static OpenDatabase(root: RootDatabase, space: Keyspace): Database<Buffer, Buffer>
+    {
+        return root.openDB<Buffer, Buffer>(space, {
+            keyEncoding: LmdbStore.BinaryEncoding,
+            encoding: LmdbStore.BinaryEncoding,
+        });
     }
 
     public async BeginRead(): Promise<IReadTransaction>

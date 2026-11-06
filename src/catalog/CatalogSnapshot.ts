@@ -24,6 +24,7 @@ export class CatalogSnapshot
     private static readonly CollisionMessage = 'Member collision: ';
     private static readonly NotInstantiableMessage = 'Aspect is not instantiable: ';
     private static readonly AggregateRootMessage = 'AggregateRoot must name a concept: ';
+    private static readonly MemberSeparator = '.';
 
     public readonly Version: number;
     /** Next unassigned type id and member id; persisted so ids are never reused. */
@@ -147,7 +148,7 @@ export class CatalogSnapshot
         const m = this.memberByName.get(concept)!.get(name);
         if (m === undefined)
         {
-            throw new CatalogError(CatalogErrorCode.UnknownMember, CatalogSnapshot.UnknownMemberMessage + concept + '.' + name);
+            throw new CatalogError(CatalogErrorCode.UnknownMember, CatalogSnapshot.UnknownMemberMessage + concept + CatalogSnapshot.MemberSeparator + name);
         }
         return m;
     }
@@ -174,7 +175,7 @@ export class CatalogSnapshot
                 return m;
             }
         }
-        throw new CatalogError(CatalogErrorCode.UnknownMember, CatalogSnapshot.UnknownMemberMessage + conceptOrAspect + '.' + name);
+        throw new CatalogError(CatalogErrorCode.UnknownMember, CatalogSnapshot.UnknownMemberMessage + conceptOrAspect + CatalogSnapshot.MemberSeparator + name);
     }
 
     public IsA(concept: string, conceptOrAspect: string): boolean
@@ -249,7 +250,7 @@ export class CatalogSnapshot
             }
             if (d.AggregateRoot !== undefined && byName.get(d.AggregateRoot)?.IsAspect !== false)
             {
-                throw new CatalogError(CatalogErrorCode.InvalidAggregateRoot, CatalogSnapshot.AggregateRootMessage + d.Name + '.' + d.AggregateRoot);
+                throw new CatalogError(CatalogErrorCode.InvalidAggregateRoot, CatalogSnapshot.AggregateRootMessage + d.Name + CatalogSnapshot.MemberSeparator + d.AggregateRoot);
             }
         }
     }
@@ -338,8 +339,8 @@ export class CatalogSnapshot
             if (provided.has(m.Name))
             {
                 throw own
-                    ? new CatalogError(CatalogErrorCode.MemberRedeclared, CatalogSnapshot.RedeclaredMessage + m.DeclaredBy + '.' + m.Name)
-                    : new CatalogError(CatalogErrorCode.MemberCollision, CatalogSnapshot.CollisionMessage + m.DeclaredBy + '.' + m.Name);
+                    ? new CatalogError(CatalogErrorCode.MemberRedeclared, CatalogSnapshot.RedeclaredMessage + m.DeclaredBy + CatalogSnapshot.MemberSeparator + m.Name)
+                    : new CatalogError(CatalogErrorCode.MemberCollision, CatalogSnapshot.CollisionMessage + m.DeclaredBy + CatalogSnapshot.MemberSeparator + m.Name);
             }
             provided.set(m.Name, m);
         }
