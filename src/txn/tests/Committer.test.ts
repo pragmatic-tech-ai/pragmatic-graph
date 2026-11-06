@@ -1084,10 +1084,12 @@ class TxnFx
                 const friends = catalog.Member('Person', 'friends').Id;
                 await store.Write(async txn =>
                 {
+                    const keys: Uint8Array[] = [];
                     for await (const [key] of txn.Scan(Keyspace.Edges, FormatKeys.EdgeRange(0, friends, EdgeDirection.Out, a)))
                     {
-                        txn.Put(Keyspace.Edges, key, Uint8Array.of(1, 2, 3));
+                        keys.push(key);
                     }
+                    keys.forEach(key => txn.Put(Keyspace.Edges, key, Uint8Array.of(1, 2, 3)));
                 });
                 // DeleteNode decodes the Out values of the node's edges (sibling lookups no longer do, ruling R33).
                 const outcome = await TxnFx.Settle(c.Submit(TxnFx.Batch(b => b.DeleteNode('a')), new ReadSet(), c.LastCommit()));

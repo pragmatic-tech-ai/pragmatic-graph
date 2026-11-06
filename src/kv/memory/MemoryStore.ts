@@ -14,7 +14,6 @@ type Snapshot = ReadonlyMap<Keyspace, readonly IEntry[]>;
 
 class Sorted
 {
-    private static readonly HexEncoding = 'hex';
 
     /** Index of the first entry whose key is >= key. */
     public static LowerBound(entries: readonly IEntry[], key: Uint8Array): number
@@ -36,32 +35,16 @@ class Sorted
         return lo;
     }
 
-    public static Hex(key: Uint8Array): string
-    {
-        return Buffer.from(key).toString(Sorted.HexEncoding);
-    }
-
-    /** Overlays changes (null value = delete) on entries and returns the result in key order. */
+    /** Overlays sorted changes (null value = delete) on sorted entries in one linear merge (not a scan: uncounted); the result is in key order. */
     public static Merge(entries: readonly IEntry[], changes: Iterable<IPendingChange>): IEntry[]
     {
-        const merged = new Map<string, IEntry>();
-        for (const entry of entries)
+        const out: IEntry[] = [];
+        const base = entries.map(e => [e.Key, e.Value] as const);
+        for (const [key, value] of PendingChanges.Merge(base, changes, new ScanCounter()))
         {
-            merged.set(Sorted.Hex(entry.Key), entry);
+            out.push({ Key: key, Value: value });
         }
-        for (const change of changes)
-        {
-            const hex = Sorted.Hex(change.Key);
-            if (change.Value === null)
-            {
-                merged.delete(hex);
-            }
-            else
-            {
-                merged.set(hex, { Key: change.Key, Value: change.Value });
-            }
-        }
-        return [...merged.values()].sort((a, b) => TupleCodec.Compare(a.Key, b.Key));
+        return out;
     }
 }
 
@@ -175,12 +158,15 @@ class MemoryWriteTransaction extends MemoryReadTransaction implements IWriteTran
     public override async *Scan(space: Keyspace, range: IKeyRange, limit?: number): AsyncIterable<[Uint8Array, Uint8Array]>
     {
         this.EnsureLive();
-        const staged = this.pending.get(space)?.InRange(range) ?? [];
-        for (const [key, value] of PendingChanges.Merge(this.Entries(space, range), staged, this.counter, limit))
+        const bucket = this.Bucket(space);
+        const version = bucket.Version;
+        for (const [key, value] of PendingChanges.Merge(this.Entries(space, range), bucket.InRange(range), this.counter, limit))
         {
             this.EnsureLive();
+            bucket.RequireVersion(version);
             yield [key.slice(), value.slice()];
         }
+        bucket.RequireVersion(version);
     }
 
     public Put(space: Keyspace, key: Uint8Array, value: Uint8Array): void
@@ -208,13 +194,18 @@ class MemoryWriteTransaction extends MemoryReadTransaction implements IWriteTran
     {
         this.EnsureLive();
         MemoryReadTransaction.RequireKey(key);
+        this.Bucket(space).Set(key.slice(), value);
+    }
+
+    private Bucket(space: Keyspace): PendingChanges
+    {
         let bucket = this.pending.get(space);
         if (bucket === undefined)
         {
             bucket = new PendingChanges();
             this.pending.set(space, bucket);
         }
-        bucket.Set(key.slice(), value);
+        return bucket;
     }
 }
 

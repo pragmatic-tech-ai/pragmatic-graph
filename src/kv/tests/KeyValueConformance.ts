@@ -14,6 +14,9 @@ export class KeyValueConformance
     private static readonly Boom = 'boom';
     private static readonly DisposedPattern = /disposed/i;
     private static readonly EmptyKeyPattern = /empty key/i;
+    private static readonly ChangedPattern = /changed during the scan/i;
+    private static readonly BulkKeys = 200000;
+    private static readonly BulkBoundMs = 5000;
     private static readonly Space = Keyspace.Rows;
     private static readonly AllKeys: IKeyRange = {
         Start: Uint8Array.of(),
@@ -31,6 +34,8 @@ export class KeyValueConformance
             KeyValueConformance.Case('scan honors limit', open, KeyValueConformance.ScanLimit);
             KeyValueConformance.Case('write scan with limit 1 merges a staged delete or put at the start of the range', open, KeyValueConformance.LimitedOwnWrites);
             KeyValueConformance.Case('a limited scan stops early: it reads a bounded number of stored entries over 10,000 keys', open, KeyValueConformance.ScanEarlyExit);
+            KeyValueConformance.Case('staging a new key in the keyspace while its scan is open makes the scan throw', open, KeyValueConformance.MutationDuringScan);
+            KeyValueConformance.Case('200,000 new keys in random order stage and commit in one write within 5 s', open, KeyValueConformance.BulkRandomPuts);
             KeyValueConformance.Case('read snapshot ignores later commits', open, KeyValueConformance.SnapshotIsolation);
             KeyValueConformance.Case('write reads see own pending writes in Get', open, KeyValueConformance.OwnWritesGet);
             KeyValueConformance.Case('write reads see own pending writes in Scan', open, KeyValueConformance.OwnWritesScan);
@@ -300,6 +305,53 @@ export class KeyValueConformance
             assert.deepEqual(await KeyValueConformance.Keys(txn, KeyValueConformance.AllKeys, 2), [key(0), key(2)]);
             assert.ok(read() - before <= 8, 'write scan pulled ' + (read() - before) + ' entries');
         });
+    }
+
+    private static async MutationDuringScan(store: IKeyValueStore): Promise<void>
+    {
+        const space = KeyValueConformance.Space;
+        const key = KeyValueConformance.Key;
+        await KeyValueConformance.Seed(store, [1, 2, 3, 4]);
+        await store.Write(async txn =>
+        {
+            txn.Put(space, key(2), KeyValueConformance.Val(9));
+            const rows = txn.Scan(space, KeyValueConformance.AllKeys)[Symbol.asyncIterator]();
+            assert.deepEqual((await rows.next()).value?.[0], key(1));
+            txn.Put(Keyspace.Meta, key(7), KeyValueConformance.Val(7));
+            assert.deepEqual((await rows.next()).value?.[0], key(2), 'other keyspaces do not disturb the scan');
+            txn.Put(space, key(5), KeyValueConformance.Val(5));
+            await assert.rejects(rows.next(), KeyValueConformance.ChangedPattern);
+            const fresh = txn.Scan(space, KeyValueConformance.AllKeys)[Symbol.asyncIterator]();
+            assert.deepEqual((await fresh.next()).value?.[0], key(1));
+            txn.Delete(space, key(3));
+            await assert.rejects(fresh.next(), KeyValueConformance.ChangedPattern, 'a new staged delete also counts');
+            assert.deepEqual(await KeyValueConformance.Keys(txn, KeyValueConformance.AllKeys), [1, 2, 4, 5].map(n => key(n)), 'a scan opened afterwards is fine');
+        });
+    }
+
+    private static async BulkRandomPuts(store: IKeyValueStore): Promise<void>
+    {
+        const space = KeyValueConformance.Space;
+        const n = KeyValueConformance.BulkKeys;
+        const started = Date.now();
+        await store.Write(async txn =>
+        {
+            // A full-period LCG over 0..n-1 (n = 200,000 = 2^6 * 5^5; multiplier - 1 divisible by 2*5*4): every key once, in scrambled order.
+            let x = 12345;
+            for (let i = 0; i < n; i++)
+            {
+                x = (x * 400001 + 7) % n;
+                txn.Put(space, KeyValueConformance.Key(x), KeyValueConformance.Val(1));
+            }
+            assert.deepEqual(await KeyValueConformance.Keys(txn, KeyValueConformance.AllKeys, 3), [0, 1, 2].map(k => KeyValueConformance.Key(k)));
+        });
+        const elapsed = Date.now() - started;
+        assert.ok(elapsed < KeyValueConformance.BulkBoundMs, 'staging and committing took ' + elapsed + ' ms');
+        const read = await store.BeginRead();
+        const all = await KeyValueConformance.Keys(read, KeyValueConformance.AllKeys);
+        read.dispose();
+        assert.equal(all.length, n);
+        assert.deepEqual(all[n - 1], KeyValueConformance.Key(n - 1));
     }
 
     private static async SnapshotIsolation(store: IKeyValueStore): Promise<void>

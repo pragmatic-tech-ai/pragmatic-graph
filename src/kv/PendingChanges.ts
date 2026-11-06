@@ -9,57 +9,124 @@ export interface IPendingChange
 }
 
 /**
- * A write transaction's staged changes in one keyspace, kept in key order (binary-searched inserts)
- * so a scan can merge them lazily with the stored entries instead of filtering and sorting them all.
+ * A write transaction's staged changes in one keyspace, in key order, as a chunked sorted list:
+ * sorted leaves of at most LeafCapacity changes, located by binary search on their first keys, so a
+ * new key costs O(log n + LeafCapacity) and a scan merges them lazily from the binary-searched start.
+ *
+ * Structural changes (staging a key not staged yet) bump Version; an InRange iteration that observes
+ * a new Version throws instead of skipping or repeating entries. Replacing an already-staged key keeps
+ * the structure and is allowed during iteration.
  */
 export class PendingChanges
 {
-    private readonly sorted: IPendingChange[] = [];
+    public static readonly LeafCapacity = 512;
+    public static readonly ErrChanged = 'Staged changes of this keyspace changed during the scan: finish or abandon the scan before staging new keys';
+
+    private readonly leaves: IPendingChange[][] = [];
+    private size = 0;
+    private version = 0;
 
     public get Size(): number
     {
-        return this.sorted.length;
+        return this.size;
+    }
+
+    /** Bumped whenever a key not staged before is staged. */
+    public get Version(): number
+    {
+        return this.version;
     }
 
     /** Stages the change; `key` and `value` must already be private copies. A later change to the same key replaces it. */
     public Set(key: Uint8Array, value: Uint8Array | null): void
     {
-        const at = this.LowerBound(key);
-        const change = { Key: key, Value: value };
-        const hit = this.sorted[at];
+        const change: IPendingChange = { Key: key, Value: value };
+        if (this.leaves.length === 0)
+        {
+            this.leaves.push([change]);
+            this.Grew();
+            return;
+        }
+        const li = this.LeafFor(key);
+        const leaf = this.leaves[li] as IPendingChange[];
+        const at = PendingChanges.LowerBound(leaf, key);
+        const hit = leaf[at];
         if (hit !== undefined && TupleCodec.Compare(hit.Key, key) === 0)
         {
-            this.sorted[at] = change;
+            leaf[at] = change;
+            return;
         }
-        else
+        leaf.splice(at, 0, change);
+        if (leaf.length > PendingChanges.LeafCapacity)
         {
-            this.sorted.splice(at, 0, change);
+            const half = leaf.length >> 1;
+            this.leaves.splice(li, 1, leaf.slice(0, half), leaf.slice(half));
         }
+        this.Grew();
     }
 
     public Get(key: Uint8Array): IPendingChange | undefined
     {
-        const hit = this.sorted[this.LowerBound(key)];
+        if (this.leaves.length === 0)
+        {
+            return undefined;
+        }
+        const leaf = this.leaves[this.LeafFor(key)] as IPendingChange[];
+        const hit = leaf[PendingChanges.LowerBound(leaf, key)];
         return hit !== undefined && TupleCodec.Compare(hit.Key, key) === 0 ? hit : undefined;
     }
 
-    /** Every change, in key order. */
-    public Values(): readonly IPendingChange[]
+    /** Every change, in key order. Do not stage new keys while iterating. */
+    public *Values(): Iterable<IPendingChange>
     {
-        return this.sorted;
+        for (const leaf of this.leaves)
+        {
+            yield* leaf;
+        }
     }
 
-    /** Changes with Start <= key < End, in key order, produced lazily from the binary-searched start. */
+    /**
+     * Changes with Start <= key < End, in key order, walked lazily leaf by leaf from the
+     * binary-searched start. Throws ErrChanged if a new key is staged while the iteration is open.
+     */
     public *InRange(range: IKeyRange): Iterable<IPendingChange>
     {
-        for (let i = this.LowerBound(range.Start); i < this.sorted.length; i++)
+        if (this.leaves.length === 0)
         {
-            const change = this.sorted[i] as IPendingChange;
+            return;
+        }
+        const version = this.version;
+        let li = this.LeafFor(range.Start);
+        let i = PendingChanges.LowerBound(this.leaves[li] as IPendingChange[], range.Start);
+        while (li < this.leaves.length)
+        {
+            const leaf = this.leaves[li] as IPendingChange[];
+            if (i >= leaf.length)
+            {
+                li++;
+                i = 0;
+                continue;
+            }
+            const change = leaf[i] as IPendingChange;
             if (TupleCodec.Compare(change.Key, range.End) >= 0)
             {
                 return;
             }
             yield change;
+            if (this.version !== version)
+            {
+                throw new Error(PendingChanges.ErrChanged);
+            }
+            i++;
+        }
+    }
+
+    /** Throws ErrChanged unless Version still equals `version`. */
+    public RequireVersion(version: number): void
+    {
+        if (this.version !== version)
+        {
+            throw new Error(PendingChanges.ErrChanged);
         }
     }
 
@@ -94,8 +161,7 @@ export class PendingChanges
                 if (order < 0)
                 {
                     yield b as readonly [Uint8Array, Uint8Array];
-                    produced++;
-                    if (produced >= max)
+                    if (++produced >= max)
                     {
                         return;
                     }
@@ -103,15 +169,10 @@ export class PendingChanges
                     continue;
                 }
                 const change = c as IPendingChange;
-                if (order === 0)
-                {
-                    b = undefined;
-                }
                 if (change.Value !== null)
                 {
                     yield [change.Key, change.Value];
-                    produced++;
-                    if (produced >= max)
+                    if (++produced >= max)
                     {
                         return;
                     }
@@ -141,14 +202,41 @@ export class PendingChanges
         return next.value;
     }
 
-    private LowerBound(key: Uint8Array): number
+    private Grew(): void
+    {
+        this.size++;
+        this.version++;
+    }
+
+    /** Index of the last leaf whose first key is <= key (leaf 0 when key precedes every leaf). */
+    private LeafFor(key: Uint8Array): number
     {
         let lo = 0;
-        let hi = this.sorted.length;
+        let hi = this.leaves.length - 1;
+        while (lo < hi)
+        {
+            const mid = (lo + hi + 1) >> 1;
+            const first = (this.leaves[mid] as IPendingChange[])[0] as IPendingChange;
+            if (TupleCodec.Compare(first.Key, key) <= 0)
+            {
+                lo = mid;
+            }
+            else
+            {
+                hi = mid - 1;
+            }
+        }
+        return lo;
+    }
+
+    private static LowerBound(leaf: readonly IPendingChange[], key: Uint8Array): number
+    {
+        let lo = 0;
+        let hi = leaf.length;
         while (lo < hi)
         {
             const mid = (lo + hi) >> 1;
-            if (TupleCodec.Compare((this.sorted[mid] as IPendingChange).Key, key) < 0)
+            if (TupleCodec.Compare((leaf[mid] as IPendingChange).Key, key) < 0)
             {
                 lo = mid + 1;
             }
