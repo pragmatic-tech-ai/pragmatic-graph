@@ -10,19 +10,22 @@ import { RowIndex } from '../identity/RowIndex.js';
 import type { IKeyValueStore, IWriteTransaction } from '../kv/KeyValue.js';
 import { GraphError, GraphErrorCode } from '../errors/GraphError.js';
 import { FormatMeta } from '../format/FormatMeta.js';
-import { CatalogPlanner } from '../schema/CatalogPlanner.js';
+import { CatalogPlanner, type ICatalogPlan } from '../schema/CatalogPlanner.js';
 import { DataPurger } from '../schema/DataPurger.js';
-import type { ISchemaDescription } from '../schema/SchemaDescription.js';
+import type { ISchemaDescription, ISeedNode } from '../schema/SchemaDescription.js';
+import { SeedMarkers } from '../schema/SeedMarkers.js';
+import { SeedSynchronizer, TransactionSeedView } from '../schema/SeedSynchronizer.js';
 import { BatchApplier } from './BatchApplier.js';
 import { CatalogIndex } from './CatalogIndex.js';
 import { CommitError } from './CommitError.js';
 import { CommitLog } from './CommitLog.js';
 import { ConflictError } from './ConflictError.js';
 import { ConflictHistory, type ISnapshotHandle } from './ConflictHistory.js';
+import { ConflictKeys } from './ConflictKeys.js';
 import { CommitKind, type ICommitApplied, LogEntry } from './LogEntry.js';
 import type { ReadSet } from './ReadSet.js';
 import { Signal } from './Signal.js';
-import { WriteBatch } from './WriteBatch.js';
+import { WriteBatch, WriteOp } from './WriteBatch.js';
 import { WriteKeySet } from './WriteKeySet.js';
 
 export { CommitKind, type ICommitApplied } from './LogEntry.js';
@@ -37,12 +40,14 @@ export interface ISchemaCommit
 /** The outcome of an upgrade (SubmitUpgrade). */
 export interface IUpgradeCommit
 {
-    /** The Upgrade entry's commit number; LastCommit() at the upgrade's turn when nothing changed. */
+    /** The Upgrade entry's commit number; when the catalog is unchanged, LastCommit() at the upgrade's turn (before any seed commit). */
     readonly Commit: bigint;
     /** The catalog in force after the upgrade (the unchanged one when Changed is false). */
     readonly Catalog: CatalogSnapshot;
     /** True iff a new catalog was saved and logged (ICatalogPlan.Changed). */
     readonly Changed: boolean;
+    /** The seed's Batch entry commit number, when the seed changed anything (ruling R53). */
+    readonly SeedCommit?: bigint;
 }
 
 export interface ICommitterOptions
@@ -150,6 +155,28 @@ class ExclusiveCommit<T> implements IExclusiveCommit
     }
 }
 
+/**
+ * The seed needed an internal id the pre-pass did not allocate (the purge removed a node the pre-pass
+ * saw); aborts the upgrade's store.Write so the upgrade can re-run with those ids (ruling R16).
+ */
+class SeedIdMiss extends Error
+{
+    private static readonly Text = 'Seed needs ids the pre-pass did not allocate';
+
+    public constructor(public readonly PublicIds: readonly string[])
+    {
+        super(SeedIdMiss.Text);
+    }
+}
+
+/** The seed's Batch commit as applied inside an upgrade's write. */
+interface ISeedCommit
+{
+    readonly Bytes: Uint8Array;
+    readonly Ids: readonly bigint[];
+    readonly Keys: WriteKeySet;
+}
+
 /** A batch that failed semantically while its group was applying; aborts the group's store.Write. */
 class BatchFailure extends Error
 {
@@ -208,6 +235,8 @@ export class Committer
     private static readonly ErrSchema = 'The schema changed after the transaction began: catalog version ';
     private static readonly ErrSchemaNow = ', now ';
     private static readonly ErrSchemaVersion = 'Schema version must be well-formed UTF-16 (no lone surrogates)';
+    private static readonly ErrSeedIds = 'Seed still needs unallocated ids after the retry: ';
+    private static readonly Comma = ', ';
     private static readonly EmptyBatch = new WriteBatch().Seal();
     private static readonly Encoder = new TextEncoder();
     private static readonly Decoder = new TextDecoder();
@@ -338,9 +367,12 @@ export class Committer
      * changes the catalog, ONE store.Write purges the data that no longer fits (DataPurger), saves the
      * catalog, writes Meta("schemaVersion"), appends an Upgrade log entry and raises CommitApplied; the
      * purge's write keys conflict open transactions, which also fail on the catalog version. When the
-     * catalog is unchanged only a differing Meta("schemaVersion") is rewritten: no commit, no entry, no
-     * signal (ruling R48). A planning error (CatalogError) rejects only this upgrade and changes nothing;
-     * a version that is not well-formed UTF-16 is GraphError InvalidArgument.
+     * version differs or the catalog changed, the same Write then applies the description's seed
+     * (SeedSynchronizer, ruling R53) and, iff it changed anything, logs it as a Batch entry with the next
+     * commit number (SeedCommit) and raises it after the Upgrade entry. An unchanged catalog with an
+     * unchanged seed only rewrites a differing Meta("schemaVersion"): no commit, no entry, no signal
+     * (ruling R48). A planning error (CatalogError) or a seed error (CommitError) rejects only this
+     * upgrade and changes nothing; a version that is not well-formed UTF-16 is GraphError InvalidArgument.
      */
     public SubmitUpgrade(description: ISchemaDescription): Promise<IUpgradeCommit>
     {
@@ -462,52 +494,192 @@ export class Committer
         return { Commit: commit, Catalog: sealed };
     }
 
-    /** Plans against the current catalog; purges, saves and logs in one Write when the catalog changes. */
+    /**
+     * Plans against the current catalog. Nothing to do when the catalog and the stored version are both
+     * unchanged (a read decides: no write transaction). Otherwise one Write purges and saves a changed
+     * catalog (Upgrade entry), applies the seed (Batch entry, when it changes anything) and writes the
+     * version. Seed ids come from a pre-pass outside the Write (ruling R16); when the purge removed a node
+     * the pre-pass saw, the upgrade re-runs once with those ids too, and a second miss is Internal.
+     */
     private async RunUpgrade(description: ISchemaDescription): Promise<IUpgradeCommit>
     {
         const old = this.index;
         const plan = CatalogPlanner.Plan(old.Catalog, description);
-        if (!plan.Changed)
+        if (!plan.Changed && (await this.StoredSchemaVersion()) === description.Version)
         {
-            // The committer is the only writer and this work runs alone: a read decides, so an unchanged
-            // upgrade (every load of an unchanged schema) costs no write transaction.
-            if ((await this.StoredSchemaVersion()) !== description.Version)
-            {
-                await this.store.Write(async txn =>
-                {
-                    await this.RequireCurrent(txn);
-                    FormatMeta.WriteSchemaVersion(txn, description.Version);
-                });
-            }
             return { Commit: this.history.Last, Catalog: old.Catalog, Changed: false };
         }
-        const next = new CatalogIndex(plan.Catalog);
-        const commit = this.history.Last + 1n;
+        let missed: readonly string[] = [];
+        for (let attempt = 0; ; attempt++)
+        {
+            const ids = await this.PreallocateSeed(old, description.Seed, missed);
+            try
+            {
+                return await this.WriteUpgrade(description, plan, ids);
+            }
+            catch (error)
+            {
+                if (!(error instanceof SeedIdMiss))
+                {
+                    throw error;
+                }
+                if (attempt > 0)
+                {
+                    throw new GraphError(GraphErrorCode.Internal, Committer.ErrSeedIds + error.PublicIds.join(Committer.Comma), error);
+                }
+                missed = error.PublicIds;
+            }
+        }
+    }
+
+    /**
+     * The read-only pre-pass over a store snapshot: one internal id per seed node that is absent or not
+     * seeded with the same hash, plus one per id the previous attempt missed.
+     */
+    private async PreallocateSeed(index: CatalogIndex, seed: readonly ISeedNode[], missed: readonly string[]): Promise<Map<string, bigint>>
+    {
+        let needed: string[];
+        const txn = await this.store.BeginRead();
+        try
+        {
+            const view = new TransactionSeedView(txn, index, this.rows, this.ids, this.edges);
+            needed = await SeedSynchronizer.IdsNeeded(view, seed, await SeedMarkers.ReadAll(txn));
+        }
+        finally
+        {
+            txn.dispose();
+        }
+        const out = new Map<string, bigint>();
+        for (const publicId of [...needed, ...missed])
+        {
+            if (!out.has(publicId))
+            {
+                const allocator = await this.Allocator();
+                out.set(publicId, await allocator.Next());
+            }
+        }
+        return out;
+    }
+
+    /** One upgrade attempt: a single store.Write, then history, catalog and signals. */
+    private async WriteUpgrade(description: ISchemaDescription, plan: ICatalogPlan, ids: ReadonlyMap<string, bigint>): Promise<IUpgradeCommit>
+    {
+        const old = this.index;
+        const next = plan.Changed ? new CatalogIndex(plan.Catalog) : old;
+        const last = this.history.Last;
+        const upgradeCommit = plan.Changed ? last + 1n : undefined;
+        const seedCommit = (upgradeCommit ?? last) + 1n;
         const keys = new WriteKeySet();
-        await this.store.Write(async txn =>
+        const seed = await this.store.Write(async txn =>
         {
             await this.RequireCurrent(txn);
-            await this.purger.Purge(txn, old, next, plan.Diff, keys);
+            if (plan.Changed)
+            {
+                await this.purger.Purge(txn, old, next, plan.Diff, keys);
+            }
+            const applied = await this.ApplySeed(txn, next, description.Seed, ids);
             await this.Compact(txn, next);
             this.Flush(txn);
-            await CatalogStore.Save(txn, plan.Catalog);
+            if (upgradeCommit !== undefined)
+            {
+                await CatalogStore.Save(txn, plan.Catalog);
+            }
             FormatMeta.WriteSchemaVersion(txn, description.Version);
-            this.log.Append(txn, commit, LogEntry.EncodeUpgrade(plan.Catalog, description.Version));
-            this.log.WriteLastCommit(txn, commit);
+            if (upgradeCommit !== undefined)
+            {
+                this.log.Append(txn, upgradeCommit, LogEntry.EncodeUpgrade(plan.Catalog, description.Version));
+            }
+            if (applied !== undefined)
+            {
+                this.log.Append(txn, seedCommit, LogEntry.EncodeBatch(next.Catalog.Version, applied.Ids, applied.Bytes));
+                this.log.WriteLastCommit(txn, seedCommit);
+            }
+            else if (upgradeCommit !== undefined)
+            {
+                this.log.WriteLastCommit(txn, upgradeCommit);
+            }
+            return applied;
         });
-        this.history.Record(commit, keys);
+        if (upgradeCommit !== undefined)
+        {
+            this.history.Record(upgradeCommit, keys);
+        }
+        if (seed !== undefined)
+        {
+            this.history.Record(seedCommit, seed.Keys);
+        }
         this.history.Prune();
         this.index = next;
-        this.RaiseApplied({
-            Commit: commit,
-            Kind: CommitKind.Upgrade,
-            CatalogVersion: plan.Catalog.Version,
-            Batch: Committer.EmptyBatch,
-            CreatedIds: Object.freeze([]),
-            Catalog: plan.Catalog,
-            SchemaVersion: description.Version,
-        });
-        return { Commit: commit, Catalog: plan.Catalog, Changed: true };
+        if (upgradeCommit !== undefined)
+        {
+            this.RaiseApplied({
+                Commit: upgradeCommit,
+                Kind: CommitKind.Upgrade,
+                CatalogVersion: plan.Catalog.Version,
+                Batch: Committer.EmptyBatch,
+                CreatedIds: Object.freeze([]),
+                Catalog: plan.Catalog,
+                SchemaVersion: description.Version,
+            });
+        }
+        if (seed === undefined)
+        {
+            return { Commit: upgradeCommit ?? last, Catalog: next.Catalog, Changed: plan.Changed };
+        }
+        // One sealed, frozen batch: no subscriber can change what the others see.
+        this.RaiseApplied({ Commit: seedCommit, Kind: CommitKind.Batch, CatalogVersion: next.Catalog.Version, Batch: WriteBatch.Deserialize(seed.Bytes).Seal(), CreatedIds: Object.freeze([...seed.Ids]) });
+        return { Commit: upgradeCommit ?? last, Catalog: next.Catalog, Changed: plan.Changed, SeedCommit: seedCommit };
+    }
+
+    /**
+     * Builds the seed batch against the post-purge state and applies it like a transaction's batch
+     * (BatchApplier: the same validation and edge rules), then writes and removes seed markers; every
+     * marker change also writes the node's Node key (IsSeeded records it). Undefined when the seed
+     * changes nothing (no op, no marker change): then there is no Batch entry.
+     */
+    private async ApplySeed(txn: IWriteTransaction, index: CatalogIndex, seed: readonly ISeedNode[], ids: ReadonlyMap<string, bigint>): Promise<ISeedCommit | undefined>
+    {
+        const view = new TransactionSeedView(txn, index, this.rows, this.ids, this.edges);
+        const plan = await new SeedSynchronizer(index.Catalog).Build(view, seed, await SeedMarkers.ReadAll(txn));
+        if (plan.Batch.Count === 0 && plan.Hashes.size === 0 && plan.Removed.length === 0)
+        {
+            return undefined;
+        }
+        const batch = plan.Batch.Seal();
+        const created: bigint[] = [];
+        const missing: string[] = [];
+        for (const op of batch.Ops())
+        {
+            if (op.Op !== WriteOp.CreateNode)
+            {
+                continue;
+            }
+            const id = ids.get(op.PublicId);
+            if (id === undefined)
+            {
+                missing.push(op.PublicId);
+            }
+            else
+            {
+                created.push(id);
+            }
+        }
+        if (missing.length > 0)
+        {
+            throw new SeedIdMiss(missing);
+        }
+        const keys = await new BatchApplier(index, this.columns, this.edges, this.rows, this.ids).Apply(txn, batch, created);
+        for (const [publicId, hash] of plan.Hashes)
+        {
+            SeedMarkers.Write(txn, publicId, hash);
+            keys.Add(ConflictKeys.NodeSpace, ConflictKeys.Node(publicId));
+        }
+        for (const publicId of plan.Removed)
+        {
+            SeedMarkers.Delete(txn, publicId);
+            keys.Add(ConflictKeys.NodeSpace, ConflictKeys.Node(publicId));
+        }
+        return { Bytes: batch.Serialize(), Ids: created, Keys: keys };
     }
 
     private async StoredSchemaVersion(): Promise<string | undefined>

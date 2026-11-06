@@ -13,6 +13,7 @@ import type { Location } from '../identity/Location.js';
 import { PublicIdIndex } from '../identity/PublicIdIndex.js';
 import type { RowIndex } from '../identity/RowIndex.js';
 import type { IWriteTransaction } from '../kv/KeyValue.js';
+import { SeedMarkers } from '../schema/SeedMarkers.js';
 import { GraphError, GraphErrorCode } from '../errors/GraphError.js';
 import type { CatalogIndex } from './CatalogIndex.js';
 import { CommitError, CommitErrorCode } from './CommitError.js';
@@ -208,6 +209,8 @@ export class BatchApplier
         await this.columns.WriteCell(txn, node.Location, CatalogSnapshot.NodeIdMember, null);
         await this.rows.Clear(txn, node.Id);
         await this.ids.Unbind(txn, node.PublicId, node.Id);
+        // A deleted node is no longer seeded: its marker goes with it (ruling R53).
+        SeedMarkers.Delete(txn, node.PublicId);
         keys.Add(ConflictKeys.NodeSpace, ConflictKeys.Node(node.PublicId));
         keys.Add(ConflictKeys.ExtentSpace, ConflictKeys.Extent(node.Location.TypeId));
         BatchApplier.AddCellKeys(keys, node.Id, node.Location.TypeId, CatalogSnapshot.NodeIdMember.Id);
@@ -399,7 +402,8 @@ export class BatchApplier
         }
     }
 
-    private static RequirePublicId(publicId: string): void
+    /** CommitError InvalidPublicId unless the id is 1..400 UTF-8 bytes without U+0000. */
+    public static RequirePublicId(publicId: string): void
     {
         const length = BatchApplier.Encoder.encode(publicId).length;
         if (length === 0 || length > PublicIdIndex.MaxBytes || publicId.includes(BatchApplier.Nul))

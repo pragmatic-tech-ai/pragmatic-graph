@@ -75,9 +75,11 @@ export class GraphStore
     /**
      * Internal (the schema-description loader is its caller): upgrades the stored schema to `description`.
      * The catalog is planned against the current one (CatalogPlanner); data that no longer fits is
-     * discarded in the same commit, which is logged as an Upgrade entry and raised on CommitApplied. An
-     * unchanged catalog with a new Version only records the version (Changed false, no commit). A planning
-     * failure (CatalogError) leaves the store unchanged. Transactions begun before a changing upgrade fail
+     * discarded in the same commit, which is logged as an Upgrade entry and raised on CommitApplied. The
+     * description's seed is then applied in the same write (seed wins for seeded nodes, spec 4.3) and,
+     * when it changed anything, logged and raised as the next Batch commit (SeedCommit). An unchanged
+     * catalog with a new Version and an unchanged seed only records the version (Changed false, no
+     * commit). A planning failure (CatalogError) or seed failure (CommitError) leaves the store unchanged. Transactions begun before a changing upgrade fail
      * Commit with ConflictError.
      */
     public async Upgrade(description: ISchemaDescription): Promise<IUpgradeCommit>

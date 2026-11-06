@@ -23,9 +23,23 @@ export enum CatalogTag
 /** Tuple-encoded key builders: the one place that defines every key of the on-disk format. */
 export class FormatKeys
 {
+    private static readonly SeedName = 'seed';
+
     public static Meta(name: string, ...qualifiers: TupleElement[]): Uint8Array
     {
         return TupleCodec.Encode([name, ...qualifiers]);
+    }
+
+    /** Keyspace.Meta: the seed marker of a node the schema's seed placed: Meta("seed", publicId) -> 32-byte SeedHash. */
+    public static Seed(publicId: string): Uint8Array
+    {
+        return FormatKeys.Meta(FormatKeys.SeedName, publicId);
+    }
+
+    /** Keyspace.Meta: every seed marker. */
+    public static SeedRange(): IKeyRange
+    {
+        return FormatKeys.PrefixRange(FormatKeys.Meta(FormatKeys.SeedName));
     }
 
     public static CatalogRoot(): Uint8Array

@@ -7,6 +7,7 @@ import { GraphError, GraphErrorCode } from './errors/GraphError.js';
 import { EdgeDirection } from './format/FormatKeys.js';
 import type { Location } from './identity/Location.js';
 import type { GraphContext, IGraphDisposable, ReadSnapshot } from './GraphContext.js';
+import { SeedMarkers } from './schema/SeedMarkers.js';
 import { ConflictKeys } from './txn/ConflictKeys.js';
 import type { ReadSet } from './txn/ReadSet.js';
 
@@ -151,6 +152,18 @@ export class GraphReader implements IGraphDisposable
         this.RequireOpen();
         const node = await this.Locate(publicId);
         return node === undefined ? undefined : this.context.Ids.OwnerOf(this.snapshot.Txn, node.Id);
+    }
+
+    /**
+     * True iff the node exists and was placed by the schema's seed (it has a seed marker, spec 4.3):
+     * false for runtime nodes and when no node has the public id. Records the node's binding, which every
+     * seed write to the node also writes.
+     */
+    public async IsSeeded(publicId: string): Promise<boolean>
+    {
+        this.RequireOpen();
+        const node = await this.Locate(publicId);
+        return node !== undefined && (await SeedMarkers.Read(this.snapshot.Txn, publicId)) !== undefined;
     }
 
     /**

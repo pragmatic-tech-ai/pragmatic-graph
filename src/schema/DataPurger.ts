@@ -13,6 +13,7 @@ import type { CatalogIndex } from '../txn/CatalogIndex.js';
 import { ConflictKeys } from '../txn/ConflictKeys.js';
 import type { WriteKeySet } from '../txn/WriteKeySet.js';
 import type { CatalogDiff } from './CatalogDiff.js';
+import { SeedMarkers } from './SeedMarkers.js';
 
 /** What one purge removed. A value is a non-null property cell (member 0 excluded); an edge counts once. */
 export interface IPurgeStats
@@ -232,7 +233,7 @@ class PurgeRun
     /**
      * Removes the node like DeleteNode does (rows, public-id binding and owner, member 0), except that a
      * removed concept's cells go with DropType; a surviving concept's node has every cell that can hold a
-     * value nulled (slots are not reused). Seed markers (a later task) are removed here too.
+     * value nulled (slots are not reused). The node's seed marker goes too (ruling R53).
      */
     private async RemoveNode(node: IDoomedNode): Promise<void>
     {
@@ -243,6 +244,7 @@ class PurgeRun
         }
         await this.rows.Clear(this.txn, node.Id);
         await this.ids.Unbind(this.txn, publicId, node.Id);
+        SeedMarkers.Delete(this.txn, publicId);
         this.keys.Add(ConflictKeys.NodeSpace, ConflictKeys.Node(publicId));
         this.keys.Add(ConflictKeys.ExtentSpace, ConflictKeys.Extent(node.Location.TypeId));
         this.AddCellKeys(node.Id, node.Location.TypeId, CatalogSnapshot.NodeIdMember.Id);
