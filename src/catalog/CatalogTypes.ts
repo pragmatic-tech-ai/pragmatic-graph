@@ -1,4 +1,13 @@
-import { MemberKind, ValueType } from './ValueType.js';
+import { MemberKind, Placement, ValueType } from './ValueType.js';
+
+/** Per-concept placement metadata for DefineConcept (seam 3, ruling F5). */
+export interface IConceptOptions
+{
+    /** Default Partitioned. */
+    readonly Placement?: Placement;
+    /** The concept whose instances this concept's instances are co-located with (and conflict-partitioned by). */
+    readonly AggregateRoot?: string;
+}
 
 export interface MemberInput
 {
@@ -35,4 +44,8 @@ export interface TypeDefinition
     readonly Parent: string | null;
     readonly Aspects: readonly string[];
     readonly Members: readonly MemberDef[];
+    /** Concepts only (always present on a concept; absent on aspects). */
+    readonly Placement?: Placement;
+    /** Concepts only, optional: names a concept. */
+    readonly AggregateRoot?: string;
 }

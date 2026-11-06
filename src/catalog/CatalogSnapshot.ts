@@ -23,6 +23,7 @@ export class CatalogSnapshot
     private static readonly RedeclaredMessage = 'Member redeclared: ';
     private static readonly CollisionMessage = 'Member collision: ';
     private static readonly NotInstantiableMessage = 'Aspect is not instantiable: ';
+    private static readonly AggregateRootMessage = 'AggregateRoot must name a concept: ';
 
     public readonly Version: number;
     /** Next unassigned type id and member id; persisted so ids are never reused. */
@@ -245,6 +246,10 @@ export class CatalogSnapshot
             for (const m of d.Members)
             {
                 CatalogSnapshot.CheckTargets(m, byName);
+            }
+            if (d.AggregateRoot !== undefined && byName.get(d.AggregateRoot)?.IsAspect !== false)
+            {
+                throw new CatalogError(CatalogErrorCode.InvalidAggregateRoot, CatalogSnapshot.AggregateRootMessage + d.Name + '.' + d.AggregateRoot);
             }
         }
     }

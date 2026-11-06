@@ -42,9 +42,10 @@ export class FormatKeys
         return TupleCodec.Encode([IdsTag.InternalToPublic, id]);
     }
 
-    public static RowBlock(partition: number, block: bigint): Uint8Array
+    /** The row index is global (ruling F5): keyed by row block number only; entries carry the partition. */
+    public static RowBlock(block: bigint): Uint8Array
     {
-        return TupleCodec.Encode([partition, block]);
+        return TupleCodec.Encode([block]);
     }
 
     public static Column(partition: number, typeId: number, memberId: number, chunk: bigint): Uint8Array

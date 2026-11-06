@@ -1,9 +1,11 @@
 import { CatalogError, CatalogErrorCode } from './CatalogError.js';
 import { CatalogSnapshot } from './CatalogSnapshot.js';
-import { MemberDef, MemberInput, TypeDefinition } from './CatalogTypes.js';
-import { MemberKind } from './ValueType.js';
+import { IConceptOptions, MemberDef, MemberInput, TypeDefinition } from './CatalogTypes.js';
+import { MemberKind, Placement } from './ValueType.js';
 
-export type { MemberDef, MemberInput, TypeDefinition } from './CatalogTypes.js';
+export type { IConceptOptions, MemberDef, MemberInput, TypeDefinition } from './CatalogTypes.js';
+
+type MutableTypeDefinition = { -readonly [K in keyof TypeDefinition]: TypeDefinition[K] };
 
 type MutableMemberDef = { -readonly [K in keyof MemberDef]: MemberDef[K] };
 
@@ -54,7 +56,8 @@ export class CatalogModel
         return max;
     }
 
-    public DefineConcept(name: string, parent: string | null, aspects: readonly string[], members: readonly MemberInput[]): void
+    /** Records a concept; `options` sets its Placement (default Partitioned) and AggregateRoot (ruling F5). */
+    public DefineConcept(name: string, parent: string | null, aspects: readonly string[], members: readonly MemberInput[], options?: IConceptOptions): void
     {
         const existing = this.definitions.get(name);
         if (existing !== undefined && !existing.IsAspect && existing.Parent !== parent)
@@ -62,7 +65,7 @@ export class CatalogModel
             throw new CatalogError(CatalogErrorCode.MultipleParents, CatalogModel.ConflictingParentMessage + name);
         }
         this.EnsureNew(name);
-        this.Record(name, false, parent, aspects, members);
+        this.Record(name, false, parent, aspects, members, options);
     }
 
     public DefineAspect(name: string, includes: readonly string[], members: readonly MemberInput[]): void
@@ -86,19 +89,28 @@ export class CatalogModel
         }
     }
 
-    private Record(name: string, isAspect: boolean, parent: string | null, aspects: readonly string[], members: readonly MemberInput[]): void
+    private Record(name: string, isAspect: boolean, parent: string | null, aspects: readonly string[], members: readonly MemberInput[], options?: IConceptOptions): void
     {
         const defs = this.ConvertMembers(name, name, members, false);
         const typeId = this.nextTypeId;
         this.nextTypeId += 1;
-        this.definitions.set(name, Object.freeze({
+        const def: MutableTypeDefinition = {
             Name: name,
             IsAspect: isAspect,
             TypeId: typeId,
             Parent: parent,
             Aspects: Object.freeze([...aspects]),
             Members: Object.freeze(defs),
-        }));
+        };
+        if (!isAspect)
+        {
+            def.Placement = options?.Placement ?? Placement.Partitioned;
+            if (options?.AggregateRoot !== undefined)
+            {
+                def.AggregateRoot = options.AggregateRoot;
+            }
+        }
+        this.definitions.set(name, Object.freeze(def));
     }
 
     private ConvertMembers(owner: string, path: string, inputs: readonly MemberInput[], edge: boolean): MemberDef[]

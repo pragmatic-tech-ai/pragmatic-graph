@@ -15,6 +15,8 @@ export enum CatalogErrorCode
     InvalidMember,
     VersionConflict,
     CorruptCatalog,
+    /** AggregateRoot does not name a concept. */
+    InvalidAggregateRoot,
 }
 
 export class CatalogError extends GraphError

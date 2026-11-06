@@ -67,7 +67,7 @@ class TxnState
 /**
  * Node property cells in column chunks, with writes going to a per-chunk delta overlay (folded into
  * the chunk by Compactor). Chunk number = slot / 2048, slot-in-chunk = slot % 2048. A missing chunk
- * and no delta entry reads as null. The per-type slot counter lives in Meta("slots", typeId) and is
+ * and no delta entry reads as null. The per-type slot counter lives in Meta("slots", partition, typeId) and is
  * written through the caller's write transaction, so it commits or rolls back with it.
  * Only properties (and the node-id member 0) are stored here; relationships are rejected.
  * Deleting a node is writing null to member 0; its slot is not reused in v1.
@@ -126,7 +126,7 @@ export class ColumnStore
             throw new RangeError(ColumnStore.ErrSlotsExhausted + typeId);
         }
         slots.set(typeId, next + 1);
-        txn.Put(Keyspace.Meta, this.SlotsKey(typeId), TupleCodec.Encode([BigInt(next + 1)]));
+        txn.Put(Keyspace.Meta, this.SlotsKey(partition, typeId), TupleCodec.Encode([BigInt(next + 1)]));
         return next;
     }
 
@@ -142,12 +142,12 @@ export class ColumnStore
         }
         if (state === undefined)
         {
-            return this.LoadSlotCount(txn, typeId);
+            return this.LoadSlotCount(txn, partition, typeId);
         }
         let loading = state.SlotLoads.get(typeId);
         if (loading === undefined)
         {
-            loading = this.LoadSlotCount(txn, typeId).then(count =>
+            loading = this.LoadSlotCount(txn, partition, typeId).then(count =>
             {
                 state.SlotLoads.delete(typeId);
                 if (!state.Slots.has(typeId))
@@ -434,9 +434,9 @@ export class ColumnStore
         return new DeltaState(key, type, cells, partition, typeId, memberId, chunk);
     }
 
-    private async LoadSlotCount(txn: IReadTransaction, typeId: number): Promise<number>
+    private async LoadSlotCount(txn: IReadTransaction, partition: number, typeId: number): Promise<number>
     {
-        const raw = await txn.Get(Keyspace.Meta, this.SlotsKey(typeId));
+        const raw = await txn.Get(Keyspace.Meta, this.SlotsKey(partition, typeId));
         return raw === undefined ? 0 : Number(TupleCodec.Decode(raw)[0] as bigint);
     }
 
@@ -462,7 +462,8 @@ export class ColumnStore
         return partition + s + typeId + s + memberId + s + chunk;
     }
 
-    private SlotsKey(typeId: number): Uint8Array
+    /** Meta("slots", partition, typeId), cached per type (only partition 0 passes RequirePartition in v1). */
+    private SlotsKey(partition: number, typeId: number): Uint8Array
     {
         let key = this.slotKeys.get(typeId);
         if (key === undefined)
@@ -471,7 +472,7 @@ export class ColumnStore
             {
                 throw new RangeError(ColumnStore.ErrTypeId + typeId);
             }
-            key = FormatKeys.Meta(ColumnStore.SlotsName, typeId);
+            key = FormatKeys.Meta(ColumnStore.SlotsName, partition, typeId);
             this.slotKeys.set(typeId, key);
         }
         return key;

@@ -7,6 +7,7 @@ import { CatalogSnapshot } from '../../catalog/CatalogSnapshot.js';
 import { MemberKind, ValueType } from '../../catalog/ValueType.js';
 import type { MemberDef } from '../../catalog/CatalogTypes.js';
 import { FormatKeys } from '../../format/FormatKeys.js';
+import { TupleCodec } from '../../format/TupleCodec.js';
 import type { Location } from '../../identity/Location.js';
 import { InternalId } from '../../identity/InternalId.js';
 import type { IKeyRange, IKeyValueStore, IReadTransaction, IScanOptions, IWriteTransaction } from '../../kv/KeyValue.js';
@@ -173,6 +174,11 @@ class ColumnFx
                 {
                     assert.equal(await cs.AllocateSlot(txn, 0, 5), 2);
                 });
+                const r = await store.BeginRead();
+                // F5: the slot counter key carries the partition: Meta("slots", partition, typeId).
+                assert.deepEqual(await r.Get(Keyspace.Meta, FormatKeys.Meta('slots', 0, 5)), TupleCodec.Encode([3n]));
+                assert.equal(await r.Get(Keyspace.Meta, FormatKeys.Meta('slots', 5)), undefined);
+                r.dispose();
                 await store.dispose();
             });
 

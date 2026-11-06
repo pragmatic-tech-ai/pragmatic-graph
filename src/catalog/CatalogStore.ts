@@ -5,6 +5,7 @@ import { TupleCodec } from '../format/TupleCodec.js';
 import { CatalogError, CatalogErrorCode } from './CatalogError.js';
 import { CatalogSnapshot } from './CatalogSnapshot.js';
 import type { MemberDef, TypeDefinition } from './CatalogTypes.js';
+import { Placement } from './ValueType.js';
 
 interface IStoredCatalog
 {
@@ -122,7 +123,19 @@ export class CatalogStore
             && (v.Parent === null || typeof v.Parent === 'string')
             && CatalogStore.IsStringArray(v.Aspects)
             && Array.isArray(v.Members)
-            && v.Members.every((m: unknown) => CatalogStore.IsMember(m));
+            && v.Members.every((m: unknown) => CatalogStore.IsMember(m))
+            && CatalogStore.IsPlacement(v);
+    }
+
+    /** Placement and AggregateRoot (ruling F5): optional on concepts (Placement defaults to Partitioned on load), absent on aspects. */
+    private static IsPlacement(v: Record<string, unknown>): boolean
+    {
+        if (v.IsAspect === true)
+        {
+            return v.Placement === undefined && v.AggregateRoot === undefined;
+        }
+        return CatalogStore.IsOptional(v.Placement, x => x === Placement.Replicated || x === Placement.Partitioned)
+            && CatalogStore.IsOptional(v.AggregateRoot, x => typeof x === 'string');
     }
 
     private static IsMember(v: unknown): boolean
@@ -186,6 +199,7 @@ export class CatalogStore
     {
         return Object.freeze({
             ...d,
+            ...(d.IsAspect ? {} : { Placement: d.Placement ?? Placement.Partitioned }),
             Aspects: Object.freeze([...d.Aspects]),
             Members: Object.freeze(d.Members.map(m => CatalogStore.FreezeMember(m))),
         });

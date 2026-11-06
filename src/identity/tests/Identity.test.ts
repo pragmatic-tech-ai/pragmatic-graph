@@ -9,6 +9,8 @@ import { MemoryStore } from '../../kv/memory/MemoryStore.js';
 import { IdAllocator } from '../IdAllocator.js';
 import { PublicIdIndex, PublicIdTooLongError } from '../PublicIdIndex.js';
 import { RowIndex } from '../RowIndex.js';
+import { FormatKeys } from '../../format/FormatKeys.js';
+import { Keyspace } from '../../kv/Keyspace.js';
 import { InternalId } from '../InternalId.js';
 
 class IdentityFx
@@ -289,6 +291,24 @@ class IdentityFx
                 const fresh = await store.BeginRead();
                 assert.deepEqual(await rows.Locate(fresh, 1n), IdentityFx.Loc(9, 9));
                 fresh.dispose();
+                await store.dispose();
+            });
+
+            it('row entries are (partition, typeId, slot) u32 LE in a global block keyed by block number only (F5)', async () =>
+            {
+                const store = await open();
+                const rows = new RowIndex();
+                await store.Write(async txn =>
+                {
+                    await rows.Assign(txn, 3n, IdentityFx.Loc(7, 9));
+                });
+                const r = await store.BeginRead();
+                const block = await r.Get(Keyspace.Rows, FormatKeys.RowBlock(0n)) as Uint8Array;
+                r.dispose();
+                assert.equal(block.length, RowIndex.BlockEntries * 12);
+                const view = new DataView(block.buffer, block.byteOffset, block.byteLength);
+                assert.deepEqual([view.getUint32(36, true), view.getUint32(40, true), view.getUint32(44, true)], [0, 7, 9]);
+                assert.deepEqual([view.getUint32(24, true), view.getUint32(28, true), view.getUint32(32, true)], [0xffffffff, 0xffffffff, 0xffffffff]);
                 await store.dispose();
             });
 

@@ -7,7 +7,7 @@ import { CatalogError, CatalogErrorCode } from '../CatalogError.js';
 import { CatalogModel } from '../CatalogModel.js';
 import { CatalogSnapshot } from '../CatalogSnapshot.js';
 import { CatalogStore } from '../CatalogStore.js';
-import { MemberKind, ValueType } from '../ValueType.js';
+import { MemberKind, Placement, ValueType } from '../ValueType.js';
 import type { IKeyValueStore } from '../../kv/KeyValue.js';
 import { LmdbStore } from '../../kv/lmdb/LmdbStore.js';
 import { Keyspace } from '../../kv/Keyspace.js';
@@ -16,6 +16,15 @@ import { MemoryStore } from '../../kv/memory/MemoryStore.js';
 
 class CatalogFx
 {
+    /** Raw stored JSON definitions of the current catalog root. */
+    public static async RawDefinitions(store: IKeyValueStore): Promise<Array<Record<string, unknown>>>
+    {
+        const r = await store.BeginRead();
+        const raw = await r.Get(Keyspace.Catalog, FormatKeys.CatalogRoot()) as Uint8Array;
+        r.dispose();
+        return (JSON.parse(new TextDecoder().decode(raw)) as { Definitions: Array<Record<string, unknown>> }).Definitions;
+    }
+
     private static readonly Dirs: string[] = [];
     private static readonly DirPrefix = 'pragmatic-graph-catalog-';
 
@@ -322,3 +331,62 @@ for (const [name, open] of backends)
         });
     });
 }
+
+describe('catalog placement (F5)', () =>
+{
+    it('concepts record Placement (default Partitioned) and an optional AggregateRoot; both round-trip', async () =>
+    {
+        const store = new MemoryStore();
+        const m = new CatalogModel();
+        m.DefineConcept('File', null, [], []);
+        m.DefineConcept('Term', null, [], [], { Placement: Placement.Replicated });
+        m.DefineConcept('AstNode', null, [], [], { AggregateRoot: 'File' });
+        m.DefineAspect('Named', [], []);
+        const saved = m.Seal();
+        await CatalogFx.Save(store, saved);
+        const raw = await CatalogFx.RawDefinitions(store);
+        assert.deepEqual(raw.map(d => [d['Name'], d['Placement'], d['AggregateRoot']]), [
+            ['File', Placement.Partitioned, undefined],
+            ['Term', Placement.Replicated, undefined],
+            ['AstNode', Placement.Partitioned, 'File'],
+            ['Named', undefined, undefined],
+        ]);
+        const r = await store.BeginRead();
+        const loaded = await CatalogStore.Load(r);
+        r.dispose();
+        assert.deepEqual(loaded.Definitions(), saved.Definitions());
+        await store.dispose();
+    });
+
+    it('a stored concept without Placement loads as Partitioned (additive JSON)', async () =>
+    {
+        const store = new MemoryStore();
+        await CatalogFx.PutObject(store, { NextTypeId: 2, NextMemberId: 1, Definitions: [{ Name: 'Old', IsAspect: false, TypeId: 1, Parent: null, Aspects: [], Members: [] }] });
+        const r = await store.BeginRead();
+        const loaded = await CatalogStore.Load(r);
+        r.dispose();
+        assert.equal(loaded.Definitions()[0]?.Placement, Placement.Partitioned);
+        await store.dispose();
+    });
+
+    it('AggregateRoot must name a concept; aspects carry no placement; unknown Placement values are corrupt', async () =>
+    {
+        for (const root of ['Missing', 'Named'])
+        {
+            const m = new CatalogModel();
+            m.DefineAspect('Named', [], []);
+            m.DefineConcept('AstNode', null, [], [], { AggregateRoot: root });
+            assert.throws(() => m.Seal(), (e: unknown) => e instanceof CatalogError && e.Code === CatalogErrorCode.InvalidAggregateRoot, root);
+        }
+        const store = new MemoryStore();
+        await CatalogFx.PutObject(store, { NextTypeId: 2, NextMemberId: 1, Definitions: [{ Name: 'X', IsAspect: false, TypeId: 1, Parent: null, Aspects: [], Members: [], Placement: 7 }] });
+        const r = await store.BeginRead();
+        await assert.rejects(CatalogStore.Load(r), (e: unknown) => e instanceof CatalogError && e.Code === CatalogErrorCode.CorruptCatalog);
+        r.dispose();
+        await CatalogFx.PutObject(store, { NextTypeId: 2, NextMemberId: 1, Definitions: [{ Name: 'A', IsAspect: true, TypeId: 1, Parent: null, Aspects: [], Members: [], Placement: 1 }] });
+        const r2 = await store.BeginRead();
+        await assert.rejects(CatalogStore.Load(r2), (e: unknown) => e instanceof CatalogError && e.Code === CatalogErrorCode.CorruptCatalog);
+        r2.dispose();
+        await store.dispose();
+    });
+});

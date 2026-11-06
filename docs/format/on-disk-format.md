@@ -23,7 +23,7 @@ This document is the contract between the TypeScript engine and the future Rust 
 | `catalog` | `(1)` catalog root | catalog definitions: UTF-8 JSON, see Catalog |
 | `ids` | `(1, publicId: string)` | internal id: tuple-encoded `(id: u64)` |
 | `ids` | `(2, id: u64)` | public id: UTF-8 bytes |
-| `rows` | `(partition, block: u64)` | row block |
+| `rows` | `(block: u64)` | row block (global; entries carry the partition) |
 | `columns` | `(partition, typeId, memberId, chunk: u64)` | column chunk |
 | `deltas` | `(partition, typeId, memberId, chunk: u64)` | delta |
 | `edges` | `(partition, relationshipId, direction, node: u64, position: bytes, other: u64)` | Out: edge-property list; In: empty (see Edges) |
@@ -39,7 +39,7 @@ Keys are `(name, ...qualifiers)`. Names defined so far:
 
 Names added by later tasks, each with its value layout completed by that task:
 
-- `("slots", typeId)`: the number of slots ever allocated for the type (partition 0 in v1), a tuple-encoded single integer `(n)`; absent means `0`. Slots are allocated densely from 0 (`AllocateSlot` returns `n` and stores `n + 1`) inside the caller's write transaction; slot `0xFFFFFFFF` is reserved. Deleted slots are not reused in v1.
+- `("slots", partition, typeId)`: the number of slots ever allocated for the type in that partition (only partition 0 in v1), a tuple-encoded single integer `(n)`; absent means `0`. Slots are allocated densely from 0 (`AllocateSlot` returns `n` and stores `n + 1`) inside the caller's write transaction; slot `0xFFFFFFFF` is reserved. Deleted slots are not reused in v1.
 - `("commit")`: the last commit number, a tuple-encoded single integer `(n)`; absent means `0` (no commits). Written only by the committer, in the same write transaction as the log entries it covers, so it always equals the highest `log` key.
 
 ### Catalog
@@ -48,11 +48,11 @@ Names added by later tasks, each with its value layout completed by that task:
 
 ```
 { NextTypeId: number, NextMemberId: number, Definitions: TypeDefinition[] }
-TypeDefinition = { Name, IsAspect, TypeId, Parent: string|null, Aspects: string[], Members: MemberDef[] }
+TypeDefinition = { Name, IsAspect, TypeId, Parent: string|null, Aspects: string[], Members: MemberDef[], Placement?, AggregateRoot? }
 MemberDef = { Id, Name, Kind, Type?, Nullable, Targets?, Many?, Ordered?, EdgeProperties?: MemberDef[], DeclaredBy }
 ```
 
-`Definitions` are in definition order. `Kind` is `1` Property or `2` Relationship; `Type` is `1` Boolean, `2` Int64, `3` Float64, `4` String, `5` Date, `6` DateTime, `7` Duration. Type ids and member ids are stored as assigned. `NextTypeId` and `NextMemberId` are the persisted next-id counters, so ids are never reused; a counter must be at least `1` and at least one more than the largest stored id of its kind (edge properties included), else the catalog is corrupt. The catalog version lives in `Meta("catalogVersion")`, not in the row, and is written in the same transaction. A save must carry exactly the stored version plus one, otherwise it is rejected as a version conflict. A value that is not valid JSON of this shape, or that repeats a type id or member id (edge properties included), is rejected on load as a corrupt catalog.
+`Definitions` are in definition order. `Placement` and `AggregateRoot` (seam 3, ruling F5) are concept-only and additive: `Placement` is `1` Replicated (ontology core, taxonomies: copied to every partition) or `2` Partitioned (instance data); a concept stored without it loads as Partitioned, and the engine always writes it for concepts. `AggregateRoot` is optional and names a concept (not an aspect, not undefined) whose instances this concept's instances are co-located with and conflict-partitioned by. An aspect with either field, or a `Placement` outside `1..2`, is a corrupt catalog; an `AggregateRoot` that does not name a concept is rejected as a schema error (`InvalidAggregateRoot`). `Kind` is `1` Property or `2` Relationship; `Type` is `1` Boolean, `2` Int64, `3` Float64, `4` String, `5` Date, `6` DateTime, `7` Duration. Type ids and member ids are stored as assigned. `NextTypeId` and `NextMemberId` are the persisted next-id counters, so ids are never reused; a counter must be at least `1` and at least one more than the largest stored id of its kind (edge properties included), else the catalog is corrupt. The catalog version lives in `Meta("catalogVersion")`, not in the row, and is written in the same transaction. A save must carry exactly the stored version plus one, otherwise it is rejected as a version conflict. A value that is not valid JSON of this shape, or that repeats a type id or member id (edge properties included), is rejected on load as a corrupt catalog.
 
 Member ids are catalog-global: one id space across all concepts and aspects, assigned once, stable, never reused, starting at `1`. An aspect-contributed member keeps its one id in every carrier concept. Member id `0` is reserved: it is the implicit node-id column (Int64, non-null) present on every concept.
 
@@ -64,14 +64,15 @@ Values: `PublicToInternal` holds the internal id as a tuple-encoded single integ
 
 ### Rows (row index)
 
-A block covers 4,096 consecutive internal ids: `block = id / 4096`, entry index `id % 4096`. The value is 4,096 entries of 8 bytes (32,768 bytes), entry `i` at byte offset `8 * i`:
+The row index is global (ruling F5): it maps every internal id to its location, whatever partition holds the node, so its key is the row block number alone and each entry carries the partition. A block covers 4,096 consecutive internal ids: `block = id / 4096`, entry index `id % 4096`. The value is 4,096 entries of 12 bytes (49,152 bytes), entry `i` at byte offset `12 * i`:
 
 ```
-typeId : u32 little-endian
-slot   : u32 little-endian
+partition : u32 little-endian
+typeId    : u32 little-endian
+slot      : u32 little-endian
 ```
 
-An entry is unassigned iff both `typeId` and `slot` are `0xFFFFFFFF`; therefore `0xFFFFFFFF` is reserved and is never a valid type id or slot. A missing block means all 4,096 entries are unassigned. The row entry is an index only: it locates the node's cells; it never copies data. Edges point to internal ids, never slots.
+An entry is unassigned iff all three of `partition`, `typeId` and `slot` are `0xFFFFFFFF`; therefore `0xFFFFFFFF` is reserved and is never a valid partition, type id or slot. A missing block means all of its entries are unassigned. The row entry is an index only: it locates the node's cells; it never copies data. Edges point to internal ids, never slots.
 
 ### Columns
 

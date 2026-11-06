@@ -6,9 +6,9 @@ export { GraphReader, type IScanRow } from './GraphReader.js';
 export { GraphTransaction } from './GraphTransaction.js';
 
 // Schema definition.
-export { CatalogModel, type MemberDef, type MemberInput, type TypeDefinition } from './catalog/CatalogModel.js';
+export { CatalogModel, type IConceptOptions, type MemberDef, type MemberInput, type TypeDefinition } from './catalog/CatalogModel.js';
 export type { CatalogSnapshot } from './catalog/CatalogSnapshot.js';
-export { MemberKind, ValueType } from './catalog/ValueType.js';
+export { MemberKind, Placement, ValueType } from './catalog/ValueType.js';
 
 // Values and directions.
 export { DateTimeValue, DateValue, DurationValue, type CellValue } from './columns/CellValue.js';
