@@ -19,7 +19,8 @@ export { WriteBatch, WriteOp, type BatchOp, type ICreateNodeOp, type IDeleteNode
 export type { ICommitApplied } from './txn/Committer.js';
 export type { ISignal, ISubscription } from './txn/Signal.js';
 
-// Errors.
+// Errors: every error the engine raises on purpose is a GraphError with a GraphErrorCode (ruling F8).
+export { GraphError, GraphErrorCode } from './errors/GraphError.js';
 export { ConflictError } from './txn/ConflictError.js';
 export { CommitError, CommitErrorCode } from './txn/CommitError.js';
 export { CatalogError, CatalogErrorCode } from './catalog/CatalogError.js';

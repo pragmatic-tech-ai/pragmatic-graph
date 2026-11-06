@@ -1,5 +1,6 @@
 import type { CellValue } from './columns/CellValue.js';
 import type { GraphContext, ReadSnapshot } from './GraphContext.js';
+import { GraphError, GraphErrorCode } from './errors/GraphError.js';
 import { GraphReader } from './GraphReader.js';
 import { ConflictError } from './txn/ConflictError.js';
 import type { ISnapshotHandle } from './txn/ConflictHistory.js';
@@ -114,7 +115,7 @@ export class GraphTransaction extends GraphReader
         this.RequireOpen();
         if (this.committing)
         {
-            throw new Error(GraphTransaction.ErrFinished);
+            throw new GraphError(GraphErrorCode.Disposed, GraphTransaction.ErrFinished);
         }
     }
 }

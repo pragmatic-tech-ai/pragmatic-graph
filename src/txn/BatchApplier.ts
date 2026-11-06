@@ -13,6 +13,7 @@ import type { Location } from '../identity/Location.js';
 import { PublicIdIndex } from '../identity/PublicIdIndex.js';
 import type { RowIndex } from '../identity/RowIndex.js';
 import type { IWriteTransaction } from '../kv/KeyValue.js';
+import { GraphError, GraphErrorCode } from '../errors/GraphError.js';
 import type { CatalogIndex } from './CatalogIndex.js';
 import { CommitError, CommitErrorCode } from './CommitError.js';
 import { ConflictKeys } from './ConflictKeys.js';
@@ -98,7 +99,7 @@ export class BatchApplier
                     const id = allocated[nextId++];
                     if (id === undefined)
                     {
-                        throw new Error(BatchApplier.ErrIdsExhausted);
+                        throw new GraphError(GraphErrorCode.Internal, BatchApplier.ErrIdsExhausted);
                     }
                     const concept = await this.CreateNode(txn, op, id, keys);
                     created.set(id, { PublicId: op.PublicId, Concept: concept, Set: new Set() });
@@ -319,7 +320,7 @@ export class BatchApplier
         const concept = location === undefined ? undefined : this.index.ConceptOf(location.TypeId);
         if (location === undefined || concept === undefined)
         {
-            throw new Error(BatchApplier.ErrCorruptRow + publicId);
+            throw new GraphError(GraphErrorCode.Corrupt, BatchApplier.ErrCorruptRow + publicId);
         }
         return { PublicId: publicId, Id: id, Location: location, Concept: concept };
     }

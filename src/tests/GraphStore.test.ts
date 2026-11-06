@@ -22,6 +22,8 @@ import {
     DateValue,
     EdgeDirection,
     FormatVersionMismatchError,
+    GraphError,
+    GraphErrorCode,
     GraphReader,
     GraphStore,
     GraphTransaction,
@@ -177,7 +179,7 @@ class GraphFx
                     assert.deepEqual((await r.Neighbors('loc', 'in', EdgeDirection.In)).sort(), ['c1', 'c2']);
                     assert.deepEqual(await r.Neighbors('nobody', 'in', EdgeDirection.Out), []);
                     await assert.rejects(r.GetProperty('f1', 'nope'), CatalogError);
-                    await assert.rejects(r.GetProperty('c1', 'in'), RangeError);
+                    await assert.rejects(r.GetProperty('c1', 'in'), GraphError);
                 });
                 await g.dispose();
             });
@@ -405,6 +407,40 @@ class GraphFx
                 assert.equal((await GraphFx.Settle(u.Commit()) as CommitError).Code, CommitErrorCode.TargetTypeMismatch);
                 await GraphFx.Read(g, async r => assert.equal(await r.GetProperty('f5', 'path'), undefined));
                 await g.dispose();
+            });
+
+            it('reads and writes raise the same GraphErrorCode for the same mistake; every engine error is a GraphError (F8)', async () =>
+            {
+                const g = await GraphFx.Defined(open);
+                await GraphFx.Seed(g);
+                const long = 'x'.repeat(401);
+                const cases: Array<[string, GraphErrorCode, (r: GraphReader) => Promise<unknown>, (t: GraphTransaction) => void]> = [
+                    ['relationship read as a property', GraphErrorCode.SchemaViolation, r => r.GetProperty('c1', 'in'), t => t.SetProperty('c1', 'in', 'x')],
+                    ['unknown member', GraphErrorCode.SchemaViolation, r => r.GetProperty('f1', 'nope'), t => t.SetProperty('f1', 'nope', 'x')],
+                    ['property followed as a relationship', GraphErrorCode.SchemaViolation, r => r.Neighbors('f1', 'path', EdgeDirection.Out), t => t.Link('f1', 'path', 'loc')],
+                    ['public id over 400 bytes', GraphErrorCode.InvalidArgument, r => r.GetProperty(long, 'path'), t => t.SetProperty(long, 'path', 'x')],
+                    ['empty public id', GraphErrorCode.InvalidArgument, r => r.GetProperty('', 'path'), t => t.SetProperty('', 'path', 'x')],
+                ];
+                for (const [label, code, read, write] of cases)
+                {
+                    const readError = await GraphFx.Read(g, r => GraphFx.Settle(read(r)));
+                    const t = await g.Begin();
+                    write(t);
+                    const writeError = await GraphFx.Settle(t.Commit());
+                    assert.ok(readError instanceof GraphError && readError.GraphCode === code, label + ' (read): ' + String(readError));
+                    assert.ok(writeError instanceof GraphError && writeError.GraphCode === code, label + ' (write): ' + String(writeError));
+                }
+                const reader = await g.BeginRead();
+                reader.dispose();
+                const disposed = await GraphFx.Settle(reader.GetProperty('f1', 'path'));
+                assert.ok(disposed instanceof GraphError && disposed.GraphCode === GraphErrorCode.Disposed, String(disposed));
+                await g.dispose();
+                const closed = await GraphFx.Settle(g.BeginRead());
+                assert.ok(closed instanceof GraphError && closed.GraphCode === GraphErrorCode.Disposed, String(closed));
+                for (const type of [CommitError, CatalogError, ConflictError, Api.EdgeError, PublicIdTooLongError, FormatVersionMismatchError])
+                {
+                    assert.ok(type.prototype instanceof GraphError, type.name);
+                }
             });
 
             it('a 401-byte public id is a clear error on read and on commit, never a storage crash; 400 bytes works', async () =>

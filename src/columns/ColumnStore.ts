@@ -1,6 +1,7 @@
 import { MemberKind, ValueType } from '../catalog/ValueType.js';
 import type { MemberDef } from '../catalog/CatalogTypes.js';
 import { CatalogSnapshot } from '../catalog/CatalogSnapshot.js';
+import { GraphError, GraphErrorCode } from '../errors/GraphError.js';
 import { FormatKeys } from '../format/FormatKeys.js';
 import { TupleCodec } from '../format/TupleCodec.js';
 import type { Location } from '../identity/Location.js';
@@ -249,7 +250,7 @@ export class ColumnStore
     {
         if (this.HasPendingWrites(txn))
         {
-            throw new Error(ColumnStore.ErrUnflushed);
+            throw new GraphError(GraphErrorCode.Internal, ColumnStore.ErrUnflushed);
         }
     }
 

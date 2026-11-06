@@ -1,5 +1,6 @@
 import { open, RootDatabase, Database, Transaction, type RootDatabaseOptionsWithPath } from 'lmdb';
 import { IKeyRange, IKeyValueStore, IReadTransaction, IScanProbe, IWriteTransaction, ScanCounter } from '../KeyValue.js';
+import { GraphError, GraphErrorCode } from '../../errors/GraphError.js';
 import { Keyspace } from '../Keyspace.js';
 import { PendingChanges } from '../PendingChanges.js';
 
@@ -23,7 +24,7 @@ class LmdbKeys
     {
         if (key.length === 0)
         {
-            throw new Error(LmdbErrors.EmptyKey);
+            throw new GraphError(GraphErrorCode.InvalidArgument, LmdbErrors.EmptyKey);
         }
     }
 }
@@ -72,7 +73,7 @@ class LmdbReadTransaction implements IReadTransaction
     {
         if (this.disposed)
         {
-            throw new Error(LmdbErrors.TxnDisposed);
+            throw new GraphError(GraphErrorCode.Disposed, LmdbErrors.TxnDisposed);
         }
     }
 
@@ -267,7 +268,7 @@ export class LmdbStore implements IKeyValueStore, IScanProbe
     {
         if (this.disposed)
         {
-            return Promise.reject(new Error(LmdbErrors.StoreDisposed));
+            return Promise.reject(new GraphError(GraphErrorCode.Disposed, LmdbErrors.StoreDisposed));
         }
         const run = this.tail.then(() => this.RunExclusive(work));
         this.tail = run.catch(() => undefined);
@@ -315,7 +316,7 @@ export class LmdbStore implements IKeyValueStore, IScanProbe
     {
         if (this.disposed)
         {
-            throw new Error(LmdbErrors.StoreDisposed);
+            throw new GraphError(GraphErrorCode.Disposed, LmdbErrors.StoreDisposed);
         }
     }
 }

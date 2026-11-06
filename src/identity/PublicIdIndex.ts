@@ -1,17 +1,18 @@
+import { GraphError, GraphErrorCode } from '../errors/GraphError.js';
 import type { IReadTransaction, IWriteTransaction } from '../kv/KeyValue.js';
 import { Keyspace } from '../kv/Keyspace.js';
 import { FormatKeys } from '../format/FormatKeys.js';
 import { InternalId } from './InternalId.js';
 import { TupleCodec } from '../format/TupleCodec.js';
 
-export class PublicIdTooLongError extends Error
+export class PublicIdTooLongError extends GraphError
 {
     private static readonly ErrorName = 'PublicIdTooLongError';
     private static readonly Text = 'Public id exceeds 400 UTF-8 bytes';
 
     public constructor()
     {
-        super(PublicIdTooLongError.Text);
+        super(GraphErrorCode.InvalidArgument, PublicIdTooLongError.Text);
         this.name = PublicIdTooLongError.ErrorName;
     }
 }
@@ -49,12 +50,12 @@ export class PublicIdIndex
         const existing = await this.Resolve(txn, publicId);
         if (existing !== undefined && existing !== id)
         {
-            throw new Error(PublicIdIndex.ErrBound + publicId);
+            throw new GraphError(GraphErrorCode.ConstraintViolation, PublicIdIndex.ErrBound + publicId);
         }
         const owner = await this.PublicIdOf(txn, id);
         if (owner !== undefined && owner !== publicId)
         {
-            throw new Error(PublicIdIndex.ErrIdBound + id);
+            throw new GraphError(GraphErrorCode.ConstraintViolation, PublicIdIndex.ErrIdBound + id);
         }
         txn.Put(Keyspace.Ids, FormatKeys.PublicToInternal(publicId), TupleCodec.Encode([id]));
         txn.Put(Keyspace.Ids, FormatKeys.InternalToPublic(id), PublicIdIndex.Encoder.encode(publicId));
@@ -65,7 +66,7 @@ export class PublicIdIndex
         const existing = await this.Resolve(txn, publicId);
         if (existing !== id)
         {
-            throw new Error(PublicIdIndex.ErrMismatch + publicId);
+            throw new GraphError(GraphErrorCode.InvalidArgument, PublicIdIndex.ErrMismatch + publicId);
         }
         txn.Delete(Keyspace.Ids, FormatKeys.PublicToInternal(publicId));
         txn.Delete(Keyspace.Ids, FormatKeys.InternalToPublic(id));
@@ -75,7 +76,7 @@ export class PublicIdIndex
     {
         if (publicId.length === 0)
         {
-            throw new Error(PublicIdIndex.ErrEmpty);
+            throw new GraphError(GraphErrorCode.InvalidArgument, PublicIdIndex.ErrEmpty);
         }
         if (PublicIdIndex.Encoder.encode(publicId).length > PublicIdIndex.MaxBytes)
         {

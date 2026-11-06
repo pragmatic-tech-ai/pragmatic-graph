@@ -1,14 +1,20 @@
+import { GraphError, GraphErrorCode } from '../errors/GraphError.js';
 import { Keyspace } from '../kv/Keyspace.js';
 import type { IReadTransaction, IWriteTransaction } from '../kv/KeyValue.js';
 import { FormatKeys } from './FormatKeys.js';
 import { TupleCodec } from './TupleCodec.js';
 
-export class FormatVersionMismatchError extends Error
+export class FormatVersionMismatchError extends GraphError
 {
+    private static readonly ErrorName = 'FormatVersionMismatchError';
+    private static readonly FoundText = 'Unsupported on-disk format version: found ';
+    private static readonly ExpectedText = ', expected ';
+    private static readonly NoneText = 'none';
+
     public constructor(public readonly Found: bigint | undefined, public readonly Expected: bigint)
     {
-        super(`Unsupported on-disk format version: found ${Found === undefined ? 'none' : String(Found)}, expected ${String(Expected)}`);
-        this.name = 'FormatVersionMismatchError';
+        super(GraphErrorCode.Unsupported, FormatVersionMismatchError.FoundText + (Found === undefined ? FormatVersionMismatchError.NoneText : String(Found)) + FormatVersionMismatchError.ExpectedText + String(Expected));
+        this.name = FormatVersionMismatchError.ErrorName;
     }
 }
 

@@ -20,12 +20,14 @@ export enum CommitErrorCode
     MissingRequired,
 }
 
+import { GraphError, GraphErrorCode } from '../errors/GraphError.js';
+
 /**
  * A batch is semantically invalid against the graph state it was applied to. Only that batch is
  * rejected; its writes leave no trace. `cause` carries the underlying EdgeError, CatalogError or column
  * error when there is one.
  */
-export class CommitError extends Error
+export class CommitError extends GraphError
 {
     private static readonly ErrorName = 'CommitError';
 
@@ -33,8 +35,26 @@ export class CommitError extends Error
 
     public constructor(code: CommitErrorCode, message: string, cause?: unknown)
     {
-        super(message, cause === undefined ? undefined : { cause });
+        super(CommitError.Category(code), message, cause);
         this.name = CommitError.ErrorName;
         this.Code = code;
+    }
+
+    /** The engine-wide category of a commit error code (the same code a read raises for the same mistake). */
+    public static Category(code: CommitErrorCode): GraphErrorCode
+    {
+        switch (code)
+        {
+            case CommitErrorCode.UnknownNode:
+                return GraphErrorCode.NotFound;
+            case CommitErrorCode.InvalidPublicId:
+                return GraphErrorCode.InvalidArgument;
+            case CommitErrorCode.DuplicatePublicId:
+            case CommitErrorCode.InvalidEdge:
+            case CommitErrorCode.MissingRequired:
+                return GraphErrorCode.ConstraintViolation;
+            default:
+                return GraphErrorCode.SchemaViolation;
+        }
     }
 }

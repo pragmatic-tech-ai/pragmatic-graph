@@ -1,5 +1,6 @@
 import { TupleCodec } from '../../format/TupleCodec.js';
 import { IKeyRange, IKeyValueStore, IReadTransaction, IScanProbe, IWriteTransaction, ScanCounter } from '../KeyValue.js';
+import { GraphError, GraphErrorCode } from '../../errors/GraphError.js';
 import { Keyspace } from '../Keyspace.js';
 import { type IPendingChange, PendingChanges } from '../PendingChanges.js';
 
@@ -105,7 +106,7 @@ class MemoryReadTransaction implements IReadTransaction
     {
         if (this.disposed)
         {
-            throw new Error(MemoryReadTransaction.ErrDisposed);
+            throw new GraphError(GraphErrorCode.Disposed, MemoryReadTransaction.ErrDisposed);
         }
     }
 
@@ -113,7 +114,7 @@ class MemoryReadTransaction implements IReadTransaction
     {
         if (key.length === 0)
         {
-            throw new Error(MemoryReadTransaction.ErrEmptyKey);
+            throw new GraphError(GraphErrorCode.InvalidArgument, MemoryReadTransaction.ErrEmptyKey);
         }
     }
 
@@ -248,7 +249,7 @@ export class MemoryStore implements IKeyValueStore, IScanProbe
     {
         if (this.disposed)
         {
-            return Promise.reject(new Error(MemoryStore.ErrDisposed));
+            return Promise.reject(new GraphError(GraphErrorCode.Disposed, MemoryStore.ErrDisposed));
         }
         const run = this.tail.then(() => this.RunExclusive(work));
         this.tail = run.catch(() => undefined);
@@ -296,7 +297,7 @@ export class MemoryStore implements IKeyValueStore, IScanProbe
     {
         if (this.disposed)
         {
-            throw new Error(MemoryStore.ErrDisposed);
+            throw new GraphError(GraphErrorCode.Disposed, MemoryStore.ErrDisposed);
         }
     }
 }

@@ -3,6 +3,7 @@ import type { MemberDef } from './catalog/CatalogTypes.js';
 import { CatalogSnapshot } from './catalog/CatalogSnapshot.js';
 import { MemberKind } from './catalog/ValueType.js';
 import type { CellValue } from './columns/CellValue.js';
+import { GraphError, GraphErrorCode } from './errors/GraphError.js';
 import { EdgeDirection } from './format/FormatKeys.js';
 import type { Location } from './identity/Location.js';
 import type { GraphContext, IGraphDisposable, ReadSnapshot } from './GraphContext.js';
@@ -56,8 +57,9 @@ export class GraphReader implements IGraphDisposable
 
     /**
      * The property's value (null for an unset nullable property), or undefined when no node has the
-     * public id. Unknown members are a CatalogError; relationship members a RangeError; public ids over
-     * 400 UTF-8 bytes a PublicIdTooLongError.
+     * public id. Errors are GraphErrors with the codes a commit uses for the same mistake (ruling F8):
+     * unknown members are a CatalogError and relationship members a GraphError (both SchemaViolation);
+     * public ids over 400 UTF-8 bytes a PublicIdTooLongError (InvalidArgument).
      */
     public async GetProperty(publicId: string, member: string): Promise<CellValue | undefined>
     {
@@ -70,7 +72,7 @@ export class GraphReader implements IGraphDisposable
         const def = this.snapshot.Index.Catalog.Member(node.Concept, member);
         if (def.Kind !== MemberKind.Property)
         {
-            throw new RangeError(GraphReader.ErrNotProperty + node.Concept + GraphReader.Dot + member);
+            throw new GraphError(GraphErrorCode.SchemaViolation, GraphReader.ErrNotProperty + node.Concept + GraphReader.Dot + member);
         }
         this.Reads?.AddKey(ConflictKeys.CellSpace, ConflictKeys.Cell(node.Id, def.Id));
         return this.context.Columns.ReadCell(this.snapshot.Txn, node.Location, def);
@@ -86,7 +88,7 @@ export class GraphReader implements IGraphDisposable
         this.RequireOpen();
         if (direction !== EdgeDirection.Out && direction !== EdgeDirection.In)
         {
-            throw new RangeError(GraphReader.ErrDirection + String(direction));
+            throw new GraphError(GraphErrorCode.InvalidArgument, GraphReader.ErrDirection + String(direction));
         }
         const node = await this.Locate(publicId);
         if (node === undefined)
@@ -155,7 +157,7 @@ export class GraphReader implements IGraphDisposable
     {
         if (this.disposed)
         {
-            throw new Error(GraphReader.ErrDisposed);
+            throw new GraphError(GraphErrorCode.Disposed, GraphReader.ErrDisposed);
         }
     }
 
@@ -198,7 +200,7 @@ export class GraphReader implements IGraphDisposable
             const rel = index.Catalog.Member(concept, name);
             if (rel.Kind !== MemberKind.Relationship)
             {
-                throw new RangeError(GraphReader.ErrNotRelationship + concept + GraphReader.Dot + name);
+                throw new GraphError(GraphErrorCode.SchemaViolation, GraphReader.ErrNotRelationship + concept + GraphReader.Dot + name);
             }
             return [rel];
         }
@@ -224,7 +226,7 @@ export class GraphReader implements IGraphDisposable
         const concept = location === undefined ? undefined : this.snapshot.Index.ConceptOf(location.TypeId);
         if (location === undefined || concept === undefined)
         {
-            throw new Error(GraphReader.ErrCorrupt + publicId);
+            throw new GraphError(GraphErrorCode.Corrupt, GraphReader.ErrCorrupt + publicId);
         }
         return { Id: id, Location: location, Concept: concept };
     }
@@ -234,7 +236,7 @@ export class GraphReader implements IGraphDisposable
         const publicId = await this.context.Ids.PublicIdOf(this.snapshot.Txn, id);
         if (publicId === undefined)
         {
-            throw new Error(GraphReader.ErrCorrupt + id);
+            throw new GraphError(GraphErrorCode.Corrupt, GraphReader.ErrCorrupt + id);
         }
         return publicId;
     }

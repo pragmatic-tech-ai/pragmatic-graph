@@ -19,6 +19,7 @@ import type { IKeyRange, IKeyValueStore, IReadTransaction, IWriteTransaction } f
 import { Keyspace } from '../../kv/Keyspace.js';
 import { LmdbStore } from '../../kv/lmdb/LmdbStore.js';
 import { MemoryStore } from '../../kv/memory/MemoryStore.js';
+import { GraphError, GraphErrorCode } from '../../errors/GraphError.js';
 import { CommitError, CommitErrorCode } from '../CommitError.js';
 import { CommitLog } from '../CommitLog.js';
 import { Committer } from '../Committer.js';
@@ -738,7 +739,7 @@ class TxnFx
                 assert.ok((await TxnFx.Settle(c.Submit(touchB(), TxnFx.ReadsCell(b, age), 3n))) instanceof ConflictError);
                 assert.equal(await c.Submit(touchB(), TxnFx.ReadsCell(a, age), 4n), 6n);
                 const tooNew = await TxnFx.Settle(c.Submit(touchB(), new ReadSet(), 99n));
-                assert.ok(tooNew instanceof RangeError);
+                assert.ok(tooNew instanceof GraphError && tooNew.GraphCode === GraphErrorCode.InvalidArgument);
                 assert.ok(!(tooNew instanceof ConflictError));
                 await store.dispose();
             });

@@ -1,6 +1,7 @@
 import { CatalogModel } from './catalog/CatalogModel.js';
 import type { CatalogSnapshot } from './catalog/CatalogSnapshot.js';
 import { CatalogStore } from './catalog/CatalogStore.js';
+import { GraphError, GraphErrorCode } from './errors/GraphError.js';
 import { FormatMeta } from './format/FormatMeta.js';
 import { GraphContext } from './GraphContext.js';
 import { GraphReader } from './GraphReader.js';
@@ -146,7 +147,7 @@ export class GraphStore
         if (this.disposing !== undefined)
         {
             reader.dispose();
-            throw new Error(GraphStore.ErrDisposed);
+            throw new GraphError(GraphErrorCode.Disposed, GraphStore.ErrDisposed);
         }
         return reader;
     }
@@ -155,7 +156,7 @@ export class GraphStore
     {
         if (this.disposing !== undefined)
         {
-            throw new Error(GraphStore.ErrDisposed);
+            throw new GraphError(GraphErrorCode.Disposed, GraphStore.ErrDisposed);
         }
     }
 

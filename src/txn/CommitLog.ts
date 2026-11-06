@@ -1,3 +1,4 @@
+import { GraphError, GraphErrorCode } from '../errors/GraphError.js';
 import { FormatKeys } from '../format/FormatKeys.js';
 import { TupleCodec } from '../format/TupleCodec.js';
 import type { IReadTransaction, IWriteTransaction } from '../kv/KeyValue.js';
@@ -33,7 +34,7 @@ export class CommitLog
         const value = parts[0];
         if (parts.length !== 1 || typeof value !== 'bigint' || value < 0n)
         {
-            throw new RangeError(CommitLog.ErrCorrupt);
+            throw new GraphError(GraphErrorCode.Corrupt, CommitLog.ErrCorrupt);
         }
         return value;
     }

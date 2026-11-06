@@ -6,6 +6,7 @@ import { IdAllocator } from '../identity/IdAllocator.js';
 import { PublicIdIndex } from '../identity/PublicIdIndex.js';
 import { RowIndex } from '../identity/RowIndex.js';
 import type { IKeyValueStore, IWriteTransaction } from '../kv/KeyValue.js';
+import { GraphError, GraphErrorCode } from '../errors/GraphError.js';
 import { BatchApplier } from './BatchApplier.js';
 import { CatalogIndex } from './CatalogIndex.js';
 import { CommitError } from './CommitError.js';
@@ -190,17 +191,17 @@ export class Committer
      * Commits the batch if nothing it read (readSet, taken at snapshotCommit) was written by a later
      * commit; resolves with its commit number. Rejects with ConflictError on a read conflict (or a
      * snapshot older than the retained window), CommitError when the batch is semantically invalid, and
-     * RangeError when snapshotCommit is after LastCommit(). The batch and read set are captured now.
+     * GraphError InvalidArgument when snapshotCommit is after LastCommit(). The batch and read set are captured now.
      */
     public Submit(batch: WriteBatch, readSet: ReadSet, snapshotCommit: bigint): Promise<bigint>
     {
         if (this.disposed)
         {
-            return Promise.reject(new Error(Committer.ErrDisposed));
+            return Promise.reject(new GraphError(GraphErrorCode.Disposed, Committer.ErrDisposed));
         }
         if (snapshotCommit > this.history.Last || snapshotCommit < 0n)
         {
-            return Promise.reject(new RangeError(Committer.ErrSnapshot + snapshotCommit));
+            return Promise.reject(new GraphError(GraphErrorCode.InvalidArgument, Committer.ErrSnapshot + snapshotCommit));
         }
         let bytes: Uint8Array;
         try
@@ -232,7 +233,7 @@ export class Committer
             return;
         }
         this.disposed = true;
-        const error = new Error(Committer.ErrDisposed);
+        const error = new GraphError(GraphErrorCode.Disposed, Committer.ErrDisposed);
         for (const p of this.queue.splice(0, this.queue.length))
         {
             p.Reject(error);
@@ -370,7 +371,7 @@ export class Committer
         const stored = await CommitLog.ReadLastCommit(txn);
         if (stored !== this.history.Last)
         {
-            throw new Error(Committer.ErrStale + stored + Committer.ErrExpected + this.history.Last);
+            throw new GraphError(GraphErrorCode.Internal, Committer.ErrStale + stored + Committer.ErrExpected + this.history.Last);
         }
         const applier = new BatchApplier(index, this.columns, this.edges, this.rows, this.ids);
         const groupKeys = new WriteKeySet();
@@ -427,7 +428,7 @@ export class Committer
             const member = index.PropertyById(d.MemberId);
             if (member === undefined)
             {
-                throw new Error(Committer.ErrCompactMember + d.MemberId);
+                throw new GraphError(GraphErrorCode.Corrupt, Committer.ErrCompactMember + d.MemberId);
             }
             await this.compactor.CompactChunk(txn, d.Partition, d.TypeId, member, d.Chunk);
         }

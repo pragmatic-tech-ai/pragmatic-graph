@@ -1,3 +1,4 @@
+import { GraphError, GraphErrorCode } from '../errors/GraphError.js';
 import { TupleCodec } from '../format/TupleCodec.js';
 import type { IKeyRange, ScanCounter } from './KeyValue.js';
 
@@ -112,7 +113,7 @@ export class PendingChanges
             yield change;
             if (this.version !== version)
             {
-                throw new Error(PendingChanges.ErrChanged);
+                throw new GraphError(GraphErrorCode.InvalidArgument, PendingChanges.ErrChanged);
             }
             i++;
         }
@@ -129,7 +130,7 @@ export class PendingChanges
     {
         if (PendingChanges.VersionOf(changes) !== version)
         {
-            throw new Error(PendingChanges.ErrChanged);
+            throw new GraphError(GraphErrorCode.InvalidArgument, PendingChanges.ErrChanged);
         }
     }
 
