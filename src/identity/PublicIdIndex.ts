@@ -1,6 +1,7 @@
 import type { IReadTransaction, IWriteTransaction } from '../kv/KeyValue.js';
 import { Keyspace } from '../kv/Keyspace.js';
 import { FormatKeys } from '../format/FormatKeys.js';
+import { InternalId } from './InternalId.js';
 import { TupleCodec } from '../format/TupleCodec.js';
 
 export class PublicIdTooLongError extends Error
@@ -21,8 +22,6 @@ export class PublicIdIndex
     public static readonly MaxBytes = 400;
     private static readonly Encoder = new TextEncoder();
     private static readonly Decoder = new TextDecoder('utf-8');
-    public static readonly MaxId = (1n << 64n) - 1n;
-    private static readonly ErrIdRange = 'Internal id must be within 1..2^64-1: ';
     private static readonly ErrEmpty = 'Public id must not be empty';
     private static readonly ErrBound = 'Public id is already bound to a different internal id: ';
     private static readonly ErrIdBound = 'Internal id is already bound to a different public id: ';
@@ -37,7 +36,7 @@ export class PublicIdIndex
 
     public async PublicIdOf(txn: IReadTransaction, id: bigint): Promise<string | undefined>
     {
-        PublicIdIndex.RequireId(id);
+        InternalId.Require(id);
         const raw = await txn.Get(Keyspace.Ids, FormatKeys.InternalToPublic(id));
         return raw === undefined ? undefined : PublicIdIndex.Decoder.decode(raw);
     }
@@ -46,7 +45,7 @@ export class PublicIdIndex
     public async Bind(txn: IWriteTransaction, publicId: string, id: bigint): Promise<void>
     {
         PublicIdIndex.Validate(publicId);
-        PublicIdIndex.RequireId(id);
+        InternalId.Require(id);
         const existing = await this.Resolve(txn, publicId);
         if (existing !== undefined && existing !== id)
         {
@@ -70,14 +69,6 @@ export class PublicIdIndex
         }
         txn.Delete(Keyspace.Ids, FormatKeys.PublicToInternal(publicId));
         txn.Delete(Keyspace.Ids, FormatKeys.InternalToPublic(id));
-    }
-
-    public static RequireId(id: bigint): void
-    {
-        if (id < 1n || id > PublicIdIndex.MaxId)
-        {
-            throw new RangeError(PublicIdIndex.ErrIdRange + id);
-        }
     }
 
     private static Validate(publicId: string): void

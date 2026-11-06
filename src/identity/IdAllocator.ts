@@ -31,6 +31,7 @@ export class IdAllocator
     public static readonly BlockSize = 4096;
     public static readonly MaxOpenHints = 1024;
     private static readonly BlockSizeBig = BigInt(IdAllocator.BlockSize);
+    private static readonly ErrMaxHints = 'MaxOpenHints must be a positive safe integer: ';
     private static readonly NextBlockName = 'nextBlock';
 
     private readonly hints = new Map<string, IOpenBlock>();
@@ -46,7 +47,12 @@ export class IdAllocator
 
     public static async Open(store: IKeyValueStore, options?: IIdAllocatorOptions): Promise<IdAllocator>
     {
-        return new IdAllocator(store, options?.MaxOpenHints ?? IdAllocator.MaxOpenHints);
+        const max = options?.MaxOpenHints ?? IdAllocator.MaxOpenHints;
+        if (!Number.isSafeInteger(max) || max < 1)
+        {
+            throw new RangeError(IdAllocator.ErrMaxHints + max);
+        }
+        return new IdAllocator(store, max);
     }
 
     /** Number of hinted blocks currently held open. */

@@ -1,7 +1,7 @@
 import type { IReadTransaction, IWriteTransaction } from '../kv/KeyValue.js';
 import { Keyspace } from '../kv/Keyspace.js';
 import { FormatKeys } from '../format/FormatKeys.js';
-import { PublicIdIndex } from './PublicIdIndex.js';
+import { InternalId } from './InternalId.js';
 import type { Location } from './Location.js';
 
 /**
@@ -22,7 +22,7 @@ export class RowIndex
 
     public async Locate(txn: IReadTransaction, id: bigint): Promise<Location | undefined>
     {
-        RowIndex.RequireId(id);
+        InternalId.Require(id);
         const block = await this.Load(txn, id / RowIndex.BlockEntriesBig);
         const view = RowIndex.View(block);
         const offset = Number(id % RowIndex.BlockEntriesBig) * RowIndex.EntryBytes;
@@ -37,7 +37,7 @@ export class RowIndex
 
     public async Assign(txn: IWriteTransaction, id: bigint, location: Location): Promise<void>
     {
-        RowIndex.RequireId(id);
+        InternalId.Require(id);
         if (
             location.Partition !== RowIndex.Partition ||
             !RowIndex.IsU32(location.TypeId) ||
@@ -51,7 +51,7 @@ export class RowIndex
 
     public async Clear(txn: IWriteTransaction, id: bigint): Promise<void>
     {
-        RowIndex.RequireId(id);
+        InternalId.Require(id);
         if ((await this.Locate(txn, id)) === undefined)
         {
             return;
@@ -102,10 +102,5 @@ export class RowIndex
     private static IsU32(value: number): boolean
     {
         return Number.isInteger(value) && value >= 0 && value < RowIndex.Unassigned;
-    }
-
-    private static RequireId(id: bigint): void
-    {
-        PublicIdIndex.RequireId(id);
     }
 }

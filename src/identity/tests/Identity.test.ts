@@ -9,6 +9,7 @@ import { MemoryStore } from '../../kv/memory/MemoryStore.js';
 import { IdAllocator } from '../IdAllocator.js';
 import { PublicIdIndex, PublicIdTooLongError } from '../PublicIdIndex.js';
 import { RowIndex } from '../RowIndex.js';
+import { InternalId } from '../InternalId.js';
 
 class IdentityFx
 {
@@ -127,6 +128,25 @@ class IdentityFx
                 assert.notEqual(b / IdentityFx.BlockSize, (first.get('b') as bigint) / IdentityFx.BlockSize);
                 assert.ok(alloc.OpenHintCount <= IdentityFx.SmallBound);
                 await store.dispose();
+            });
+
+            it('rejects invalid MaxOpenHints', async () =>
+            {
+                const store = await open();
+                for (const bad of [0, -1, Number.NaN, 1.5, Number.POSITIVE_INFINITY])
+                {
+                    await assert.rejects(IdAllocator.Open(store, { MaxOpenHints: bad }), RangeError);
+                }
+                await store.dispose();
+            });
+
+            it('InternalId bounds', async () =>
+            {
+                assert.equal(InternalId.Max, (1n << 64n) - 1n);
+                InternalId.Require(1n);
+                InternalId.Require(InternalId.Max);
+                assert.throws(() => InternalId.Require(0n), RangeError);
+                assert.throws(() => InternalId.Require(InternalId.Max + 1n), RangeError);
             });
 
             it('rejects invalid public ids on Resolve and Unbind', async () =>
