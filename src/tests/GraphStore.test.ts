@@ -17,6 +17,7 @@ import type { IScanProbe } from '../kv/KeyValue.js';
 import type { Location } from '../identity/Location.js';
 import * as Api from '../index.js';
 import {
+    AccessScope,
     CatalogError,
     CatalogErrorCode,
     CatalogModel,
@@ -91,7 +92,7 @@ class GraphFx
     /** Commits one transaction built by `build`. */
     public static async Commit(g: GraphStore, build: (t: GraphTransaction) => void | Promise<void>): Promise<bigint>
     {
-        const t = await g.Begin();
+        const t = await g.Begin(AccessScope.System);
         await build(t);
         return t.Commit();
     }
@@ -130,7 +131,7 @@ class GraphFx
 
     public static async Read<T>(g: GraphStore, work: (r: GraphReader) => Promise<T>): Promise<T>
     {
-        const r = await g.BeginRead();
+        const r = await g.BeginRead(AccessScope.System);
         try
         {
             return await work(r);
@@ -215,12 +216,12 @@ class GraphFx
             {
                 const g = await GraphFx.Defined(open);
                 await GraphFx.Seed(g);
-                const before = await g.BeginRead();
+                const before = await g.BeginRead(AccessScope.System);
                 assert.equal(before.SnapshotCommit, 2n);
                 await GraphFx.Commit(g, t => t.SetProperty('f1', 'path', '/b.txt'));
                 assert.equal(await before.GetProperty('f1', 'path'), '/a.txt');
                 before.dispose();
-                const t = await g.Begin();
+                const t = await g.Begin(AccessScope.System);
                 t.SetProperty('f1', 'path', '/c.txt');
                 t.CreateNode('f9', 'file');
                 t.SetProperty('f9', 'path', '/9');
@@ -235,16 +236,16 @@ class GraphFx
             {
                 const g = await GraphFx.Defined(open);
                 await GraphFx.Seed(g);
-                const t1 = await g.Begin();
-                const t2 = await g.Begin();
+                const t1 = await g.Begin(AccessScope.System);
+                const t2 = await g.Begin(AccessScope.System);
                 assert.equal(await t1.GetProperty('f1', 'path'), '/a.txt');
                 assert.equal(await t2.GetProperty('f1', 'path'), '/a.txt');
                 t1.SetProperty('f1', 'path', '/t1');
                 t2.SetProperty('s1', 'path', '/t2');
                 await t1.Commit();
                 assert.ok((await GraphFx.Settle(t2.Commit())) instanceof ConflictError);
-                const d1 = await g.Begin();
-                const d2 = await g.Begin();
+                const d1 = await g.Begin(AccessScope.System);
+                const d2 = await g.Begin(AccessScope.System);
                 await d1.GetProperty('f1', 'path');
                 await d2.GetProperty('s1', 'path');
                 d1.SetProperty('f1', 'path', '/d1');
@@ -271,17 +272,17 @@ class GraphFx
                     }
                     t.CreateNode('c1', 'component');
                 });
-                const scan = await g.Begin();
-                const other = await g.Begin();
+                const scan = await g.Begin(AccessScope.System);
+                const other = await g.Begin(AccessScope.System);
                 assert.equal((await GraphFx.Scan(scan, 'file', 'path')).length, 500);
                 await GraphFx.Scan(other, 'file', 'path');
-                const reads = (scan as unknown as { reads: ReadSet }).reads;
+                const reads = (scan as unknown as { Reads: ReadSet }).Reads;
                 assert.ok(reads.KeyCount <= 5, 'scan recorded ' + reads.KeyCount + ' keys');
                 scan.SetProperty('c1', 'name', 'a');
                 other.SetProperty('c1', 'name', 'b');
                 await GraphFx.Commit(g, t => t.SetProperty('p42', 'path', '/changed'));
                 assert.ok((await GraphFx.Settle(scan.Commit())) instanceof ConflictError);
-                const unrelated = await g.Begin();
+                const unrelated = await g.Begin(AccessScope.System);
                 await GraphFx.Scan(unrelated, 'file', 'path');
                 unrelated.SetProperty('c1', 'name', 'c');
                 await GraphFx.Commit(g, t => t.SetProperty('c1', 'since', new DateValue(1)));
@@ -294,16 +295,16 @@ class GraphFx
             {
                 const g = await GraphFx.Defined(open);
                 await GraphFx.Seed(g);
-                const scan = await g.Begin();
+                const scan = await g.Begin(AccessScope.System);
                 await GraphFx.Scan(scan, 'file', 'path');
                 scan.SetProperty('c1', 'name', 'x');
-                const edges = await g.Begin();
+                const edges = await g.Begin(AccessScope.System);
                 await edges.Neighbors('loc', 'in', EdgeDirection.In);
                 edges.SetProperty('c1', 'name', 'y');
-                const missing = await g.Begin();
+                const missing = await g.Begin(AccessScope.System);
                 assert.equal(await missing.GetProperty('f2', 'path'), undefined);
                 missing.SetProperty('c1', 'name', 'z');
-                const reader = await g.Begin();
+                const reader = await g.Begin(AccessScope.System);
                 await reader.GetProperty('c1', 'name');
                 await GraphFx.Commit(g, t =>
                 {
@@ -324,7 +325,7 @@ class GraphFx
             {
                 const g = await GraphFx.Defined(open);
                 await GraphFx.Seed(g);
-                const t = await g.Begin();
+                const t = await g.Begin(AccessScope.System);
                 t.SetProperty('f1', 'path', '/late');
                 await g.DefineSchema(m => m.DefineConcept('extra', 'file', [], []));
                 assert.ok((await GraphFx.Settle(t.Commit())) instanceof ConflictError);
@@ -391,7 +392,7 @@ class GraphFx
             {
                 const g = await GraphFx.Defined(open);
                 await GraphFx.Seed(g);
-                const t = await g.Begin();
+                const t = await g.Begin(AccessScope.System);
                 t.SetProperty('f1', 'path', '/raced');
                 const schema = g.DefineSchema(m => m.DefineConcept('later', null, [], []));
                 const result = await GraphFx.Settle(t.Commit());
@@ -435,7 +436,7 @@ class GraphFx
                 await GraphFx.Seed(g);
                 const seen: bigint[] = [];
                 g.CommitApplied.Subscribe(e => seen.push(e.Commit));
-                const t = await g.Begin();
+                const t = await g.Begin(AccessScope.System);
                 await t.GetProperty('f1', 'path');
                 assert.equal(await t.Commit(), t.SnapshotCommit);
                 assert.equal(t.SnapshotCommit, 2n);
@@ -450,13 +451,13 @@ class GraphFx
                 const g = await GraphFx.Defined(open);
                 await GraphFx.Seed(g);
                 const committer = GraphFx.Committer(g);
-                const reader = await g.BeginRead();
+                const reader = await g.BeginRead(AccessScope.System);
                 for (let i = 0; i < 3; i++)
                 {
                     await GraphFx.Commit(g, x => x.SetProperty('f1', 'path', '/r' + i));
                 }
                 assert.equal(committer.HistoryFloor, committer.LastCommit() - 1n, 'reader must not hold the window open');
-                const t = await g.Begin();
+                const t = await g.Begin(AccessScope.System);
                 const pinned = committer.LastCommit();
                 await GraphFx.Commit(g, x => x.SetProperty('f1', 'path', '/pinned'));
                 await GraphFx.Commit(g, x => x.SetProperty('f1', 'path', '/pinned2'));
@@ -473,7 +474,7 @@ class GraphFx
                 await GraphFx.Seed(g);
                 for (const [name, member] of [['file', 'path'], ['placed', 'in']] as const)
                 {
-                    const r = await g.BeginRead();
+                    const r = await g.BeginRead(AccessScope.System);
                     const rows = r.ScanConcept(name, member)[Symbol.asyncIterator]();
                     assert.equal((await rows.next()).done, false);
                     r.dispose();
@@ -502,10 +503,10 @@ class GraphFx
             {
                 const g = await GraphFx.Defined(open);
                 await GraphFx.Seed(g);
-                const t = await g.Begin();
+                const t = await g.Begin(AccessScope.System);
                 t.CreateNode('f5', 'file');
                 assert.equal((await GraphFx.Settle(t.Commit()) as CommitError).Code, CommitErrorCode.MissingRequired);
-                const u = await g.Begin();
+                const u = await g.Begin(AccessScope.System);
                 u.CreateNode('f5', 'file');
                 u.SetProperty('f5', 'path', '/5');
                 u.Link('c1', 'in', 'f5');
@@ -530,18 +531,18 @@ class GraphFx
                 for (const [label, code, read, write] of cases)
                 {
                     const readError = await GraphFx.Read(g, r => GraphFx.Settle(read(r)));
-                    const t = await g.Begin();
+                    const t = await g.Begin(AccessScope.System);
                     write(t);
                     const writeError = await GraphFx.Settle(t.Commit());
                     assert.ok(readError instanceof GraphError && readError.GraphCode === code, label + ' (read): ' + String(readError));
                     assert.ok(writeError instanceof GraphError && writeError.GraphCode === code, label + ' (write): ' + String(writeError));
                 }
-                const reader = await g.BeginRead();
+                const reader = await g.BeginRead(AccessScope.System);
                 reader.dispose();
                 const disposed = await GraphFx.Settle(reader.GetProperty('f1', 'path'));
                 assert.ok(disposed instanceof GraphError && disposed.GraphCode === GraphErrorCode.Disposed, String(disposed));
                 await g.dispose();
-                const closed = await GraphFx.Settle(g.BeginRead());
+                const closed = await GraphFx.Settle(g.BeginRead(AccessScope.System));
                 assert.ok(closed instanceof GraphError && closed.GraphCode === GraphErrorCode.Disposed, String(closed));
                 for (const type of [CommitError, CatalogError, ConflictError, Api.EdgeError, PublicIdTooLongError, FormatVersionMismatchError])
                 {
@@ -559,7 +560,7 @@ class GraphFx
                     await assert.rejects(r.GetProperty(long, 'path'), PublicIdTooLongError);
                     await assert.rejects(r.Neighbors(long, 'in', EdgeDirection.Out), PublicIdTooLongError);
                 });
-                const t = await g.Begin();
+                const t = await g.Begin(AccessScope.System);
                 t.CreateNode(long, 'file');
                 t.SetProperty(long, 'path', '/long');
                 const failed = await GraphFx.Settle(t.Commit());
@@ -741,20 +742,20 @@ class GraphFx
             {
                 const g = await GraphFx.Defined(open);
                 await GraphFx.Seed(g);
-                const t = await g.Begin();
+                const t = await g.Begin(AccessScope.System);
                 t.SetProperty('f1', 'path', '/1');
                 await t.Commit();
                 assert.throws(() => t.SetProperty('f1', 'path', '/2'));
                 await assert.rejects(t.Commit());
                 await assert.rejects(t.GetProperty('f1', 'path'));
-                const open1 = await g.BeginRead();
-                const open2 = await g.Begin();
+                const open1 = await g.BeginRead(AccessScope.System);
+                const open2 = await g.Begin(AccessScope.System);
                 await Promise.all([g.dispose(), g.dispose()]);
                 await g.dispose();
                 await assert.rejects(open1.GetProperty('f1', 'path'));
                 await assert.rejects(open2.Commit());
-                await assert.rejects(g.BeginRead());
-                await assert.rejects(g.Begin());
+                await assert.rejects(g.BeginRead(AccessScope.System));
+                await assert.rejects(g.Begin(AccessScope.System));
                 await assert.rejects(g.DefineSchema(m => GraphFx.Define(m)));
                 open1.dispose();
             });
@@ -774,7 +775,7 @@ describe('GraphStore durability on LMDB', () =>
         const g = await GraphFx.Defined(() => GraphStore.OpenLmdb(dir));
         await GraphFx.Seed(g);
         await GraphFx.Commit(g, t => t.SetProperty('f1', 'path', '/committed'));
-        const pending = await g.Begin();
+        const pending = await g.Begin(AccessScope.System);
         pending.CreateNode('ghost', 'file');
         pending.SetProperty('ghost', 'path', '/ghost');
         pending.SetProperty('f1', 'path', '/uncommitted');

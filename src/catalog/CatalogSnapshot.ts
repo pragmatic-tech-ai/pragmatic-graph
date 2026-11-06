@@ -360,6 +360,12 @@ export class CatalogSnapshot
         throw new CatalogError(CatalogErrorCode.UnknownMember, CatalogSnapshot.UnknownMemberMessage + conceptOrAspect + CatalogSnapshot.MemberSeparator + name);
     }
 
+    /** True iff a concept or aspect of that name is defined. */
+    public Has(name: string): boolean
+    {
+        return this.byName.has(name);
+    }
+
     public IsA(concept: string, conceptOrAspect: string): boolean
     {
         this.RequireConcept(concept);

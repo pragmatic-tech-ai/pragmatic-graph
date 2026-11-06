@@ -1,4 +1,4 @@
-import { GraphStore, MemberKind, ValueType } from '../index.js';
+import { AccessScope, GraphStore, MemberKind, ValueType } from '../index.js';
 
 /**
  * Child process for the GraphStore durability tests: `commit <dir>` defines the schema, commits one
@@ -23,14 +23,14 @@ class DurabilityChild
         if (mode === DurabilityChild.CommitMode)
         {
             await g.DefineSchema(m => m.DefineConcept('file', null, [], [{ Name: 'path', Kind: MemberKind.Property, Type: ValueType.String }]));
-            const t = await g.Begin();
+            const t = await g.Begin(AccessScope.System);
             t.CreateNode('child', 'file');
             t.SetProperty('child', 'path', '/from-child');
             await t.Commit();
         }
         else
         {
-            const t = await g.Begin();
+            const t = await g.Begin(AccessScope.System);
             t.CreateNode('orphan', 'file');
             t.SetProperty('orphan', 'path', '/orphan');
             t.SetProperty('child', 'path', '/overwritten');

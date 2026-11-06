@@ -1,3 +1,4 @@
+import type { AccessScope } from './access/AccessScope.js';
 import type { CellValue } from './columns/CellValue.js';
 import type { GraphContext, ReadSnapshot } from './GraphContext.js';
 import { GraphError, GraphErrorCode } from './errors/GraphError.js';
@@ -9,7 +10,8 @@ import { type ICreateNodeOptions, type LinkOptions, WriteBatch } from './txn/Wri
 
 /**
  * An optimistic, serializable read-write transaction. Reads are snapshot reads at Begin and are
- * recorded (ruling R31); writes are recorded as a WriteBatch and applied only by Commit.
+ * recorded (ruling R31), visibility reads under the transaction's AccessScope included; writes are
+ * recorded as a WriteBatch and applied only by Commit.
  *
  * Reads do NOT see the transaction's own pending writes (no read-your-own-writes, as in the flow
  * language): every read answers from the snapshot taken at Begin. Commit fails with ConflictError when
@@ -24,13 +26,12 @@ export class GraphTransaction extends GraphReader
     private static readonly ErrSchemaNow = ', now ';
 
     private readonly batch = new WriteBatch();
-    private readonly reads = new ReadSet();
     private committing = false;
 
     /** @internal Created by GraphStore.Begin. */
-    public constructor(context: GraphContext, snapshot: ReadSnapshot)
+    public constructor(context: GraphContext, snapshot: ReadSnapshot, scope: AccessScope)
     {
-        super(context, snapshot);
+        super(context, snapshot, scope, new ReadSet());
     }
 
     public CreateNode(publicId: string, concept: string, options?: ICreateNodeOptions): void
@@ -85,7 +86,7 @@ export class GraphTransaction extends GraphReader
                 return this.SnapshotCommit;
             }
             // The catalog version is checked inside the commit group against the group's catalog (ruling F4).
-            return await this.context.Committer.Submit(this.batch, this.reads, this.ValidationCommit(), began);
+            return await this.context.Committer.Submit(this.batch, this.Reads, this.ValidationCommit(), began);
         }
         finally
         {
@@ -94,9 +95,10 @@ export class GraphTransaction extends GraphReader
         }
     }
 
+    /** Always set: the constructor hands the reader a ReadSet. */
     protected override get Reads(): ReadSet
     {
-        return this.reads;
+        return super.Reads as ReadSet;
     }
 
     /**

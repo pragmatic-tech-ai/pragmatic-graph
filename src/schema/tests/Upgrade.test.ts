@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { AccessScope } from '../../access/AccessScope.js';
 import { CatalogError, CatalogErrorCode } from '../../catalog/CatalogError.js';
 import type { MemberInput } from '../../catalog/CatalogTypes.js';
 import { MemberKind, ValueType } from '../../catalog/ValueType.js';
@@ -146,7 +147,7 @@ class UpgradeFx
 
     public static async Commit(g: GraphStore, build: (t: GraphTransaction) => void): Promise<bigint>
     {
-        const t = await g.Begin();
+        const t = await g.Begin(AccessScope.System);
         build(t);
         return t.Commit();
     }
@@ -158,7 +159,7 @@ class UpgradeFx
 
     public static async Read<T>(g: GraphStore, work: (r: GraphReader) => Promise<T>): Promise<T>
     {
-        const r = await g.BeginRead();
+        const r = await g.BeginRead(AccessScope.System);
         try
         {
             return await work(r);
@@ -588,7 +589,7 @@ class UpgradeFx
             it('open transaction conflicts after upgrade', async () =>
             {
                 const g = await UpgradeFx.Ready(open);
-                const t = await g.Begin();
+                const t = await g.Begin(AccessScope.System);
                 assert.equal(await t.GetProperty('d1', 'title'), 'Spec');
                 t.SetProperty('d1', 'title', 'Changed');
                 await g.Upgrade(UpgradeFx.Replace('v2', 'Item'));

@@ -7,7 +7,7 @@ import { FormatKeys, IdsTag } from '../format/FormatKeys.js';
 import { TupleCodec } from '../format/TupleCodec.js';
 import { Keyspace } from '../kv/Keyspace.js';
 import type { GraphContext } from '../GraphContext.js';
-import { CatalogModel, ConflictError, GraphReader, GraphStore, GraphTransaction, MemberKind, ValueType } from '../index.js';
+import { AccessScope, CatalogModel, ConflictError, GraphReader, GraphStore, GraphTransaction, MemberKind, ValueType } from '../index.js';
 
 /** Schema and helpers for the node-level read tests. */
 class NodeFx
@@ -52,14 +52,14 @@ class NodeFx
 
     public static async Commit(g: GraphStore, build: (t: GraphTransaction) => void): Promise<bigint>
     {
-        const t = await g.Begin();
+        const t = await g.Begin(AccessScope.System);
         build(t);
         return t.Commit();
     }
 
     public static async Read<T>(g: GraphStore, work: (r: GraphReader) => Promise<T>): Promise<T>
     {
-        const r = await g.BeginRead();
+        const r = await g.BeginRead(AccessScope.System);
         try
         {
             return await work(r);
@@ -189,7 +189,7 @@ class NodeFx
             {
                 const g = await NodeFx.Defined(open);
                 await NodeFx.Commit(g, t => t.CreateNode('s1', NodeFx.Server));
-                const t1 = await g.Begin();
+                const t1 = await g.Begin(AccessScope.System);
                 await NodeFx.Ids(t1, NodeFx.Asset);
                 await NodeFx.Commit(g, t => t.CreateNode('l1', NodeFx.Laptop));
                 t1.CreateNode('p1', NodeFx.Person);
@@ -200,12 +200,12 @@ class NodeFx
             it('ConceptOf and OwnerOf record the node key', async () =>
             {
                 const g = await NodeFx.Defined(open);
-                const t1 = await g.Begin();
+                const t1 = await g.Begin(AccessScope.System);
                 assert.equal(await t1.OwnerOf('a'), undefined);
                 await NodeFx.Commit(g, t => t.CreateNode('a', NodeFx.Person, { Owner: 'm' }));
                 t1.CreateNode('p1', NodeFx.Person);
                 assert.ok((await NodeFx.Settle(t1.Commit())) instanceof ConflictError);
-                const t2 = await g.Begin();
+                const t2 = await g.Begin(AccessScope.System);
                 assert.equal(await t2.ConceptOf('a'), NodeFx.Person);
                 await NodeFx.Commit(g, t => t.DeleteNode('a'));
                 t2.CreateNode('p2', NodeFx.Person);

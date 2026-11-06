@@ -2,8 +2,8 @@ import { DateTimeValue, DateValue, DurationValue, type CellValue } from '../colu
 import { And, Compare, CompareOp, IdIn, In, IsNull, Not, Or, Predicate, PredicateKind } from './Predicate.js';
 import { PredicateError, PredicateErrorCode } from './PredicateError.js';
 
-/** Internal three-valued truth (SQL style). Unknown arises only from null/absent operands. */
-enum Tri
+/** Three-valued truth (SQL style). Unknown arises only from null/absent operands. */
+export enum Truth
 {
     False = 0,
     True = 1,
@@ -30,17 +30,30 @@ export class NodeEvaluator
         {
             throw new PredicateError(PredicateErrorCode.NotNodeLocal, NodeEvaluator.NotNodeLocalMessage);
         }
-        return NodeEvaluator.Eval(p, values, publicId) === Tri.True;
+        return NodeEvaluator.Eval(p, values, publicId) === Truth.True;
     }
 
-    private static Eval(p: Predicate, values: ReadonlyMap<string, CellValue>, publicId: string): Tri
+    /**
+     * The uncollapsed three-valued result of a node-local predicate, for evaluators that combine it with
+     * graph predicates (the ScopeEvaluator) and must keep Kleene logic across the whole tree.
+     */
+    public static Evaluate(p: Predicate, values: ReadonlyMap<string, CellValue>, publicId: string): Truth
+    {
+        if (!p.IsNodeLocal)
+        {
+            throw new PredicateError(PredicateErrorCode.NotNodeLocal, NodeEvaluator.NotNodeLocalMessage);
+        }
+        return NodeEvaluator.Eval(p, values, publicId);
+    }
+
+    private static Eval(p: Predicate, values: ReadonlyMap<string, CellValue>, publicId: string): Truth
     {
         switch (p.Kind)
         {
             case PredicateKind.True:
-                return Tri.True;
+                return Truth.True;
             case PredicateKind.False:
-                return Tri.False;
+                return Truth.False;
             case PredicateKind.Compare:
             {
                 const c = p as Compare;
@@ -49,9 +62,9 @@ export class NodeEvaluator
             case PredicateKind.In:
                 return NodeEvaluator.EvalIn(p as In, values);
             case PredicateKind.IsNull:
-                return (values.get((p as IsNull).Member) ?? null) === null ? Tri.True : Tri.False;
+                return (values.get((p as IsNull).Member) ?? null) === null ? Truth.True : Truth.False;
             case PredicateKind.IdIn:
-                return (p as IdIn).Ids.has(publicId) ? Tri.True : Tri.False;
+                return (p as IdIn).Ids.has(publicId) ? Truth.True : Truth.False;
             case PredicateKind.And:
                 return NodeEvaluator.EvalAnd(p as And, values, publicId);
             case PredicateKind.Or:
@@ -59,92 +72,92 @@ export class NodeEvaluator
             case PredicateKind.Not:
             {
                 const inner = NodeEvaluator.Eval((p as Not).Term, values, publicId);
-                return inner === Tri.Unknown ? Tri.Unknown : inner === Tri.True ? Tri.False : Tri.True;
+                return inner === Truth.Unknown ? Truth.Unknown : inner === Truth.True ? Truth.False : Truth.True;
             }
             default:
                 throw new PredicateError(PredicateErrorCode.NotNodeLocal, NodeEvaluator.UnknownKindMessage);
         }
     }
 
-    private static EvalAnd(p: And, values: ReadonlyMap<string, CellValue>, publicId: string): Tri
+    private static EvalAnd(p: And, values: ReadonlyMap<string, CellValue>, publicId: string): Truth
     {
-        let result = Tri.True;
+        let result = Truth.True;
         for (const term of p.Terms)
         {
             const t = NodeEvaluator.Eval(term, values, publicId);
-            if (t === Tri.False)
+            if (t === Truth.False)
             {
-                return Tri.False;
+                return Truth.False;
             }
-            if (t === Tri.Unknown)
+            if (t === Truth.Unknown)
             {
-                result = Tri.Unknown;
+                result = Truth.Unknown;
             }
         }
         return result;
     }
 
-    private static EvalOr(p: Or, values: ReadonlyMap<string, CellValue>, publicId: string): Tri
+    private static EvalOr(p: Or, values: ReadonlyMap<string, CellValue>, publicId: string): Truth
     {
-        let result = Tri.False;
+        let result = Truth.False;
         for (const term of p.Terms)
         {
             const t = NodeEvaluator.Eval(term, values, publicId);
-            if (t === Tri.True)
+            if (t === Truth.True)
             {
-                return Tri.True;
+                return Truth.True;
             }
-            if (t === Tri.Unknown)
+            if (t === Truth.Unknown)
             {
-                result = Tri.Unknown;
+                result = Truth.Unknown;
             }
         }
         return result;
     }
 
-    private static EvalIn(p: In, values: ReadonlyMap<string, CellValue>): Tri
+    private static EvalIn(p: In, values: ReadonlyMap<string, CellValue>): Truth
     {
         const v = values.get(p.Member) ?? null;
         if (v === null)
         {
-            return Tri.Unknown;
+            return Truth.Unknown;
         }
-        let result = Tri.False;
+        let result = Truth.False;
         for (const candidate of p.Values)
         {
             const t = NodeEvaluator.CompareValues(v, CompareOp.Eq, candidate);
-            if (t === Tri.True)
+            if (t === Truth.True)
             {
-                return Tri.True;
+                return Truth.True;
             }
-            if (t === Tri.Unknown)
+            if (t === Truth.Unknown)
             {
-                result = Tri.Unknown;
+                result = Truth.Unknown;
             }
         }
         return result;
     }
 
-    private static CompareValues(a: CellValue, op: CompareOp, b: CellValue): Tri
+    private static CompareValues(a: CellValue, op: CompareOp, b: CellValue): Truth
     {
         if (a === null || b === null)
         {
-            return Tri.Unknown;
+            return Truth.Unknown;
         }
         if (a instanceof DurationValue)
         {
             if (!(b instanceof DurationValue) || (op !== CompareOp.Eq && op !== CompareOp.Ne))
             {
-                return Tri.False;
+                return Truth.False;
             }
-            return (a.Equals(b) === (op === CompareOp.Eq)) ? Tri.True : Tri.False;
+            return (a.Equals(b) === (op === CompareOp.Eq)) ? Truth.True : Truth.False;
         }
         const order = NodeEvaluator.Order(a, b);
         if (order === undefined)
         {
-            return Tri.False;
+            return Truth.False;
         }
-        return NodeEvaluator.Satisfies(order, op) ? Tri.True : Tri.False;
+        return NodeEvaluator.Satisfies(order, op) ? Truth.True : Truth.False;
     }
 
     private static Satisfies(order: number, op: CompareOp): boolean

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { AccessScope } from '../../access/AccessScope.js';
 import type { MemberInput } from '../../catalog/CatalogTypes.js';
 import { MemberKind, ValueType } from '../../catalog/ValueType.js';
 import type { CellValue } from '../../columns/CellValue.js';
@@ -156,14 +157,14 @@ class SeedFx
 
     public static async Commit(g: GraphStore, build: (t: GraphTransaction) => void): Promise<bigint>
     {
-        const t = await g.Begin();
+        const t = await g.Begin(AccessScope.System);
         build(t);
         return t.Commit();
     }
 
     public static async Read<T>(g: GraphStore, work: (r: GraphReader) => Promise<T>): Promise<T>
     {
-        const r = await g.BeginRead();
+        const r = await g.BeginRead(AccessScope.System);
         try
         {
             return await work(r);
@@ -575,7 +576,7 @@ class SeedFx
             it('IsSeeded is a recorded read: a seed that rewrites the node conflicts the transaction', async () =>
             {
                 const g = await SeedFx.Ready(open);
-                const t = await g.Begin();
+                const t = await g.Begin(AccessScope.System);
                 assert.equal(await t.IsSeeded('a1'), true);
                 t.CreateNode('z1', 'App');
                 await g.Upgrade(SeedFx.Desc('v2', SeedFx.With('a1', SeedFx.Node('a1', 'App', { label: 'uno' }))));

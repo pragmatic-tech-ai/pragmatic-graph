@@ -1,3 +1,5 @@
+import type { AccessScope } from './access/AccessScope.js';
+import { ScopeEvaluator } from './access/ScopeEvaluator.js';
 import { CatalogError, CatalogErrorCode } from './catalog/CatalogError.js';
 import type { MemberDef } from './catalog/CatalogTypes.js';
 import { CatalogSnapshot } from './catalog/CatalogSnapshot.js';
@@ -5,11 +7,11 @@ import { MemberKind } from './catalog/ValueType.js';
 import type { CellValue } from './columns/CellValue.js';
 import { GraphError, GraphErrorCode } from './errors/GraphError.js';
 import { EdgeDirection } from './format/FormatKeys.js';
-import type { Location } from './identity/Location.js';
 import { IndexKey, type IIndexRange } from './indexes/IndexKey.js';
 import type { IKeyRange } from './kv/KeyValue.js';
 import type { GraphContext, IGraphDisposable, ReadSnapshot } from './GraphContext.js';
-import { SeedMarkers } from './schema/SeedMarkers.js';
+import { Predicate } from './predicate/Predicate.js';
+import { type IReadNode, RecordedReads } from './RecordedReads.js';
 import { ConflictKeys } from './txn/ConflictKeys.js';
 import type { ReadSet } from './txn/ReadSet.js';
 
@@ -20,36 +22,35 @@ export interface IScanRow
     readonly Value: CellValue;
 }
 
-/** A live node resolved inside the reader's snapshot. */
-interface IReadNode
-{
-    readonly Id: bigint;
-    readonly Location: Location;
-    readonly Concept: string;
-}
-
 /**
  * A consistent, read-only view of the graph at one commit (snapshot isolation): commits made after
  * the reader opened are not visible. Created by GraphStore.BeginRead; end it with dispose() (the store
  * disposes readers still open when it is disposed). Values returned are copies, never live storage.
+ *
+ * Every reader carries an AccessScope (spec section 7). A node the scope does not let it see behaves
+ * exactly as a missing node in every read; a member the scope hides reads as null in GetProperty and
+ * yields no rows in ScanConcept (and an index over a hidden member skips the node in SeekIndex). The
+ * visibility reads are recorded like any other read. EstimateCount stays an unscoped upper bound.
  */
 export class GraphReader implements IGraphDisposable
 {
     private static readonly ErrDisposed = 'Reader has been disposed';
     private static readonly ErrNotProperty = 'Member is not a property: ';
-    private static readonly ErrNotRelationship = 'Member is not a relationship: ';
-    private static readonly ErrNoIncoming = 'No relationship of this name targets the concept: ';
     private static readonly ErrDirection = 'Unknown edge direction: ';
-    private static readonly ErrCorrupt = 'Corrupt graph: node has no stored row or public id: ';
     private static readonly ErrUnknownIndex = 'Unknown index: ';
     private static readonly Dot = '.';
     private static readonly Partition = 0;
 
+    private readonly recorded: RecordedReads;
+    /** Undefined when the scope restricts no read (System): the hot path then does no evaluator work. */
+    private readonly evaluator: ScopeEvaluator | undefined;
     private disposed = false;
 
-    /** @internal Created by GraphStore.BeginRead and GraphStore.Begin. */
-    public constructor(protected readonly context: GraphContext, protected readonly snapshot: ReadSnapshot)
+    /** @internal Created by GraphStore.BeginRead and GraphStore.Begin; `reads` only for a transaction. */
+    public constructor(protected readonly context: GraphContext, protected readonly snapshot: ReadSnapshot, private readonly scope: AccessScope, reads?: ReadSet)
     {
+        this.recorded = new RecordedReads(context, snapshot, reads);
+        this.evaluator = scope.ReadsUnrestricted ? undefined : new ScopeEvaluator(scope, this.recorded);
         context.Track(this);
     }
 
@@ -59,11 +60,18 @@ export class GraphReader implements IGraphDisposable
         return this.snapshot.Commit;
     }
 
+    /** The access scope every read of this reader is enforced under. */
+    public get Scope(): AccessScope
+    {
+        return this.scope;
+    }
+
     /**
-     * The property's value (null for an unset nullable property), or undefined when no node has the
-     * public id. Errors are GraphErrors with the codes a commit uses for the same mistake (ruling F8):
-     * unknown members are a CatalogError and relationship members a GraphError (both SchemaViolation);
-     * public ids over 400 UTF-8 bytes a PublicIdTooLongError (InvalidArgument).
+     * The property's value (null for an unset nullable property or a member the scope hides), or
+     * undefined when no visible node has the public id. Errors are GraphErrors with the codes a commit
+     * uses for the same mistake (ruling F8): unknown members are a CatalogError and relationship members
+     * a GraphError (both SchemaViolation); public ids over 400 UTF-8 bytes a PublicIdTooLongError
+     * (InvalidArgument).
      */
     public async GetProperty(publicId: string, member: string): Promise<CellValue | undefined>
     {
@@ -78,14 +86,18 @@ export class GraphReader implements IGraphDisposable
         {
             throw new GraphError(GraphErrorCode.SchemaViolation, GraphReader.ErrNotProperty + node.Concept + GraphReader.Dot + member);
         }
-        this.Reads?.AddKey(ConflictKeys.CellSpace, ConflictKeys.Cell(node.Id, def.Id));
-        return this.context.Columns.ReadCell(this.snapshot.Txn, node.Location, def);
+        if (this.evaluator !== undefined && this.evaluator.HiddenMembers(node.Concept).has(member))
+        {
+            return null;
+        }
+        return this.recorded.Cell(node, def);
     }
 
     /**
-     * Public ids of the nodes at the far end of the node's `relationship` edges, in edge order (ordered
-     * relationships keep their insertion order). Out follows the node's own relationship; In follows
-     * every relationship of that name whose targets admit the node's concept. A missing node has none.
+     * Public ids of the visible nodes at the far end of the node's `relationship` edges, in edge order
+     * (ordered relationships keep their insertion order). Out follows the node's own relationship; In
+     * follows every relationship of that name whose targets admit the node's concept. A missing or
+     * invisible node has none; a relationship the scope hides on its source concept yields none.
      */
     public async Neighbors(publicId: string, relationship: string, direction: EdgeDirection): Promise<string[]>
     {
@@ -99,24 +111,46 @@ export class GraphReader implements IGraphDisposable
         {
             return [];
         }
+        const rels = this.recorded.Relationships(node.Concept, relationship, direction);
+        const evaluator = this.evaluator;
         const out: string[] = [];
-        for (const rel of this.Relationships(node.Concept, relationship, direction))
+        if (evaluator === undefined)
         {
-            this.Reads?.AddRange(ConflictKeys.EdgeSpace, ConflictKeys.Adjacency(rel.Id, direction, node.Id));
-            for await (const n of this.context.Edges.Adjacent(this.snapshot.Txn, rel, node.Id, direction))
+            for (const rel of rels)
             {
-                out.push(await this.PublicIdOf(n.Node));
+                for await (const id of this.recorded.Adjacent(rel, node.Id, direction))
+                {
+                    out.push(await this.recorded.PublicIdOf(id));
+                }
+            }
+            return out;
+        }
+        if (direction === EdgeDirection.Out && evaluator.HiddenMembers(node.Concept).has(relationship))
+        {
+            return out;
+        }
+        for (const rel of rels)
+        {
+            for await (const id of this.recorded.Adjacent(rel, node.Id, direction))
+            {
+                const neighbor = await evaluator.VisibleById(id);
+                // In: the edge is a member of the neighbor (its source), so the neighbor's Hidden decides.
+                if (neighbor !== undefined && (direction === EdgeDirection.Out || !evaluator.HiddenMembers(neighbor.Concept).has(relationship)))
+                {
+                    out.push(neighbor.PublicId);
+                }
             }
         }
         return out;
     }
 
     /**
-     * Every live node whose concept is, inherits from, or carries `conceptOrAspect`, with its `member`
-     * value: one row per node for a property, one row per outgoing edge (Value = target public id) for a
-     * relationship. Rows come per matching concept, then in storage (slot) order. The member must belong
-     * to the named concept or aspect (CatalogError UnknownMember otherwise, even when nothing carries
-     * the aspect). Disposing the reader ends the scan: the next row rejects.
+     * Every visible live node whose concept is, inherits from, or carries `conceptOrAspect`, with its
+     * `member` value: one row per node for a property, one row per outgoing edge to a visible target
+     * (Value = target public id) for a relationship; none for a concept on which the scope hides the
+     * member. Rows come per matching concept, then in storage (slot) order. The member must belong to
+     * the named concept or aspect (CatalogError UnknownMember otherwise, even when nothing carries the
+     * aspect). Disposing the reader ends the scan: the next row rejects.
      */
     public async *ScanConcept(conceptOrAspect: string, member: string): AsyncIterable<IScanRow>
     {
@@ -126,7 +160,12 @@ export class GraphReader implements IGraphDisposable
         for (const typeId of index.Catalog.ConceptsMatching(conceptOrAspect))
         {
             this.RequireOpen();
-            const def = index.Catalog.Member(index.ConceptOf(typeId) as string, member);
+            const concept = index.ConceptOf(typeId) as string;
+            if (this.evaluator !== undefined && this.evaluator.HiddenMembers(concept).has(member))
+            {
+                continue;
+            }
+            const def = index.Catalog.Member(concept, member);
             this.Reads?.AddKey(ConflictKeys.ExtentSpace, ConflictKeys.Extent(typeId));
             if (def.Kind === MemberKind.Property)
             {
@@ -139,7 +178,7 @@ export class GraphReader implements IGraphDisposable
         }
     }
 
-    /** The node's concept name, or undefined when no node has the public id. Records the node's binding. */
+    /** The node's concept name, or undefined when no visible node has the public id. Records the node's binding. */
     public async ConceptOf(publicId: string): Promise<string | undefined>
     {
         this.RequireOpen();
@@ -148,30 +187,30 @@ export class GraphReader implements IGraphDisposable
 
     /**
      * The name of the model that holds the node: '' when it was created without an owner, undefined when
-     * no node has the public id. Records the node's binding.
+     * no visible node has the public id. Records the node's binding.
      */
     public async OwnerOf(publicId: string): Promise<string | undefined>
     {
         this.RequireOpen();
         const node = await this.Locate(publicId);
-        return node === undefined ? undefined : this.context.Ids.OwnerOf(this.snapshot.Txn, node.Id);
+        return node === undefined ? undefined : this.recorded.Owner(node);
     }
 
     /**
-     * True iff the node exists and was placed by the schema's seed (it has a seed marker, spec 4.3):
-     * false for runtime nodes and when no node has the public id. Records the node's binding, which every
-     * seed write to the node also writes.
+     * True iff the node exists, is visible and was placed by the schema's seed (it has a seed marker,
+     * spec 4.3): false for runtime nodes and when no visible node has the public id. Records the node's
+     * binding, which every seed write to the node also writes.
      */
     public async IsSeeded(publicId: string): Promise<boolean>
     {
         this.RequireOpen();
         const node = await this.Locate(publicId);
-        return node !== undefined && (await SeedMarkers.Read(this.snapshot.Txn, publicId)) !== undefined;
+        return node !== undefined && this.recorded.Seeded(node);
     }
 
     /**
-     * Public ids of the live nodes whose concept is, inherits from, or carries `conceptOrAspect`, per
-     * matching concept then in slot order. Disposing the reader ends the scan: the next id rejects.
+     * Public ids of the visible live nodes whose concept is, inherits from, or carries `conceptOrAspect`,
+     * per matching concept then in slot order. Disposing the reader ends the scan: the next id rejects.
      */
     public async *ScanNodes(conceptOrAspect: string): AsyncIterable<string>
     {
@@ -184,16 +223,20 @@ export class GraphReader implements IGraphDisposable
             for await (const row of this.context.Columns.ScanColumn(this.snapshot.Txn, GraphReader.Partition, typeId, CatalogSnapshot.NodeIdMember))
             {
                 this.RequireOpen();
-                const publicId = await this.PublicIdOf(row.NodeId);
+                const publicId = await this.VisibleIdOf(row.NodeId);
                 this.RequireOpen();
-                yield publicId;
+                if (publicId !== undefined)
+                {
+                    yield publicId;
+                }
             }
         }
     }
 
     /**
      * An upper bound of the live nodes matching `conceptOrAspect`: the sum of the matching concepts' slot
-     * counts, which still include deleted slots. Records nothing: the figure is advisory.
+     * counts, which still include deleted slots. Unscoped (it counts invisible nodes too) and records
+     * nothing: the figure is advisory.
      */
     public async EstimateCount(conceptOrAspect: string): Promise<number>
     {
@@ -207,14 +250,15 @@ export class GraphReader implements IGraphDisposable
     }
 
     /**
-     * Public ids of the nodes whose entries in the named secondary index lie in `range`, in index order
-     * (by value tuple, then internal id; descending with Reverse), at most Limit. `Prefix` fixes the
-     * leading members (null matches a null value: nulls are indexed and sort first); `Lower`/`Upper` bound
-     * the member after the prefix. Records the key range scanned (phantom-safe): the whole range, or, when
-     * Limit entries were produced, the range up to the last one. Errors: CatalogError UnknownMember for an
-     * unknown index; GraphError InvalidArgument for a prefix longer than the index, a bound after a full
-     * prefix, a value that does not fit its member, or a non-integer Limit. Disposing the reader ends the
-     * seek: the next id rejects.
+     * Public ids of the visible nodes whose entries in the named secondary index lie in `range`, in index
+     * order (by value tuple, then internal id; descending with Reverse), at most Limit (counting visible
+     * nodes only). A node on which the scope hides a member the index reads (key or Where) is skipped.
+     * `Prefix` fixes the leading members (null matches a null value: nulls are indexed and sort first);
+     * `Lower`/`Upper` bound the member after the prefix. Records the key range scanned (phantom-safe):
+     * the whole range, or, when Limit ids were produced, the range up to the last entry examined.
+     * Errors: CatalogError UnknownMember for an unknown index; GraphError InvalidArgument for a prefix
+     * longer than the index, a bound after a full prefix, a value that does not fit its member, or a
+     * non-integer Limit. Disposing the reader ends the seek: the next id rejects.
      */
     public async *SeekIndex(index: string, range: IIndexRange): AsyncIterable<string>
     {
@@ -225,21 +269,36 @@ export class GraphReader implements IGraphDisposable
         {
             throw new CatalogError(CatalogErrorCode.UnknownMember, GraphReader.ErrUnknownIndex + index);
         }
-        const keys = IndexKey.SeekRange(def.Name, def.Id, catalog.IndexMembers(def), range);
+        const members = catalog.IndexMembers(def);
+        const keys = IndexKey.SeekRange(def.Name, def.Id, members, range);
         const limit = range.Limit ?? 0;
         const reverse = range.Reverse === true;
+        const evaluator = this.evaluator;
+        // Under a restricting scope Limit counts visible ids, so the store seek itself is unlimited.
+        const seek = limit > 0 && evaluator === undefined ? { Limit: limit, Reverse: reverse } : { Reverse: reverse };
+        const read = evaluator === undefined ? undefined : new Set([...members.map(m => m.Name), ...(def.Where === undefined ? [] : Predicate.MemberNames(def.Where))]);
         let last: Uint8Array | undefined;
         let count = 0;
         try
         {
-            for await (const key of this.context.Indexes.Seek(this.snapshot.Txn, keys, limit > 0 ? { Limit: limit, Reverse: reverse } : { Reverse: reverse }))
+            for await (const key of this.context.Indexes.Seek(this.snapshot.Txn, keys, seek))
             {
                 this.RequireOpen();
                 last = key;
-                count += 1;
-                const publicId = await this.PublicIdOf(IndexKey.InternalId(key));
+                const publicId = evaluator === undefined
+                    ? await this.recorded.PublicIdOf(IndexKey.InternalId(key))
+                    : await this.VisibleIndexed(evaluator, IndexKey.InternalId(key), read as ReadonlySet<string>);
                 this.RequireOpen();
+                if (publicId === undefined)
+                {
+                    continue;
+                }
+                count += 1;
                 yield publicId;
+                if (limit > 0 && count >= limit)
+                {
+                    break;
+                }
             }
         }
         finally
@@ -263,7 +322,7 @@ export class GraphReader implements IGraphDisposable
     /** Where reads are recorded for conflict detection; only a GraphTransaction records (ruling R31). */
     protected get Reads(): ReadSet | undefined
     {
-        return undefined;
+        return this.recorded.Reads;
     }
 
     protected RequireOpen(): void
@@ -285,48 +344,65 @@ export class GraphReader implements IGraphDisposable
         for await (const row of this.context.Columns.ScanColumn(this.snapshot.Txn, GraphReader.Partition, typeId, def))
         {
             this.RequireOpen();
-            const publicId = await this.PublicIdOf(row.NodeId);
+            const publicId = await this.VisibleIdOf(row.NodeId);
             this.RequireOpen();
-            yield { PublicId: publicId, Value: row.Value };
+            if (publicId !== undefined)
+            {
+                yield { PublicId: publicId, Value: row.Value };
+            }
         }
     }
 
     private async *ScanRelationship(typeId: number, def: MemberDef): AsyncIterable<IScanRow>
     {
-        const txn = this.snapshot.Txn;
-        for await (const row of this.context.Columns.ScanColumn(txn, GraphReader.Partition, typeId, CatalogSnapshot.NodeIdMember))
+        for await (const row of this.context.Columns.ScanColumn(this.snapshot.Txn, GraphReader.Partition, typeId, CatalogSnapshot.NodeIdMember))
         {
             this.RequireOpen();
-            const source = await this.PublicIdOf(row.NodeId);
-            this.Reads?.AddRange(ConflictKeys.EdgeSpace, ConflictKeys.Adjacency(def.Id, EdgeDirection.Out, row.NodeId));
-            for await (const n of this.context.Edges.Adjacent(txn, def, row.NodeId, EdgeDirection.Out))
+            const source = await this.VisibleIdOf(row.NodeId);
+            if (source === undefined)
+            {
+                continue;
+            }
+            for await (const n of this.recorded.Adjacent(def, row.NodeId, EdgeDirection.Out))
             {
                 this.RequireOpen();
-                const target = await this.PublicIdOf(n.Node);
+                const target = await this.VisibleIdOf(n);
                 this.RequireOpen();
-                yield { PublicId: source, Value: target };
+                if (target !== undefined)
+                {
+                    yield { PublicId: source, Value: target };
+                }
             }
         }
     }
 
-    private Relationships(concept: string, name: string, direction: EdgeDirection): readonly MemberDef[]
+    /** The public id of the node behind an internal id when the scope lets the reader see it. */
+    private async VisibleIdOf(id: bigint): Promise<string | undefined>
     {
-        const index = this.snapshot.Index;
-        if (direction === EdgeDirection.Out)
+        if (this.evaluator === undefined)
         {
-            const rel = index.Catalog.Member(concept, name);
-            if (rel.Kind !== MemberKind.Relationship)
+            return this.recorded.PublicIdOf(id);
+        }
+        return (await this.evaluator.VisibleById(id))?.PublicId;
+    }
+
+    /** As VisibleIdOf, also skipping a node on which the scope hides a member the index reads. */
+    private async VisibleIndexed(evaluator: ScopeEvaluator, id: bigint, read: ReadonlySet<string>): Promise<string | undefined>
+    {
+        const node = await evaluator.VisibleById(id);
+        if (node === undefined)
+        {
+            return undefined;
+        }
+        const hidden = evaluator.HiddenMembers(node.Concept);
+        for (const name of read)
+        {
+            if (hidden.has(name))
             {
-                throw new GraphError(GraphErrorCode.SchemaViolation, GraphReader.ErrNotRelationship + concept + GraphReader.Dot + name);
+                return undefined;
             }
-            return [rel];
         }
-        const incoming = index.IncomingRelationships(concept).filter(r => r.Name === name);
-        if (incoming.length === 0)
-        {
-            throw new CatalogError(CatalogErrorCode.UnknownMember, GraphReader.ErrNoIncoming + concept + GraphReader.Dot + name);
-        }
-        return incoming;
+        return node.PublicId;
     }
 
     /** The part of a seek's range its result depends on: up to the last key when Limit stopped it, else all of it. */
@@ -339,32 +415,14 @@ export class GraphReader implements IGraphDisposable
         return reverse ? { Start: last, End: range.End } : { Start: range.Start, End: IndexKey.After(last) };
     }
 
-    /** Resolves the node, recording the public id's binding (also when missing, which catches a later create). */
+    /** Resolves the node when it exists and is visible, recording its binding (also when missing) and the visibility reads. */
     private async Locate(publicId: string): Promise<IReadNode | undefined>
     {
-        const txn = this.snapshot.Txn;
-        const id = await this.context.Ids.Resolve(txn, publicId);
-        this.Reads?.AddKey(ConflictKeys.NodeSpace, ConflictKeys.Node(publicId));
-        if (id === undefined)
+        const node = await this.recorded.Locate(publicId);
+        if (node === undefined || this.evaluator === undefined)
         {
-            return undefined;
+            return node;
         }
-        const location = await this.context.Rows.Locate(txn, id);
-        const concept = location === undefined ? undefined : this.snapshot.Index.ConceptOf(location.TypeId);
-        if (location === undefined || concept === undefined)
-        {
-            throw new GraphError(GraphErrorCode.Corrupt, GraphReader.ErrCorrupt + publicId);
-        }
-        return { Id: id, Location: location, Concept: concept };
-    }
-
-    private async PublicIdOf(id: bigint): Promise<string>
-    {
-        const publicId = await this.context.Ids.PublicIdOf(this.snapshot.Txn, id);
-        if (publicId === undefined)
-        {
-            throw new GraphError(GraphErrorCode.Corrupt, GraphReader.ErrCorrupt + id);
-        }
-        return publicId;
+        return (await this.evaluator.IsVisible(node)) ? node : undefined;
     }
 }

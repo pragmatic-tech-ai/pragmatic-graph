@@ -1,3 +1,4 @@
+import type { AccessScope } from './access/AccessScope.js';
 import { CatalogModel } from './catalog/CatalogModel.js';
 import type { CatalogSnapshot } from './catalog/CatalogSnapshot.js';
 import { CatalogStore } from './catalog/CatalogStore.js';
@@ -20,6 +21,7 @@ import { type ISignal, SignalView } from './txn/Signal.js';
  *
  * Define the schema with DefineSchema, read with BeginRead (a snapshot), write with Begin (an
  * optimistic, serializable transaction) and listen to CommitApplied for every applied commit, in order.
+ * Both take the AccessScope their reads are enforced under (AccessScope.System sees everything).
  * A commit is durable once its Commit() promise resolves. dispose() waits for a commit already being
  * written, ends open readers and transactions, and closes the store.
  */
@@ -130,19 +132,19 @@ export class GraphStore
         }
     }
 
-    /** A read-only snapshot of the latest commit. */
-    public async BeginRead(): Promise<GraphReader>
+    /** A read-only snapshot of the latest commit, read under `scope`. */
+    public async BeginRead(scope: AccessScope): Promise<GraphReader>
     {
         this.RequireLive();
-        const reader = new GraphReader(this.context, await this.context.OpenSnapshot(false));
+        const reader = new GraphReader(this.context, await this.context.OpenSnapshot(false), scope);
         return this.Handed(reader);
     }
 
-    /** A read-write transaction over a snapshot of the latest commit. */
-    public async Begin(): Promise<GraphTransaction>
+    /** A read-write transaction over a snapshot of the latest commit, reading under `scope` (writes are not gated by it yet). */
+    public async Begin(scope: AccessScope): Promise<GraphTransaction>
     {
         this.RequireLive();
-        const txn = new GraphTransaction(this.context, await this.context.OpenSnapshot(true));
+        const txn = new GraphTransaction(this.context, await this.context.OpenSnapshot(true), scope);
         return this.Handed(txn);
     }
 

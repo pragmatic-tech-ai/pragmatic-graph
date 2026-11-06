@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { AccessScope } from '../../access/AccessScope.js';
 import { CatalogError, CatalogErrorCode } from '../../catalog/CatalogError.js';
 import type { MemberInput } from '../../catalog/CatalogTypes.js';
 import { MemberKind, ValueType } from '../../catalog/ValueType.js';
@@ -99,7 +100,7 @@ class IndexFx
 
     public static async Commit(g: GraphStore, build: (t: GraphTransaction) => void): Promise<bigint>
     {
-        const t = await g.Begin();
+        const t = await g.Begin(AccessScope.System);
         build(t);
         return t.Commit();
     }
@@ -122,7 +123,7 @@ class IndexFx
 
     public static async Seek(g: GraphStore, index: string, range: IIndexRange): Promise<string[]>
     {
-        const r = await g.BeginRead();
+        const r = await g.BeginRead(AccessScope.System);
         try
         {
             return await IndexFx.Collect(r, index, range);
@@ -430,8 +431,8 @@ class IndexFx
             it('concurrent unique inserts: one wins', async () =>
             {
                 const g = await IndexFx.Ready(open);
-                const t1 = await g.Begin();
-                const t2 = await g.Begin();
+                const t1 = await g.Begin(AccessScope.System);
+                const t2 = await g.Begin(AccessScope.System);
                 t1.CreateNode('a', 'Person');
                 t1.SetProperty('a', 'email', 'same@x');
                 t2.CreateNode('b', 'Person');
@@ -448,19 +449,19 @@ class IndexFx
             {
                 const g = await IndexFx.Ready(open);
                 await IndexFx.People(g, { a: { age: 10n }, b: { age: 50n }, w: {} });
-                const t1 = await g.Begin();
+                const t1 = await g.Begin(AccessScope.System);
                 assert.deepEqual(await IndexFx.Collect(t1, 'byAge', { Prefix: [], Lower: { Value: 10n, Inclusive: true }, Upper: { Value: 50n, Inclusive: true } }), ['a', 'b']);
                 await IndexFx.People(g, { c: { age: 25n } });
                 t1.SetProperty('w', 'status', 'x');
                 await assert.rejects(t1.Commit(), ConflictError);
 
-                const t2 = await g.Begin();
+                const t2 = await g.Begin(AccessScope.System);
                 await IndexFx.Collect(t2, 'byAge', { Prefix: [], Lower: { Value: 10n, Inclusive: true }, Upper: { Value: 50n, Inclusive: true } });
                 await IndexFx.People(g, { d: { age: 99n } });
                 t2.SetProperty('w', 'status', 'y');
                 await t2.Commit();
 
-                const t3 = await g.Begin();
+                const t3 = await g.Begin(AccessScope.System);
                 assert.deepEqual(await IndexFx.Collect(t3, 'byAge', { Prefix: [], Lower: { Value: 10n, Inclusive: true }, Limit: 1 }), ['a']);
                 await IndexFx.People(g, { e: { age: 60n } });
                 t3.SetProperty('w', 'status', 'z');
@@ -563,7 +564,7 @@ class IndexFx
                 await IndexFx.People(g, { a: { age: 10n }, b: { age: 20n }, c: { age: 30n }, d: { age: 40n }, w: {} });
                 const run = async (age: bigint): Promise<unknown> =>
                 {
-                    const t = await g.Begin();
+                    const t = await g.Begin(AccessScope.System);
                     assert.equal((await IndexFx.Collect(t, 'byAge', { Prefix: [], Lower: { Value: 0n, Inclusive: true }, Reverse: true, Limit: 2 }))[0], 'd');
                     await IndexFx.People(g, { ['n' + age]: { age } });
                     t.SetProperty('w', 'status', String(age));
@@ -596,7 +597,7 @@ class IndexFx
                 assert.deepEqual(await IndexFx.Seek(g, 'byTag', { Prefix: [long] }), [], 'an over-long equality prefix is an empty seek');
                 assert.deepEqual(await IndexFx.Seek(g, 'byTag', { Prefix: [], Lower: { Value: long, Inclusive: true } }), ['r2'], 'an over-long lower bound still bounds exactly');
                 assert.deepEqual(await IndexFx.Seek(g, 'byTag', { Prefix: [], Upper: { Value: long, Inclusive: false } }), ['r1']);
-                const t = await g.Begin();
+                const t = await g.Begin(AccessScope.System);
                 assert.deepEqual(await IndexFx.Collect(t, 'byTag', { Prefix: [long] }), []);
                 t.SetProperty('r1', 'serial', 's');
                 await t.Commit();
