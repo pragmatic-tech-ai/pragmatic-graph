@@ -15,7 +15,7 @@ import type { GraphReader } from '../../GraphReader.js';
 import { GraphStore } from '../../GraphStore.js';
 import type { GraphTransaction } from '../../GraphTransaction.js';
 import { Keyspace } from '../../kv/Keyspace.js';
-import { Compare, CompareOp, Related, TruePredicate } from '../../predicate/Predicate.js';
+import { And, Compare, CompareOp, IsNull, Not, Related, TruePredicate } from '../../predicate/Predicate.js';
 import type { IDefinitionDescription, IIndexDescription, ISchemaDescription, ISeedNode } from '../../schema/SchemaDescription.js';
 import { CommitError, CommitErrorCode } from '../../txn/CommitError.js';
 import { ConflictError } from '../../txn/ConflictError.js';
@@ -509,6 +509,69 @@ class IndexFx
                 const related = new Related('knows', EdgeDirection.Out, TruePredicate.Instance);
                 await assert.rejects(g.Upgrade(IndexFx.Desc('v2', [{ Name: 'bad', On: 'Person', Members: ['age'], Where: related }])), IndexFx.IsCatalog(CatalogErrorCode.InvalidMember));
                 await assert.rejects(g.Upgrade(IndexFx.Desc('v2', [{ Name: 'bad', On: 'Person', Members: ['span'] }])), IndexFx.IsCatalog(CatalogErrorCode.InvalidMember));
+                const unknown = new And([new Compare('status', CompareOp.Eq, 'open'), new Not(new IsNull('nmae'))]);
+                await assert.rejects(g.Upgrade(IndexFx.Desc('v2', [{ Name: 'bad', On: 'Person', Members: ['age'], Where: unknown }])), IndexFx.IsCatalog(CatalogErrorCode.UnknownMember), 'Where reads a member Person does not have');
+                await assert.rejects(g.Upgrade(IndexFx.Desc('v2', [{ Name: 'bad', On: 'Tagged', Members: ['tag'], Where: new Compare('age', CompareOp.Gt, 1n) }])), IndexFx.IsCatalog(CatalogErrorCode.UnknownMember), 'a carrier member is not a member of the aspect');
+                await g.Upgrade(IndexFx.Desc('v2', [{ Name: 'ok', On: 'Person', Members: ['age'], Where: new Compare('tag', CompareOp.Eq, 'x') }]));
+                await g.dispose();
+            });
+
+            it('String values with an embedded NUL keep exact prefix ranges', async () =>
+            {
+                const g = await IndexFx.Ready(open);
+                await IndexFx.People(g, { p1: { email: 'ab' }, p2: { email: 'ab\u0000x' } });
+                assert.deepEqual(await IndexFx.Seek(g, 'uniqueEmail', { Prefix: ['ab'] }), ['p1'], 'equality excludes the NUL-extended string');
+                assert.deepEqual(await IndexFx.Seek(g, 'uniqueEmail', { Prefix: ['ab\u0000x'] }), ['p2']);
+                await assert.rejects(IndexFx.People(g, { p3: { email: 'ab' } }), IndexFx.IsCommit(CommitErrorCode.UniqueViolation), 'a real duplicate still violates');
+                await IndexFx.Commit(g, t =>
+                {
+                    for (const [id, tag] of [['r1', 'ab'], ['r2', 'ab\u0000'], ['r3', 'ab\u0000x'], ['r4', 'ab\u0001']] as const)
+                    {
+                        t.CreateNode(id, 'Robot');
+                        t.SetProperty(id, 'tag', tag);
+                    }
+                });
+                const nul = 'ab\u0000';
+                assert.deepEqual(await IndexFx.Seek(g, 'byTag', { Prefix: [], Lower: { Value: nul, Inclusive: false } }), ['r3', 'r4']);
+                assert.deepEqual(await IndexFx.Seek(g, 'byTag', { Prefix: [], Lower: { Value: nul, Inclusive: true } }), ['r2', 'r3', 'r4']);
+                assert.deepEqual(await IndexFx.Seek(g, 'byTag', { Prefix: [], Lower: { Value: '', Inclusive: true }, Upper: { Value: nul, Inclusive: true } }), ['r1', 'r2']);
+                assert.deepEqual(await IndexFx.Seek(g, 'byTag', { Prefix: [], Lower: { Value: '', Inclusive: true }, Upper: { Value: nul, Inclusive: false } }), ['r1']);
+                assert.deepEqual(await IndexFx.Seek(g, 'byTag', { Prefix: [], Lower: { Value: 'ab', Inclusive: false } }), ['r2', 'r3', 'r4']);
+                assert.deepEqual(await IndexFx.Seek(g, 'byTag', { Prefix: [], Lower: { Value: '', Inclusive: true }, Upper: { Value: 'ab', Inclusive: true } }), ['r1']);
+                await g.dispose();
+            });
+
+            it('an index key over 511 bytes is InvalidValue, in a batch and in an upgrade build', async () =>
+            {
+                const long = 'x'.repeat(600);
+                const g = await IndexFx.Ready(open);
+                await assert.rejects(IndexFx.People(g, { p1: { email: long } }), IndexFx.IsCommit(CommitErrorCode.InvalidValue));
+                assert.deepEqual(await IndexFx.Seek(g, 'uniqueEmail', { Prefix: [] }), []);
+                await g.dispose();
+                const h = await IndexFx.Ready(open, IndexFx.Desc('v1', []));
+                await IndexFx.People(h, { p1: { email: long } });
+                const before = await IndexFx.Snapshot(h);
+                await assert.rejects(h.Upgrade(IndexFx.Desc('v2')), IndexFx.IsCommit(CommitErrorCode.InvalidValue));
+                assert.deepEqual(await IndexFx.Snapshot(h), before, 'the failed build leaves the store unchanged');
+                assert.equal(await h.SchemaVersion(), 'v1');
+                await h.dispose();
+            });
+
+            it('reverse seek with Limit records only the range down to the last key', async () =>
+            {
+                const g = await IndexFx.Ready(open);
+                await IndexFx.People(g, { a: { age: 10n }, b: { age: 20n }, c: { age: 30n }, d: { age: 40n }, w: {} });
+                const run = async (age: bigint): Promise<unknown> =>
+                {
+                    const t = await g.Begin();
+                    assert.equal((await IndexFx.Collect(t, 'byAge', { Prefix: [], Lower: { Value: 0n, Inclusive: true }, Reverse: true, Limit: 2 }))[0], 'd');
+                    await IndexFx.People(g, { ['n' + age]: { age } });
+                    t.SetProperty('w', 'status', String(age));
+                    return t.Commit().then(() => undefined, (e: unknown) => e);
+                };
+                assert.equal(await run(25n), undefined, 'an insert below the last key read does not conflict');
+                assert.ok((await run(30n)) instanceof ConflictError, 'an insert at the last value (a higher internal id) conflicts');
+                assert.ok((await run(35n)) instanceof ConflictError, 'an insert above the last key conflicts');
                 await g.dispose();
             });
 
@@ -520,15 +583,34 @@ class IndexFx
                 await assert.rejects(IndexFx.Seek(g, 'byAge', { Prefix: [1n, 2n] }), invalid, 'prefix longer than the index');
                 await assert.rejects(IndexFx.Seek(g, 'byAge', { Prefix: [1n], Lower: { Value: 1n, Inclusive: true } }), invalid, 'bound after a full prefix');
                 await assert.rejects(IndexFx.Seek(g, 'byAge', { Prefix: ['x'] }), invalid, 'value of the wrong type');
+                await assert.rejects(IndexFx.Seek(g, 'byAge', { Prefix: [], Limit: 1.5 }), invalid, 'non-integer Limit');
+                // Over-long prefixes and bounds never surface KeyTooLong: no stored entry can be that long.
+                await IndexFx.Commit(g, t =>
+                {
+                    t.CreateNode('r1', 'Robot');
+                    t.SetProperty('r1', 'tag', 'zz');
+                    t.CreateNode('r2', 'Robot');
+                    t.SetProperty('r2', 'tag', '{');
+                });
+                const long = 'z'.repeat(600);
+                assert.deepEqual(await IndexFx.Seek(g, 'byTag', { Prefix: [long] }), [], 'an over-long equality prefix is an empty seek');
+                assert.deepEqual(await IndexFx.Seek(g, 'byTag', { Prefix: [], Lower: { Value: long, Inclusive: true } }), ['r2'], 'an over-long lower bound still bounds exactly');
+                assert.deepEqual(await IndexFx.Seek(g, 'byTag', { Prefix: [], Upper: { Value: long, Inclusive: false } }), ['r1']);
+                const t = await g.Begin();
+                assert.deepEqual(await IndexFx.Collect(t, 'byTag', { Prefix: [long] }), []);
+                t.SetProperty('r1', 'serial', 's');
+                await t.Commit();
                 await g.dispose();
             });
+        });
+    }
 
+    public static RegisterLmdbOnly(): void
+    {
+        describe('Secondary indexes on lmdb (durability)', () =>
+        {
             it('indexes survive a reopen', async () =>
             {
-                if (name !== 'lmdb')
-                {
-                    return;
-                }
                 const dir = IndexFx.Dir();
                 const g = await IndexFx.Ready(() => GraphStore.OpenLmdb(dir));
                 await IndexFx.People(g, { p1: { age: 1n } });
@@ -544,3 +626,4 @@ class IndexFx
 after(() => IndexFx.RemoveDirs());
 IndexFx.Register('memory', () => GraphStore.OpenMemory());
 IndexFx.Register('lmdb', () => GraphStore.OpenLmdb(IndexFx.Dir()));
+IndexFx.RegisterLmdbOnly();

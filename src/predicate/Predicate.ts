@@ -56,6 +56,45 @@ export abstract class Predicate
     {
         return FalsePredicate.Instance;
     }
+
+    /**
+     * The member names the predicate reads on the node itself (Compare, In and IsNull, through And, Or and
+     * Not); the targets of Related and Reachable are other nodes and are not included.
+     */
+    public static MemberNames(p: Predicate): ReadonlySet<string>
+    {
+        const out = new Set<string>();
+        Predicate.CollectNames(p, out);
+        return out;
+    }
+
+    private static CollectNames(p: Predicate, out: Set<string>): void
+    {
+        switch (p.Kind)
+        {
+            case PredicateKind.Compare:
+                out.add((p as Compare).Member);
+                break;
+            case PredicateKind.In:
+                out.add((p as In).Member);
+                break;
+            case PredicateKind.IsNull:
+                out.add((p as IsNull).Member);
+                break;
+            case PredicateKind.And:
+            case PredicateKind.Or:
+                for (const term of (p as And | Or).Terms)
+                {
+                    Predicate.CollectNames(term, out);
+                }
+                break;
+            case PredicateKind.Not:
+                Predicate.CollectNames((p as Not).Term, out);
+                break;
+            default:
+                break;
+        }
+    }
 }
 
 export class TruePredicate extends Predicate

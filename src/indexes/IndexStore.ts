@@ -10,8 +10,7 @@ import type { PublicIdIndex } from '../identity/PublicIdIndex.js';
 import type { IKeyRange, IReadTransaction, IScanOptions, IWriteTransaction } from '../kv/KeyValue.js';
 import { Keyspace } from '../kv/Keyspace.js';
 import { NodeEvaluator } from '../predicate/NodeEvaluator.js';
-import type { And, Compare, In, IsNull, Not, Or, Predicate } from '../predicate/Predicate.js';
-import { PredicateKind } from '../predicate/Predicate.js';
+import { Predicate } from '../predicate/Predicate.js';
 import { CommitError, CommitErrorCode } from '../txn/CommitError.js';
 import { ConflictKeys } from '../txn/ConflictKeys.js';
 import type { WriteKeySet } from '../txn/WriteKeySet.js';
@@ -52,9 +51,7 @@ export class ConceptIndex
             const reads = new Map(members.map(m => [m.Id, m]));
             if (def.Where !== undefined)
             {
-                const names = new Set<string>();
-                ConceptIndex.Names(def.Where, names);
-                for (const name of names)
+                for (const name of Predicate.MemberNames(def.Where))
                 {
                     const m = properties.get(name);
                     if (m !== undefined)
@@ -65,35 +62,6 @@ export class ConceptIndex
             }
             return new ConceptIndex(def, members, [...reads.values()]);
         });
-    }
-
-    /** Member names a node-local predicate reads. */
-    private static Names(p: Predicate, out: Set<string>): void
-    {
-        switch (p.Kind)
-        {
-            case PredicateKind.Compare:
-                out.add((p as Compare).Member);
-                break;
-            case PredicateKind.In:
-                out.add((p as In).Member);
-                break;
-            case PredicateKind.IsNull:
-                out.add((p as IsNull).Member);
-                break;
-            case PredicateKind.And:
-            case PredicateKind.Or:
-                for (const term of (p as And | Or).Terms)
-                {
-                    ConceptIndex.Names(term, out);
-                }
-                break;
-            case PredicateKind.Not:
-                ConceptIndex.Names((p as Not).Term, out);
-                break;
-            default:
-                break;
-        }
     }
 }
 

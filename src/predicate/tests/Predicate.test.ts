@@ -320,3 +320,18 @@ describe('PredicateCodec strictness and limits', () =>
         assert.equal(T.Matches(new Compare('s', CompareOp.Lt, String.fromCharCode(0xFFFE)), { s: lone }), true);
     });
 });
+
+describe('Predicate.MemberNames', () =>
+{
+    it('lists the members read on the node itself, not through Related', () =>
+    {
+        const p = new And([
+            new Compare('a', CompareOp.Eq, 1n),
+            new Or([new In('b', ['x']), new Not(new IsNull('c'))]),
+            new Related('r', EdgeDirection.Out, new Compare('far', CompareOp.Eq, 1n)),
+            new IdIn(new Set(['n1'])),
+        ]);
+        assert.deepEqual([...Predicate.MemberNames(p)].sort(), ['a', 'b', 'c']);
+        assert.equal(Predicate.MemberNames(Predicate.True).size, 0);
+    });
+});

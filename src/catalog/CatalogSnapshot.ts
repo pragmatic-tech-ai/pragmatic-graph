@@ -1,5 +1,6 @@
 import { CatalogError, CatalogErrorCode } from './CatalogError.js';
 import { IndexDef, MemberDef, TypeDefinition } from './CatalogTypes.js';
+import { Predicate } from '../predicate/Predicate.js';
 import { MemberKind, ValueType } from './ValueType.js';
 
 /** Immutable, validated catalog. Type ids and member ids are stable; pre-order intervals are recomputed per snapshot. */
@@ -32,6 +33,7 @@ export class CatalogSnapshot
     private static readonly UnknownIndexMessage = 'Unknown index: ';
     private static readonly IndexWhereMessage = 'Index Where must be node-local: ';
     private static readonly IndexDurationMessage = 'A Duration member is not indexable: ';
+    private static readonly IndexWhereMemberMessage = 'Index Where reads a member that is not a property of the indexed type: ';
     private static readonly MemberSeparator = '.';
 
     public readonly Version: number;
@@ -153,7 +155,8 @@ export class CatalogSnapshot
     /**
      * The one seam for index validation. Checks: names unique, `On` names a known concept or aspect, at
      * least one member, every member id a distinct property effective on `On` and not a Duration (no
-     * total order), and `Where` node-local (evaluated against the node's own values; ruling R-a).
+     * total order), and `Where` node-local (evaluated against the node's own values; ruling R-a) and
+     * reading only properties effective on `On` (UnknownMember otherwise).
      */
     private static ValidateIndexes(indexes: readonly IndexDef[], byName: ReadonlyMap<string, TypeDefinition>): void
     {
@@ -178,6 +181,17 @@ export class CatalogSnapshot
                 throw new CatalogError(CatalogErrorCode.InvalidMember, CatalogSnapshot.IndexWhereMessage + index.Name);
             }
             const available = CatalogSnapshot.PropertiesOf(index.On, byName);
+            if (index.Where !== undefined)
+            {
+                const names = new Set([...available.values()].map(m => m.Name));
+                for (const name of Predicate.MemberNames(index.Where))
+                {
+                    if (!names.has(name))
+                    {
+                        throw new CatalogError(CatalogErrorCode.UnknownMember, CatalogSnapshot.IndexWhereMemberMessage + index.Name + CatalogSnapshot.MemberSeparator + name);
+                    }
+                }
+            }
             const seen = new Set<number>();
             for (const id of index.Members)
             {
