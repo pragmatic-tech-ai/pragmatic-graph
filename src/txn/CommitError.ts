@@ -18,6 +18,8 @@ export enum CommitErrorCode
     InvalidPublicId,
     /** A node created by the batch lacks a value for a non-nullable property at the end of the batch (ruling R29). */
     MissingRequired,
+    /** A unique index would hold two entries with the same value tuple (one without a null). */
+    UniqueViolation,
 }
 
 import { GraphError, GraphErrorCode } from '../errors/GraphError.js';
@@ -52,6 +54,7 @@ export class CommitError extends GraphError
             case CommitErrorCode.DuplicatePublicId:
             case CommitErrorCode.InvalidEdge:
             case CommitErrorCode.MissingRequired:
+            case CommitErrorCode.UniqueViolation:
                 return GraphErrorCode.ConstraintViolation;
             default:
                 return GraphErrorCode.SchemaViolation;

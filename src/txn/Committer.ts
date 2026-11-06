@@ -7,6 +7,7 @@ import { EdgeStore } from '../edges/EdgeStore.js';
 import { IdAllocator } from '../identity/IdAllocator.js';
 import { PublicIdIndex } from '../identity/PublicIdIndex.js';
 import { RowIndex } from '../identity/RowIndex.js';
+import { IndexStore } from '../indexes/IndexStore.js';
 import type { IKeyValueStore, IWriteTransaction } from '../kv/KeyValue.js';
 import { GraphError, GraphErrorCode } from '../errors/GraphError.js';
 import { FormatMeta } from '../format/FormatMeta.js';
@@ -248,9 +249,10 @@ export class Committer
     private readonly edges = new EdgeStore();
     private readonly rows = new RowIndex();
     private readonly ids = new PublicIdIndex();
+    private readonly indexes = new IndexStore(this.columns, this.ids);
     private readonly log = new CommitLog();
     private readonly history: ConflictHistory;
-    private readonly purger = new DataPurger(this.columns, this.edges, this.rows, this.ids);
+    private readonly purger = new DataPurger(this.columns, this.edges, this.rows, this.ids, this.indexes);
     private readonly queue: Array<PendingCommit | IExclusiveCommit> = [];
     private index: CatalogIndex;
     private allocator: Promise<IdAllocator> | undefined;
@@ -670,7 +672,7 @@ export class Committer
         {
             throw new SeedIdMiss(missing);
         }
-        const keys = await new BatchApplier(index, this.columns, this.edges, this.rows, this.ids).Apply(txn, batch, created);
+        const keys = await new BatchApplier(index, this.columns, this.edges, this.rows, this.ids, this.indexes).Apply(txn, batch, created);
         for (const [publicId, hash] of plan.Hashes)
         {
             SeedMarkers.Write(txn, publicId, hash);
@@ -820,7 +822,7 @@ export class Committer
     private async ApplyGroup(txn: IWriteTransaction, index: CatalogIndex, candidates: readonly PendingCommit[]): Promise<IGroupOutcome>
     {
         await this.RequireCurrent(txn);
-        const applier = new BatchApplier(index, this.columns, this.edges, this.rows, this.ids);
+        const applier = new BatchApplier(index, this.columns, this.edges, this.rows, this.ids, this.indexes);
         const groupKeys = new WriteKeySet();
         const accepted: IAccepted[] = [];
         const conflicts: Array<readonly [PendingCommit, Error]> = [];

@@ -29,6 +29,9 @@ export class CatalogSnapshot
     private static readonly IndexMemberNotPropertyMessage = 'Index member is not a property of the indexed type: ';
     private static readonly IndexDuplicateMemberMessage = 'Index lists a member twice: ';
     private static readonly IndexCounterMessage = 'NextIndexId must exceed every index id: ';
+    private static readonly UnknownIndexMessage = 'Unknown index: ';
+    private static readonly IndexWhereMessage = 'Index Where must be node-local: ';
+    private static readonly IndexDurationMessage = 'A Duration member is not indexable: ';
     private static readonly MemberSeparator = '.';
 
     public readonly Version: number;
@@ -47,6 +50,8 @@ export class CatalogSnapshot
     private readonly matching: ReadonlyMap<string, readonly number[]>;
     private readonly indexList: readonly IndexDef[];
     private readonly indexesByType: ReadonlyMap<string, readonly IndexDef[]>;
+    private readonly indexByName: ReadonlyMap<string, IndexDef>;
+    private readonly indexMembers: ReadonlyMap<number, readonly MemberDef[]>;
 
     private constructor(
         version: number,
@@ -76,6 +81,14 @@ export class CatalogSnapshot
         this.intervals = CatalogSnapshot.ComputeIntervals(defs);
         this.matching = CatalogSnapshot.ComputeMatching(defs, isaSets);
         this.indexesByType = CatalogSnapshot.ComputeIndexesByType(indexes, isaSets);
+        this.indexByName = new Map(indexes.map(i => [i.Name, i]));
+        const members = new Map<number, readonly MemberDef[]>();
+        for (const i of indexes)
+        {
+            const available = CatalogSnapshot.PropertiesOf(i.On, this.byName);
+            members.set(i.Id, Object.freeze(i.Members.map(id => available.get(id)!)));
+        }
+        this.indexMembers = members;
     }
 
     /** Validates the definitions and builds a snapshot; throws CatalogError on any type-model violation. */
@@ -138,8 +151,9 @@ export class CatalogSnapshot
     }
 
     /**
-     * The one seam for index validation (Task 6 adds its rules here). Checks: names unique, `On` names a
-     * known concept or aspect, at least one member, every member id a distinct property effective on `On`.
+     * The one seam for index validation. Checks: names unique, `On` names a known concept or aspect, at
+     * least one member, every member id a distinct property effective on `On` and not a Duration (no
+     * total order), and `Where` node-local (evaluated against the node's own values; ruling R-a).
      */
     private static ValidateIndexes(indexes: readonly IndexDef[], byName: ReadonlyMap<string, TypeDefinition>): void
     {
@@ -159,6 +173,10 @@ export class CatalogSnapshot
             {
                 throw new CatalogError(CatalogErrorCode.InvalidMember, CatalogSnapshot.IndexNeedsMembersMessage + index.Name);
             }
+            if (index.Where !== undefined && !index.Where.IsNodeLocal)
+            {
+                throw new CatalogError(CatalogErrorCode.InvalidMember, CatalogSnapshot.IndexWhereMessage + index.Name);
+            }
             const available = CatalogSnapshot.PropertiesOf(index.On, byName);
             const seen = new Set<number>();
             for (const id of index.Members)
@@ -168,18 +186,23 @@ export class CatalogSnapshot
                     throw new CatalogError(CatalogErrorCode.InvalidMember, CatalogSnapshot.IndexDuplicateMemberMessage + index.Name);
                 }
                 seen.add(id);
-                if (!available.has(id))
+                const member = available.get(id);
+                if (member === undefined)
                 {
                     throw new CatalogError(CatalogErrorCode.UnknownMember, CatalogSnapshot.IndexMemberNotPropertyMessage + index.Name + CatalogSnapshot.MemberSeparator + id);
+                }
+                if (member.Type === ValueType.Duration)
+                {
+                    throw new CatalogError(CatalogErrorCode.InvalidMember, CatalogSnapshot.IndexDurationMessage + index.Name + CatalogSnapshot.MemberSeparator + member.Name);
                 }
             }
         }
     }
 
-    /** Ids of the property members of a concept (own, ancestors' and carried aspects') or of an aspect (own and included). */
-    private static PropertiesOf(name: string, byName: ReadonlyMap<string, TypeDefinition>): ReadonlySet<number>
+    /** The property members, by id, of a concept (own, ancestors' and carried aspects') or of an aspect (own and included). */
+    private static PropertiesOf(name: string, byName: ReadonlyMap<string, TypeDefinition>): ReadonlyMap<number, MemberDef>
     {
-        const ids = new Set<number>();
+        const ids = new Map<number, MemberDef>();
         const roots: string[] = [];
         if (byName.get(name)!.IsAspect)
         {
@@ -205,13 +228,13 @@ export class CatalogSnapshot
         return ids;
     }
 
-    private static AddProperties(members: readonly MemberDef[], into: Set<number>): void
+    private static AddProperties(members: readonly MemberDef[], into: Map<number, MemberDef>): void
     {
         for (const m of members)
         {
             if (m.Kind === MemberKind.Property)
             {
-                into.add(m.Id);
+                into.set(m.Id, m);
             }
         }
     }
@@ -230,6 +253,23 @@ export class CatalogSnapshot
     public Indexes(): readonly IndexDef[]
     {
         return this.indexList;
+    }
+
+    /** The declared index of that name, or undefined. */
+    public Index(name: string): IndexDef | undefined
+    {
+        return this.indexByName.get(name);
+    }
+
+    /** The member definitions of a declared index, in key order (as effective on its `On`). */
+    public IndexMembers(index: IndexDef): readonly MemberDef[]
+    {
+        const members = this.indexMembers.get(index.Id);
+        if (members === undefined)
+        {
+            throw new CatalogError(CatalogErrorCode.UnknownMember, CatalogSnapshot.UnknownIndexMessage + index.Name);
+        }
+        return members;
     }
 
     /** The indexes that apply to instances of a concept: declared on it, on an ancestor, or on an aspect it carries. */

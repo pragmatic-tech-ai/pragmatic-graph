@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { TupleCodec, type TupleElement } from '../TupleCodec.js';
+import { TupleCodec, TupleDouble, type TupleElement } from '../TupleCodec.js';
 
 describe('TupleCodec', () =>
 {
@@ -46,6 +46,24 @@ describe('TupleCodec', () =>
     it('orders by type code across kinds', () =>
     {
         TupleCodecTestHelper.AssertSortedAndDistinct([new Uint8Array([9]), 'a', -5n, 5n]);
+    });
+
+    it('encodes null, booleans and doubles as the FoundationDB tuple layer does', () =>
+    {
+        assert.deepEqual([...TupleCodec.Encode([null])], [0x00]);
+        assert.deepEqual([...TupleCodec.Encode([false, true])], [0x26, 0x27]);
+        assert.deepEqual([...TupleCodec.Encode([new TupleDouble(1)])], [0x21, 0xbf, 0xf0, 0, 0, 0, 0, 0, 0]);
+        assert.deepEqual([...TupleCodec.Encode([new TupleDouble(-1)])], [0x21, 0x40, 0x0f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
+        const input: TupleElement[] = [null, true, false, new TupleDouble(-2.5), new TupleDouble(Number.POSITIVE_INFINITY), 7n];
+        assert.deepEqual(TupleCodec.Decode(TupleCodec.Encode(input)), input);
+        assert.throws(() => TupleCodec.Decode(new Uint8Array([0x21, 0x80])), 'truncated double');
+    });
+
+    it('orders doubles numerically and null before every kind', () =>
+    {
+        const doubles = [Number.NEGATIVE_INFINITY, -1e300, -2.5, -Number.MIN_VALUE, -0, 0, Number.MIN_VALUE, 0.5, 1, 1e300, Number.POSITIVE_INFINITY, Number.NaN];
+        TupleCodecTestHelper.AssertSortedAndDistinct(doubles.map(d => new TupleDouble(d)));
+        TupleCodecTestHelper.AssertSortedAndDistinct([null, new Uint8Array([0]), '', -1n, new TupleDouble(-1), false, true]);
     });
 
     it('sorts a prefix tuple before its extensions and before longer siblings', () =>

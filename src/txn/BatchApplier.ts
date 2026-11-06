@@ -10,6 +10,7 @@ import { EdgeError, EdgeErrorCode } from '../edges/EdgeError.js';
 import type { EdgeStore, IAdjacent, ILinkOptions } from '../edges/EdgeStore.js';
 import { EdgeDirection } from '../format/FormatKeys.js';
 import type { Location } from '../identity/Location.js';
+import type { IIndexEntry, IndexStore } from '../indexes/IndexStore.js';
 import { PublicIdIndex } from '../identity/PublicIdIndex.js';
 import type { RowIndex } from '../identity/RowIndex.js';
 import type { IWriteTransaction } from '../kv/KeyValue.js';
@@ -30,6 +31,17 @@ interface INode
     readonly Concept: string;
 }
 
+/**
+ * A node whose secondary-index entries the batch may change: its entries before the batch (none for a
+ * node the batch created) and whether it is still live at the end of the batch.
+ */
+interface ITouchedNode
+{
+    readonly Node: INode;
+    readonly Before: readonly IIndexEntry[];
+    Live: boolean;
+}
+
 /** A node created by the batch being applied, with the members the batch has set on it so far. */
 interface ICreatedNode
 {
@@ -43,6 +55,10 @@ interface ICreatedNode
  * operation sees the batch's earlier ones) and returns the batch's logical write-key set (ruling R23).
  * Semantic violations throw CommitError (ruling R26); any other error means storage trouble or an
  * engine bug and is not attributed to the batch. Partition is always 0 in v1.
+ *
+ * Secondary indexes are maintained at the end of the batch, per node, from its post-batch values (like
+ * MissingRequired): every node the batch created, deleted, or set an indexed (or `Where`-read) member of
+ * gets its entries recomputed; removed entries are deleted before added ones are unique-checked and put.
  */
 export class BatchApplier
 {
@@ -72,6 +88,7 @@ export class BatchApplier
         private readonly edges: EdgeStore,
         private readonly rows: RowIndex,
         private readonly ids: PublicIdIndex,
+        private readonly indexes: IndexStore,
     )
     {
     }
@@ -91,6 +108,7 @@ export class BatchApplier
     {
         const keys = new WriteKeySet();
         const created = new Map<bigint, ICreatedNode>();
+        const touched = new Map<bigint, ITouchedNode>();
         let nextId = 0;
         for (const op of batch.Ops())
         {
@@ -103,18 +121,22 @@ export class BatchApplier
                     {
                         throw new GraphError(GraphErrorCode.Internal, BatchApplier.ErrIdsExhausted);
                     }
-                    const concept = await this.CreateNode(txn, op, id, keys);
-                    created.set(id, { PublicId: op.PublicId, Concept: concept, Set: new Set() });
+                    const node = await this.CreateNode(txn, op, id, keys);
+                    created.set(id, { PublicId: op.PublicId, Concept: node.Concept, Set: new Set() });
+                    if (this.index.IndexesFor(node.Concept).length > 0)
+                    {
+                        touched.set(id, { Node: node, Before: [], Live: true });
+                    }
                     break;
                 }
                 case WriteOp.SetProperty:
                 {
-                    const set = await this.SetProperty(txn, op, keys);
+                    const set = await this.SetProperty(txn, op, keys, touched);
                     created.get(set.Node)?.Set.add(set.Member);
                     break;
                 }
                 case WriteOp.DeleteNode:
-                    created.delete(await this.DeleteNode(txn, op, keys));
+                    created.delete(await this.DeleteNode(txn, op, keys, touched));
                     break;
                 case WriteOp.Link:
                     await this.Link(txn, op, keys);
@@ -128,7 +150,35 @@ export class BatchApplier
         {
             this.RequireComplete(node);
         }
+        await this.MaintainIndexes(txn, touched, keys);
         return keys;
+    }
+
+    /** Records the node's current index entries before the batch first changes something they depend on. */
+    private async Track(txn: IWriteTransaction, node: INode, touched: Map<bigint, ITouchedNode>): Promise<void>
+    {
+        if (touched.has(node.Id))
+        {
+            return;
+        }
+        const before = await this.indexes.EntriesOf(txn, this.index.IndexesFor(node.Concept), node.Location, node.Id, node.PublicId);
+        touched.set(node.Id, { Node: node, Before: before, Live: true });
+    }
+
+    /** Diffs each touched node's entries before the batch against its post-batch ones and applies the diff. */
+    private async MaintainIndexes(txn: IWriteTransaction, touched: ReadonlyMap<bigint, ITouchedNode>, keys: WriteKeySet): Promise<void>
+    {
+        const removed: IIndexEntry[] = [];
+        const added: IIndexEntry[] = [];
+        for (const t of touched.values())
+        {
+            const after = t.Live ? await this.indexes.EntriesOf(txn, this.index.IndexesFor(t.Node.Concept), t.Node.Location, t.Node.Id, t.Node.PublicId) : [];
+            const kept = new Set(after.map(e => e.Hex));
+            const had = new Set(t.Before.map(e => e.Hex));
+            removed.push(...t.Before.filter(e => !kept.has(e.Hex)));
+            added.push(...after.filter(e => !had.has(e.Hex)));
+        }
+        await this.indexes.Apply(txn, removed, added, keys);
     }
 
     /** R29: each non-nullable property of a newly created node was given a value by the batch. */
@@ -143,8 +193,7 @@ export class BatchApplier
         }
     }
 
-    /** Returns the created node's concept. */
-    private async CreateNode(txn: IWriteTransaction, op: ICreateNodeOp, id: bigint, keys: WriteKeySet): Promise<string>
+    private async CreateNode(txn: IWriteTransaction, op: ICreateNodeOp, id: bigint, keys: WriteKeySet): Promise<INode>
     {
         BatchApplier.RequirePublicId(op.PublicId);
         const typeId = BatchApplier.Catalog(() => this.index.Catalog.RequireInstantiable(op.Concept));
@@ -161,11 +210,11 @@ export class BatchApplier
         keys.Add(ConflictKeys.NodeSpace, ConflictKeys.Node(op.PublicId));
         BatchApplier.AddCellKeys(keys, id, typeId, CatalogSnapshot.NodeIdMember.Id);
         keys.Add(ConflictKeys.ExtentSpace, ConflictKeys.Extent(typeId));
-        return op.Concept;
+        return { PublicId: op.PublicId, Id: id, Location: location, Concept: op.Concept };
     }
 
     /** Returns the node and member written. */
-    private async SetProperty(txn: IWriteTransaction, op: ISetPropertyOp, keys: WriteKeySet): Promise<{ Node: bigint; Member: number }>
+    private async SetProperty(txn: IWriteTransaction, op: ISetPropertyOp, keys: WriteKeySet, touched: Map<bigint, ITouchedNode>): Promise<{ Node: bigint; Member: number }>
     {
         const node = await this.Locate(txn, op.PublicId);
         const member = BatchApplier.Catalog(() => this.index.Catalog.Member(node.Concept, op.Member));
@@ -174,15 +223,24 @@ export class BatchApplier
             throw new CommitError(CommitErrorCode.NotAProperty, BatchApplier.ErrNotProperty + node.Concept + BatchApplier.Dot + op.Member);
         }
         BatchApplier.RequireValue(node, member, op.Value);
+        if (this.index.IndexesFor(node.Concept).some(i => i.Touches(member.Id)))
+        {
+            await this.Track(txn, node, touched);
+        }
         await this.columns.WriteCell(txn, node.Location, member, op.Value);
         BatchApplier.AddCellKeys(keys, node.Id, node.Location.TypeId, member.Id);
         return { Node: node.Id, Member: member.Id };
     }
 
     /** Returns the deleted node's internal id. */
-    private async DeleteNode(txn: IWriteTransaction, op: IDeleteNodeOp, keys: WriteKeySet): Promise<bigint>
+    private async DeleteNode(txn: IWriteTransaction, op: IDeleteNodeOp, keys: WriteKeySet, touched: Map<bigint, ITouchedNode>): Promise<bigint>
     {
         const node = await this.Locate(txn, op.PublicId);
+        if (this.index.IndexesFor(node.Concept).length > 0)
+        {
+            await this.Track(txn, node, touched);
+            (touched.get(node.Id) as ITouchedNode).Live = false;
+        }
         const members = this.index.Catalog.EffectiveMembers(node.Concept);
         // Each edge is unlinked at the position its scan already found: no per-edge lookup (F9).
         for (const rel of members.filter(m => m.Kind === MemberKind.Relationship))

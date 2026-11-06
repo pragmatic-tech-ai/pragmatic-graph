@@ -8,4 +8,5 @@ export enum Keyspace
     Deltas = 'deltas',
     Edges = 'edges',
     Log = 'log',
+    Index = 'index',
 }

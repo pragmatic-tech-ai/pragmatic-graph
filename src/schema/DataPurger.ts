@@ -6,6 +6,7 @@ import type { EdgeStore } from '../edges/EdgeStore.js';
 import { GraphError, GraphErrorCode } from '../errors/GraphError.js';
 import { EdgeDirection } from '../format/FormatKeys.js';
 import type { Location } from '../identity/Location.js';
+import type { ConceptIndex, IIndexEntry, IndexStore } from '../indexes/IndexStore.js';
 import type { PublicIdIndex } from '../identity/PublicIdIndex.js';
 import type { RowIndex } from '../identity/RowIndex.js';
 import type { IWriteTransaction } from '../kv/KeyValue.js';
@@ -53,6 +54,13 @@ interface IDoomedEdge
     readonly Position: Uint8Array;
 }
 
+/** An index (as resolved on one surviving concept) to build over that concept's surviving nodes. */
+interface IIndexBuild
+{
+    readonly Index: ConceptIndex;
+    readonly TypeId: number;
+}
+
 /** A property column of a surviving concept that the new catalog no longer has. */
 interface IDroppedColumn
 {
@@ -75,6 +83,9 @@ class PurgeRun
     private readonly doomed = new Map<bigint, IDoomedNode>();
     private readonly doomedEdges = new Map<string, IDoomedEdge>();
     private readonly droppedColumns: IDroppedColumn[] = [];
+    /** Index entries computed with the OLD catalog from the OLD values, removed in the write phase (by hex). */
+    private readonly staleEntries = new Map<string, IIndexEntry>();
+    private readonly builds: IIndexBuild[] = [];
     /** Internal ids of nodes that lose a value or an edge (doomed ones included; filtered at the end). */
     private readonly touched = new Set<bigint>();
     private readonly removedTypes: TypeDefinition[];
@@ -91,6 +102,7 @@ class PurgeRun
         private readonly edges: EdgeStore,
         private readonly rows: RowIndex,
         private readonly ids: PublicIdIndex,
+        private readonly indexes: IndexStore,
     )
     {
         this.removedTypes = diff.RemovedTypes.filter(d => !d.IsAspect);
@@ -107,6 +119,7 @@ class PurgeRun
         }
         await this.CollectRemovedMembers();
         await this.CollectRejectedTargets();
+        await this.CollectIndexes();
         const modified = await this.ModifiedNodes();
 
         for (const edge of this.doomedEdges.values())
@@ -125,7 +138,99 @@ class PurgeRun
         {
             await this.columns.DropType(this.txn, PurgeRun.Partition, type.TypeId);
         }
+        await this.RewriteIndexes();
         return { NodesRemoved: this.doomed.size, ValuesRemoved: this.values, EdgesRemoved: this.doomedEdges.size, ModifiedNodes: modified };
+    }
+
+    /**
+     * Per old concept and each index kept by id (removed indexes are dropped wholesale): an index slice
+     * (the index as resolved on the concept) is stale when it no longer applies to the concept, its
+     * resolved members (key or `Where`-read) changed, or one of them lost its column; every live node's
+     * entry of a stale slice goes and the slice is rebuilt when it still applies. Otherwise only removed
+     * nodes lose their entries. A slice that newly applies to a surviving concept (an added index, or a
+     * hierarchy change) is built. Entries are computed now, from the old values with the old catalog.
+     */
+    private async CollectIndexes(): Promise<void>
+    {
+        const nextIds = new Set(this.next.Catalog.Indexes().map(i => i.Id));
+        const keptTypes = new Set(this.keptConcepts.map(d => d.TypeId));
+        for (const def of this.old.Catalog.Definitions().filter(d => !d.IsAspect))
+        {
+            const before = this.old.IndexesFor(def.Name).filter(i => nextIds.has(i.Def.Id));
+            const after = keptTypes.has(def.TypeId) ? this.next.IndexesFor(def.Name) : [];
+            const lost = new Set(this.diff.RemovedMembers.filter(r => r.Type === def.Name).map(r => r.Member.Id));
+            const stale = before.filter(o =>
+            {
+                const n = after.find(x => x.Def.Id === o.Def.Id);
+                return n === undefined || o.Reads.some(m => lost.has(m.Id)) || !PurgeRun.SameMembers(o, n);
+            });
+            if (stale.length > 0)
+            {
+                for (const node of await this.Live(def.TypeId))
+                {
+                    await this.CollectEntries(def.TypeId, node.Id, node.Slot, stale);
+                }
+            }
+            const rest = before.filter(i => !stale.includes(i));
+            if (rest.length > 0)
+            {
+                for (const node of this.doomed.values())
+                {
+                    if (node.Location.TypeId === def.TypeId)
+                    {
+                        await this.CollectEntries(def.TypeId, node.Id, node.Location.Slot, rest);
+                    }
+                }
+            }
+            for (const n of after)
+            {
+                const o = before.find(x => x.Def.Id === n.Def.Id);
+                if (o === undefined || stale.includes(o))
+                {
+                    this.builds.push({ Index: n, TypeId: def.TypeId });
+                }
+            }
+        }
+    }
+
+    /** Removed indexes go wholesale, stale entries one by one; then the slices to build are built over the surviving nodes. */
+    private async RewriteIndexes(): Promise<void>
+    {
+        for (const removed of this.diff.RemovedIndexes)
+        {
+            await this.indexes.Drop(this.txn, removed.Id, this.keys);
+        }
+        await this.indexes.Apply(this.txn, [...this.staleEntries.values()], [], this.keys);
+        for (const build of this.builds)
+        {
+            await this.indexes.Build(this.txn, build.Index, build.TypeId, this.keys);
+        }
+    }
+
+    private async CollectEntries(typeId: number, id: bigint, slot: number, slices: readonly ConceptIndex[]): Promise<void>
+    {
+        const publicId = await this.ids.PublicIdOf(this.txn, id);
+        if (publicId === undefined)
+        {
+            throw new GraphError(GraphErrorCode.Corrupt, PurgeRun.ErrNoPublicId + id);
+        }
+        const location: Location = { Partition: PurgeRun.Partition, TypeId: typeId, Slot: slot };
+        for (const entry of await this.indexes.EntriesOf(this.txn, slices, location, id, publicId))
+        {
+            this.staleEntries.set(entry.Hex, entry);
+        }
+    }
+
+    /** Same key members in the same order and the same set of read members. */
+    private static SameMembers(a: ConceptIndex, b: ConceptIndex): boolean
+    {
+        return PurgeRun.Ids(a.Members.map(m => m.Id)) === PurgeRun.Ids(b.Members.map(m => m.Id))
+            && PurgeRun.Ids(a.Reads.map(m => m.Id).sort((p, q) => p - q)) === PurgeRun.Ids(b.Reads.map(m => m.Id).sort((p, q) => p - q));
+    }
+
+    private static Ids(ids: readonly number[]): string
+    {
+        return ids.join(PurgeRun.Separator);
     }
 
     /** Public ids of the touched nodes that survive, read before anything is removed. */
@@ -392,8 +497,13 @@ class PurgeRun
  * - Relationship targets no longer accepting a surviving concept: edges into its nodes go; nodes stay.
  * - Non-nullable property newly effective on a surviving concept: the nodes without a value go.
  *
- * Index entries of removed indexes join this purge once secondary indexes are stored. The caller flushes
- * the column store and row index afterwards (rulings R20, F6).
+ * - Secondary indexes: a removed index's entries all go; entries of removed nodes, and of index slices
+ *   whose concept, members or member columns changed, go (computed from the old values before anything
+ *   is removed); then added and changed slices are built over the surviving nodes, so a unique violation
+ *   in existing data is CommitError UniqueViolation and fails the upgrade. The seed batch that follows
+ *   is maintained incrementally by BatchApplier.
+ *
+ * The caller flushes the column store and row index afterwards (rulings R20, F6).
  */
 export class DataPurger
 {
@@ -402,6 +512,7 @@ export class DataPurger
         private readonly edges: EdgeStore,
         private readonly rows: RowIndex,
         private readonly ids: PublicIdIndex,
+        private readonly indexes: IndexStore,
     )
     {
     }
@@ -412,6 +523,6 @@ export class DataPurger
      */
     public Purge(txn: IWriteTransaction, old: CatalogIndex, next: CatalogIndex, diff: CatalogDiff, keys: WriteKeySet): Promise<IPurgeStats>
     {
-        return new PurgeRun(txn, old, next, diff, keys, this.columns, this.edges, this.rows, this.ids).Run();
+        return new PurgeRun(txn, old, next, diff, keys, this.columns, this.edges, this.rows, this.ids, this.indexes).Run();
     }
 }

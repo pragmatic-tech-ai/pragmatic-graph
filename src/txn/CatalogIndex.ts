@@ -1,6 +1,7 @@
 import type { MemberDef } from '../catalog/CatalogTypes.js';
 import { CatalogSnapshot } from '../catalog/CatalogSnapshot.js';
 import { MemberKind } from '../catalog/ValueType.js';
+import { ConceptIndex } from '../indexes/IndexStore.js';
 
 /** Lookups the committer needs that CatalogSnapshot does not index: by type id and by member id. */
 export class CatalogIndex
@@ -9,6 +10,7 @@ export class CatalogIndex
     private readonly propertyById = new Map<number, MemberDef>();
     private readonly relationships: MemberDef[] = [];
     private readonly incoming = new Map<string, readonly MemberDef[]>();
+    private readonly indexes = new Map<string, readonly ConceptIndex[]>();
 
     public constructor(public readonly Catalog: CatalogSnapshot)
     {
@@ -52,6 +54,18 @@ export class CatalogIndex
     public Accepts(relationship: MemberDef, concept: string): boolean
     {
         return (relationship.Targets ?? []).some(t => this.Catalog.IsA(concept, t));
+    }
+
+    /** The secondary indexes that apply to nodes of `concept`, resolved against its members (cached). */
+    public IndexesFor(concept: string): readonly ConceptIndex[]
+    {
+        let found = this.indexes.get(concept);
+        if (found === undefined)
+        {
+            found = ConceptIndex.For(this.Catalog, concept);
+            this.indexes.set(concept, found);
+        }
+        return found;
     }
 
     /** Every relationship (each once, by id) whose targets admit nodes of `concept`. */

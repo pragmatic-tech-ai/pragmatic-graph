@@ -4,6 +4,7 @@ import { ColumnStore } from './columns/ColumnStore.js';
 import { EdgeStore } from './edges/EdgeStore.js';
 import { PublicIdIndex } from './identity/PublicIdIndex.js';
 import { RowIndex } from './identity/RowIndex.js';
+import { IndexStore } from './indexes/IndexStore.js';
 import type { IKeyValueStore, IReadTransaction } from './kv/KeyValue.js';
 import { CatalogIndex } from './txn/CatalogIndex.js';
 import { CommitLog } from './txn/CommitLog.js';
@@ -58,6 +59,7 @@ export class GraphContext
     public readonly Edges = new EdgeStore();
     public readonly Rows = new RowIndex();
     public readonly Ids = new PublicIdIndex();
+    public readonly Indexes = new IndexStore(this.Columns, this.Ids);
 
     private readonly open = new Set<IGraphDisposable>();
     private index: CatalogIndex;

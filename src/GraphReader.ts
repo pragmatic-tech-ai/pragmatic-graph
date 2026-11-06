@@ -6,6 +6,8 @@ import type { CellValue } from './columns/CellValue.js';
 import { GraphError, GraphErrorCode } from './errors/GraphError.js';
 import { EdgeDirection } from './format/FormatKeys.js';
 import type { Location } from './identity/Location.js';
+import { IndexKey, type IIndexRange } from './indexes/IndexKey.js';
+import type { IKeyRange } from './kv/KeyValue.js';
 import type { GraphContext, IGraphDisposable, ReadSnapshot } from './GraphContext.js';
 import { SeedMarkers } from './schema/SeedMarkers.js';
 import { ConflictKeys } from './txn/ConflictKeys.js';
@@ -39,6 +41,7 @@ export class GraphReader implements IGraphDisposable
     private static readonly ErrNoIncoming = 'No relationship of this name targets the concept: ';
     private static readonly ErrDirection = 'Unknown edge direction: ';
     private static readonly ErrCorrupt = 'Corrupt graph: node has no stored row or public id: ';
+    private static readonly ErrUnknownIndex = 'Unknown index: ';
     private static readonly Dot = '.';
     private static readonly Partition = 0;
 
@@ -203,6 +206,48 @@ export class GraphReader implements IGraphDisposable
         return total;
     }
 
+    /**
+     * Public ids of the nodes whose entries in the named secondary index lie in `range`, in index order
+     * (by value tuple, then internal id; descending with Reverse), at most Limit. `Prefix` fixes the
+     * leading members (null matches a null value: nulls are indexed and sort first); `Lower`/`Upper` bound
+     * the member after the prefix. Records the key range scanned (phantom-safe): the whole range, or, when
+     * Limit entries were produced, the range up to the last one. Errors: CatalogError UnknownMember for an
+     * unknown index; GraphError InvalidArgument for a prefix longer than the index, a bound after a full
+     * prefix, a value that does not fit its member, or a non-integer Limit. Disposing the reader ends the
+     * seek: the next id rejects.
+     */
+    public async *SeekIndex(index: string, range: IIndexRange): AsyncIterable<string>
+    {
+        this.RequireOpen();
+        const catalog = this.snapshot.Index.Catalog;
+        const def = catalog.Index(index);
+        if (def === undefined)
+        {
+            throw new CatalogError(CatalogErrorCode.UnknownMember, GraphReader.ErrUnknownIndex + index);
+        }
+        const keys = IndexKey.SeekRange(def.Name, def.Id, catalog.IndexMembers(def), range);
+        const limit = range.Limit ?? 0;
+        const reverse = range.Reverse === true;
+        let last: Uint8Array | undefined;
+        let count = 0;
+        try
+        {
+            for await (const key of this.context.Indexes.Seek(this.snapshot.Txn, keys, limit > 0 ? { Limit: limit, Reverse: reverse } : { Reverse: reverse }))
+            {
+                this.RequireOpen();
+                last = key;
+                count += 1;
+                const publicId = await this.PublicIdOf(IndexKey.InternalId(key));
+                this.RequireOpen();
+                yield publicId;
+            }
+        }
+        finally
+        {
+            this.Reads?.AddRange(ConflictKeys.IndexSpace, ConflictKeys.IndexRange(GraphReader.Scanned(keys, limit, reverse, count, last)));
+        }
+    }
+
     /** Releases the snapshot. Idempotent; later reads reject. */
     public dispose(): void
     {
@@ -282,6 +327,16 @@ export class GraphReader implements IGraphDisposable
             throw new CatalogError(CatalogErrorCode.UnknownMember, GraphReader.ErrNoIncoming + concept + GraphReader.Dot + name);
         }
         return incoming;
+    }
+
+    /** The part of a seek's range its result depends on: up to the last key when Limit stopped it, else all of it. */
+    private static Scanned(range: IKeyRange, limit: number, reverse: boolean, count: number, last: Uint8Array | undefined): IKeyRange
+    {
+        if (limit <= 0 || count < limit || last === undefined)
+        {
+            return range;
+        }
+        return reverse ? { Start: last, End: range.End } : { Start: range.Start, End: IndexKey.After(last) };
     }
 
     /** Resolves the node, recording the public id's binding (also when missing, which catches a later create). */

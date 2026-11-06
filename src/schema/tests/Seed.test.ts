@@ -23,6 +23,7 @@ import { BatchApplier } from '../../txn/BatchApplier.js';
 import { CommitError, CommitErrorCode } from '../../txn/CommitError.js';
 import { ConflictError } from '../../txn/ConflictError.js';
 import { CommitKind, type ICommitApplied } from '../../txn/LogEntry.js';
+import type { IndexStore } from '../../indexes/IndexStore.js';
 import { WriteBatch } from '../../txn/WriteBatch.js';
 import type { DataPurger, IPurgeStats } from '../DataPurger.js';
 import type { IDefinitionDescription, ISchemaDescription, ISeedLink, ISeedNode } from '../SchemaDescription.js';
@@ -36,6 +37,7 @@ interface ICommitterInternals
     readonly edges: EdgeStore;
     readonly rows: RowIndex;
     readonly ids: PublicIdIndex;
+    readonly indexes: IndexStore;
 }
 
 /**
@@ -266,7 +268,7 @@ class SeedFx
                 {
                     const batch = new WriteBatch();
                     batch.DeleteNode(victim);
-                    await new BatchApplier(args[2], host.columns, host.edges, host.rows, host.ids).Apply(args[0], batch.Seal(), []);
+                    await new BatchApplier(args[2], host.columns, host.edges, host.rows, host.ids, host.indexes).Apply(args[0], batch.Seal(), []);
                 }
                 return stats;
             },

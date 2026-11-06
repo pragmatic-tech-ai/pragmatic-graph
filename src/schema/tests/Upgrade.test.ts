@@ -18,6 +18,7 @@ import { ColumnStore } from '../../columns/ColumnStore.js';
 import { EdgeStore } from '../../edges/EdgeStore.js';
 import { PublicIdIndex } from '../../identity/PublicIdIndex.js';
 import { RowIndex } from '../../identity/RowIndex.js';
+import { IndexStore } from '../../indexes/IndexStore.js';
 import { CatalogIndex } from '../../txn/CatalogIndex.js';
 import { WriteKeySet } from '../../txn/WriteKeySet.js';
 import { CatalogPlanner } from '../CatalogPlanner.js';
@@ -548,7 +549,9 @@ class UpgradeFx
                 const desc = UpgradeFx.Desc('v2', UpgradeFx.WithoutNote('v2').Definitions.filter(d => d.Name !== 'Memo').map(d =>
                     d.Name === 'Item' ? UpgradeFx.Concept('Item', [UpgradeFx.Prop('size', ValueType.String)]) : d));
                 const plan = CatalogPlanner.Plan(old.Catalog, desc);
-                const purger = new DataPurger(new ColumnStore(), new EdgeStore(), new RowIndex(), new PublicIdIndex());
+                const columns = new ColumnStore();
+                const ids = new PublicIdIndex();
+                const purger = new DataPurger(columns, new EdgeStore(), new RowIndex(), ids, new IndexStore(columns, ids));
                 let stats: IPurgeStats | undefined;
                 // Purge then abort: the store must be unchanged.
                 await assert.rejects(context.Store.Write(async txn =>

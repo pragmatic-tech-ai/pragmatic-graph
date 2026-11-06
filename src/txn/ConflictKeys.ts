@@ -19,6 +19,9 @@ import { Keyspace } from '../kv/Keyspace.js';
  * - Column(typeId, memberId) in Keyspace.Deltas (used here only as the family's namespace): one whole
  *   property column of a concept. A full-column scan records this one coarse key instead of a Cell key
  *   per row (ruling F7); every writer of a Cell also writes the Column key of the node's type.
+ * - IndexEntry(key) in Keyspace.Index: one secondary-index entry, the stored key itself
+ *   `(indexId, ...values, internalId)`; index maintenance writes it for every entry added or removed.
+ * - IndexRange(range) in Keyspace.Index: the key range an index seek scanned (phantom protection).
  */
 export class ConflictKeys
 {
@@ -27,6 +30,7 @@ export class ConflictKeys
     public static readonly EdgeSpace = Keyspace.Edges;
     public static readonly ExtentSpace = Keyspace.Rows;
     public static readonly ColumnSpace = Keyspace.Deltas;
+    public static readonly IndexSpace = Keyspace.Index;
 
     public static Cell(internalId: bigint, memberId: number): Uint8Array
     {
@@ -62,6 +66,18 @@ export class ConflictKeys
     public static ExtentRange(typeId: number): IKeyRange
     {
         return ConflictKeys.PrefixRange(ConflictKeys.Extent(typeId));
+    }
+
+    /** A copy of the stored index-entry key: the logical key and the storage key coincide. */
+    public static IndexEntry(key: Uint8Array): Uint8Array
+    {
+        return key.slice();
+    }
+
+    /** A copy of the scanned index key range. */
+    public static IndexRange(range: IKeyRange): IKeyRange
+    {
+        return { Start: range.Start.slice(), End: range.End.slice() };
     }
 
     /** Lowercase hex of the key; a stable map key for byte strings. */

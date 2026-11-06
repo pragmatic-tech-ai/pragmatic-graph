@@ -1,11 +1,32 @@
-export type TupleElement = Uint8Array | string | bigint | number;
+/**
+ * An IEEE-754 double tuple element (a plain `number` element is a non-negative integer). Encoded as the
+ * FoundationDB double: code 0x21 then the 8 big-endian bytes with the sign bit flipped (non-negative)
+ * or every bit flipped (negative), so doubles order numerically: -Infinity < ... < -0 < 0 < ... <
+ * +Infinity < NaN. Callers that need -0 = 0 or a single NaN canonicalize before encoding.
+ */
+export class TupleDouble
+{
+    public constructor(public readonly Value: number)
+    {
+        Object.freeze(this);
+    }
+}
+
+export type TupleElement = Uint8Array | string | bigint | number | boolean | null | TupleDouble;
 
 /**
- * FoundationDB tuple-layer encoding for flat tuples of byte strings, UTF-8 strings and
- * integers (up to 64-bit magnitude). Encoded keys order bytewise like their logical tuples.
+ * FoundationDB tuple-layer encoding for flat tuples of null, byte strings, UTF-8 strings, integers (up
+ * to 64-bit magnitude), doubles and booleans. Encoded keys order bytewise like their logical tuples;
+ * across types the order is null < bytes < string < integer < double < false < true.
  */
 export class TupleCodec
 {
+    private static readonly NullCode = 0x00;
+    private static readonly DoubleCode = 0x21;
+    private static readonly FalseCode = 0x26;
+    private static readonly TrueCode = 0x27;
+    private static readonly DoubleBytes = 8;
+    private static readonly SignBit = 0x80;
     private static readonly BytesCode = 0x01;
     private static readonly StringCode = 0x02;
     private static readonly IntZeroCode = 0x14;
@@ -32,7 +53,19 @@ export class TupleCodec
         const out: number[] = [];
         for (const element of elements)
         {
-            if (element instanceof Uint8Array)
+            if (element === null)
+            {
+                out.push(TupleCodec.NullCode);
+            }
+            else if (typeof element === 'boolean')
+            {
+                out.push(element ? TupleCodec.TrueCode : TupleCodec.FalseCode);
+            }
+            else if (element instanceof TupleDouble)
+            {
+                TupleCodec.WriteDouble(out, element.Value);
+            }
+            else if (element instanceof Uint8Array)
             {
                 out.push(TupleCodec.BytesCode);
                 TupleCodec.WriteEscaped(out, element);
@@ -70,7 +103,24 @@ export class TupleCodec
         {
             const code = key[pos] as number;
             pos++;
-            if (code === TupleCodec.BytesCode || code === TupleCodec.StringCode)
+            if (code === TupleCodec.NullCode)
+            {
+                result.push(null);
+            }
+            else if (code === TupleCodec.FalseCode || code === TupleCodec.TrueCode)
+            {
+                result.push(code === TupleCodec.TrueCode);
+            }
+            else if (code === TupleCodec.DoubleCode)
+            {
+                if (pos + TupleCodec.DoubleBytes > key.length)
+                {
+                    throw new RangeError(TupleCodec.ErrTruncated);
+                }
+                result.push(new TupleDouble(TupleCodec.ReadDouble(key, pos)));
+                pos += TupleCodec.DoubleBytes;
+            }
+            else if (code === TupleCodec.BytesCode || code === TupleCodec.StringCode)
             {
                 const { bytes, next } = TupleCodec.ReadEscaped(key, pos);
                 pos = next;
@@ -138,6 +188,31 @@ export class TupleCodec
         const result = prefix.slice(0, end);
         result[end - 1] = (result[end - 1] as number) + 1;
         return result;
+    }
+
+    private static WriteDouble(out: number[], value: number): void
+    {
+        const bytes = new Uint8Array(TupleCodec.DoubleBytes);
+        new DataView(bytes.buffer).setFloat64(0, value);
+        const negative = ((bytes[0] as number) & TupleCodec.SignBit) !== 0;
+        out.push(TupleCodec.DoubleCode);
+        for (let i = 0; i < bytes.length; i++)
+        {
+            const b = bytes[i] as number;
+            out.push(negative ? b ^ TupleCodec.EscapeSuffix : i === 0 ? b ^ TupleCodec.SignBit : b);
+        }
+    }
+
+    private static ReadDouble(key: Uint8Array, start: number): number
+    {
+        const bytes = key.slice(start, start + TupleCodec.DoubleBytes);
+        const negative = ((bytes[0] as number) & TupleCodec.SignBit) === 0;
+        for (let i = 0; i < bytes.length; i++)
+        {
+            const b = bytes[i] as number;
+            bytes[i] = negative ? b ^ TupleCodec.EscapeSuffix : i === 0 ? b ^ TupleCodec.SignBit : b;
+        }
+        return new DataView(bytes.buffer).getFloat64(0);
     }
 
     private static WriteEscaped(out: number[], bytes: Uint8Array): void
