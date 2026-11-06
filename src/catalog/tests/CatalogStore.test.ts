@@ -281,6 +281,14 @@ for (const [name, open] of backends)
                 [{ ...ok, Members: [{ ...member, EdgeProperties: [null] }] }],
                 [{ ...ok, Members: [{ ...member, EdgeProperties: [{ ...member, Id: 2, Name: 3 }] }] }],
                 [42],
+                [{ ...ok, Members: [{ ...member, Targets: 5 }] }],
+                [{ ...ok, Members: [{ ...member, Targets: [1] }] }],
+                [{ ...ok, Members: [{ ...member, Many: 'y' }] }],
+                [{ ...ok, Members: [{ ...member, Ordered: 1 }] }],
+                [{ ...ok, Members: [{ ...member, Nullable: 'n' }] }],
+                [{ ...ok, Members: [{ ...member, Type: 'String' }] }],
+                [{ ...ok, Aspects: [3] }],
+                [{ ...ok, Parent: 7 }],
             ];
             const store = await open();
             for (const defs of bad)
@@ -288,6 +296,28 @@ for (const [name, open] of backends)
                 await CatalogFx.PutObject(store, { NextTypeId: 10, NextMemberId: 10, Definitions: defs });
                 await assert.rejects(CatalogFx.Load(store), CatalogFx.Corrupt);
             }
+            await store.dispose();
+        });
+
+        it('loads a catalog with ~200k member ids without argument-limit errors', async () =>
+        {
+            const defs: unknown[] = [];
+            let memberId = 1;
+            for (let t = 1; t <= 1000; t++)
+            {
+                const members: unknown[] = [];
+                for (let i = 0; i < 200; i++)
+                {
+                    members.push({ Id: memberId, Name: 'm' + i, Kind: 1, Type: 4, Nullable: false, DeclaredBy: 'T' + t });
+                    memberId += 1;
+                }
+                defs.push({ Name: 'T' + t, IsAspect: false, TypeId: t, Parent: null, Aspects: [], Members: members });
+            }
+            const store = await open();
+            await CatalogFx.PutObject(store, { NextTypeId: 1001, NextMemberId: memberId, Definitions: defs });
+            const loaded = await CatalogFx.Load(store);
+            assert.equal(loaded.Definitions().length, 1000);
+            assert.equal(loaded.NextMemberId, 200001);
             await store.dispose();
         });
     });

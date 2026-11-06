@@ -84,6 +84,31 @@ export class CatalogStore
         return o as IStoredCatalog;
     }
 
+    private static MaxOf(values: ReadonlySet<number>): number
+    {
+        let max = 0;
+        for (const v of values)
+        {
+            max = Math.max(max, v);
+        }
+        return max;
+    }
+
+    private static IsStringArray(v: unknown): boolean
+    {
+        return Array.isArray(v) && v.every((x: unknown) => typeof x === 'string');
+    }
+
+    private static IsOptional(v: unknown, test: (x: unknown) => boolean): boolean
+    {
+        return v === undefined || test(v);
+    }
+
+    private static IsBoolean(v: unknown): boolean
+    {
+        return typeof v === 'boolean';
+    }
+
     private static IsObject(v: unknown): v is Record<string, unknown>
     {
         return typeof v === 'object' && v !== null && !Array.isArray(v);
@@ -94,7 +119,8 @@ export class CatalogStore
         return CatalogStore.IsObject(v)
             && typeof v.Name === 'string'
             && Number.isInteger(v.TypeId)
-            && Array.isArray(v.Aspects)
+            && (v.Parent === null || typeof v.Parent === 'string')
+            && CatalogStore.IsStringArray(v.Aspects)
             && Array.isArray(v.Members)
             && v.Members.every((m: unknown) => CatalogStore.IsMember(m));
     }
@@ -105,6 +131,11 @@ export class CatalogStore
             && typeof v.Name === 'string'
             && Number.isInteger(v.Id)
             && Number.isInteger(v.Kind)
+            && CatalogStore.IsOptional(v.Type, x => Number.isInteger(x))
+            && CatalogStore.IsOptional(v.Targets, x => CatalogStore.IsStringArray(x))
+            && CatalogStore.IsOptional(v.Many, x => CatalogStore.IsBoolean(x))
+            && CatalogStore.IsOptional(v.Ordered, x => CatalogStore.IsBoolean(x))
+            && CatalogStore.IsOptional(v.Nullable, x => CatalogStore.IsBoolean(x))
             && (v.EdgeProperties === undefined
                 || (Array.isArray(v.EdgeProperties) && v.EdgeProperties.every((m: unknown) => CatalogStore.IsMember(m))));
     }
@@ -135,7 +166,7 @@ export class CatalogStore
             typeIds.add(d.TypeId);
             CatalogStore.CheckMemberIds(d.Members, memberIds);
         }
-        return { Type: Math.max(0, ...typeIds), Member: Math.max(0, ...memberIds) };
+        return { Type: CatalogStore.MaxOf(typeIds), Member: CatalogStore.MaxOf(memberIds) };
     }
 
     private static CheckMemberIds(members: readonly MemberDef[], seen: Set<number>): void
