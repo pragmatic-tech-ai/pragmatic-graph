@@ -48,12 +48,18 @@ export class ReadSet
     /** True when the key was read directly or lies inside a read range (Start inclusive, End exclusive). */
     public Intersects(space: Keyspace, key: Uint8Array): boolean
     {
+        return this.IntersectsEncoded(space, key, ConflictKeys.Hex(key));
+    }
+
+    /** Intersects for a caller that already holds the key's hex (`hex` must equal ConflictKeys.Hex(key)). */
+    public IntersectsEncoded(space: Keyspace, key: Uint8Array, hex: string): boolean
+    {
         const reads = this.spaces.get(space);
         if (reads === undefined)
         {
             return false;
         }
-        if (reads.Keys.has(ConflictKeys.Hex(key)))
+        if (reads.Keys.has(hex))
         {
             return true;
         }

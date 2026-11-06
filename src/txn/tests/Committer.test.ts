@@ -12,6 +12,7 @@ import { EdgeError, EdgeErrorCode } from '../../edges/EdgeError.js';
 import { EdgeStore } from '../../edges/EdgeStore.js';
 import { EdgeDirection, FormatKeys } from '../../format/FormatKeys.js';
 import { TupleCodec } from '../../format/TupleCodec.js';
+import { IdAllocator } from '../../identity/IdAllocator.js';
 import { PublicIdIndex } from '../../identity/PublicIdIndex.js';
 import { RowIndex } from '../../identity/RowIndex.js';
 import type { IKeyRange, IKeyValueStore, IReadTransaction, IWriteTransaction } from '../../kv/KeyValue.js';
@@ -135,6 +136,38 @@ class CountingStore implements IKeyValueStore
     }
 }
 
+/** A committer whose first allocator open fails, to prove a failed open is not cached. */
+class FlakyAllocatorCommitter extends Committer
+{
+    public Failures = 1;
+    public Opens = 0;
+
+    protected override OpenAllocator(): Promise<IdAllocator>
+    {
+        this.Opens++;
+        if (this.Failures > 0)
+        {
+            this.Failures--;
+            return Promise.reject(new Error('allocator open failed'));
+        }
+        return super.OpenAllocator();
+    }
+}
+
+/** A read set whose validation throws, to inject a failure into a running group. */
+class ExplodingReadSet extends ReadSet
+{
+    public override get IsEmpty(): boolean
+    {
+        throw new Error('read set exploded');
+    }
+
+    public override Clone(): ReadSet
+    {
+        return this;
+    }
+}
+
 /** Reads graph state back through the storage building blocks. */
 class Probe
 {
@@ -243,6 +276,11 @@ class TxnFx
             { Name: 'title', Kind: MemberKind.Property, Type: ValueType.String, Nullable: true },
             { Name: 'staff', Kind: MemberKind.Relationship, Targets: ['Person'], Many: true },
             { Name: 'clients', Kind: MemberKind.Relationship, Targets: ['Party'], Many: true },
+        ]);
+        m.DefineConcept('Badge', null, [], [
+            { Name: 'code', Kind: MemberKind.Property, Type: ValueType.String, Nullable: false },
+            { Name: 'note', Kind: MemberKind.Property, Type: ValueType.String, Nullable: true },
+            { Name: 'holder', Kind: MemberKind.Relationship, Targets: ['Person'] },
         ]);
         return m.Seal();
     }
@@ -813,6 +851,146 @@ class TxnFx
                 c.UpdateCatalog(next);
                 await c.Submit(TxnFx.Batch(b => { b.CreateNode('t', 'Team'); b.SetProperty('t', 'size', 4n); }), new ReadSet(), 0n);
                 assert.equal(await new Probe(store, next).Cell('t', 'size'), 4n);
+                await store.dispose();
+            });
+
+            it('R29: a node created in a batch must have every non-nullable property set by the end of that batch', async () =>
+            {
+                const store = await open();
+                const catalog = TxnFx.Catalog();
+                const c = await Committer.Open(store, catalog);
+                await TxnFx.People(c, 'p');
+                assert.equal(await TxnFx.CommitCode(c.Submit(TxnFx.Batch(b => b.CreateNode('b1', 'Badge')), new ReadSet(), 1n)), CommitErrorCode.MissingRequired);
+                assert.equal(await TxnFx.CommitCode(c.Submit(TxnFx.Batch(b =>
+                {
+                    b.CreateNode('b1', 'Badge');
+                    b.SetProperty('b1', 'note', 'n');
+                }), new ReadSet(), 1n)), CommitErrorCode.MissingRequired);
+                await c.Submit(TxnFx.Batch(b =>
+                {
+                    b.CreateNode('b2', 'Badge');
+                    b.Link('b2', 'holder', 'p');
+                    b.SetProperty('b2', 'note', 'later');
+                    b.SetProperty('b2', 'code', 'X-1');
+                }), new ReadSet(), 1n);
+                await c.Submit(TxnFx.Batch(b =>
+                {
+                    b.CreateNode('b3', 'Badge');
+                    b.DeleteNode('b3');
+                }), new ReadSet(), 2n);
+                const probe = new Probe(store, catalog);
+                assert.equal(await probe.Cell('b2', 'code'), 'X-1');
+                assert.equal(await probe.Id('b1'), undefined);
+                assert.equal(await probe.Id('b3'), undefined);
+                assert.equal(await TxnFx.CommitCode(c.Submit(TxnFx.Batch(b => b.SetProperty('b2', 'code', null)), new ReadSet(), 3n)), CommitErrorCode.InvalidValue);
+                await store.dispose();
+            });
+
+            it('a failed allocator open is not cached: the next group opens it again', async () =>
+            {
+                const store = await open();
+                const c = new FlakyAllocatorCommitter(store, TxnFx.Catalog());
+                const failed = await TxnFx.Settle(TxnFx.People(c, 'a'));
+                assert.ok(failed instanceof Error && failed.message === 'allocator open failed');
+                assert.equal(await TxnFx.People(c, 'a'), 1n);
+                assert.equal(c.Opens, 2);
+                assert.equal(await TxnFx.People(c, 'b'), 2n);
+                assert.equal(c.Opens, 2);
+                await store.dispose();
+            });
+
+            it('an unexpected failure inside a group rejects that group only; the queue keeps running', async () =>
+            {
+                const store = await open();
+                const c = await Committer.Open(store, TxnFx.Catalog());
+                const group = [
+                    c.Submit(TxnFx.Batch(b => b.CreateNode('a', 'Person')), new ReadSet(), 0n),
+                    c.Submit(TxnFx.Batch(b => b.CreateNode('b', 'Person')), new ExplodingReadSet(), 0n),
+                    c.Submit(TxnFx.Batch(b => b.CreateNode('c', 'Person')), new ReadSet(), 0n),
+                ];
+                const outcomes = await Promise.all(group.map(p => TxnFx.Settle(p)));
+                for (const o of outcomes)
+                {
+                    assert.ok(o instanceof Error && o.message === 'read set exploded', String(o));
+                }
+                assert.equal(c.LastCommit(), 0n);
+                assert.equal(await TxnFx.People(c, 'd'), 1n);
+                await store.dispose();
+            });
+
+            it('corrupt stored data surfaces as a storage error, not as a CommitError of the batch', async () =>
+            {
+                const store = await open();
+                const catalog = TxnFx.Catalog();
+                const c = await Committer.Open(store, catalog);
+                await TxnFx.People(c, 'a');
+                const name = catalog.Member('Person', 'name').Id;
+                const deltaKey = FormatKeys.Delta(0, catalog.TypeId('Person'), name, 0n);
+                await store.Write(async txn => txn.Put(Keyspace.Deltas, deltaKey, Uint8Array.of(0, 0, 1)));
+                const outcome = await TxnFx.Settle(c.Submit(TxnFx.Batch(b => b.SetProperty('a', 'name', 'x')), new ReadSet(), 1n));
+                assert.ok(outcome instanceof Error);
+                assert.ok(!(outcome instanceof CommitError), 'corruption is not the fault of the batch: ' + String(outcome));
+                assert.equal(await c.Submit(TxnFx.Batch(b => b.SetProperty('a', 'age', 1n)), new ReadSet(), 1n), 2n);
+                await store.dispose();
+            });
+
+            it('every CommitApplied subscriber gets a sealed, immutable batch', async () =>
+            {
+                const store = await open();
+                const c = await Committer.Open(store, TxnFx.Catalog());
+                const submitted = TxnFx.Batch(b =>
+                {
+                    b.CreateNode('a', 'Person');
+                    b.CreateNode('b', 'Person');
+                    b.Link('a', 'friends', 'b', { Properties: new Map([['weight', 1n]]) });
+                });
+                const attempts: string[] = [];
+                c.CommitApplied.Subscribe(e =>
+                {
+                    assert.equal(e.Batch.IsSealed, true);
+                    const tampering = [
+                        (): void => e.Batch.DeleteNode('a'),
+                        (): void => void (e.Batch.Ops() as unknown as unknown[]).pop(),
+                        (): void => void ((e.Batch.Ops()[2] as unknown as { Options: { Properties: Map<string, unknown> } }).Options.Properties).set('weight', 9n),
+                    ];
+                    for (const tamper of tampering)
+                    {
+                        try
+                        {
+                            tamper();
+                            attempts.push('mutated');
+                        }
+                        catch
+                        {
+                            attempts.push('blocked');
+                        }
+                    }
+                });
+                const seen: WriteBatch[] = [];
+                c.CommitApplied.Subscribe(e => seen.push(e.Batch));
+                await c.Submit(submitted, new ReadSet(), 0n);
+                assert.deepEqual(attempts, ['blocked', 'blocked', 'blocked']);
+                assert.deepEqual(seen[0], submitted);
+                await store.dispose();
+            });
+
+            it('dispose rejects queued and later Submits, drops subscribers and is idempotent', async () =>
+            {
+                const store = await open();
+                const c = await Committer.Open(store, TxnFx.Catalog());
+                const events: bigint[] = [];
+                c.CommitApplied.Subscribe(e => events.push(e.Commit));
+                const queued = [TxnFx.People(c, 'a'), TxnFx.People(c, 'b')];
+                c.dispose();
+                c.dispose();
+                for (const o of await Promise.all(queued.map(p => TxnFx.Settle(p))))
+                {
+                    assert.ok(o instanceof Error && !(o instanceof CommitError) && !(o instanceof ConflictError), String(o));
+                }
+                assert.ok((await TxnFx.Settle(c.Submit(new WriteBatch(), new ReadSet(), 0n))) instanceof Error);
+                assert.deepEqual(events, []);
+                assert.equal(c.LastCommit(), 0n);
+                assert.equal(await new Probe(store, TxnFx.Catalog()).Id('a'), undefined);
                 await store.dispose();
             });
 

@@ -12,10 +12,12 @@ export enum CommitErrorCode
     NotInstantiable,
     /** Edge rule violation (wraps EdgeError: duplicate, cardinality, sibling, missing edge, edge property). */
     InvalidEdge,
-    /** Cell value rejected by the column store (type mismatch, null for a non-nullable property). */
+    /** Cell value does not fit the member (type mismatch, null for a non-nullable property). */
     InvalidValue,
     /** Public id empty or longer than 400 UTF-8 bytes. */
     InvalidPublicId,
+    /** A node created by the batch lacks a value for a non-nullable property at the end of the batch (ruling R29). */
+    MissingRequired,
 }
 
 /**

@@ -8,7 +8,7 @@ export class WriteKeySet
     private static readonly Separator = ':';
 
     private readonly seen = new Set<string>();
-    private readonly entries: Array<readonly [Keyspace, Uint8Array]> = [];
+    private readonly entries: Array<readonly [Keyspace, Uint8Array, string]> = [];
 
     public get Size(): number
     {
@@ -17,19 +17,14 @@ export class WriteKeySet
 
     public Add(space: Keyspace, key: Uint8Array): void
     {
-        const id = space + WriteKeySet.Separator + ConflictKeys.Hex(key);
-        if (!this.seen.has(id))
-        {
-            this.seen.add(id);
-            this.entries.push([space, key]);
-        }
+        this.AddEncoded(space, key, ConflictKeys.Hex(key));
     }
 
     public AddAll(other: WriteKeySet): void
     {
-        for (const [space, key] of other.entries)
+        for (const [space, key, hex] of other.entries)
         {
-            this.Add(space, key);
+            this.AddEncoded(space, key, hex);
         }
     }
 
@@ -40,13 +35,23 @@ export class WriteKeySet
         {
             return false;
         }
-        for (const [space, key] of this.entries)
+        for (const [space, key, hex] of this.entries)
         {
-            if (reads.Intersects(space, key))
+            if (reads.IntersectsEncoded(space, key, hex))
             {
                 return true;
             }
         }
         return false;
+    }
+
+    private AddEncoded(space: Keyspace, key: Uint8Array, hex: string): void
+    {
+        const id = space + WriteKeySet.Separator + hex;
+        if (!this.seen.has(id))
+        {
+            this.seen.add(id);
+            this.entries.push([space, key, hex]);
+        }
     }
 }

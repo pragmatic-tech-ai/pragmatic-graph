@@ -37,15 +37,36 @@ class PendingCommit
     /** Internal ids for the batch's CreateNode ops, allocated once and reused across group re-runs. */
     public Ids: bigint[] | undefined;
 
+    /** Resolve/Reject settle once; later calls are no-ops, so a failing group can reject whatever is left. */
+    private settled = false;
+
     public constructor(
         public readonly Bytes: Uint8Array,
         public readonly Batch: WriteBatch,
         public readonly Reads: ReadSet,
         public readonly Snapshot: bigint,
-        public readonly Resolve: (commit: bigint) => void,
-        public readonly Reject: (error: unknown) => void,
+        private readonly resolve: (commit: bigint) => void,
+        private readonly reject: (error: unknown) => void,
     )
     {
+    }
+
+    public Resolve(commit: bigint): void
+    {
+        if (!this.settled)
+        {
+            this.settled = true;
+            this.resolve(commit);
+        }
+    }
+
+    public Reject(error: unknown): void
+    {
+        if (!this.settled)
+        {
+            this.settled = true;
+            this.reject(error);
+        }
     }
 }
 
@@ -98,6 +119,7 @@ export class Committer
     private static readonly ErrSnapshot = 'Snapshot commit is after the last commit: ';
     private static readonly ErrStale = 'Stored last commit does not match the committer (another writer, or not opened with Committer.Open): stored ';
     private static readonly ErrExpected = ', expected ';
+    private static readonly ErrDisposed = 'Committer has been disposed';
     private static readonly ErrInGroup = 'Read set conflicts with an earlier batch of the same commit group';
     private static readonly ErrCompactMember = 'Delta for a member the catalog does not know: ';
 
@@ -114,6 +136,7 @@ export class Committer
     private index: CatalogIndex;
     private allocator: Promise<IdAllocator> | undefined;
     private pumping = false;
+    private disposed = false;
 
     public constructor(private readonly store: IKeyValueStore, catalog: CatalogSnapshot, options?: ICommitterOptions)
     {
@@ -163,6 +186,10 @@ export class Committer
      */
     public Submit(batch: WriteBatch, readSet: ReadSet, snapshotCommit: bigint): Promise<bigint>
     {
+        if (this.disposed)
+        {
+            return Promise.reject(new Error(Committer.ErrDisposed));
+        }
         if (snapshotCommit > this.history.Last || snapshotCommit < 0n)
         {
             return Promise.reject(new RangeError(Committer.ErrSnapshot + snapshotCommit));
@@ -178,7 +205,7 @@ export class Committer
         }
         return new Promise<bigint>((resolve, reject) =>
         {
-            this.queue.push(new PendingCommit(bytes, WriteBatch.Deserialize(bytes), readSet.Clone(), snapshotCommit, resolve, reject));
+            this.queue.push(new PendingCommit(bytes, WriteBatch.Deserialize(bytes).Seal(), readSet.Clone(), snapshotCommit, resolve, reject));
             if (!this.pumping)
             {
                 this.pumping = true;
@@ -187,7 +214,36 @@ export class Committer
         });
     }
 
-    /** Runs groups until the queue is empty. Submits made in the same tick share the first group. */
+    /**
+     * Stops accepting work: every queued Submit not yet in a group and every later Submit rejects;
+     * CommitApplied subscribers are dropped. A group already writing finishes (its commits are durable
+     * and its promises settle) but raises no signal. Idempotent.
+     */
+    public dispose(): void
+    {
+        if (this.disposed)
+        {
+            return;
+        }
+        this.disposed = true;
+        const error = new Error(Committer.ErrDisposed);
+        for (const p of this.queue.splice(0, this.queue.length))
+        {
+            p.Reject(error);
+        }
+        this.CommitApplied.dispose();
+    }
+
+    /** Opens the id allocator; a failed open is not cached, so the next group retries it. */
+    protected OpenAllocator(): Promise<IdAllocator>
+    {
+        return IdAllocator.Open(this.store);
+    }
+
+    /**
+     * Runs groups until the queue is empty. Submits made in the same tick share the first group. A group
+     * that fails unexpectedly rejects its still-pending batches; the queue keeps running.
+     */
     private async Pump(): Promise<void>
     {
         try
@@ -196,7 +252,14 @@ export class Committer
             while (this.queue.length > 0)
             {
                 const group = this.queue.splice(0, this.queue.length);
-                await this.RunGroup(group);
+                try
+                {
+                    await this.RunGroup(group);
+                }
+                catch (error)
+                {
+                    group.forEach(p => p.Reject(error));
+                }
             }
         }
         finally
@@ -268,8 +331,7 @@ export class Committer
                 p.Ids = [];
                 continue;
             }
-            this.allocator ??= IdAllocator.Open(this.store);
-            const allocator = await this.allocator;
+            const allocator = await this.Allocator();
             const ids: bigint[] = [];
             for (const hint of hints)
             {
@@ -277,6 +339,23 @@ export class Committer
             }
             p.Ids = ids;
         }
+    }
+
+    private Allocator(): Promise<IdAllocator>
+    {
+        if (this.allocator === undefined)
+        {
+            const opening = this.OpenAllocator();
+            this.allocator = opening;
+            opening.catch(() =>
+            {
+                if (this.allocator === opening)
+                {
+                    this.allocator = undefined;
+                }
+            });
+        }
+        return this.allocator;
     }
 
     private async ApplyGroup(txn: IWriteTransaction, index: CatalogIndex, candidates: readonly PendingCommit[]): Promise<IGroupOutcome>
@@ -368,7 +447,8 @@ export class Committer
             const n = commits[i] as bigint;
             try
             {
-                this.CommitApplied.Raise({ Commit: n, Batch: WriteBatch.Deserialize(a.Pending.Bytes) });
+                // One sealed, frozen batch: no subscriber can change what the others (or the submitter's copy) see.
+                this.CommitApplied.Raise({ Commit: n, Batch: a.Pending.Batch });
             }
             catch
             {

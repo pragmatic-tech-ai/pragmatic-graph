@@ -82,14 +82,35 @@ export class ConflictHistory
         {
             return new ConflictError(ConflictHistory.ErrTooOld + snapshot);
         }
-        for (const entry of this.entries)
+        for (let i = this.FirstAfter(snapshot); i < this.entries.length; i++)
         {
-            if (entry.Commit > snapshot && entry.Keys.Intersects(reads))
+            const entry = this.entries[i]!;
+            if (entry.Keys.Intersects(reads))
             {
                 return new ConflictError(ConflictHistory.ErrConflict + entry.Commit + ConflictHistory.ErrAfter + snapshot + ConflictHistory.ErrClose);
             }
         }
         return undefined;
+    }
+
+    /** Index of the first entry with Commit > snapshot (entries are in commit order): binary search. */
+    private FirstAfter(snapshot: bigint): number
+    {
+        let lo = 0;
+        let hi = this.entries.length;
+        while (lo < hi)
+        {
+            const mid = (lo + hi) >>> 1;
+            if (this.entries[mid]!.Commit > snapshot)
+            {
+                hi = mid;
+            }
+            else
+            {
+                lo = mid + 1;
+            }
+        }
+        return lo;
     }
 
     /** Records the next commit (Last + 1) with its write set. */

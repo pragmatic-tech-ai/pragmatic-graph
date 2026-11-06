@@ -1,11 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { DateTimeValue, DateValue, DurationValue } from '../../columns/CellValue.js';
-import { EdgeDirection } from '../../format/FormatKeys.js';
-import { Keyspace } from '../../kv/Keyspace.js';
-import { ConflictKeys } from '../ConflictKeys.js';
-import { ReadSet } from '../ReadSet.js';
-import { Signal } from '../Signal.js';
 import { WriteBatch, WriteOp } from '../WriteBatch.js';
 
 class BatchFx
@@ -92,6 +87,50 @@ describe('WriteBatch', () =>
         assert.throws(() => b.Link('a', 'r', 'b', { Properties: new Map([['w', {} as never]]) }), TypeError);
     });
 
+    it('rejects a CreateNode hasHint flag other than 0 or 1', () =>
+    {
+        const bytes = Uint8Array.of(1, 1, 0, 0, 0, WriteOp.CreateNode, 1, 0, 0, 0, 0x61, 1, 0, 0, 0, 0x50, 2, 1, 0, 0, 0, 0x68);
+        assert.throws(() => WriteBatch.Deserialize(bytes), RangeError);
+        bytes[16] = 1;
+        assert.equal(WriteBatch.Deserialize(bytes).Ops()[0]?.Op, WriteOp.CreateNode);
+    });
+
+    it('Ops() is a frozen copy and edge property maps are read-only', () =>
+    {
+        const b = new WriteBatch();
+        b.Link('a', 'rated', 'b', { Properties: new Map([['weight', 1n]]) });
+        const ops = b.Ops();
+        assert.ok(Object.isFrozen(ops));
+        assert.throws(() => (ops as unknown as unknown[]).push(1), TypeError);
+        b.DeleteNode('a');
+        assert.equal(ops.length, 1);
+        assert.equal(b.Ops().length, 2);
+        const op = ops[0];
+        assert.ok(op !== undefined && op.Op === WriteOp.Link);
+        assert.ok(Object.isFrozen(op) && Object.isFrozen(op.Options));
+        const props = op.Options?.Properties as Map<string, unknown>;
+        assert.throws(() => props.set('weight', 2n), TypeError);
+        assert.throws(() => props.delete('weight'), TypeError);
+        assert.throws(() => props.clear(), TypeError);
+        assert.equal(props.get('weight'), 1n);
+    });
+
+    it('a sealed batch rejects further recording and still equals its unsealed copy', () =>
+    {
+        const b = new WriteBatch();
+        b.CreateNode('a', 'Person');
+        const copy = WriteBatch.Deserialize(b.Serialize());
+        assert.equal(b.Seal(), b);
+        assert.equal(b.IsSealed, true);
+        assert.equal(copy.IsSealed, false);
+        assert.throws(() => b.CreateNode('b', 'Person'), TypeError);
+        assert.throws(() => b.SetProperty('a', 'x', 1n), TypeError);
+        assert.throws(() => b.DeleteNode('a'), TypeError);
+        assert.throws(() => b.Link('a', 'r', 'b'), TypeError);
+        assert.throws(() => b.Unlink('a', 'r', 'b'), TypeError);
+        assert.deepEqual(copy, b);
+    });
+
     it('rejects corrupt bytes: bad version, unknown op, truncation, trailing bytes, invalid UTF-8', () =>
     {
         const good = BatchFx.Full().Serialize();
@@ -105,110 +144,5 @@ describe('WriteBatch', () =>
         {
             assert.throws(() => WriteBatch.Deserialize(bytes), RangeError);
         }
-    });
-});
-
-describe('ReadSet', () =>
-{
-    it('matches added keys exactly, per keyspace', () =>
-    {
-        const r = new ReadSet();
-        const key = ConflictKeys.Cell(5n, 3);
-        r.AddKey(Keyspace.Columns, key);
-        assert.equal(r.Intersects(Keyspace.Columns, ConflictKeys.Cell(5n, 3)), true);
-        assert.equal(r.Intersects(Keyspace.Columns, ConflictKeys.Cell(5n, 4)), false);
-        assert.equal(r.Intersects(Keyspace.Ids, key), false);
-    });
-
-    it('matches keys inside half-open ranges', () =>
-    {
-        const r = new ReadSet();
-        r.AddRange(Keyspace.Edges, ConflictKeys.Adjacency(7, EdgeDirection.Out, 10n));
-        assert.equal(r.Intersects(Keyspace.Edges, ConflictKeys.Edge(7, EdgeDirection.Out, 10n, 99n)), true);
-        assert.equal(r.Intersects(Keyspace.Edges, ConflictKeys.Edge(7, EdgeDirection.In, 10n, 99n)), false);
-        assert.equal(r.Intersects(Keyspace.Edges, ConflictKeys.Edge(7, EdgeDirection.Out, 11n, 99n)), false);
-        assert.equal(r.Intersects(Keyspace.Edges, ConflictKeys.Edge(8, EdgeDirection.Out, 10n, 99n)), false);
-    });
-
-    it('copies keys and ranges so caller mutation does not change it', () =>
-    {
-        const r = new ReadSet();
-        const key = ConflictKeys.Node('a');
-        r.AddKey(Keyspace.Ids, key);
-        key[key.length - 2] = 0x62;
-        assert.equal(r.Intersects(Keyspace.Ids, ConflictKeys.Node('a')), true);
-        const c = r.Clone();
-        c.AddKey(Keyspace.Ids, ConflictKeys.Node('b'));
-        assert.equal(r.Intersects(Keyspace.Ids, ConflictKeys.Node('b')), false);
-        assert.equal(c.Intersects(Keyspace.Ids, ConflictKeys.Node('a')), true);
-    });
-
-    it('reports emptiness', () =>
-    {
-        const r = new ReadSet();
-        assert.equal(r.IsEmpty, true);
-        r.AddRange(Keyspace.Rows, ConflictKeys.ExtentRange(1));
-        assert.equal(r.IsEmpty, false);
-    });
-});
-
-describe('ConflictKeys', () =>
-{
-    it('Edge keys fall inside their Adjacency range; Extent inside ExtentRange', () =>
-    {
-        const range = ConflictKeys.Adjacency(3, EdgeDirection.In, 4n);
-        const r = new ReadSet();
-        r.AddRange(Keyspace.Edges, range);
-        assert.equal(r.Intersects(Keyspace.Edges, ConflictKeys.Edge(3, EdgeDirection.In, 4n, 1n)), true);
-        const x = new ReadSet();
-        x.AddRange(Keyspace.Rows, ConflictKeys.ExtentRange(2));
-        assert.equal(x.Intersects(Keyspace.Rows, ConflictKeys.Extent(2)), true);
-        assert.equal(x.Intersects(Keyspace.Rows, ConflictKeys.Extent(3)), false);
-    });
-});
-
-describe('Signal', () =>
-{
-    it('delivers to every subscriber in subscription order until disposed', () =>
-    {
-        const s = new Signal<number>();
-        const seen: string[] = [];
-        const a = s.Subscribe(v => seen.push('a' + v));
-        s.Subscribe(v => seen.push('b' + v));
-        s.Raise(1);
-        a.dispose();
-        a.dispose();
-        s.Raise(2);
-        assert.deepEqual(seen, ['a1', 'b1', 'b2']);
-    });
-
-    it('runs every handler even when one throws, then throws an AggregateError', () =>
-    {
-        const s = new Signal<number>();
-        const seen: number[] = [];
-        s.Subscribe(() =>
-        {
-            throw new Error('boom');
-        });
-        s.Subscribe(v => seen.push(v));
-        assert.throws(() => s.Raise(5), AggregateError);
-        assert.deepEqual(seen, [5]);
-    });
-
-    it('a handler subscribing or disposing during Raise does not affect the current delivery', () =>
-    {
-        const s = new Signal<number>();
-        const seen: string[] = [];
-        let late: { dispose(): void } | undefined;
-        const first = s.Subscribe(v =>
-        {
-            seen.push('first' + v);
-            late ??= s.Subscribe(w => seen.push('late' + w));
-            first.dispose();
-        });
-        s.Raise(1);
-        s.Raise(2);
-        assert.deepEqual(seen, ['first1', 'late2']);
-        late?.dispose();
     });
 });

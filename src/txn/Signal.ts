@@ -12,11 +12,18 @@ export interface ISubscription
 export class Signal<T>
 {
     private static readonly ErrHandlers = 'One or more signal handlers threw';
+    private static readonly ErrDisposed = 'Signal has been disposed';
 
     private handlers: ReadonlyArray<(value: T) => void> = [];
+    private disposed = false;
 
+    /** Throws once the signal is disposed: a disposed source never raises again. */
     public Subscribe(handler: (value: T) => void): ISubscription
     {
+        if (this.disposed)
+        {
+            throw new Error(Signal.ErrDisposed);
+        }
         // A fresh wrapper per subscription so the same function subscribed twice is two subscriptions.
         const entry = (value: T): void => handler(value);
         this.handlers = [...this.handlers, entry];
@@ -26,6 +33,13 @@ export class Signal<T>
                 this.handlers = this.handlers.filter(h => h !== entry);
             },
         };
+    }
+
+    /** Drops every handler; later Raise calls deliver to nobody. Idempotent. */
+    public dispose(): void
+    {
+        this.disposed = true;
+        this.handlers = [];
     }
 
     public Raise(value: T): void

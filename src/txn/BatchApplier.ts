@@ -1,10 +1,11 @@
 import { CatalogError, CatalogErrorCode } from '../catalog/CatalogError.js';
 import type { MemberDef } from '../catalog/CatalogTypes.js';
 import { CatalogSnapshot } from '../catalog/CatalogSnapshot.js';
-import { MemberKind } from '../catalog/ValueType.js';
+import { MemberKind, ValueType } from '../catalog/ValueType.js';
 import type { CellValue } from '../columns/CellValue.js';
 import { ChunkCodecError } from '../columns/ChunkCodecError.js';
 import type { ColumnStore } from '../columns/ColumnStore.js';
+import { ValueCodec } from '../columns/ValueCodec.js';
 import { EdgeError, EdgeErrorCode } from '../edges/EdgeError.js';
 import type { EdgeStore, ILinkOptions } from '../edges/EdgeStore.js';
 import { EdgeDirection } from '../format/FormatKeys.js';
@@ -27,6 +28,14 @@ interface INode
     readonly Concept: string;
 }
 
+/** A node created by the batch being applied, with the members the batch has set on it so far. */
+interface ICreatedNode
+{
+    readonly PublicId: string;
+    readonly Concept: string;
+    readonly Set: Set<number>;
+}
+
 /**
  * Applies one WriteBatch's operations, in order, inside the committer's write transaction (so each
  * operation sees the batch's earlier ones) and returns the batch's logical write-key set (ruling R23).
@@ -43,6 +52,8 @@ export class BatchApplier
     private static readonly ErrNotRelationship = 'Member is not a relationship: ';
     private static readonly ErrTarget = 'Target concept is not admitted by the relationship: ';
     private static readonly ErrValue = 'Invalid value for ';
+    private static readonly ErrNull = 'Null is not allowed for ';
+    private static readonly ErrRequired = 'Created node is missing a required property: ';
     private static readonly ErrEdge = 'Edge rejected: ';
     private static readonly ErrSibling = 'Sibling is not a target of this relationship from the source: ';
     private static readonly ErrPublicId = 'Public id must be 1..400 UTF-8 bytes: ';
@@ -68,10 +79,15 @@ export class BatchApplier
         return batch.Ops().filter((op): op is ICreateNodeOp => op.Op === WriteOp.CreateNode).map(op => op.ClusterHint);
     }
 
-    /** `allocated` holds one fresh internal id per CreateNode op, in op order (see CreateHints). */
+    /**
+     * `allocated` holds one fresh internal id per CreateNode op, in op order (see CreateHints). Every node
+     * the batch creates (and does not delete again) must have each non-nullable property set by the
+     * end of the batch (ruling R29), else MissingRequired.
+     */
     public async Apply(txn: IWriteTransaction, batch: WriteBatch, allocated: readonly bigint[]): Promise<WriteKeySet>
     {
         const keys = new WriteKeySet();
+        const created = new Map<bigint, ICreatedNode>();
         let nextId = 0;
         for (const op of batch.Ops())
         {
@@ -84,14 +100,18 @@ export class BatchApplier
                     {
                         throw new Error(BatchApplier.ErrIdsExhausted);
                     }
-                    await this.CreateNode(txn, op, id, keys);
+                    const concept = await this.CreateNode(txn, op, id, keys);
+                    created.set(id, { PublicId: op.PublicId, Concept: concept, Set: new Set() });
                     break;
                 }
                 case WriteOp.SetProperty:
-                    await this.SetProperty(txn, op, keys);
+                {
+                    const set = await this.SetProperty(txn, op, keys);
+                    created.get(set.Node)?.Set.add(set.Member);
                     break;
+                }
                 case WriteOp.DeleteNode:
-                    await this.DeleteNode(txn, op, keys);
+                    created.delete(await this.DeleteNode(txn, op, keys));
                     break;
                 case WriteOp.Link:
                     await this.Link(txn, op, keys);
@@ -101,10 +121,27 @@ export class BatchApplier
                     break;
             }
         }
+        for (const node of created.values())
+        {
+            this.RequireComplete(node);
+        }
         return keys;
     }
 
-    private async CreateNode(txn: IWriteTransaction, op: ICreateNodeOp, id: bigint, keys: WriteKeySet): Promise<void>
+    /** R29: each non-nullable property of a newly created node was given a value by the batch. */
+    private RequireComplete(node: ICreatedNode): void
+    {
+        for (const m of this.index.Catalog.EffectiveMembers(node.Concept))
+        {
+            if (m.Kind === MemberKind.Property && !m.Nullable && !node.Set.has(m.Id))
+            {
+                throw new CommitError(CommitErrorCode.MissingRequired, BatchApplier.ErrRequired + node.PublicId + BatchApplier.Dot + m.Name);
+            }
+        }
+    }
+
+    /** Returns the created node's concept. */
+    private async CreateNode(txn: IWriteTransaction, op: ICreateNodeOp, id: bigint, keys: WriteKeySet): Promise<string>
     {
         BatchApplier.RequirePublicId(op.PublicId);
         const typeId = BatchApplier.Catalog(() => this.index.Catalog.RequireInstantiable(op.Concept));
@@ -120,9 +157,11 @@ export class BatchApplier
         keys.Add(ConflictKeys.NodeSpace, ConflictKeys.Node(op.PublicId));
         keys.Add(ConflictKeys.CellSpace, ConflictKeys.Cell(id, CatalogSnapshot.NodeIdMember.Id));
         keys.Add(ConflictKeys.ExtentSpace, ConflictKeys.Extent(typeId));
+        return op.Concept;
     }
 
-    private async SetProperty(txn: IWriteTransaction, op: ISetPropertyOp, keys: WriteKeySet): Promise<void>
+    /** Returns the node and member written. */
+    private async SetProperty(txn: IWriteTransaction, op: ISetPropertyOp, keys: WriteKeySet): Promise<{ Node: bigint; Member: number }>
     {
         const node = await this.Locate(txn, op.PublicId);
         const member = BatchApplier.Catalog(() => this.index.Catalog.Member(node.Concept, op.Member));
@@ -130,11 +169,14 @@ export class BatchApplier
         {
             throw new CommitError(CommitErrorCode.NotAProperty, BatchApplier.ErrNotProperty + node.Concept + BatchApplier.Dot + op.Member);
         }
-        await this.WriteValue(txn, node, member, op.Value);
+        BatchApplier.RequireValue(node, member, op.Value);
+        await this.columns.WriteCell(txn, node.Location, member, op.Value);
         keys.Add(ConflictKeys.CellSpace, ConflictKeys.Cell(node.Id, member.Id));
+        return { Node: node.Id, Member: member.Id };
     }
 
-    private async DeleteNode(txn: IWriteTransaction, op: IDeleteNodeOp, keys: WriteKeySet): Promise<void>
+    /** Returns the deleted node's internal id. */
+    private async DeleteNode(txn: IWriteTransaction, op: IDeleteNodeOp, keys: WriteKeySet): Promise<bigint>
     {
         const node = await this.Locate(txn, op.PublicId);
         const members = this.index.Catalog.EffectiveMembers(node.Concept);
@@ -164,6 +206,7 @@ export class BatchApplier
         {
             keys.Add(ConflictKeys.CellSpace, ConflictKeys.Cell(node.Id, m.Id));
         }
+        return node.Id;
     }
 
     private async Link(txn: IWriteTransaction, op: ILinkOp, keys: WriteKeySet): Promise<void>
@@ -236,17 +279,31 @@ export class BatchApplier
         return out;
     }
 
-    private async WriteValue(txn: IWriteTransaction, node: INode, member: MemberDef, value: CellValue): Promise<void>
+    /**
+     * Checks the value against the member before anything is written, so that errors the column store
+     * raises afterwards (corrupt stored deltas, slot or partition range errors) are storage failures and
+     * pass through unmapped rather than being blamed on the batch.
+     */
+    private static RequireValue(node: INode, member: MemberDef, value: CellValue): void
     {
+        const label = node.Concept + BatchApplier.Dot + member.Name;
+        if (value === null)
+        {
+            if (!member.Nullable)
+            {
+                throw new CommitError(CommitErrorCode.InvalidValue, BatchApplier.ErrNull + label);
+            }
+            return;
+        }
         try
         {
-            await this.columns.WriteCell(txn, node.Location, member, value);
+            ValueCodec.Check(member.Type as ValueType, value);
         }
         catch (error)
         {
-            if (error instanceof ChunkCodecError || error instanceof RangeError)
+            if (error instanceof ChunkCodecError)
             {
-                throw new CommitError(CommitErrorCode.InvalidValue, BatchApplier.ErrValue + node.Concept + BatchApplier.Dot + member.Name, error);
+                throw new CommitError(CommitErrorCode.InvalidValue, BatchApplier.ErrValue + label, error);
             }
             throw error;
         }
@@ -283,7 +340,8 @@ export class BatchApplier
         }
         catch (error)
         {
-            if (error instanceof EdgeError)
+            // CorruptEdge is damaged stored data, not a rule the batch broke: let it pass through.
+            if (error instanceof EdgeError && error.Code !== EdgeErrorCode.CorruptEdge)
             {
                 throw new CommitError(CommitErrorCode.InvalidEdge, BatchApplier.ErrEdge + BatchApplier.Label(from, rel, to) + BatchApplier.Colon + error.message, error);
             }

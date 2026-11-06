@@ -60,6 +60,50 @@ export interface IUnlinkOp
 
 export type BatchOp = ICreateNodeOp | ISetPropertyOp | IDeleteNodeOp | ILinkOp | IUnlinkOp;
 
+/** A Map that rejects every mutation once constructed; edge properties of recorded ops are held in one. */
+class FrozenMap<K, V> extends Map<K, V>
+{
+    private static readonly ErrFrozen = 'Recorded edge properties are read-only';
+
+    #locked = false;
+
+    public constructor(entries: Iterable<readonly [K, V]>)
+    {
+        super();
+        for (const [k, v] of entries)
+        {
+            super.set(k, v);
+        }
+        this.#locked = true;
+    }
+
+    public override set(key: K, value: V): this
+    {
+        this.RequireUnlocked();
+        return super.set(key, value);
+    }
+
+    public override delete(key: K): boolean
+    {
+        this.RequireUnlocked();
+        return super.delete(key);
+    }
+
+    public override clear(): void
+    {
+        this.RequireUnlocked();
+        super.clear();
+    }
+
+    private RequireUnlocked(): void
+    {
+        if (this.#locked)
+        {
+            throw new TypeError(FrozenMap.ErrFrozen);
+        }
+    }
+}
+
 /** Growable little-endian byte buffer for Serialize. */
 class ByteWriter
 {
@@ -196,20 +240,42 @@ export class WriteBatch
     private static readonly ErrOp = 'Corrupt write batch: unknown op ';
     private static readonly ErrTag = 'Corrupt write batch: unknown value tag ';
     private static readonly ErrFlags = 'Corrupt write batch: unknown link option flags ';
+    private static readonly ErrHasHint = 'Corrupt write batch: CreateNode hint flag must be 0 or 1, got ';
+    private static readonly ErrSealed = 'Write batch is sealed: no further operations can be recorded';
     private static readonly ErrDuplicateProperty = 'Corrupt write batch: duplicate edge property ';
     private static readonly ErrValueBytes = 'Corrupt write batch: invalid value bytes';
 
     private readonly ops: BatchOp[] = [];
+    // ES private fields: not own enumerable properties, so a sealed batch still deep-equals its unsealed copy.
+    #sealed = false;
+    #view: readonly BatchOp[] | undefined;
 
     public get Count(): number
     {
         return this.ops.length;
     }
 
-    /** The recorded operations in order (frozen). */
+    /** True once Seal() was called: the batch can no longer change. */
+    public get IsSealed(): boolean
+    {
+        return this.#sealed;
+    }
+
+    /**
+     * The recorded operations in order: a frozen array of frozen ops (edge property maps are read-only),
+     * unaffected by operations recorded later.
+     */
     public Ops(): readonly BatchOp[]
     {
-        return this.ops;
+        this.#view ??= Object.freeze([...this.ops]);
+        return this.#view;
+    }
+
+    /** Makes the batch immutable: every later record call throws TypeError. Returns this. */
+    public Seal(): this
+    {
+        this.#sealed = true;
+        return this;
     }
 
     public CreateNode(publicId: string, concept: string, clusterHint?: string): void
@@ -332,13 +398,18 @@ export class WriteBatch
             {
                 const publicId = r.Text();
                 const concept = r.Text();
-                if (r.U8() === 0)
+                const hasHint = r.U8();
+                if (hasHint === 0)
                 {
                     batch.CreateNode(publicId, concept);
                 }
-                else
+                else if (hasHint === 1)
                 {
                     batch.CreateNode(publicId, concept, r.Text());
+                }
+                else
+                {
+                    throw new RangeError(WriteBatch.ErrHasHint + hasHint);
                 }
                 return;
             }
@@ -553,20 +624,23 @@ export class WriteBatch
         }
         if (options.Properties !== undefined)
         {
-            const properties = new Map<string, CellValue>();
             for (const [name, value] of options.Properties)
             {
                 WriteBatch.RequireText(name);
                 WriteBatch.RequireValue(value);
-                properties.set(name, value);
             }
-            copy.Properties = properties;
+            copy.Properties = new FrozenMap(options.Properties);
         }
         return Object.freeze(copy);
     }
 
     private Push(op: BatchOp): void
     {
+        if (this.#sealed)
+        {
+            throw new TypeError(WriteBatch.ErrSealed);
+        }
+        this.#view = undefined;
         this.ops.push(Object.freeze(op));
     }
 }
