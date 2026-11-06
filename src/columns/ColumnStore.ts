@@ -130,6 +130,10 @@ export class ColumnStore
                     state.Slots.set(typeId, count);
                 }
                 return state.Slots.get(typeId) as number;
+            }, (error: unknown) =>
+            {
+                state.SlotLoads.delete(typeId);
+                throw error;
             });
             state.SlotLoads.set(typeId, loading);
         }
@@ -362,6 +366,10 @@ export class ColumnStore
                 }
                 state.Deltas.set(id, loaded);
                 return loaded;
+            }, (error: unknown) =>
+            {
+                state.DeltaLoads.delete(id);
+                throw error;
             });
             state.DeltaLoads.set(id, loading);
         }

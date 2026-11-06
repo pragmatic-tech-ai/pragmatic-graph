@@ -25,7 +25,7 @@ This document is the contract between the TypeScript engine and the future Rust 
 | `rows` | `(partition, block: u64)` | row block |
 | `columns` | `(partition, typeId, memberId, chunk: u64)` | column chunk |
 | `deltas` | `(partition, typeId, memberId, chunk: u64)` | delta |
-| `edges` | `(partition, relationshipId, direction, node: u64, position: bytes, other: u64)` | edge payload (empty in v1 unless a later task defines properties) |
+| `edges` | `(partition, relationshipId, direction, node: u64, position: bytes, other: u64)` | Out: edge-property list; In: empty (see Edges) |
 | `log` | `(commit: u64)` | log entry |
 
 ### Meta
@@ -154,6 +154,10 @@ The `value` bytes are the single-value layout defined under Columns (Single valu
 ### Edges
 
 Key `(partition, relationshipId, direction, node, position, other)` where `direction` is `0` = Out, `1` = In and `position` is a `FractionalPosition` byte string (tuple byte-string element). Every edge is written twice: once as Out under its source node and once as In under its target node. For one `(partition, relationshipId, direction, node)` prefix, keys sort by `position` then `other`. All edges of a node and direction form the range `[prefix, PrefixEnd(prefix))`, built by `FormatKeys.EdgeRange`.
+
+The Out key on the source is `(partition, relationshipId, 0, from, position, to)` and the In key on the target is `(partition, relationshipId, 1, to, position, from)`; both carry the same position. Unordered relationships use the empty position (zero-length byte string); ordered ones use a `FractionalPosition`. A `(from, relationship, to)` pair links at most once, and a relationship without `Many` allows one Out edge per source.
+
+**Out value** (edge properties): for each non-null property, sorted by member id ascending, `memberId: u32 LE`, `length: u32 LE`, then `length` bytes of single-value encoding (the Columns single value layout for the property type). Null and absent properties are not stored; an edge with no properties has an empty value. **In value**: empty; In-direction reads fetch properties from the matching Out key.
 
 ### Log
 

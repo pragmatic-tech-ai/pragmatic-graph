@@ -9,7 +9,7 @@ import type { MemberDef } from '../../catalog/CatalogTypes.js';
 import { FormatKeys } from '../../format/FormatKeys.js';
 import type { Location } from '../../identity/Location.js';
 import { InternalId } from '../../identity/InternalId.js';
-import type { IKeyValueStore, IWriteTransaction } from '../../kv/KeyValue.js';
+import type { IKeyRange, IKeyValueStore, IReadTransaction, IWriteTransaction } from '../../kv/KeyValue.js';
 import { Keyspace } from '../../kv/Keyspace.js';
 import { LmdbStore } from '../../kv/lmdb/LmdbStore.js';
 import { MemoryStore } from '../../kv/memory/MemoryStore.js';
@@ -17,6 +17,75 @@ import { CellValue, DateTimeValue } from '../CellValue.js';
 import { ChunkCodec } from '../ChunkCodec.js';
 import { ColumnStore } from '../ColumnStore.js';
 import { Compactor } from '../Compactor.js';
+
+/** A write transaction whose next Get rejects once (set through the owning FlakyStore). */
+class FlakyTxn implements IWriteTransaction
+{
+    public constructor(private readonly inner: IWriteTransaction, private readonly owner: FlakyStore)
+    {
+    }
+
+    public Get(space: Keyspace, key: Uint8Array): Promise<Uint8Array | undefined>
+    {
+        return this.owner.TakeFailure() ? Promise.reject(new Error('flaky')) : this.inner.Get(space, key);
+    }
+
+    public Scan(space: Keyspace, range: IKeyRange, limit?: number): AsyncIterable<[Uint8Array, Uint8Array]>
+    {
+        return this.inner.Scan(space, range, limit);
+    }
+
+    public Put(space: Keyspace, key: Uint8Array, value: Uint8Array): void
+    {
+        this.inner.Put(space, key, value);
+    }
+
+    public Delete(space: Keyspace, key: Uint8Array): void
+    {
+        this.inner.Delete(space, key);
+    }
+
+    public dispose(): void
+    {
+        this.inner.dispose();
+    }
+}
+
+class FlakyStore implements IKeyValueStore
+{
+    private failNext = false;
+
+    public constructor(private readonly inner: IKeyValueStore)
+    {
+    }
+
+    public FailNextGet(): void
+    {
+        this.failNext = true;
+    }
+
+    public TakeFailure(): boolean
+    {
+        const fail = this.failNext;
+        this.failNext = false;
+        return fail;
+    }
+
+    public BeginRead(): Promise<IReadTransaction>
+    {
+        return this.inner.BeginRead();
+    }
+
+    public Write<T>(work: (txn: IWriteTransaction) => Promise<T>): Promise<T>
+    {
+        return this.inner.Write(txn => work(new FlakyTxn(txn, this)));
+    }
+
+    public dispose(): Promise<void>
+    {
+        return this.inner.dispose();
+    }
+}
 
 class ColumnFx
 {
@@ -514,6 +583,25 @@ class ColumnFx
                 assert.equal(await cs.ReadCell(r, ColumnFx.Loc(1), ColumnFx.NameMember), 'b');
                 r.dispose();
                 await store.dispose();
+            });
+
+            it('a rejected in-flight load is not cached: SlotCount and WriteCell retry on the same txn', async () =>
+            {
+                const inner = await open();
+                const store = new FlakyStore(inner);
+                const cs = new ColumnStore();
+                await store.Write(async txn =>
+                {
+                    store.FailNextGet();
+                    await assert.rejects(cs.SlotCount(txn, 0, ColumnFx.Type));
+                    assert.equal(await cs.AllocateSlot(txn, 0, ColumnFx.Type), 0);
+                    store.FailNextGet();
+                    await assert.rejects(cs.WriteCell(txn, ColumnFx.Loc(0), ColumnFx.AgeMember, 3n));
+                    await cs.WriteCell(txn, ColumnFx.Loc(0), ColumnFx.AgeMember, 3n);
+                    assert.equal(await cs.ReadCell(txn, ColumnFx.Loc(0), ColumnFx.AgeMember), 3n);
+                    cs.Flush(txn);
+                });
+                await inner.dispose();
             });
 
             it('stores the largest internal id (2^63-1) in the node-id column', async () =>
