@@ -1,3 +1,4 @@
+import type { AccessScope } from './access/AccessScope.js';
 import type { CatalogSnapshot } from './catalog/CatalogSnapshot.js';
 import { CatalogStore } from './catalog/CatalogStore.js';
 import { ColumnStore } from './columns/ColumnStore.js';
@@ -62,6 +63,8 @@ export class GraphContext
     public readonly Indexes = new IndexStore(this.Columns, this.Ids);
 
     private readonly open = new Set<IGraphDisposable>();
+    /** Per scope, the catalog version it was last validated against (ruling R63). */
+    private readonly validated = new WeakMap<AccessScope, number>();
     private index: CatalogIndex;
 
     public constructor(public readonly Store: IKeyValueStore, public readonly Committer: Committer, catalog: CatalogSnapshot)
@@ -106,6 +109,17 @@ export class GraphContext
             handle?.dispose();
             throw error;
         }
+    }
+
+    /** Validates the scope's names against `catalog` once per (scope, catalog version); see AccessScope.Validate. */
+    public ValidateScope(scope: AccessScope, catalog: CatalogSnapshot): void
+    {
+        if (this.validated.get(scope) === catalog.Version)
+        {
+            return;
+        }
+        scope.Validate(catalog);
+        this.validated.set(scope, catalog.Version);
     }
 
     public Track(reader: IGraphDisposable): void

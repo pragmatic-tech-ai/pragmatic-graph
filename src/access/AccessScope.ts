@@ -1,3 +1,5 @@
+import { CatalogError } from '../catalog/CatalogError.js';
+import type { CatalogSnapshot } from '../catalog/CatalogSnapshot.js';
 import { GraphError, GraphErrorCode } from '../errors/GraphError.js';
 import type { Predicate } from '../predicate/Predicate.js';
 
@@ -32,11 +34,15 @@ export interface IAccessScopeOptions
  * What one reader or transaction may see and write, declared in engine terms only (concepts, aspects,
  * members, predicates): the engine knows nothing about who the scope is for (spec section 7). Decided
  * outside, enforced inside: every GraphReader and GraphTransaction carries one. Immutable; Build copies
- * its maps. Names the catalog does not know never apply (a scope may outlive a schema version).
+ * its maps. Every name must be known to the catalog a reader opens on (GraphStore.BeginRead and Begin
+ * validate it, ruling R63).
  */
 export class AccessScope
 {
     private static readonly ErrDefault = 'AccessScope Default must be an AccessDefault: ';
+    private static readonly ErrUnknownName = 'AccessScope names an unknown concept or aspect: ';
+    private static readonly ErrUnknownMember = 'AccessScope hides a member that is not effective on its key: ';
+    private static readonly Dot = '.';
     private static readonly NoRows: ReadonlyMap<string, Predicate> = new Map();
     private static readonly NoHidden: ReadonlyMap<string, ReadonlySet<string>> = new Map();
     private static readonly NoWrites: ReadonlyMap<string, IWriteRules> = new Map();
@@ -76,6 +82,43 @@ export class AccessScope
             writes.set(name, Object.freeze({ ...rules }));
         }
         return new AccessScope(options.Default, new Map(options.Rows ?? AccessScope.NoRows), hidden, writes);
+    }
+
+    /**
+     * @internal Throws GraphError InvalidArgument, naming the bad key, unless every Rows, Hidden and Writes
+     * key is a concept or aspect of `catalog` and every Hidden member is a member of its key (own,
+     * inherited or included, as CatalogSnapshot.MemberOf).
+     */
+    public Validate(catalog: CatalogSnapshot): void
+    {
+        for (const keys of [this.Rows.keys(), this.Hidden.keys(), this.Writes.keys()])
+        {
+            for (const key of keys)
+            {
+                if (!catalog.Has(key))
+                {
+                    throw new GraphError(GraphErrorCode.InvalidArgument, AccessScope.ErrUnknownName + key);
+                }
+            }
+        }
+        for (const [key, members] of this.Hidden)
+        {
+            for (const member of members)
+            {
+                try
+                {
+                    catalog.MemberOf(key, member);
+                }
+                catch (error)
+                {
+                    if (error instanceof CatalogError)
+                    {
+                        throw new GraphError(GraphErrorCode.InvalidArgument, AccessScope.ErrUnknownMember + key + AccessScope.Dot + member, error);
+                    }
+                    throw error;
+                }
+            }
+        }
     }
 
     /**

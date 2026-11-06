@@ -18,17 +18,32 @@ class NodeFacts
 }
 
 /**
+ * One top-level visibility decision (one public read asking about one node): the nodes it is deciding
+ * (its cycle guard) and how often the guard was hit. Never shared between decisions, so concurrent
+ * reads on one reader cannot see each other's in-progress nodes.
+ */
+class Evaluation
+{
+    public readonly Deciding = new Set<bigint>();
+    public GuardHits = 0;
+}
+
+/**
  * Internal: decides, for one reader or transaction, which nodes its AccessScope lets it see and which
  * members it hides. Applicable entries for a node are those keyed by its concept, an ancestor or a
  * carried aspect (CatalogSnapshot.IsA); the node is visible iff every applicable Rows predicate is True
  * (Kleene logic, Unknown collapsed to not visible at the top), and Default decides when none applies.
  *
  * Every read goes through the reader's RecordedReads (unscoped, recorded): visibility is a read and
- * lands in a transaction's ReadSet. Related evaluates its Target on visible neighbors only, under the
- * same scope; a node whose visibility is asked while it is being decided counts as not visible (cycle
- * guard). Reachable sets are computed once per evaluator (BFS through unscoped edges) and cached, as
- * are per-concept applicable entries and visibility results that did not depend on the cycle guard.
- * The snapshot never changes under a reader (R30), so cached results stay correct for its lifetime.
+ * lands in a transaction's ReadSet. Related is the Kleene Or, over the neighbors, of (neighbor visible
+ * AND Target), under the same scope. Each top-level decision carries its own Evaluation: a node whose
+ * visibility is asked again while that decision is deciding it is Unknown (cycle guard), which stays
+ * Unknown under Not and collapses to not visible at the top, so cyclic rules terminate and never grant
+ * through the cycle. Reachable sets are computed once per evaluator (BFS through unscoped edges) and
+ * cached, as are per-concept applicable entries and visibility results that did not depend on a guard
+ * hit (only those are facts about the node rather than about one decision). The snapshot never changes
+ * under a reader (R30), so cached results stay correct for its lifetime; the cache holds one boolean
+ * per node actually decided.
  */
 export class ScopeEvaluator
 {
@@ -41,8 +56,6 @@ export class ScopeEvaluator
     private readonly memberNames = new Map<Predicate, ReadonlySet<string>>();
     private readonly reachable = new Map<Reachable, Promise<ReadonlySet<bigint>>>();
     private readonly visible = new Map<bigint, boolean>();
-    private readonly deciding = new Set<bigint>();
-    private cycleHits = 0;
 
     public constructor(private readonly scope: AccessScope, private readonly reads: RecordedReads)
     {
@@ -55,48 +68,10 @@ export class ScopeEvaluator
         return node !== undefined && this.IsVisible(node);
     }
 
-    /** Visibility of a resolved node. */
+    /** Visibility of a resolved node: a top-level decision (Unknown collapses to not visible). */
     public async IsVisible(node: IReadNode): Promise<boolean>
     {
-        const rows = this.ApplicableRows(node.Concept);
-        if (rows.length === 0)
-        {
-            return this.scope.Default === AccessDefault.Allow;
-        }
-        const known = this.visible.get(node.Id);
-        if (known !== undefined)
-        {
-            return known;
-        }
-        if (this.deciding.has(node.Id))
-        {
-            this.cycleHits += 1;
-            return false;
-        }
-        const hitsBefore = this.cycleHits;
-        this.deciding.add(node.Id);
-        let result = true;
-        try
-        {
-            const facts = new NodeFacts(node);
-            for (const row of rows)
-            {
-                if ((await this.Eval(row, facts)) !== Truth.True)
-                {
-                    result = false;
-                    break;
-                }
-            }
-        }
-        finally
-        {
-            this.deciding.delete(node.Id);
-        }
-        if (this.cycleHits === hitsBefore)
-        {
-            this.visible.set(node.Id, result);
-        }
-        return result;
+        return (await this.Decide(node, new Evaluation())) === Truth.True;
     }
 
     /** The node behind an internal id when it is visible, else undefined. */
@@ -155,7 +130,62 @@ export class ScopeEvaluator
         return catalog.Has(name) && catalog.IsA(concept, name);
     }
 
-    private async Eval(p: Predicate, facts: NodeFacts): Promise<Truth>
+    /**
+     * The node's visibility within one decision: True or False when settled (a guard-free result is a
+     * fact and is cached), Unknown when it depends on a node the decision is still deciding.
+     */
+    private async Decide(node: IReadNode, evaluation: Evaluation): Promise<Truth>
+    {
+        const rows = this.ApplicableRows(node.Concept);
+        if (rows.length === 0)
+        {
+            return this.scope.Default === AccessDefault.Allow ? Truth.True : Truth.False;
+        }
+        const known = this.visible.get(node.Id);
+        if (known !== undefined)
+        {
+            return known ? Truth.True : Truth.False;
+        }
+        if (evaluation.Deciding.has(node.Id))
+        {
+            evaluation.GuardHits += 1;
+            return Truth.Unknown;
+        }
+        const hitsBefore = evaluation.GuardHits;
+        evaluation.Deciding.add(node.Id);
+        let result = Truth.True;
+        try
+        {
+            const facts = new NodeFacts(node);
+            for (const row of rows)
+            {
+                const t = await this.Eval(row, facts, evaluation);
+                if (t === Truth.False)
+                {
+                    result = Truth.False;
+                    break;
+                }
+                if (t === Truth.Unknown)
+                {
+                    result = Truth.Unknown;
+                }
+            }
+        }
+        finally
+        {
+            evaluation.Deciding.delete(node.Id);
+        }
+        if (evaluation.GuardHits !== hitsBefore)
+        {
+            return result;
+        }
+        // Guard-free: an Unknown from null operands is a settled "not visible".
+        const visible = result === Truth.True;
+        this.visible.set(node.Id, visible);
+        return visible ? Truth.True : Truth.False;
+    }
+
+    private async Eval(p: Predicate, facts: NodeFacts, evaluation: Evaluation): Promise<Truth>
     {
         if (p.IsNodeLocal)
         {
@@ -165,16 +195,16 @@ export class ScopeEvaluator
         switch (p.Kind)
         {
             case PredicateKind.And:
-                return this.EvalAnd(p as And, facts);
+                return this.EvalAnd(p as And, facts, evaluation);
             case PredicateKind.Or:
-                return this.EvalOr(p as Or, facts);
+                return this.EvalOr(p as Or, facts, evaluation);
             case PredicateKind.Not:
             {
-                const inner = await this.Eval((p as Not).Term, facts);
+                const inner = await this.Eval((p as Not).Term, facts, evaluation);
                 return inner === Truth.Unknown ? Truth.Unknown : inner === Truth.True ? Truth.False : Truth.True;
             }
             case PredicateKind.Related:
-                return (await this.EvalRelated(p as Related, facts.Node)) ? Truth.True : Truth.False;
+                return this.EvalRelated(p as Related, facts.Node, evaluation);
             case PredicateKind.Reachable:
                 return (await this.ReachableSet(p as Reachable)).has(facts.Node.Id) ? Truth.True : Truth.False;
             case PredicateKind.Seeded:
@@ -186,12 +216,12 @@ export class ScopeEvaluator
         }
     }
 
-    private async EvalAnd(p: And, facts: NodeFacts): Promise<Truth>
+    private async EvalAnd(p: And, facts: NodeFacts, evaluation: Evaluation): Promise<Truth>
     {
         let result = Truth.True;
         for (const term of p.Terms)
         {
-            const t = await this.Eval(term, facts);
+            const t = await this.Eval(term, facts, evaluation);
             if (t === Truth.False)
             {
                 return Truth.False;
@@ -204,12 +234,12 @@ export class ScopeEvaluator
         return result;
     }
 
-    private async EvalOr(p: Or, facts: NodeFacts): Promise<Truth>
+    private async EvalOr(p: Or, facts: NodeFacts, evaluation: Evaluation): Promise<Truth>
     {
         let result = Truth.False;
         for (const term of p.Terms)
         {
-            const t = await this.Eval(term, facts);
+            const t = await this.Eval(term, facts, evaluation);
             if (t === Truth.True)
             {
                 return Truth.True;
@@ -222,21 +252,35 @@ export class ScopeEvaluator
         return result;
     }
 
-    /** Some neighbor over the relationship is visible under this scope and satisfies Target. */
-    private async EvalRelated(p: Related, node: IReadNode): Promise<boolean>
+    /**
+     * Kleene Or over the neighbors of (visible AND Target): True when some neighbor is visible and
+     * satisfies Target, Unknown when none does but some could (an Unknown visibility or Target), else False.
+     */
+    private async EvalRelated(p: Related, node: IReadNode, evaluation: Evaluation): Promise<Truth>
     {
+        let result = Truth.False;
         for (const rel of this.reads.RelationshipsOrNone(node.Concept, p.Relationship, p.Direction))
         {
             for await (const id of this.reads.Adjacent(rel, node.Id, p.Direction))
             {
-                const neighbor = await this.VisibleById(id);
-                if (neighbor !== undefined && (await this.Eval(p.Target, new NodeFacts(neighbor))) === Truth.True)
+                const neighbor = await this.reads.NodeById(id);
+                const visible = await this.Decide(neighbor, evaluation);
+                if (visible === Truth.False)
                 {
-                    return true;
+                    continue;
+                }
+                const target = await this.Eval(p.Target, new NodeFacts(neighbor), evaluation);
+                if (visible === Truth.True && target === Truth.True)
+                {
+                    return Truth.True;
+                }
+                if (target !== Truth.False)
+                {
+                    result = Truth.Unknown;
                 }
             }
         }
-        return false;
+        return result;
     }
 
     private ReachableSet(p: Reachable): Promise<ReadonlySet<bigint>>

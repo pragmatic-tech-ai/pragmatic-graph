@@ -469,6 +469,138 @@ class ScopeFx
                 assert.ok((await ScopeFx.Settle(t1.Commit())) instanceof ConflictError);
                 await g.dispose();
             });
+
+            it('concurrent reads on one reader decide independently', async () =>
+            {
+                const g = await ScopeFx.Ready(open);
+                await ScopeFx.Commit(g, t =>
+                {
+                    t.CreateNode('n', ScopeFx.Ticket);
+                    t.SetProperty('n', ScopeFx.Status, ScopeFx.Open);
+                    t.CreateNode('b', ScopeFx.Person);
+                    t.SetProperty('b', ScopeFx.Status, ScopeFx.Open);
+                    t.CreateNode('t', ScopeFx.Ticket);
+                    t.Link('t', ScopeFx.About, 'b');
+                });
+                const open1 = ScopeFx.Rows([[ScopeFx.Ticket, new Compare(ScopeFx.Status, CompareOp.Eq, ScopeFx.Open)]]);
+                await ScopeFx.Read(g, open1, async r =>
+                {
+                    const all = await Promise.all([r.ConceptOf('n'), r.ConceptOf('n'), r.ConceptOf('n')]);
+                    assert.deepEqual(all, [ScopeFx.Ticket, ScopeFx.Ticket, ScopeFx.Ticket]);
+                });
+                // b (slow to decide) is visible, so t (visible iff no visible `about` target) is not.
+                const slow = new And(Array.from({ length: 8 }, () => new Compare(ScopeFx.Status, CompareOp.Eq, ScopeFx.Open)));
+                const leak = ScopeFx.Rows([
+                    [ScopeFx.Person, slow],
+                    [ScopeFx.Ticket, new Not(new Related(ScopeFx.About, EdgeDirection.Out, TruePredicate.Instance))],
+                ]);
+                await ScopeFx.Read(g, leak, async r =>
+                {
+                    assert.deepEqual(await Promise.all([r.ConceptOf('b'), r.ConceptOf('t')]), [ScopeFx.Person, undefined]);
+                });
+                await g.dispose();
+            });
+
+            it('Not(Related) over a cycle is invisible', async () =>
+            {
+                const g = await ScopeFx.Ready(open);
+                await ScopeFx.Commit(g, t =>
+                {
+                    for (const p of ['c1', 'c2', 'd1', 'd2', 'd3', 'boss', 'leaf'])
+                    {
+                        t.CreateNode(p, ScopeFx.Person);
+                    }
+                    t.Link('c1', ScopeFx.Manages, 'c2');
+                    t.Link('c2', ScopeFx.Manages, 'c1');
+                    t.Link('d1', ScopeFx.Manages, 'd2');
+                    t.Link('d2', ScopeFx.Manages, 'd3');
+                    t.Link('d3', ScopeFx.Manages, 'd1');
+                    t.Link('boss', ScopeFx.Manages, 'leaf');
+                });
+                // Visible iff it manages no visible person: undecidable on a cycle (odd or even), so its members stay hidden.
+                const scope = ScopeFx.Rows([[ScopeFx.Person, new Not(new Related(ScopeFx.Manages, EdgeDirection.Out, TruePredicate.Instance))]]);
+                await ScopeFx.Read(g, scope, async r =>
+                {
+                    assert.deepEqual(await ScopeFx.Ids(r, ScopeFx.Person), ['leaf']);
+                    assert.equal(await r.ConceptOf('c1'), undefined);
+                    assert.deepEqual(await ScopeFx.Visible(r, ['d1', 'd2', 'd3']), [], 'decided first, d1 must not be granted through the cycle');
+                });
+                await g.dispose();
+            });
+
+            it('SeekIndex with Limit records the range up to the last examined entry', async () =>
+            {
+                const g = await ScopeFx.Ready(open);
+                await ScopeFx.Commit(g, t =>
+                {
+                    t.CreateNode('c', ScopeFx.Ticket);
+                    t.SetProperty('c', ScopeFx.Status, ScopeFx.Closed);
+                    t.CreateNode('o', ScopeFx.Ticket);
+                    t.SetProperty('o', ScopeFx.Status, ScopeFx.Open);
+                });
+                const scope = ScopeFx.Rows([[ScopeFx.Ticket, new Compare(ScopeFx.Status, CompareOp.Eq, ScopeFx.Open)]]);
+                const range = { Prefix: [], Limit: 1 };
+                // An entry after the last examined one ('open' < 'zz') is outside the recorded range.
+                const t1 = await g.Begin(scope);
+                assert.deepEqual(await ScopeFx.Collect(t1.SeekIndex(ScopeFx.TicketByStatus, range)), ['o']);
+                await ScopeFx.Commit(g, t =>
+                {
+                    t.CreateNode('late', ScopeFx.Ticket);
+                    t.SetProperty('late', ScopeFx.Status, 'zz');
+                });
+                t1.CreateNode('x1', ScopeFx.Team);
+                assert.equal(typeof (await t1.Commit()), 'bigint');
+                // An entry between the invisible leading entry and the yielded one is inside it.
+                const t2 = await g.Begin(scope);
+                assert.deepEqual(await ScopeFx.Collect(t2.SeekIndex(ScopeFx.TicketByStatus, range)), ['o']);
+                await ScopeFx.Commit(g, t =>
+                {
+                    t.CreateNode('mid', ScopeFx.Ticket);
+                    t.SetProperty('mid', ScopeFx.Status, 'm');
+                });
+                t2.CreateNode('x2', ScopeFx.Team);
+                assert.ok((await ScopeFx.Settle(t2.Commit())) instanceof ConflictError);
+                await g.dispose();
+            });
+
+            it('unknown names in a scope are rejected', async () =>
+            {
+                const g = await ScopeFx.Ready(open);
+                const invalid = (e: unknown): boolean => e instanceof GraphError && e.GraphCode === GraphErrorCode.InvalidArgument && e.message.includes('Persn');
+                const typo = ScopeFx.Rows([['Persn', TruePredicate.Instance]]);
+                await assert.rejects(g.BeginRead(typo), invalid);
+                await assert.rejects(g.Begin(typo), invalid);
+                await assert.rejects(g.BeginRead(AccessScope.Build({ Default: AccessDefault.Allow, Writes: new Map([['Persn', {}]]) })), invalid);
+                await assert.rejects(g.BeginRead(AccessScope.Build({ Default: AccessDefault.Allow, Hidden: new Map([['Persn', new Set<string>()]]) })), invalid);
+                const badMember = AccessScope.Build({ Default: AccessDefault.Allow, Hidden: new Map([[ScopeFx.Person, new Set(['nmae'])]]) });
+                await assert.rejects(g.BeginRead(badMember), (e: unknown) => e instanceof GraphError && e.GraphCode === GraphErrorCode.InvalidArgument && e.message.includes('Person.nmae'));
+                // A member effective through a carried aspect is known on the concept.
+                const viaAspect = AccessScope.Build({ Default: AccessDefault.Allow, Hidden: new Map([[ScopeFx.Person, new Set([ScopeFx.Level])]]) });
+                await ScopeFx.Read(g, viaAspect, async r => assert.equal(await r.ConceptOf('nobody'), undefined));
+                await g.dispose();
+            });
+
+            it('the visibility cache holds only the nodes decided', async () =>
+            {
+                const g = await ScopeFx.Ready(open);
+                await ScopeFx.Commit(g, t =>
+                {
+                    for (let i = 0; i < 10; i++)
+                    {
+                        t.CreateNode('k' + i, ScopeFx.Ticket);
+                    }
+                });
+                const scope = ScopeFx.Rows([[ScopeFx.Ticket, TruePredicate.Instance]]);
+                await ScopeFx.Read(g, scope, async r =>
+                {
+                    await r.ConceptOf('k0');
+                    await r.ConceptOf('k1');
+                    await r.ConceptOf(ScopeFx.SeedTeam);
+                    const cache = (r as unknown as { evaluator: { visible: Map<bigint, boolean> } }).evaluator.visible;
+                    assert.equal(cache.size, 2, 'a node with no applicable entry is not cached');
+                });
+                await g.dispose();
+            });
         });
     }
 }

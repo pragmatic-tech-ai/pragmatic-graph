@@ -1,10 +1,10 @@
-import type { AccessScope } from './access/AccessScope.js';
+import { AccessScope } from './access/AccessScope.js';
 import { CatalogModel } from './catalog/CatalogModel.js';
 import type { CatalogSnapshot } from './catalog/CatalogSnapshot.js';
 import { CatalogStore } from './catalog/CatalogStore.js';
 import { GraphError, GraphErrorCode } from './errors/GraphError.js';
 import { FormatMeta } from './format/FormatMeta.js';
-import { GraphContext } from './GraphContext.js';
+import { GraphContext, type ReadSnapshot } from './GraphContext.js';
 import { GraphReader } from './GraphReader.js';
 import { GraphTransaction } from './GraphTransaction.js';
 import type { IKeyValueStore, IReadTransaction, IWriteTransaction } from './kv/KeyValue.js';
@@ -132,19 +132,25 @@ export class GraphStore
         }
     }
 
-    /** A read-only snapshot of the latest commit, read under `scope`. */
+    /**
+     * A read-only snapshot of the latest commit, read under `scope`. GraphError InvalidArgument when the
+     * scope names a concept, aspect or hidden member the snapshot's catalog does not have (ruling R63).
+     */
     public async BeginRead(scope: AccessScope): Promise<GraphReader>
     {
         this.RequireLive();
-        const reader = new GraphReader(this.context, await this.context.OpenSnapshot(false), scope);
+        const reader = new GraphReader(this.context, this.Scoped(await this.context.OpenSnapshot(false), scope), scope);
         return this.Handed(reader);
     }
 
-    /** A read-write transaction over a snapshot of the latest commit, reading under `scope` (writes are not gated by it yet). */
+    /**
+     * A read-write transaction over a snapshot of the latest commit, reading under `scope` (validated as
+     * for BeginRead; writes are not gated by it yet).
+     */
     public async Begin(scope: AccessScope): Promise<GraphTransaction>
     {
         this.RequireLive();
-        const txn = new GraphTransaction(this.context, await this.context.OpenSnapshot(true), scope);
+        const txn = new GraphTransaction(this.context, this.Scoped(await this.context.OpenSnapshot(true), scope), scope);
         return this.Handed(txn);
     }
 
@@ -201,6 +207,25 @@ export class GraphStore
             }
         }
         return true;
+    }
+
+    /** The snapshot, once `scope` is validated against its catalog (System needs none); released when invalid. */
+    private Scoped(snapshot: ReadSnapshot, scope: AccessScope): ReadSnapshot
+    {
+        if (scope === AccessScope.System)
+        {
+            return snapshot;
+        }
+        try
+        {
+            this.context.ValidateScope(scope, snapshot.Index.Catalog);
+        }
+        catch (error)
+        {
+            snapshot.dispose();
+            throw error;
+        }
+        return snapshot;
     }
 
     /** A reader created while dispose() started is ended at once rather than handed out. */
