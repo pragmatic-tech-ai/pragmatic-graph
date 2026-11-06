@@ -89,6 +89,40 @@ class EdgeFx
     {
         describe('edge store on ' + name, () =>
         {
+            it('1,000 inserts between the same two siblings keep order and never renumber an existing edge', async () =>
+            {
+                const store = await open();
+                const es = new EdgeStore();
+                const rel = EdgeFx.ManyOrdered;
+                const positions = new Map<bigint, string>();
+                const hex = (p: Uint8Array): string => Buffer.from(p).toString('hex');
+                const ends = await store.Write(async txn => ({ left: await es.Link(txn, rel, 1n, 2n), right: await es.Link(txn, rel, 1n, 3n) }));
+                positions.set(2n, hex(ends.left));
+                positions.set(3n, hex(ends.right));
+                let before = ends.right;
+                const expected: bigint[] = [];
+                await store.Write(async txn =>
+                {
+                    for (let i = 0; i < 1000; i++)
+                    {
+                        const node = 100n + BigInt(i);
+                        // The gap between `left` and the item inserted last, narrowed every time.
+                        before = await es.Link(txn, rel, 1n, node, { After: ends.left, Before: before });
+                        positions.set(node, hex(before));
+                        expected.unshift(node);
+                    }
+                });
+                const r = await store.BeginRead();
+                const list = await EdgeFx.List(es, r, rel, 1n, EdgeDirection.Out);
+                r.dispose();
+                assert.deepEqual(list.map(n => n.Node), [2n, ...expected, 3n]);
+                for (const n of list)
+                {
+                    assert.equal(hex(n.Position), positions.get(n.Node), 'edge to ' + n.Node + ' kept its position');
+                }
+                await store.dispose();
+            });
+
             it('a link is visible from both ends, with In/Out keys on the right nodes', async () =>
             {
                 const store = await open();

@@ -135,7 +135,8 @@ export class Committer
     private readonly queue: PendingCommit[] = [];
     private index: CatalogIndex;
     private allocator: Promise<IdAllocator> | undefined;
-    private pumping = false;
+    /** The running Pump (undefined when idle); dispose() awaits it. */
+    private pump: Promise<void> | undefined;
     private disposed = false;
 
     public constructor(private readonly store: IKeyValueStore, catalog: CatalogSnapshot, options?: ICommitterOptions)
@@ -206,23 +207,21 @@ export class Committer
         return new Promise<bigint>((resolve, reject) =>
         {
             this.queue.push(new PendingCommit(bytes, WriteBatch.Deserialize(bytes).Seal(), readSet.Clone(), snapshotCommit, resolve, reject));
-            if (!this.pumping)
-            {
-                this.pumping = true;
-                void this.Pump();
-            }
+            this.pump ??= this.Pump();
         });
     }
 
     /**
      * Stops accepting work: every queued Submit not yet in a group and every later Submit rejects;
      * CommitApplied subscribers are dropped. A group already writing finishes (its commits are durable
-     * and its promises settle) but raises no signal. Idempotent.
+     * and its promises settle) but raises no signal; no new group starts. Resolves once that group has
+     * settled, so the store can then be closed. Idempotent: every call resolves at the same point.
      */
-    public dispose(): void
+    public async dispose(): Promise<void>
     {
         if (this.disposed)
         {
+            await this.pump;
             return;
         }
         this.disposed = true;
@@ -232,6 +231,7 @@ export class Committer
             p.Reject(error);
         }
         this.CommitApplied.dispose();
+        await this.pump;
     }
 
     /** Opens the id allocator; a failed open is not cached, so the next group retries it. */
@@ -264,7 +264,7 @@ export class Committer
         }
         finally
         {
-            this.pumping = false;
+            this.pump = undefined;
         }
     }
 

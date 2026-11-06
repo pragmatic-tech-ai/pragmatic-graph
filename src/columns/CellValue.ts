@@ -3,6 +3,7 @@ export class DateValue
 {
     public constructor(public readonly Days: number)
     {
+        Object.freeze(this);
     }
 
     public Equals(other: DateValue): boolean
@@ -16,6 +17,7 @@ export class DateTimeValue
 {
     public constructor(public readonly Micros: bigint, public readonly Zone: string)
     {
+        Object.freeze(this);
     }
 
     public Equals(other: DateTimeValue): boolean
@@ -29,6 +31,7 @@ export class DurationValue
 {
     public constructor(public readonly Months: number, public readonly Days: number, public readonly Micros: bigint)
     {
+        Object.freeze(this);
     }
 
     public Equals(other: DurationValue): boolean
@@ -37,5 +40,5 @@ export class DurationValue
     }
 }
 
-/** One cell of a column; null is the null cell. Int64 is bigint, Float64 is number. */
+/** One cell of a column; temporal values are frozen instances. null is the null cell. Int64 is bigint, Float64 is number. */
 export type CellValue = boolean | bigint | number | string | DateValue | DateTimeValue | DurationValue | null;

@@ -136,6 +136,55 @@ class CountingStore implements IKeyValueStore
     }
 }
 
+/** A store whose next Write blocks inside its work (after the transaction began) until Release(). */
+class GatedStore implements IKeyValueStore
+{
+    public Entered: Promise<void> = Promise.resolve();
+    private gate: Promise<void> | undefined;
+    private open: () => void = () => undefined;
+    private entered: () => void = () => undefined;
+
+    public constructor(private readonly inner: IKeyValueStore)
+    {
+    }
+
+    public Hold(): void
+    {
+        this.gate = new Promise<void>(resolve => { this.open = resolve; });
+        this.Entered = new Promise<void>(resolve => { this.entered = resolve; });
+    }
+
+    public Release(): void
+    {
+        this.open();
+    }
+
+    public BeginRead(): Promise<IReadTransaction>
+    {
+        return this.inner.BeginRead();
+    }
+
+    public Write<T>(work: (txn: IWriteTransaction) => Promise<T>): Promise<T>
+    {
+        const gate = this.gate;
+        this.gate = undefined;
+        return this.inner.Write(async txn =>
+        {
+            if (gate !== undefined)
+            {
+                this.entered();
+                await gate;
+            }
+            return work(txn);
+        });
+    }
+
+    public dispose(): Promise<void>
+    {
+        return this.inner.dispose();
+    }
+}
+
 /** A committer whose first allocator open fails, to prove a failed open is not cached. */
 class FlakyAllocatorCommitter extends Committer
 {
@@ -981,8 +1030,10 @@ class TxnFx
                 const events: bigint[] = [];
                 c.CommitApplied.Subscribe(e => events.push(e.Commit));
                 const queued = [TxnFx.People(c, 'a'), TxnFx.People(c, 'b')];
-                c.dispose();
-                c.dispose();
+                const disposing = c.dispose();
+                const again = c.dispose();
+                assert.ok(disposing instanceof Promise && again instanceof Promise);
+                await Promise.all([disposing, again]);
                 for (const o of await Promise.all(queued.map(p => TxnFx.Settle(p))))
                 {
                     assert.ok(o instanceof Error && !(o instanceof CommitError) && !(o instanceof ConflictError), String(o));
@@ -991,6 +1042,59 @@ class TxnFx
                 assert.deepEqual(events, []);
                 assert.equal(c.LastCommit(), 0n);
                 assert.equal(await new Probe(store, TxnFx.Catalog()).Id('a'), undefined);
+                await store.dispose();
+            });
+
+            it('dispose during an in-flight group waits for it: its promise settles, the commit is durable, no CommitApplied', async () =>
+            {
+                const inner = await open();
+                const catalog = TxnFx.Catalog();
+                const setup = await Committer.Open(inner, catalog);
+                await TxnFx.People(setup, 'a');
+                await setup.dispose();
+                const store = new GatedStore(inner);
+                const c = await Committer.Open(store, catalog);
+                const events: bigint[] = [];
+                c.CommitApplied.Subscribe(e => events.push(e.Commit));
+                store.Hold();
+                const inFlight = TxnFx.Settle(c.Submit(TxnFx.Batch(b => b.SetProperty('a', 'age', 7n)), new ReadSet(), 1n));
+                await store.Entered;
+                let disposed = false;
+                const disposing = c.dispose().then(() => { disposed = true; });
+                const late = await TxnFx.Settle(c.Submit(TxnFx.Batch(b => b.SetProperty('a', 'age', 8n)), new ReadSet(), 1n));
+                assert.ok(late instanceof Error && !(late instanceof CommitError));
+                await new Promise(resolve => setTimeout(resolve, 20));
+                assert.equal(disposed, false, 'dispose waits for the group that is writing');
+                store.Release();
+                await disposing;
+                assert.equal(await inFlight, 2n);
+                assert.deepEqual(events, []);
+                assert.equal(await new Probe(inner, catalog).Cell('a', 'age'), 7n);
+                await inner.dispose();
+            });
+
+            it('a CorruptEdge read while applying passes through unmapped (not InvalidEdge)', async () =>
+            {
+                const store = await open();
+                const catalog = TxnFx.Catalog();
+                const c = await Committer.Open(store, catalog);
+                await TxnFx.People(c, 'a', 'b', 'x');
+                await c.Submit(TxnFx.Batch(b => b.Link('a', 'friends', 'b', { Properties: new Map([['weight', 1n]]) })), new ReadSet(), c.LastCommit());
+                const a = await new Probe(store, catalog).RequireId('a');
+                const friends = catalog.Member('Person', 'friends').Id;
+                await store.Write(async txn =>
+                {
+                    for await (const [key] of txn.Scan(Keyspace.Edges, FormatKeys.EdgeRange(0, friends, EdgeDirection.Out, a)))
+                    {
+                        txn.Put(Keyspace.Edges, key, Uint8Array.of(1, 2, 3));
+                    }
+                });
+                for (const build of [(b: WriteBatch): void => b.DeleteNode('a'), (b: WriteBatch): void => b.Link('a', 'friends', 'x', { AfterSibling: 'b' })])
+                {
+                    const outcome = await TxnFx.Settle(c.Submit(TxnFx.Batch(build), new ReadSet(), c.LastCommit()));
+                    assert.ok(outcome instanceof EdgeError && outcome.Code === EdgeErrorCode.CorruptEdge, String(outcome));
+                }
+                assert.ok((await new Probe(store, catalog).Id('a')) !== undefined, 'the failed batches left no trace');
                 await store.dispose();
             });
 
