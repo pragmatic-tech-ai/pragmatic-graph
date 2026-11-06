@@ -33,6 +33,7 @@ export class ScopeValidator
     private static readonly ErrUnknownMember = 'AccessScope hides a member that is not effective on its key: ';
     private static readonly ErrProperty = 'AccessScope predicate reads a name that is not an effective property: ';
     private static readonly ErrRelationship = 'AccessScope predicate follows a name that is not an effective relationship: ';
+    private static readonly ErrNoConcept = 'AccessScope predicate follows a relationship that reaches no concept: ';
     private static readonly Dot = '.';
 
     public static Validate(scope: AccessScope, index: CatalogIndex): void
@@ -135,15 +136,22 @@ export class ScopeValidator
             const rels = place.Key !== undefined
                 ? [ScopeValidator.MemberOf(index, place.Key, name)]
                 : place.Concepts.map(c => ScopeValidator.Effective(index, c, name));
+            let found = false;
             for (const rel of rels)
             {
                 if (rel?.Kind === MemberKind.Relationship)
                 {
+                    found = true;
                     for (const target of rel.Targets ?? [])
                     {
                         ScopeValidator.AddMatching(index, target, reached);
                     }
                 }
+            }
+            if (found && reached.size === 0)
+            {
+                // A relationship whose targets are only aspects no concept carries: real, but it reaches nothing.
+                throw new GraphError(GraphErrorCode.InvalidArgument, ScopeValidator.ErrNoConcept + place.Label + ScopeValidator.Dot + name);
             }
         }
         else

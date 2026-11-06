@@ -687,6 +687,28 @@ class ScopeFx
                 await ScopeFx.Read(g, valid, async r => assert.equal(await r.ConceptOf('nobody'), undefined));
                 await g.dispose();
             });
+
+            it('a relationship reaching no concept is rejected as such', async () =>
+            {
+                const g = await open();
+                const tag = 'Tag';
+                const box = 'Box';
+                const tagged = 'tagged';
+                await g.Upgrade({
+                    Version: 'v1',
+                    Definitions: [
+                        { Name: tag, IsAspect: true, Parent: null, Aspects: [], Members: [] },
+                        { Name: box, IsAspect: false, Parent: null, Aspects: [], Members: [ScopeFx.Rel(tagged, tag, true)] },
+                    ],
+                    Indexes: [],
+                    Seed: [],
+                    Bindings: [],
+                });
+                const scope = ScopeFx.Rows([[box, new Related(tagged, EdgeDirection.Out, TruePredicate.Instance)]]);
+                await assert.rejects(g.BeginRead(scope), (e: unknown) => e instanceof GraphError && e.GraphCode === GraphErrorCode.InvalidArgument
+                    && e.message.includes('reaches no concept') && e.message.includes('Box.tagged'));
+                await g.dispose();
+            });
         });
     }
 }
