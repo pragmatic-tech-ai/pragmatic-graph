@@ -50,12 +50,15 @@ Names added by later tasks, each with its value layout completed by that task:
 `(1)` is the catalog root and the only catalog key in v1. Its value is the UTF-8 encoding of a JSON object:
 
 ```
-{ NextTypeId: number, NextMemberId: number, Definitions: TypeDefinition[] }
+{ NextTypeId: number, NextMemberId: number, Definitions: TypeDefinition[], NextIndexId?: number, Indexes?: IndexDef[] }
 TypeDefinition = { Name, IsAspect, TypeId, Parent: string|null, Aspects: string[], Members: MemberDef[], Placement?, AggregateRoot? }
 MemberDef = { Id, Name, Kind, Type?, Nullable, Targets?, Many?, Ordered?, EdgeProperties?: MemberDef[], DeclaredBy }
+IndexDef = { Id, Name, On, Members: number[], Unique: boolean, Where?: PredicateJson }
 ```
 
 `Definitions` are in definition order. `Placement` and `AggregateRoot` (seam 3, ruling F5) are concept-only and additive: `Placement` is `1` Replicated (ontology core, taxonomies: copied to every partition) or `2` Partitioned (instance data); a concept stored without it loads as Partitioned, and the engine always writes it for concepts. `AggregateRoot` is optional and names a concept (not an aspect, not undefined) whose instances this concept's instances are co-located with and conflict-partitioned by. An aspect with either field, or a `Placement` outside `1..2`, is a corrupt catalog; an `AggregateRoot` that does not name a concept is rejected as a schema error (`InvalidAggregateRoot`). `Kind` is `1` Property or `2` Relationship; `Type` is `1` Boolean, `2` Int64, `3` Float64, `4` String, `5` Date, `6` DateTime, `7` Duration. Type ids and member ids are stored as assigned. `NextTypeId` and `NextMemberId` are the persisted next-id counters, so ids are never reused; a counter must be at least `1` and at least one more than the largest stored id of its kind (edge properties included), else the catalog is corrupt. The catalog version lives in `Meta("catalogVersion")`, not in the row, and is written in the same transaction. A save must carry exactly the stored version plus one, otherwise it is rejected as a version conflict. A value that is not valid JSON of this shape, or that repeats a type id or member id (edge properties included), is rejected on load as a corrupt catalog.
+
+`Indexes` and `NextIndexId` (consolidation Task 3) are additive: a catalog stored without them loads with no indexes and `NextIndexId = 1`. An index id comes from its own counter, starting at `1`, never reused; `NextIndexId` must be at least `1` and one more than the largest index id, else the catalog is corrupt (as are repeated index ids). `On` names a concept or an aspect; `Members` are member ids (not names) of property members effective on `On`, in key order, at least one, no repeats; index names are unique. Violations of these are schema errors on save. `Where` is the predicate JSON of `PredicateCodec` (predicate rulings R42), omitted when there is none.
 
 Cost note (F9): the catalog root is one value, so every schema change rewrites (and logs) the whole catalog: O(catalog size) per change, fine at thousands of concepts. Per-definition keys (one key per type definition, so a change writes only what it touches) are a deferred format change; the root key `(1)` and its tag leave room for them.
 

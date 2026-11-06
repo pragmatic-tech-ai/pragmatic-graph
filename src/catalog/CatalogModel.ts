@@ -1,11 +1,24 @@
 import { CatalogError, CatalogErrorCode } from './CatalogError.js';
 import { CatalogSnapshot } from './CatalogSnapshot.js';
-import { IConceptOptions, MemberDef, MemberInput, TypeDefinition } from './CatalogTypes.js';
+import type { Predicate } from '../predicate/Predicate.js';
+import { IConceptOptions, IndexDef, MemberDef, MemberInput, TypeDefinition } from './CatalogTypes.js';
 import { MemberKind, Placement } from './ValueType.js';
 
-export type { IConceptOptions, MemberDef, MemberInput, TypeDefinition } from './CatalogTypes.js';
+export type { IConceptOptions, IndexDef, MemberDef, MemberInput, TypeDefinition } from './CatalogTypes.js';
 
 type MutableTypeDefinition = { -readonly [K in keyof TypeDefinition]: TypeDefinition[K] };
+
+/** An index recorded by DefineIndex (member names, resolved at Seal) or restored with its member ids. */
+interface IPendingIndex
+{
+    readonly Id: number;
+    readonly Name: string;
+    readonly On: string;
+    readonly MemberNames?: readonly string[];
+    readonly MemberIds?: readonly number[];
+    readonly Unique: boolean;
+    readonly Where?: Predicate;
+}
 
 type MutableMemberDef = { -readonly [K in keyof MemberDef]: MemberDef[K] };
 
@@ -27,6 +40,8 @@ export class CatalogModel
     private readonly definitions = new Map<string, TypeDefinition>();
     private nextTypeId = 1;
     private nextMemberId = 1;
+    private nextIndexId = 1;
+    private readonly indexes: IPendingIndex[] = [];
     private version = 0;
 
     public static FromSnapshot(snapshot: CatalogSnapshot): CatalogModel
@@ -35,6 +50,7 @@ export class CatalogModel
         model.version = snapshot.Version;
         model.nextTypeId = Math.max(1, snapshot.NextTypeId);
         model.nextMemberId = Math.max(1, snapshot.NextMemberId);
+        model.nextIndexId = Math.max(1, snapshot.NextIndexId);
         for (const def of snapshot.Definitions())
         {
             model.definitions.set(def.Name, def);
@@ -44,6 +60,21 @@ export class CatalogModel
                 model.nextMemberId = Math.max(model.nextMemberId, CatalogModel.MaxId(m) + 1);
             }
         }
+        for (const index of snapshot.Indexes())
+        {
+            model.RestoreIndex(index);
+        }
+        return model;
+    }
+
+    /** A model with no definitions or indexes whose version and id counters continue from `snapshot` (for CatalogPlanner). */
+    public static EmptyFrom(snapshot: CatalogSnapshot): CatalogModel
+    {
+        const model = new CatalogModel();
+        model.version = snapshot.Version;
+        model.nextTypeId = Math.max(1, snapshot.NextTypeId);
+        model.nextMemberId = Math.max(1, snapshot.NextMemberId);
+        model.nextIndexId = Math.max(1, snapshot.NextIndexId);
         return model;
     }
 
@@ -75,11 +106,63 @@ export class CatalogModel
         this.Record(name, true, null, includes, members);
     }
 
+    /** Records an index over property member names of a concept or aspect; names resolve to member ids at Seal. */
+    public DefineIndex(name: string, on: string, members: readonly string[], unique: boolean, where?: Predicate): void
+    {
+        const id = this.nextIndexId;
+        this.nextIndexId += 1;
+        this.indexes.push({ Id: id, Name: name, On: on, MemberNames: Object.freeze([...members]), Unique: unique, ...(where === undefined ? {} : { Where: where }) });
+    }
+
+    /** Records a definition exactly as given, ids included. Internal: used only by CatalogPlanner. */
+    public Restore(def: TypeDefinition): void
+    {
+        this.EnsureNew(def.Name);
+        this.definitions.set(def.Name, def);
+        this.nextTypeId = Math.max(this.nextTypeId, def.TypeId + 1);
+        for (const m of def.Members)
+        {
+            this.nextMemberId = Math.max(this.nextMemberId, CatalogModel.MaxId(m) + 1);
+        }
+    }
+
+    /** Records an index exactly as given, id included. Internal: used only by CatalogPlanner. */
+    public RestoreIndex(def: IndexDef): void
+    {
+        this.nextIndexId = Math.max(this.nextIndexId, def.Id + 1);
+        this.indexes.push({ Id: def.Id, Name: def.Name, On: def.On, MemberIds: def.Members, Unique: def.Unique, ...(def.Where === undefined ? {} : { Where: def.Where }) });
+    }
+
     public Seal(): CatalogSnapshot
     {
-        const snapshot = CatalogSnapshot.Build(this.version + 1, [...this.definitions.values()], this.nextTypeId, this.nextMemberId);
-        this.version += 1;
+        const version = this.version + 1;
+        const defs = [...this.definitions.values()];
+        let snapshot: CatalogSnapshot;
+        if (this.indexes.length === 0)
+        {
+            snapshot = CatalogSnapshot.Build(version, defs, this.nextTypeId, this.nextMemberId, [], this.nextIndexId);
+        }
+        else
+        {
+            const types = CatalogSnapshot.Build(version, defs, this.nextTypeId, this.nextMemberId, [], this.nextIndexId);
+            const resolved = this.indexes.map(i => CatalogModel.Resolve(types, i));
+            snapshot = CatalogSnapshot.Build(version, defs, this.nextTypeId, this.nextMemberId, resolved, this.nextIndexId);
+        }
+        this.version = version;
         return snapshot;
+    }
+
+    private static Resolve(types: CatalogSnapshot, index: IPendingIndex): IndexDef
+    {
+        const members = index.MemberIds ?? (index.MemberNames ?? []).map(n => types.MemberOf(index.On, n).Id);
+        return Object.freeze({
+            Id: index.Id,
+            Name: index.Name,
+            On: index.On,
+            Members: Object.freeze([...members]),
+            Unique: index.Unique,
+            ...(index.Where === undefined ? {} : { Where: index.Where }),
+        });
     }
 
     private EnsureNew(name: string): void

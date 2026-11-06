@@ -1,3 +1,4 @@
+import type { Predicate } from '../predicate/Predicate.js';
 import { MemberKind, Placement, ValueType } from './ValueType.js';
 
 /** Per-concept placement metadata for DefineConcept (seam 3, ruling F5). */
@@ -48,4 +49,17 @@ export interface TypeDefinition
     readonly Placement?: Placement;
     /** Concepts only, optional: names a concept. */
     readonly AggregateRoot?: string;
+}
+
+/** A declared secondary index: ids are a separate stable counter from 1 (NextIndexId). */
+export interface IndexDef
+{
+    readonly Id: number;
+    readonly Name: string;
+    /** A concept or aspect name. */
+    readonly On: string;
+    /** Member ids of property members effective on `On`, in key order. */
+    readonly Members: readonly number[];
+    readonly Unique: boolean;
+    readonly Where?: Predicate;
 }

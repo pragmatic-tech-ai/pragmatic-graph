@@ -7,7 +7,7 @@ export { GraphReader, type IScanRow } from './GraphReader.js';
 export { GraphTransaction } from './GraphTransaction.js';
 
 // Schema definition.
-export { CatalogModel, type IConceptOptions, type MemberDef, type MemberInput, type TypeDefinition } from './catalog/CatalogModel.js';
+export { CatalogModel, type IConceptOptions, type IndexDef, type MemberDef, type MemberInput, type TypeDefinition } from './catalog/CatalogModel.js';
 export type { CatalogSnapshot } from './catalog/CatalogSnapshot.js';
 export { MemberKind, Placement, ValueType } from './catalog/ValueType.js';
 
@@ -34,6 +34,11 @@ export { And, Compare, CompareOp, FalsePredicate, IdIn, In, IsNull, Not, Or, Own
 export { PredicateCodec } from './predicate/PredicateCodec.js';
 export { PredicateError, PredicateErrorCode } from './predicate/PredicateError.js';
 export { NodeEvaluator } from './predicate/NodeEvaluator.js';
+
+// Schema description and catalog planning.
+export type { IBindingDescription, IDefinitionDescription, IIndexDescription, ISchemaDescription, ISeedLink, ISeedNode } from './schema/SchemaDescription.js';
+export { CatalogPlanner, type ICatalogPlan } from './schema/CatalogPlanner.js';
+export { CatalogDiff, type IRemovedMember } from './schema/CatalogDiff.js';
 
 export class EngineInfo
 {

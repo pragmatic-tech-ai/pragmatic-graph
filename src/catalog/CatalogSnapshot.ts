@@ -1,5 +1,5 @@
 import { CatalogError, CatalogErrorCode } from './CatalogError.js';
-import { MemberDef, TypeDefinition } from './CatalogTypes.js';
+import { IndexDef, MemberDef, TypeDefinition } from './CatalogTypes.js';
 import { MemberKind, ValueType } from './ValueType.js';
 
 /** Immutable, validated catalog. Type ids and member ids are stable; pre-order intervals are recomputed per snapshot. */
@@ -24,12 +24,19 @@ export class CatalogSnapshot
     private static readonly CollisionMessage = 'Member collision: ';
     private static readonly NotInstantiableMessage = 'Aspect is not instantiable: ';
     private static readonly AggregateRootMessage = 'AggregateRoot must name a concept: ';
+    private static readonly DuplicateIndexMessage = 'Duplicate index name: ';
+    private static readonly IndexNeedsMembersMessage = 'Index needs at least one member: ';
+    private static readonly IndexMemberNotPropertyMessage = 'Index member is not a property of the indexed type: ';
+    private static readonly IndexDuplicateMemberMessage = 'Index lists a member twice: ';
+    private static readonly IndexCounterMessage = 'NextIndexId must exceed every index id: ';
     private static readonly MemberSeparator = '.';
 
     public readonly Version: number;
     /** Next unassigned type id and member id; persisted so ids are never reused. */
     public readonly NextTypeId: number;
     public readonly NextMemberId: number;
+    /** Next unassigned index id (a separate counter from 1). */
+    public readonly NextIndexId: number;
 
     private readonly defs: readonly TypeDefinition[];
     private readonly byName: ReadonlyMap<string, TypeDefinition>;
@@ -38,6 +45,8 @@ export class CatalogSnapshot
     private readonly isaSets: ReadonlyMap<string, ReadonlySet<string>>;
     private readonly intervals: ReadonlyMap<string, readonly [number, number]>;
     private readonly matching: ReadonlyMap<string, readonly number[]>;
+    private readonly indexList: readonly IndexDef[];
+    private readonly indexesByType: ReadonlyMap<string, readonly IndexDef[]>;
 
     private constructor(
         version: number,
@@ -45,11 +54,15 @@ export class CatalogSnapshot
         effective: Map<string, readonly MemberDef[]>,
         isaSets: Map<string, ReadonlySet<string>>,
         nextTypeId: number,
-        nextMemberId: number)
+        nextMemberId: number,
+        indexes: readonly IndexDef[],
+        nextIndexId: number)
     {
         this.Version = version;
         this.NextTypeId = nextTypeId;
         this.NextMemberId = nextMemberId;
+        this.NextIndexId = nextIndexId;
+        this.indexList = Object.freeze([...indexes]);
         this.defs = Object.freeze([...defs]);
         this.byName = new Map(defs.map(d => [d.Name, d]));
         this.effective = effective;
@@ -62,10 +75,17 @@ export class CatalogSnapshot
         this.memberByName = lookup;
         this.intervals = CatalogSnapshot.ComputeIntervals(defs);
         this.matching = CatalogSnapshot.ComputeMatching(defs, isaSets);
+        this.indexesByType = CatalogSnapshot.ComputeIndexesByType(indexes, isaSets);
     }
 
     /** Validates the definitions and builds a snapshot; throws CatalogError on any type-model violation. */
-    public static Build(version: number, defs: readonly TypeDefinition[], nextTypeId: number, nextMemberId: number): CatalogSnapshot
+    public static Build(
+        version: number,
+        defs: readonly TypeDefinition[],
+        nextTypeId: number,
+        nextMemberId: number,
+        indexes: readonly IndexDef[],
+        nextIndexId: number): CatalogSnapshot
     {
         const byName = new Map(defs.map(d => [d.Name, d]));
         CatalogSnapshot.CheckReferences(defs, byName);
@@ -98,7 +118,13 @@ export class CatalogSnapshot
                 minMember = Math.max(minMember, CatalogSnapshot.MaxMemberId(m) + 1);
             }
         }
-        return new CatalogSnapshot(version, defs, effective, isaSets, Math.max(nextTypeId, minType), Math.max(nextMemberId, minMember));
+        CatalogSnapshot.ValidateIndexes(indexes, byName);
+        let minIndex = 1;
+        for (const i of indexes)
+        {
+            minIndex = Math.max(minIndex, i.Id + 1);
+        }
+        return new CatalogSnapshot(version, defs, effective, isaSets, Math.max(nextTypeId, minType), Math.max(nextMemberId, minMember), indexes, Math.max(nextIndexId, minIndex));
     }
 
     private static MaxMemberId(member: MemberDef): number
@@ -109,6 +135,108 @@ export class CatalogSnapshot
             max = Math.max(max, CatalogSnapshot.MaxMemberId(e));
         }
         return max;
+    }
+
+    /**
+     * The one seam for index validation (Task 6 adds its rules here). Checks: names unique, `On` names a
+     * known concept or aspect, at least one member, every member id a distinct property effective on `On`.
+     */
+    private static ValidateIndexes(indexes: readonly IndexDef[], byName: ReadonlyMap<string, TypeDefinition>): void
+    {
+        const names = new Set<string>();
+        for (const index of indexes)
+        {
+            if (names.has(index.Name))
+            {
+                throw new CatalogError(CatalogErrorCode.DuplicateType, CatalogSnapshot.DuplicateIndexMessage + index.Name);
+            }
+            names.add(index.Name);
+            if (!byName.has(index.On))
+            {
+                throw new CatalogError(CatalogErrorCode.UnknownType, CatalogSnapshot.UnknownTypeMessage + index.On);
+            }
+            if (index.Members.length === 0)
+            {
+                throw new CatalogError(CatalogErrorCode.InvalidMember, CatalogSnapshot.IndexNeedsMembersMessage + index.Name);
+            }
+            const available = CatalogSnapshot.PropertiesOf(index.On, byName);
+            const seen = new Set<number>();
+            for (const id of index.Members)
+            {
+                if (seen.has(id))
+                {
+                    throw new CatalogError(CatalogErrorCode.InvalidMember, CatalogSnapshot.IndexDuplicateMemberMessage + index.Name);
+                }
+                seen.add(id);
+                if (!available.has(id))
+                {
+                    throw new CatalogError(CatalogErrorCode.UnknownMember, CatalogSnapshot.IndexMemberNotPropertyMessage + index.Name + CatalogSnapshot.MemberSeparator + id);
+                }
+            }
+        }
+    }
+
+    /** Ids of the property members of a concept (own, ancestors' and carried aspects') or of an aspect (own and included). */
+    private static PropertiesOf(name: string, byName: ReadonlyMap<string, TypeDefinition>): ReadonlySet<number>
+    {
+        const ids = new Set<number>();
+        const roots: string[] = [];
+        if (byName.get(name)!.IsAspect)
+        {
+            roots.push(name);
+        }
+        else
+        {
+            let cursor: string | null = name;
+            while (cursor !== null)
+            {
+                const def: TypeDefinition = byName.get(cursor)!;
+                roots.push(...def.Aspects);
+                CatalogSnapshot.AddProperties(def.Members, ids);
+                cursor = def.Parent;
+            }
+        }
+        const closure = new Set<string>();
+        CatalogSnapshot.Closure(roots, byName, closure);
+        for (const a of closure)
+        {
+            CatalogSnapshot.AddProperties(byName.get(a)!.Members, ids);
+        }
+        return ids;
+    }
+
+    private static AddProperties(members: readonly MemberDef[], into: Set<number>): void
+    {
+        for (const m of members)
+        {
+            if (m.Kind === MemberKind.Property)
+            {
+                into.add(m.Id);
+            }
+        }
+    }
+
+    private static ComputeIndexesByType(indexes: readonly IndexDef[], isaSets: ReadonlyMap<string, ReadonlySet<string>>): ReadonlyMap<string, readonly IndexDef[]>
+    {
+        const result = new Map<string, readonly IndexDef[]>();
+        for (const [concept, isa] of isaSets)
+        {
+            result.set(concept, Object.freeze(indexes.filter(i => isa.has(i.On))));
+        }
+        return result;
+    }
+
+    /** Every declared index, in definition order. */
+    public Indexes(): readonly IndexDef[]
+    {
+        return this.indexList;
+    }
+
+    /** The indexes that apply to instances of a concept: declared on it, on an ancestor, or on an aspect it carries. */
+    public IndexesOn(concept: string): readonly IndexDef[]
+    {
+        this.RequireConcept(concept);
+        return this.indexesByType.get(concept)!;
     }
 
     public Definitions(): readonly TypeDefinition[]

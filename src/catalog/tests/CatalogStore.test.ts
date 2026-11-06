@@ -12,6 +12,8 @@ import type { IKeyValueStore } from '../../kv/KeyValue.js';
 import { LmdbStore } from '../../kv/lmdb/LmdbStore.js';
 import { Keyspace } from '../../kv/Keyspace.js';
 import { FormatKeys } from '../../format/FormatKeys.js';
+import { Compare, CompareOp } from '../../predicate/Predicate.js';
+import { PredicateCodec } from '../../predicate/PredicateCodec.js';
 import { MemoryStore } from '../../kv/memory/MemoryStore.js';
 
 class CatalogFx
@@ -100,6 +102,30 @@ for (const [name, open] of backends)
 {
     describe(`CatalogStore (${name})`, () =>
     {
+        it('indexes round-trip through Save/Load and an old catalog loads with none', async () =>
+        {
+            const store = await open();
+            const m = new CatalogModel();
+            m.DefineConcept('Thing', null, [], [{ Name: 'id', Kind: MemberKind.Property, Type: ValueType.Int64 }]);
+            m.DefineIndex('ById', 'Thing', ['id'], true, new Compare('id', CompareOp.Gt, 0n));
+            const saved = m.Seal();
+            await CatalogFx.Save(store, saved);
+            const loaded = await CatalogFx.Load(store);
+            assert.equal(loaded.Indexes().length, 1);
+            assert.equal(loaded.NextIndexId, saved.NextIndexId);
+            assert.deepEqual(loaded.Indexes()[0]!.Members, saved.Indexes()[0]!.Members);
+            assert.equal(loaded.Indexes()[0]!.Unique, true);
+            assert.deepEqual(PredicateCodec.ToJson(loaded.Indexes()[0]!.Where!), PredicateCodec.ToJson(saved.Indexes()[0]!.Where!));
+            await store.dispose();
+
+            const old = await open();
+            await CatalogFx.PutObject(old, { NextTypeId: 1, NextMemberId: 1, Definitions: [] });
+            const none = await CatalogFx.Load(old);
+            assert.equal(none.Indexes().length, 0);
+            assert.equal(none.NextIndexId, 1);
+            await old.dispose();
+        });
+
         it('an empty store loads an empty catalog at version 0', async () =>
         {
             const store = await open();

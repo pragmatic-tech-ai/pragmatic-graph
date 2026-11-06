@@ -4,7 +4,9 @@ import { FormatKeys } from '../format/FormatKeys.js';
 import { TupleCodec } from '../format/TupleCodec.js';
 import { CatalogError, CatalogErrorCode } from './CatalogError.js';
 import { CatalogSnapshot } from './CatalogSnapshot.js';
-import type { MemberDef, TypeDefinition } from './CatalogTypes.js';
+import { PredicateCodec } from '../predicate/PredicateCodec.js';
+import { PredicateError } from '../predicate/PredicateError.js';
+import type { IndexDef, MemberDef, TypeDefinition } from './CatalogTypes.js';
 import { Placement } from './ValueType.js';
 
 interface IStoredCatalog
@@ -12,6 +14,20 @@ interface IStoredCatalog
     readonly NextTypeId: number;
     readonly NextMemberId: number;
     readonly Definitions: TypeDefinition[];
+    /** Additive: absent in catalogs written before indexes existed. */
+    readonly NextIndexId?: number;
+    readonly Indexes?: IStoredIndex[];
+}
+
+/** An index as stored: `Where` is the PredicateCodec JSON of the predicate. */
+interface IStoredIndex
+{
+    readonly Id: number;
+    readonly Name: string;
+    readonly On: string;
+    readonly Members: number[];
+    readonly Unique: boolean;
+    readonly Where?: unknown;
 }
 
 /** Persists the catalog: `{ NextTypeId, NextMemberId, Definitions }` as UTF-8 JSON under the catalog root, version under Meta("catalogVersion"). */
@@ -26,6 +42,8 @@ export class CatalogStore
     private static readonly CounterMessage = 'id counter below largest used id or below 1: ';
     private static readonly DuplicateTypeIdMessage = 'duplicate type id ';
     private static readonly DuplicateMemberIdMessage = 'duplicate member id ';
+    private static readonly DuplicateIndexIdMessage = 'duplicate index id ';
+    private static readonly BadIndexMessage = 'invalid index ';
 
     public static async Load(txn: IReadTransaction): Promise<CatalogSnapshot>
     {
@@ -33,7 +51,7 @@ export class CatalogStore
         const raw = await txn.Get(Keyspace.Catalog, FormatKeys.CatalogRoot());
         if (raw === undefined)
         {
-            return CatalogSnapshot.Build(version, [], 1, 1);
+            return CatalogSnapshot.Build(version, [], 1, 1, [], 1);
         }
         return CatalogStore.Decode(version, raw);
     }
@@ -45,6 +63,8 @@ export class CatalogStore
             NextTypeId: snapshot.NextTypeId,
             NextMemberId: snapshot.NextMemberId,
             Definitions: [...snapshot.Definitions()],
+            NextIndexId: snapshot.NextIndexId,
+            Indexes: snapshot.Indexes().map(i => CatalogStore.EncodeIndex(i)),
         };
         return new TextEncoder().encode(JSON.stringify(payload));
     }
@@ -58,7 +78,46 @@ export class CatalogStore
             version,
             stored.Definitions.map(d => CatalogStore.FreezeDefinition(d)),
             stored.NextTypeId,
-            stored.NextMemberId);
+            stored.NextMemberId,
+            (stored.Indexes ?? []).map(i => CatalogStore.DecodeIndex(i)),
+            stored.NextIndexId ?? 1);
+    }
+
+    private static EncodeIndex(index: IndexDef): IStoredIndex
+    {
+        return {
+            Id: index.Id,
+            Name: index.Name,
+            On: index.On,
+            Members: [...index.Members],
+            Unique: index.Unique,
+            ...(index.Where === undefined ? {} : { Where: PredicateCodec.ToJson(index.Where) }),
+        };
+    }
+
+    private static DecodeIndex(stored: IStoredIndex): IndexDef
+    {
+        let where;
+        try
+        {
+            where = stored.Where === undefined ? undefined : PredicateCodec.FromJson(stored.Where);
+        }
+        catch (e)
+        {
+            if (e instanceof PredicateError)
+            {
+                throw CatalogStore.Corrupt(CatalogStore.BadIndexMessage + stored.Name);
+            }
+            throw e;
+        }
+        return Object.freeze({
+            Id: stored.Id,
+            Name: stored.Name,
+            On: stored.On,
+            Members: Object.freeze([...stored.Members]),
+            Unique: stored.Unique,
+            ...(where === undefined ? {} : { Where: where }),
+        });
     }
 
     /** Requires snapshot.Version to be exactly the stored version plus one. */
@@ -89,7 +148,9 @@ export class CatalogStore
         const o = value as Partial<IStoredCatalog> | null;
         if (typeof o !== 'object' || o === null
             || !Number.isInteger(o.NextTypeId) || !Number.isInteger(o.NextMemberId) || !Array.isArray(o.Definitions)
-            || !o.Definitions.every(d => CatalogStore.IsDefinition(d)))
+            || !o.Definitions.every(d => CatalogStore.IsDefinition(d))
+            || !CatalogStore.IsOptional(o.NextIndexId, x => Number.isInteger(x))
+            || !CatalogStore.IsOptional(o.Indexes, x => Array.isArray(x) && x.every((i: unknown) => CatalogStore.IsIndex(i))))
         {
             throw CatalogStore.Corrupt(CatalogStore.BadShapeMessage);
         }
@@ -139,6 +200,16 @@ export class CatalogStore
     }
 
     /** Placement and AggregateRoot (ruling F5): optional on concepts (Placement defaults to Partitioned on load), absent on aspects. */
+    private static IsIndex(v: unknown): boolean
+    {
+        return CatalogStore.IsObject(v)
+            && Number.isInteger(v.Id)
+            && typeof v.Name === 'string'
+            && typeof v.On === 'string'
+            && Array.isArray(v.Members) && v.Members.every((x: unknown) => Number.isInteger(x))
+            && typeof v.Unique === 'boolean';
+    }
+
     private static IsPlacement(v: Record<string, unknown>): boolean
     {
         if (v.IsAspect === true)
@@ -170,6 +241,19 @@ export class CatalogStore
         if (stored.NextTypeId < 1 || stored.NextTypeId < maxType.Type + 1)
         {
             throw CatalogStore.Corrupt(CatalogStore.CounterMessage + 'NextTypeId ' + stored.NextTypeId);
+        }
+        const indexIds = new Set<number>();
+        for (const i of stored.Indexes ?? [])
+        {
+            if (indexIds.has(i.Id))
+            {
+                throw CatalogStore.Corrupt(CatalogStore.DuplicateIndexIdMessage + i.Id);
+            }
+            indexIds.add(i.Id);
+        }
+        if ((stored.NextIndexId ?? 1) < 1 || (stored.NextIndexId ?? 1) < CatalogStore.MaxOf(indexIds) + 1)
+        {
+            throw CatalogStore.Corrupt(CatalogStore.CounterMessage + 'NextIndexId ' + stored.NextIndexId);
         }
         if (stored.NextMemberId < 1 || stored.NextMemberId < maxType.Member + 1)
         {
