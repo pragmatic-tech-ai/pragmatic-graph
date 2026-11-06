@@ -70,7 +70,7 @@ class TxnState
  * and no delta entry reads as null. The per-type slot counter lives in Meta("slots", partition, typeId) and is
  * written through the caller's write transaction, so it commits or rolls back with it.
  * Only properties (and the node-id member 0) are stored here; relationships are rejected.
- * Deleting a node is writing null to member 0; its slot is not reused in v1.
+ * Deleting a node nulls every property cell and member 0 (BatchApplier); its slot is not reused in v1.
  *
  * Within a write transaction, WriteCell mutates a parsed in-memory delta (one parse per chunk per
  * transaction); reads in that transaction see it. The caller MUST call Flush(txn) before the
