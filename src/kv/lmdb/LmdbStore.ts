@@ -1,4 +1,4 @@
-import { open, RootDatabase, Database, Transaction } from 'lmdb';
+import { open, RootDatabase, Database, Transaction, type RootDatabaseOptionsWithPath } from 'lmdb';
 import { IKeyRange, IKeyValueStore, IReadTransaction, IScanProbe, IWriteTransaction, ScanCounter } from '../KeyValue.js';
 import { Keyspace } from '../Keyspace.js';
 import { PendingChanges } from '../PendingChanges.js';
@@ -210,6 +210,12 @@ export class LmdbStore implements IKeyValueStore, IScanProbe
         return this.counter.Count;
     }
 
+    /** Diagnostics: whether the open environment syncs commits asynchronously (always false; see OpenOptions). */
+    public get OverlappingSync(): boolean
+    {
+        return (this.root as unknown as { overlappingSync?: boolean }).overlappingSync === true;
+    }
+
     private constructor(
         private readonly root: RootDatabase,
         private readonly databases: Databases,
@@ -217,16 +223,27 @@ export class LmdbStore implements IKeyValueStore, IScanProbe
     {
     }
 
+    /**
+     * The lmdb-js environment options Open uses. overlappingSync is explicitly off on every platform
+     * (lmdb-js turns it on by default outside Windows, which lets transactionSync return before the
+     * fsync): a Write resolves only once its data is durable.
+     */
+    public static OpenOptions(path: string, options?: ILmdbOptions): RootDatabaseOptionsWithPath
+    {
+        return {
+            path,
+            mapSize: options?.MapSizeBytes ?? LmdbStore.DefaultMapSizeBytes,
+            maxDbs: Object.values(Keyspace).length,
+            keyEncoding: LmdbStore.BinaryEncoding,
+            encoding: LmdbStore.BinaryEncoding,
+            overlappingSync: false,
+        };
+    }
+
     public static async Open(path: string, options?: ILmdbOptions): Promise<LmdbStore>
     {
         const spaces = Object.values(Keyspace);
-        const root = open({
-            path,
-            mapSize: options?.MapSizeBytes ?? LmdbStore.DefaultMapSizeBytes,
-            maxDbs: spaces.length,
-            keyEncoding: LmdbStore.BinaryEncoding,
-            encoding: LmdbStore.BinaryEncoding,
-        });
+        const root = open(LmdbStore.OpenOptions(path, options));
         const databases = new Map<Keyspace, Database<Buffer, Buffer>>();
         for (const space of spaces)
         {

@@ -1,4 +1,5 @@
-import { after } from 'node:test';
+import { after, describe, it } from 'node:test';
+import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -56,3 +57,20 @@ KeyValueConformance.Register(
     () => LmdbReopenTarget.Open(),
     store => LmdbReopenTarget.Reopen(store as LmdbStore),
 );
+
+describe('lmdb store durability options', () =>
+{
+    it('opens with overlappingSync off on every platform, so a commit resolves only once it is durable (F2)', async () =>
+    {
+        assert.equal(LmdbStore.OpenOptions(LmdbTestDirs.Make()).overlappingSync, false);
+        const store = await LmdbStore.Open(LmdbTestDirs.Make());
+        try
+        {
+            assert.equal(store.OverlappingSync, false);
+        }
+        finally
+        {
+            await store.dispose();
+        }
+    });
+});
