@@ -1081,7 +1081,7 @@ class TxnFx
                 await inner.dispose();
             });
 
-            it('a CorruptEdge read while applying passes through unmapped (not InvalidEdge)', async () =>
+            it('DeleteNode never decodes edge values: it removes edges whose stored properties are corrupt (F9)', async () =>
             {
                 const store = await open();
                 const catalog = TxnFx.Catalog();
@@ -1099,10 +1099,13 @@ class TxnFx
                     }
                     keys.forEach(key => txn.Put(Keyspace.Edges, key, Uint8Array.of(1, 2, 3)));
                 });
-                // DeleteNode decodes the Out values of the node's edges (sibling lookups no longer do, ruling R33).
+                // Ruling F9: DeleteNode walks edges without their properties, so corrupt values are not read
+                // (no commit path decodes edge properties any more; Neighbors still reports CorruptEdge).
                 const outcome = await TxnFx.Settle(c.Submit(TxnFx.Batch(b => b.DeleteNode('a')), new ReadSet(), c.LastCommit()));
-                assert.ok(outcome instanceof EdgeError && outcome.Code === EdgeErrorCode.CorruptEdge, String(outcome));
-                assert.ok((await new Probe(store, catalog).Id('a')) !== undefined, 'the failed batches left no trace');
+                assert.equal(typeof outcome, 'bigint', String(outcome));
+                const probe = new Probe(store, catalog);
+                assert.equal(await probe.Id('a'), undefined);
+                assert.deepEqual(await probe.Neighbors('b', 'Person', 'friends', EdgeDirection.In), []);
                 await store.dispose();
             });
 
