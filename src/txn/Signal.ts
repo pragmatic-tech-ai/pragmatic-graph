@@ -4,12 +4,35 @@ export interface ISubscription
     dispose(): void;
 }
 
+/** The subscriber's side of a Signal: subscribe only, so a listener can neither raise nor end it. */
+export interface ISignal<T>
+{
+    Subscribe(handler: (value: T) => void): ISubscription;
+}
+
+/** Hands out only the subscribe side of a Signal; the owner keeps Raise and dispose. */
+export class SignalView<T> implements ISignal<T>
+{
+    readonly #source: Signal<T>;
+
+    public constructor(source: Signal<T>)
+    {
+        this.#source = source;
+        Object.freeze(this);
+    }
+
+    public Subscribe(handler: (value: T) => void): ISubscription
+    {
+        return this.#source.Subscribe(handler);
+    }
+}
+
 /**
  * Upward notification primitive: the engine raises, higher layers subscribe. Raise delivers to the
  * handlers subscribed when it starts, in subscription order. Every handler runs even if an earlier one
  * throws; the failures are then thrown together as one AggregateError.
  */
-export class Signal<T>
+export class Signal<T> implements ISignal<T>
 {
     private static readonly ErrHandlers = 'One or more signal handlers threw';
     private static readonly ErrDisposed = 'Signal has been disposed';

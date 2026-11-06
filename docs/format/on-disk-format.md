@@ -159,7 +159,7 @@ The Out key on the source is `(partition, relationshipId, 0, from, position, to)
 
 **Out value** (edge properties): for each non-null property, sorted by member id ascending, `memberId: u32 LE`, `length: u32 LE`, then `length` bytes of single-value encoding (the Columns single value layout for the property type). Null and absent properties are not stored; an edge with no properties has an empty value. **In value**: empty; In-direction reads fetch properties from the matching Out key.
 
-Lookup cost by `(from, to)`: O(1) for unordered Many relationships (direct key), one single-key scan for unordered one-valued relationships, and O(out-degree) for ordered relationships (the position is part of the key, so the source's Out range is scanned; appending also scans to find the last sibling). A future `(from, to)` to position pair index would make ordered lookups O(1).
+Lookup cost by `(from, to)`: O(1) for unordered Many relationships (direct key), one single-key scan for unordered one-valued relationships, and O(in-degree of `to`) for ordered relationships: the In keys carry the position, so the target's In range is scanned (ruling R33; 1 for trees). An ordered insert after a sibling then finds the neighbour with one forward scan of at most 2 keys from that sibling's Out position. A plain append, and an insert with only a Before sibling, still scan the source's Out range, O(out-degree), to find the last or preceding sibling; a later tail index or reverse scan removes that. No format change.
 
 ### Log
 

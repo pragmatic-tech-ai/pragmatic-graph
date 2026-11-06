@@ -25,7 +25,7 @@ export class GraphTransaction extends GraphReader
     private readonly reads = new ReadSet();
     private committing = false;
 
-    /** Internal: use GraphStore.Begin. */
+    /** @internal Created by GraphStore.Begin. */
     public constructor(context: GraphContext, snapshot: ReadSnapshot)
     {
         super(context, snapshot);
@@ -61,7 +61,12 @@ export class GraphTransaction extends GraphReader
         this.batch.Unlink(from, relationship, to);
     }
 
-    /** Commits the recorded writes; resolves with the commit number. Ends the transaction. */
+    /**
+     * Commits the recorded writes; resolves with the commit number. Ends the transaction. A
+     * transaction that recorded no writes commits nothing: after the schema check it resolves with its
+     * SnapshotCommit, consumes no commit number and raises no CommitApplied (its reads need no
+     * validation, being a consistent snapshot).
+     */
     public async Commit(): Promise<bigint>
     {
         this.RequireActive();
@@ -72,6 +77,10 @@ export class GraphTransaction extends GraphReader
             if (began !== this.context.CatalogVersion)
             {
                 throw new ConflictError(GraphTransaction.ErrSchema + began + GraphTransaction.ErrSchemaNow + this.context.CatalogVersion);
+            }
+            if (this.batch.Count === 0)
+            {
+                return this.SnapshotCommit;
             }
             return await this.context.Committer.Submit(this.batch, this.reads, this.ValidationCommit());
         }

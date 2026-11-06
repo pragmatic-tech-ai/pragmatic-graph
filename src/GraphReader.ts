@@ -42,7 +42,7 @@ export class GraphReader implements IGraphDisposable
 
     private disposed = false;
 
-    /** Internal: use GraphStore.BeginRead or GraphStore.Begin. */
+    /** @internal Created by GraphStore.BeginRead and GraphStore.Begin. */
     public constructor(protected readonly context: GraphContext, protected readonly snapshot: ReadSnapshot)
     {
         context.Track(this);
@@ -108,16 +108,19 @@ export class GraphReader implements IGraphDisposable
     /**
      * Every live node whose concept is, inherits from, or carries `conceptOrAspect`, with its `member`
      * value: one row per node for a property, one row per outgoing edge (Value = target public id) for a
-     * relationship. Rows come per matching concept, then in storage (slot) order.
+     * relationship. Rows come per matching concept, then in storage (slot) order. The member must belong
+     * to the named concept or aspect (CatalogError UnknownMember otherwise, even when nothing carries
+     * the aspect). Disposing the reader ends the scan: the next row rejects.
      */
     public async *ScanConcept(conceptOrAspect: string, member: string): AsyncIterable<IScanRow>
     {
         this.RequireOpen();
         const index = this.snapshot.Index;
+        index.Catalog.MemberOf(conceptOrAspect, member);
         for (const typeId of index.Catalog.ConceptsMatching(conceptOrAspect))
         {
-            const concept = index.ConceptOf(typeId) as string;
-            const def = index.Catalog.Member(concept, member);
+            this.RequireOpen();
+            const def = index.Catalog.Member(index.ConceptOf(typeId) as string, member);
             this.Reads?.AddKey(ConflictKeys.ExtentSpace, ConflictKeys.Extent(typeId));
             if (def.Kind === MemberKind.Property)
             {
@@ -156,30 +159,16 @@ export class GraphReader implements IGraphDisposable
         }
     }
 
-    /** Live slots of the type in slot order: the member column zipped with the node-id column (both skip deleted slots). */
+    /** Live slots of the type in slot order; each column row carries its node id, so one pass suffices. */
     private async *ScanProperty(typeId: number, def: MemberDef): AsyncIterable<IScanRow>
     {
-        const txn = this.snapshot.Txn;
-        const values = this.context.Columns.ScanColumn(txn, GraphReader.Partition, typeId, def)[Symbol.asyncIterator]();
-        const ids = this.context.Columns.ScanColumn(txn, GraphReader.Partition, typeId, CatalogSnapshot.NodeIdMember)[Symbol.asyncIterator]();
-        try
+        for await (const row of this.context.Columns.ScanColumn(this.snapshot.Txn, GraphReader.Partition, typeId, def))
         {
-            for (;;)
-            {
-                const [value, id] = await Promise.all([values.next(), ids.next()]);
-                if (value.done === true || id.done === true)
-                {
-                    return;
-                }
-                const internal = id.value.Value as bigint;
-                this.Reads?.AddKey(ConflictKeys.CellSpace, ConflictKeys.Cell(internal, def.Id));
-                yield { PublicId: await this.PublicIdOf(internal), Value: value.value.Value };
-            }
-        }
-        finally
-        {
-            await values.return?.();
-            await ids.return?.();
+            this.RequireOpen();
+            this.Reads?.AddKey(ConflictKeys.CellSpace, ConflictKeys.Cell(row.NodeId, def.Id));
+            const publicId = await this.PublicIdOf(row.NodeId);
+            this.RequireOpen();
+            yield { PublicId: publicId, Value: row.Value };
         }
     }
 
@@ -188,12 +177,15 @@ export class GraphReader implements IGraphDisposable
         const txn = this.snapshot.Txn;
         for await (const row of this.context.Columns.ScanColumn(txn, GraphReader.Partition, typeId, CatalogSnapshot.NodeIdMember))
         {
-            const internal = row.Value as bigint;
-            const source = await this.PublicIdOf(internal);
-            this.Reads?.AddRange(ConflictKeys.EdgeSpace, ConflictKeys.Adjacency(def.Id, EdgeDirection.Out, internal));
-            for await (const n of this.context.Edges.Neighbors(txn, def, internal, EdgeDirection.Out))
+            this.RequireOpen();
+            const source = await this.PublicIdOf(row.NodeId);
+            this.Reads?.AddRange(ConflictKeys.EdgeSpace, ConflictKeys.Adjacency(def.Id, EdgeDirection.Out, row.NodeId));
+            for await (const n of this.context.Edges.Neighbors(txn, def, row.NodeId, EdgeDirection.Out))
             {
-                yield { PublicId: source, Value: await this.PublicIdOf(n.Node) };
+                this.RequireOpen();
+                const target = await this.PublicIdOf(n.Node);
+                this.RequireOpen();
+                yield { PublicId: source, Value: target };
             }
         }
     }

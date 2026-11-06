@@ -17,7 +17,7 @@ export { EdgeDirection } from './format/FormatKeys.js';
 // Commits and change notification.
 export { WriteBatch, WriteOp, type BatchOp, type ICreateNodeOp, type IDeleteNodeOp, type ILinkOp, type ISetPropertyOp, type IUnlinkOp, type LinkOptions } from './txn/WriteBatch.js';
 export type { ICommitApplied } from './txn/Committer.js';
-export { Signal, type ISubscription } from './txn/Signal.js';
+export type { ISignal, ISubscription } from './txn/Signal.js';
 
 // Errors.
 export { ConflictError } from './txn/ConflictError.js';

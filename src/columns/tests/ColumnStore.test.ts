@@ -148,7 +148,7 @@ class ColumnFx
         const out: Array<{ Slot: number; Value: CellValue }> = [];
         for await (const e of cs.ScanColumn(r, 0, typeId, member))
         {
-            out.push(e);
+            out.push({ Slot: e.Slot, Value: e.Value });
         }
         r.dispose();
         return out;
@@ -348,6 +348,14 @@ class ColumnFx
                 ]);
                 const ids = await ColumnFx.Scan(store, cs, ColumnFx.Id);
                 assert.deepEqual(ids.map(e => e.Slot), [0, 2, 3, 4]);
+                const r = await store.BeginRead();
+                const withIds: Array<[number, bigint]> = [];
+                for await (const e of cs.ScanColumn(r, 0, ColumnFx.Type, ColumnFx.NameMember))
+                {
+                    withIds.push([e.Slot, e.NodeId]);
+                }
+                r.dispose();
+                assert.deepEqual(withIds, [[0, 100n], [2, 102n], [3, 103n], [4, 104n]], 'each row carries its node id');
                 await store.dispose();
             });
 

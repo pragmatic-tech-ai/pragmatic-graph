@@ -74,6 +74,12 @@ export class FormatKeys
         return TupleCodec.Encode([partition, relationshipId, direction, node]);
     }
 
+    /** Prefix of every edge key of the node at exactly this position (the other id follows). */
+    public static EdgeAt(partition: number, relationshipId: number, direction: EdgeDirection, node: bigint, position: Uint8Array): Uint8Array
+    {
+        return TupleCodec.Encode([partition, relationshipId, direction, node, position]);
+    }
+
     public static EdgeRange(partition: number, relationshipId: number, direction: EdgeDirection, node: bigint): IKeyRange
     {
         const prefix = FormatKeys.EdgePrefix(partition, relationshipId, direction, node);

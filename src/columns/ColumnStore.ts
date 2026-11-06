@@ -35,6 +35,15 @@ class DeltaState
 }
 
 /** A chunk whose delta this write transaction has written, with the delta's total entry count. */
+/** One live row of ScanColumn. */
+export interface IColumnRow
+{
+    readonly Slot: number;
+    readonly Value: CellValue;
+    /** The node's internal id (its member-0 cell). */
+    readonly NodeId: bigint;
+}
+
 export interface ITouchedDelta
 {
     readonly Partition: number;
@@ -306,8 +315,8 @@ export class ColumnStore
         return ChunkDelta.Parse(type, bytes);
     }
 
-    /** Live slots (member-0 cell non-null after overlay) in slot order, with this member's value. */
-    public async *ScanColumn(txn: IReadTransaction, partition: number, typeId: number, member: MemberDef): AsyncIterable<{ Slot: number; Value: CellValue }>
+    /** Live slots (member-0 cell non-null after overlay) in slot order, with this member's value and the slot's node id (member 0). */
+    public async *ScanColumn(txn: IReadTransaction, partition: number, typeId: number, member: MemberDef): AsyncIterable<IColumnRow>
     {
         const type = ColumnStore.RequireType(member);
         ColumnStore.RequirePartition(partition);
@@ -322,9 +331,10 @@ export class ColumnStore
             const ids = isId ? values : await this.LoadChunk(txn, partition, typeId, idMember.Id, idMember.Type as ValueType, chunk, n);
             for (let i = 0; i < n; i++)
             {
-                if (ids[i] !== null)
+                const id = ids[i];
+                if (id !== null)
                 {
-                    yield { Slot: start + i, Value: values[i] as CellValue };
+                    yield { Slot: start + i, Value: values[i] as CellValue, NodeId: id as bigint };
                 }
             }
         }

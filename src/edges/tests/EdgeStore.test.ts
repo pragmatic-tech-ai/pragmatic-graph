@@ -8,7 +8,7 @@ import type { MemberDef } from '../../catalog/CatalogTypes.js';
 import { CellValue } from '../../columns/CellValue.js';
 import { EdgeDirection, FormatKeys } from '../../format/FormatKeys.js';
 import { TupleCodec } from '../../format/TupleCodec.js';
-import type { IKeyValueStore, IReadTransaction } from '../../kv/KeyValue.js';
+import type { IKeyRange, IKeyValueStore, IReadTransaction, IWriteTransaction } from '../../kv/KeyValue.js';
 import { Keyspace } from '../../kv/Keyspace.js';
 import { LmdbStore } from '../../kv/lmdb/LmdbStore.js';
 import { MemoryStore } from '../../kv/memory/MemoryStore.js';
@@ -20,6 +20,46 @@ interface INeighbor
     Node: bigint;
     Position: Uint8Array;
     Properties: ReadonlyMap<string, CellValue>;
+}
+
+/** Counts the entries a write transaction returned from Get and Scan. */
+class CountingTxn implements IWriteTransaction
+{
+    public Read = 0;
+
+    public constructor(private readonly inner: IWriteTransaction)
+    {
+    }
+
+    public async Get(space: Keyspace, key: Uint8Array): Promise<Uint8Array | undefined>
+    {
+        this.Read++;
+        return this.inner.Get(space, key);
+    }
+
+    public async *Scan(space: Keyspace, range: IKeyRange, limit?: number): AsyncIterable<[Uint8Array, Uint8Array]>
+    {
+        for await (const entry of this.inner.Scan(space, range, limit))
+        {
+            this.Read++;
+            yield entry;
+        }
+    }
+
+    public Put(space: Keyspace, key: Uint8Array, value: Uint8Array): void
+    {
+        this.inner.Put(space, key, value);
+    }
+
+    public Delete(space: Keyspace, key: Uint8Array): void
+    {
+        this.inner.Delete(space, key);
+    }
+
+    public dispose(): void
+    {
+        this.inner.dispose();
+    }
 }
 
 class EdgeFx
@@ -89,6 +129,32 @@ class EdgeFx
     {
         describe('edge store on ' + name, () =>
         {
+            it('an ordered insert next to a sibling reads a bounded number of keys, independent of out-degree (R33)', async () =>
+            {
+                const store = await open();
+                const es = new EdgeStore();
+                const rel = EdgeFx.ManyOrdered;
+                const positions: Uint8Array[] = [];
+                await store.Write(async txn =>
+                {
+                    for (let i = 0; i < 300; i++)
+                    {
+                        positions.push(await es.Link(txn, rel, 1n, 1000n + BigInt(i)));
+                    }
+                });
+                const middle = positions[150] as Uint8Array;
+                const after = await store.Write(async txn =>
+                {
+                    const counting = new CountingTxn(txn);
+                    await es.Link(counting, rel, 1n, 5n, { After: middle });
+                    await es.Link(counting, rel, 1n, 6n, { After: middle, Before: await es.PositionOf(counting, rel, 1n, 5n) as Uint8Array });
+                    return counting.Read;
+                });
+                assert.ok(after <= 8, 'read ' + after + ' keys');
+                assert.deepEqual((await EdgeFx.Nodes(store, es, rel, 1n, EdgeDirection.Out)).slice(150, 154), [1150n, 6n, 5n, 1151n]);
+                await store.dispose();
+            });
+
             it('1,000 inserts between the same two siblings keep order and never renumber an existing edge', async () =>
             {
                 const store = await open();

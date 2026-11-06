@@ -151,6 +151,31 @@ export class CatalogSnapshot
         return m;
     }
 
+    /**
+     * A member of a concept (its effective members, as Member) or of an aspect (its own members and
+     * those of the aspects it includes), whether or not any concept carries the aspect. Throws
+     * UnknownType for an unknown name and UnknownMember for a member it does not have.
+     */
+    public MemberOf(conceptOrAspect: string, name: string): MemberDef
+    {
+        const def = this.Require(conceptOrAspect);
+        if (!def.IsAspect)
+        {
+            return this.Member(conceptOrAspect, name);
+        }
+        const closure = new Set<string>();
+        CatalogSnapshot.Closure([conceptOrAspect], this.byName, closure);
+        for (const aspect of closure)
+        {
+            const m = this.byName.get(aspect)!.Members.find(x => x.Name === name);
+            if (m !== undefined)
+            {
+                return m;
+            }
+        }
+        throw new CatalogError(CatalogErrorCode.UnknownMember, CatalogSnapshot.UnknownMemberMessage + conceptOrAspect + '.' + name);
+    }
+
     public IsA(concept: string, conceptOrAspect: string): boolean
     {
         this.RequireConcept(concept);

@@ -1089,11 +1089,9 @@ class TxnFx
                         txn.Put(Keyspace.Edges, key, Uint8Array.of(1, 2, 3));
                     }
                 });
-                for (const build of [(b: WriteBatch): void => b.DeleteNode('a'), (b: WriteBatch): void => b.Link('a', 'friends', 'x', { AfterSibling: 'b' })])
-                {
-                    const outcome = await TxnFx.Settle(c.Submit(TxnFx.Batch(build), new ReadSet(), c.LastCommit()));
-                    assert.ok(outcome instanceof EdgeError && outcome.Code === EdgeErrorCode.CorruptEdge, String(outcome));
-                }
+                // DeleteNode decodes the Out values of the node's edges (sibling lookups no longer do, ruling R33).
+                const outcome = await TxnFx.Settle(c.Submit(TxnFx.Batch(b => b.DeleteNode('a')), new ReadSet(), c.LastCommit()));
+                assert.ok(outcome instanceof EdgeError && outcome.Code === EdgeErrorCode.CorruptEdge, String(outcome));
                 assert.ok((await new Probe(store, catalog).Id('a')) !== undefined, 'the failed batches left no trace');
                 await store.dispose();
             });

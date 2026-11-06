@@ -41,9 +41,11 @@ interface ISibling
  *
  * Cost: finding an existing edge by (from, to) is O(1) for unordered Many relationships (the pair key
  * is directly addressable), a single-key scan for unordered one-valued relationships, and a scan of
- * the source's Out range, O(out-degree), for ordered relationships (the position is part of the key).
- * Appending to an ordered relationship also scans to find the last sibling. A future (from, to) to
- * position pair index would make ordered lookups O(1).
+ * the target's In range, O(in-degree of the target), for ordered relationships (In keys carry the
+ * position; ruling R33; 1 for trees). An ordered insert After a sibling then reads the neighbour with
+ * one bounded forward scan (limit 2) from that position. A plain append (no After/Before) and an
+ * insert with only Before still scan the source's Out range, O(out-degree): finding the last or the
+ * preceding sibling needs a tail index or a reverse scan, which a later plan adds.
  */
 export class EdgeStore
 {
@@ -82,9 +84,15 @@ export class EdgeStore
         let position = EdgeStore.EmptyPosition;
         if (ordered)
         {
-            const siblings = await this.Siblings(txn, relationship, from);
-            EdgeStore.RequireNew(relationship, siblings, to, many, from);
-            position = EdgeStore.ChoosePosition(siblings, options);
+            if ((await this.FindPosition(txn, relationship, from, to)) !== undefined)
+            {
+                throw EdgeStore.Duplicate(relationship, from, to);
+            }
+            if (!many)
+            {
+                EdgeStore.RequireNew(relationship, await this.Siblings(txn, relationship, from, 1), to, many, from);
+            }
+            position = await this.OrderedPosition(txn, relationship, from, options);
         }
         else if (many)
         {
@@ -140,12 +148,30 @@ export class EdgeStore
         }
     }
 
-    /** Position of the edge from -> to, or undefined. Cost depends on the relationship shape (see class comment). */
+    /** Position of the edge from -> to, or undefined when there is none. Cost depends on the relationship shape (see class comment). */
+    public async PositionOf(txn: IReadTransaction, relationship: MemberDef, from: bigint, to: bigint): Promise<Uint8Array | undefined>
+    {
+        EdgeStore.RequireRelationship(relationship);
+        InternalId.Require(from);
+        InternalId.Require(to);
+        return this.FindPosition(txn, relationship, from, to);
+    }
+
     private async FindPosition(txn: IReadTransaction, relationship: MemberDef, from: bigint, to: bigint): Promise<Uint8Array | undefined>
     {
         if (relationship.Ordered === true)
         {
-            return (await this.Siblings(txn, relationship, from)).find(s => s.Other === to)?.Position;
+            // In keys carry the position: scan the target's In range, O(in-degree of `to`) (ruling R33).
+            const range = FormatKeys.EdgeRange(EdgeStore.Partition, relationship.Id, EdgeDirection.In, to);
+            for await (const [key] of txn.Scan(Keyspace.Edges, range))
+            {
+                const parts = TupleCodec.Decode(key);
+                if (parts[5] === from)
+                {
+                    return parts[4] as Uint8Array;
+                }
+            }
+            return undefined;
         }
         if (relationship.Many === true)
         {
@@ -156,9 +182,50 @@ export class EdgeStore
         return first !== undefined && first.Other === to ? first.Position : undefined;
     }
 
-    private async Siblings(txn: IReadTransaction, relationship: MemberDef, from: bigint, limit?: number): Promise<ISibling[]>
+    /**
+     * Position for a new edge of an ordered relationship. With After: one bounded scan (limit 2) from
+     * that position gives the sibling itself and its neighbour; Before (when also given) must be that
+     * neighbour. Without After it falls back to scanning every sibling (see class comment).
+     */
+    private async OrderedPosition(txn: IReadTransaction, relationship: MemberDef, from: bigint, options: ILinkOptions | undefined): Promise<Uint8Array>
     {
-        const range = FormatKeys.EdgeRange(EdgeStore.Partition, relationship.Id, EdgeDirection.Out, from);
+        const after = options?.After ?? null;
+        if (after === null)
+        {
+            return EdgeStore.ChoosePosition(await this.Siblings(txn, relationship, from), options);
+        }
+        const window = await this.Siblings(txn, relationship, from, 2, after);
+        if (window[0] === undefined || TupleCodec.Compare(window[0].Position, after) !== 0)
+        {
+            throw new EdgeError(EdgeErrorCode.UnknownSibling, EdgeStore.ErrSibling);
+        }
+        const next = window[1]?.Position ?? null;
+        const before = options?.Before ?? null;
+        if (before === null)
+        {
+            return FractionalPosition.Between(after, next);
+        }
+        const at = await this.Siblings(txn, relationship, from, 1, before);
+        if (at[0] === undefined || TupleCodec.Compare(at[0].Position, before) !== 0)
+        {
+            throw new EdgeError(EdgeErrorCode.UnknownSibling, EdgeStore.ErrSibling);
+        }
+        if (TupleCodec.Compare(after, before) >= 0)
+        {
+            throw new EdgeError(EdgeErrorCode.InvalidOrder, EdgeStore.ErrBounds);
+        }
+        if (next === null || TupleCodec.Compare(next, before) !== 0)
+        {
+            throw new EdgeError(EdgeErrorCode.NotAdjacent, EdgeStore.ErrNotAdjacent);
+        }
+        return FractionalPosition.Between(after, before);
+    }
+
+    /** The source's Out edges in key order, starting at position `start` (inclusive) when given. */
+    private async Siblings(txn: IReadTransaction, relationship: MemberDef, from: bigint, limit?: number, start?: Uint8Array): Promise<ISibling[]>
+    {
+        const all = FormatKeys.EdgeRange(EdgeStore.Partition, relationship.Id, EdgeDirection.Out, from);
+        const range = start === undefined ? all : { Start: FormatKeys.EdgeAt(EdgeStore.Partition, relationship.Id, EdgeDirection.Out, from, start), End: all.End };
         const out: ISibling[] = [];
         for await (const [key] of txn.Scan(Keyspace.Edges, range, limit))
         {

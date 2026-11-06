@@ -254,16 +254,14 @@ export class BatchApplier
         return rel;
     }
 
-    /** Position of the existing edge (from, rel, sibling); UnknownNode if the sibling does not exist, InvalidEdge if it is not linked. */
+    /** Position of the existing edge (from, rel, sibling), found from the sibling's In range (ruling R33); UnknownNode if the sibling does not exist, InvalidEdge if it is not linked. */
     private async SiblingPosition(txn: IWriteTransaction, from: INode, rel: MemberDef, sibling: string): Promise<Uint8Array>
     {
         const target = await this.Locate(txn, sibling);
-        for await (const n of this.edges.Neighbors(txn, rel, from.Id, EdgeDirection.Out))
+        const position = await this.edges.PositionOf(txn, rel, from.Id, target.Id);
+        if (position !== undefined)
         {
-            if (n.Node === target.Id)
-            {
-                return n.Position;
-            }
+            return position;
         }
         const label = BatchApplier.Label(from, rel, target);
         throw new CommitError(CommitErrorCode.InvalidEdge, BatchApplier.ErrSibling + label, new EdgeError(EdgeErrorCode.UnknownSibling, BatchApplier.ErrSibling + label));

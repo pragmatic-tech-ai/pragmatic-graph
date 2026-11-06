@@ -10,7 +10,7 @@ import { Keyspace } from './kv/Keyspace.js';
 import { LmdbStore } from './kv/lmdb/LmdbStore.js';
 import { MemoryStore } from './kv/memory/MemoryStore.js';
 import { Committer, type ICommitApplied } from './txn/Committer.js';
-import type { Signal } from './txn/Signal.js';
+import { type ISignal, SignalView } from './txn/Signal.js';
 
 /**
  * The embedding API of the graph engine: one graph over one durable (LMDB) or in-memory store.
@@ -26,10 +26,14 @@ export class GraphStore
     /** Covers every tuple-encoded key (type codes are below 0xFF). */
     private static readonly AnyKey = { Start: Uint8Array.of(0x00), End: Uint8Array.of(0xff) };
 
+    /** Raised once per applied commit, in commit order, after the commit is durable. Subscribe-only. */
+    public readonly CommitApplied: ISignal<ICommitApplied>;
+
     private disposing: Promise<void> | undefined;
 
     private constructor(private readonly context: GraphContext)
     {
+        this.CommitApplied = new SignalView(context.Committer.CommitApplied);
     }
 
     /** Opens (creating when absent) the LMDB environment in directory `path`. */
@@ -42,12 +46,6 @@ export class GraphStore
     public static async OpenMemory(): Promise<GraphStore>
     {
         return GraphStore.Open(new MemoryStore());
-    }
-
-    /** Raised once per applied commit, in commit order, after the commit is durable. */
-    public get CommitApplied(): Signal<ICommitApplied>
-    {
-        return this.context.Committer.CommitApplied;
     }
 
     /**

@@ -9,8 +9,10 @@ import { FormatKeys } from '../format/FormatKeys.js';
 import { TupleCodec } from '../format/TupleCodec.js';
 import { Keyspace } from '../kv/Keyspace.js';
 import { LmdbStore } from '../kv/lmdb/LmdbStore.js';
+import * as Api from '../index.js';
 import {
     CatalogError,
+    CatalogErrorCode,
     CatalogModel,
     CommitError,
     CommitErrorCode,
@@ -37,7 +39,8 @@ class GraphFx
 
     /**
      * file { path: String }, sourceFile : file { language: String? }, aspect placed { in -> location },
-     * component : placed { name: String? }, location {}, folder { items -> file (many, ordered) }.
+     * component : placed { name: String? }, location {}, folder { items -> file (many, ordered) },
+     * aspect tagged { tag: String? } (carried by nothing).
      */
     public static Define(m: CatalogModel): void
     {
@@ -50,6 +53,7 @@ class GraphFx
         ]);
         m.DefineConcept('location', null, [], []);
         m.DefineConcept('folder', null, [], [{ Name: 'items', Kind: MemberKind.Relationship, Targets: ['file'], Many: true, Ordered: true }]);
+        m.DefineAspect('tagged', [], [{ Name: 'tag', Kind: MemberKind.Property, Type: ValueType.String, Nullable: true }]);
     }
 
     public static Dir(): string
@@ -292,6 +296,68 @@ class GraphFx
                 assert.deepEqual(seen.map(e => e.Commit), [1n, 2n]);
                 assert.deepEqual(seen[1]!.Batch.Ops(), [{ Op: WriteOp.SetProperty, PublicId: 'f1', Member: 'path', Value: '/x' }]);
                 sub.dispose();
+                await g.dispose();
+            });
+
+            it('CommitApplied is subscribe-only: subscribers can neither raise nor dispose it; Signal is not exported', async () =>
+            {
+                const g = await GraphFx.Defined(open);
+                const surface = g.CommitApplied as unknown as Record<string, unknown>;
+                assert.equal(typeof surface['Subscribe'], 'function');
+                assert.equal(surface['Raise'], undefined);
+                assert.equal(surface['dispose'], undefined);
+                assert.equal('Signal' in Api, false);
+                const seen: bigint[] = [];
+                g.CommitApplied.Subscribe(e => seen.push(e.Commit));
+                await GraphFx.Seed(g);
+                assert.deepEqual(seen, [1n]);
+                await g.dispose();
+            });
+
+            it('an empty transaction commits nothing: it returns its snapshot commit and raises no CommitApplied', async () =>
+            {
+                const g = await GraphFx.Defined(open);
+                await GraphFx.Seed(g);
+                const seen: bigint[] = [];
+                g.CommitApplied.Subscribe(e => seen.push(e.Commit));
+                const t = await g.Begin();
+                await t.GetProperty('f1', 'path');
+                assert.equal(await t.Commit(), t.SnapshotCommit);
+                assert.equal(t.SnapshotCommit, 1n);
+                await assert.rejects(t.Commit());
+                assert.deepEqual(seen, []);
+                assert.equal(await GraphFx.Commit(g, x => x.SetProperty('f1', 'path', '/n')), 2n, 'no commit number was consumed');
+                await g.dispose();
+            });
+
+            it('a reader disposed during ScanConcept stops yielding', async () =>
+            {
+                const g = await GraphFx.Defined(open);
+                await GraphFx.Seed(g);
+                for (const [name, member] of [['file', 'path'], ['placed', 'in']] as const)
+                {
+                    const r = await g.BeginRead();
+                    const rows = r.ScanConcept(name, member)[Symbol.asyncIterator]();
+                    assert.equal((await rows.next()).done, false);
+                    r.dispose();
+                    await assert.rejects(rows.next(), /Reader has been disposed/);
+                }
+                await g.dispose();
+            });
+
+            it('ScanConcept validates the member against the named concept or aspect, even without carriers', async () =>
+            {
+                const g = await GraphFx.Defined(open);
+                await GraphFx.Seed(g);
+                await GraphFx.Read(g, async r =>
+                {
+                    assert.deepEqual(await GraphFx.Scan(r, 'tagged', 'tag'), []);
+                    for (const [name, member] of [['tagged', 'bogus'], ['placed', 'bogus'], ['file', 'name']] as const)
+                    {
+                        const error = await GraphFx.Settle(GraphFx.Scan(r, name, member));
+                        assert.ok(error instanceof CatalogError && error.Code === CatalogErrorCode.UnknownMember, name + '.' + member + ': ' + String(error));
+                    }
+                });
                 await g.dispose();
             });
 
