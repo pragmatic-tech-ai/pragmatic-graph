@@ -179,22 +179,15 @@ export class ValueCodec
         return decoded.Value;
     }
 
-    /** Decodes one value starting at `offset`; End is the offset just past it. */
-    public static DecodeAt(type: ValueType, bytes: Uint8Array, offset: number): DecodedValue
+    /** Decodes one value starting at `offset`; End is the offset just past it. Pass `view` to avoid building one per call. */
+    public static DecodeAt(type: ValueType, bytes: Uint8Array, offset: number, view?: DataView): DecodedValue
     {
-        const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.length);
-        const need = (n: number): void =>
-        {
-            if (offset + n > bytes.length)
-            {
-                throw ChunkCodecError.Corrupt(ValueCodec.TruncatedValue);
-            }
-        };
+        view ??= new DataView(bytes.buffer, bytes.byteOffset, bytes.length);
         switch (type)
         {
             case ValueType.Boolean:
             {
-                need(1);
+                ValueCodec.Need(bytes, offset, 1);
                 const b = bytes[offset]!;
                 if (b > 1)
                 {
@@ -203,26 +196,26 @@ export class ValueCodec
                 return { Value: b === 1, End: offset + 1 };
             }
             case ValueType.Int64:
-                need(8);
+                ValueCodec.Need(bytes, offset, 8);
                 return { Value: view.getBigInt64(offset, true), End: offset + 8 };
             case ValueType.Float64:
-                need(8);
+                ValueCodec.Need(bytes, offset, 8);
                 return { Value: view.getFloat64(offset, true), End: offset + 8 };
             case ValueType.String:
             {
-                need(4);
+                ValueCodec.Need(bytes, offset, 4);
                 const len = view.getUint32(offset, true);
-                need(4 + len);
+                ValueCodec.Need(bytes, offset, 4 + len);
                 return { Value: ValueCodec.DecodeText(bytes.subarray(offset + 4, offset + 4 + len)), End: offset + 4 + len };
             }
             case ValueType.Date:
-                need(4);
+                ValueCodec.Need(bytes, offset, 4);
                 return { Value: new DateValue(view.getInt32(offset, true)), End: offset + 4 };
             case ValueType.DateTime:
             {
-                need(10);
+                ValueCodec.Need(bytes, offset, 10);
                 const len = view.getUint16(offset + 8, true);
-                need(10 + len);
+                ValueCodec.Need(bytes, offset, 10 + len);
                 const zone = ValueCodec.DecodeText(bytes.subarray(offset + 10, offset + 10 + len));
                 if (zone.length === 0)
                 {
@@ -231,13 +224,55 @@ export class ValueCodec
                 return { Value: new DateTimeValue(view.getBigInt64(offset, true), zone), End: offset + 10 + len };
             }
             case ValueType.Duration:
-                need(16);
+                ValueCodec.Need(bytes, offset, 16);
                 return {
                     Value: new DurationValue(view.getInt32(offset, true), view.getInt32(offset + 4, true), view.getBigInt64(offset + 8, true)),
                     End: offset + 16,
                 };
             default:
                 throw ChunkCodecError.TypeMismatch(type, ValueCodec.UnknownType);
+        }
+    }
+
+    /** Byte length of the single value at `offset`, read from its framing without decoding it. */
+    public static ValueLength(type: ValueType, bytes: Uint8Array, offset: number, view: DataView): number
+    {
+        let length: number;
+        switch (type)
+        {
+            case ValueType.Boolean:
+                length = 1;
+                break;
+            case ValueType.Int64:
+            case ValueType.Float64:
+                length = 8;
+                break;
+            case ValueType.Date:
+                length = 4;
+                break;
+            case ValueType.Duration:
+                length = 16;
+                break;
+            case ValueType.String:
+                ValueCodec.Need(bytes, offset, 4);
+                length = 4 + view.getUint32(offset, true);
+                break;
+            case ValueType.DateTime:
+                ValueCodec.Need(bytes, offset, 10);
+                length = 10 + view.getUint16(offset + 8, true);
+                break;
+            default:
+                throw ChunkCodecError.TypeMismatch(type, ValueCodec.UnknownType);
+        }
+        ValueCodec.Need(bytes, offset, length);
+        return length;
+    }
+
+    private static Need(bytes: Uint8Array, offset: number, n: number): void
+    {
+        if (offset + n > bytes.length)
+        {
+            throw ChunkCodecError.Corrupt(ValueCodec.TruncatedValue);
         }
     }
 

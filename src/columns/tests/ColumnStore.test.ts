@@ -9,7 +9,7 @@ import type { MemberDef } from '../../catalog/CatalogTypes.js';
 import { FormatKeys } from '../../format/FormatKeys.js';
 import type { Location } from '../../identity/Location.js';
 import { InternalId } from '../../identity/InternalId.js';
-import type { IKeyValueStore } from '../../kv/KeyValue.js';
+import type { IKeyValueStore, IWriteTransaction } from '../../kv/KeyValue.js';
 import { Keyspace } from '../../kv/Keyspace.js';
 import { LmdbStore } from '../../kv/lmdb/LmdbStore.js';
 import { MemoryStore } from '../../kv/memory/MemoryStore.js';
@@ -54,6 +54,25 @@ class ColumnFx
         }
     }
 
+    /** Runs work in a write txn and flushes the column store's pending deltas before commit, as the committer does. */
+    public static Write<T>(store: IKeyValueStore, cs: ColumnStore, work: (txn: IWriteTransaction) => Promise<T>): Promise<T>
+    {
+        return store.Write(async txn =>
+        {
+            const result = await work(txn);
+            cs.Flush(txn);
+            return result;
+        });
+    }
+
+    public static async Alloc(cs: ColumnStore, txn: IWriteTransaction, count: number, typeId = ColumnFx.Type): Promise<void>
+    {
+        for (let i = 0; i < count; i++)
+        {
+            await cs.AllocateSlot(txn, 0, typeId);
+        }
+    }
+
     public static async Scan(store: IKeyValueStore, cs: ColumnStore, member: MemberDef, typeId = ColumnFx.Type): Promise<Array<{ Slot: number; Value: CellValue }>>
     {
         const r = await store.BeginRead();
@@ -74,13 +93,13 @@ class ColumnFx
             {
                 const store = await open();
                 const cs = new ColumnStore();
-                await store.Write(async txn =>
+                await ColumnFx.Write(store, cs, async txn =>
                 {
                     assert.equal(await cs.AllocateSlot(txn, 0, 5), 0);
                     assert.equal(await cs.AllocateSlot(txn, 0, 5), 1);
                     assert.equal(await cs.AllocateSlot(txn, 0, 6), 0);
                 });
-                await store.Write(async txn =>
+                await ColumnFx.Write(store, cs, async txn =>
                 {
                     assert.equal(await cs.AllocateSlot(txn, 0, 5), 2);
                 });
@@ -91,8 +110,9 @@ class ColumnFx
             {
                 const store = await open();
                 const cs = new ColumnStore();
-                await store.Write(async txn =>
+                await ColumnFx.Write(store, cs, async txn =>
                 {
+                    await ColumnFx.Alloc(cs, txn, 5);
                     await cs.WriteCell(txn, ColumnFx.Loc(3), ColumnFx.NameMember, 'alice');
                     assert.equal(await cs.ReadCell(txn, ColumnFx.Loc(3), ColumnFx.NameMember), 'alice');
                 });
@@ -104,7 +124,7 @@ class ColumnFx
                 assert.equal(await cs.ReadCell(r, ColumnFx.Loc(3), ColumnFx.NameMember), 'alice');
                 assert.equal(await cs.ReadCell(r, ColumnFx.Loc(4), ColumnFx.NameMember), null);
                 r.dispose();
-                await store.Write(async txn => new Compactor().CompactChunk(txn, 0, ColumnFx.Type, ColumnFx.NameMember, 0n));
+                await ColumnFx.Write(store, cs, async txn => new Compactor(cs).CompactChunk(txn, 0, ColumnFx.Type, ColumnFx.NameMember, 0n));
                 r = await store.BeginRead();
                 assert.equal(await r.Get(Keyspace.Deltas, dKey), undefined);
                 assert.ok((await r.Get(Keyspace.Columns, cKey)) !== undefined);
@@ -118,14 +138,15 @@ class ColumnFx
             {
                 const store = await open();
                 const cs = new ColumnStore();
-                const comp = new Compactor();
-                await store.Write(async txn =>
+                const comp = new Compactor(cs);
+                await ColumnFx.Write(store, cs, async txn =>
                 {
+                    await ColumnFx.Alloc(cs, txn, 2);
                     await cs.WriteCell(txn, ColumnFx.Loc(0), ColumnFx.NameMember, 'a');
                     await cs.WriteCell(txn, ColumnFx.Loc(1), ColumnFx.NameMember, 'b');
                     await comp.CompactChunk(txn, 0, ColumnFx.Type, ColumnFx.NameMember, 0n);
                 });
-                await store.Write(async txn =>
+                await ColumnFx.Write(store, cs, async txn =>
                 {
                     await cs.WriteCell(txn, ColumnFx.Loc(0), ColumnFx.NameMember, null);
                     await cs.WriteCell(txn, ColumnFx.Loc(1), ColumnFx.NameMember, 'b2');
@@ -135,7 +156,7 @@ class ColumnFx
                 assert.equal(await cs.ReadCell(r, ColumnFx.Loc(0), ColumnFx.NameMember), null);
                 assert.equal(await cs.ReadCell(r, ColumnFx.Loc(1), ColumnFx.NameMember), 'b3');
                 r.dispose();
-                await store.Write(async txn => comp.CompactChunk(txn, 0, ColumnFx.Type, ColumnFx.NameMember, 0n));
+                await ColumnFx.Write(store, cs, async txn => comp.CompactChunk(txn, 0, ColumnFx.Type, ColumnFx.NameMember, 0n));
                 r = await store.BeginRead();
                 assert.equal(await cs.ReadCell(r, ColumnFx.Loc(0), ColumnFx.NameMember), null);
                 assert.equal(await cs.ReadCell(r, ColumnFx.Loc(1), ColumnFx.NameMember), 'b3');
@@ -147,8 +168,9 @@ class ColumnFx
             {
                 const store = await open();
                 const cs = new ColumnStore();
-                await store.Write(async txn =>
+                await ColumnFx.Write(store, cs, async txn =>
                 {
+                    await ColumnFx.Alloc(cs, txn, 10);
                     for (const s of [9, 2, 9, 5])
                     {
                         await cs.WriteCell(txn, ColumnFx.Loc(s), ColumnFx.AgeMember, BigInt(s));
@@ -172,14 +194,15 @@ class ColumnFx
             {
                 const store = await open();
                 const cs = new ColumnStore();
-                const comp = new Compactor();
-                await store.Write(async txn =>
+                const comp = new Compactor(cs);
+                await ColumnFx.Write(store, cs, async txn =>
                 {
+                    await ColumnFx.Alloc(cs, txn, 2050);
                     await cs.WriteCell(txn, ColumnFx.Loc(1), ColumnFx.AgeMember, 10n);
                     await cs.WriteCell(txn, ColumnFx.Loc(2049), ColumnFx.AgeMember, 20n);
                     await comp.CompactChunk(txn, 0, ColumnFx.Type, ColumnFx.AgeMember, 0n);
                 });
-                await store.Write(async txn =>
+                await ColumnFx.Write(store, cs, async txn =>
                 {
                     await cs.WriteCell(txn, ColumnFx.Loc(100), ColumnFx.AgeMember, 11n);
                     await comp.CompactChunk(txn, 0, ColumnFx.Type, ColumnFx.AgeMember, 0n);
@@ -200,11 +223,15 @@ class ColumnFx
                 const store = await open();
                 const cs = new ColumnStore();
                 const v = new DateTimeValue(123456789n, 'Europe/Kyiv');
-                await store.Write(async txn => cs.WriteCell(txn, ColumnFx.Loc(7), ColumnFx.SeenMember, v));
+                await ColumnFx.Write(store, cs, async txn =>
+                {
+                    await ColumnFx.Alloc(cs, txn, 8);
+                    await cs.WriteCell(txn, ColumnFx.Loc(7), ColumnFx.SeenMember, v);
+                });
                 let r = await store.BeginRead();
                 assert.ok(((await cs.ReadCell(r, ColumnFx.Loc(7), ColumnFx.SeenMember)) as DateTimeValue).Equals(v));
                 r.dispose();
-                await store.Write(async txn => new Compactor().CompactChunk(txn, 0, ColumnFx.Type, ColumnFx.SeenMember, 0n));
+                await ColumnFx.Write(store, cs, async txn => new Compactor(cs).CompactChunk(txn, 0, ColumnFx.Type, ColumnFx.SeenMember, 0n));
                 r = await store.BeginRead();
                 assert.ok(((await cs.ReadCell(r, ColumnFx.Loc(7), ColumnFx.SeenMember)) as DateTimeValue).Equals(v));
                 r.dispose();
@@ -214,7 +241,8 @@ class ColumnFx
             it('compacting a chunk with no delta is a no-op', async () =>
             {
                 const store = await open();
-                await store.Write(async txn => new Compactor().CompactChunk(txn, 0, ColumnFx.Type, ColumnFx.NameMember, 0n));
+                const cs = new ColumnStore();
+                await ColumnFx.Write(store, cs, async txn => new Compactor(cs).CompactChunk(txn, 0, ColumnFx.Type, ColumnFx.NameMember, 0n));
                 const r = await store.BeginRead();
                 assert.equal(await r.Get(Keyspace.Columns, FormatKeys.Column(0, ColumnFx.Type, 1, 0n)), undefined);
                 r.dispose();
@@ -225,8 +253,8 @@ class ColumnFx
             {
                 const store = await open();
                 const cs = new ColumnStore();
-                const comp = new Compactor();
-                await store.Write(async txn =>
+                const comp = new Compactor(cs);
+                await ColumnFx.Write(store, cs, async txn =>
                 {
                     for (let i = 0; i < 5; i++)
                     {
@@ -237,7 +265,7 @@ class ColumnFx
                     await comp.CompactChunk(txn, 0, ColumnFx.Type, ColumnFx.Id, 0n);
                     await comp.CompactChunk(txn, 0, ColumnFx.Type, ColumnFx.NameMember, 0n);
                 });
-                await store.Write(async txn =>
+                await ColumnFx.Write(store, cs, async txn =>
                 {
                     await cs.WriteCell(txn, ColumnFx.Loc(1), ColumnFx.Id, null);
                     await cs.WriteCell(txn, ColumnFx.Loc(3), ColumnFx.NameMember, 'changed');
@@ -259,7 +287,7 @@ class ColumnFx
                 const store = await open();
                 const cs = new ColumnStore();
                 assert.deepEqual(await ColumnFx.Scan(store, cs, ColumnFx.NameMember, 99), []);
-                await store.Write(async txn =>
+                await ColumnFx.Write(store, cs, async txn =>
                 {
                     for (let i = 0; i < 2050; i++)
                     {
@@ -270,7 +298,7 @@ class ColumnFx
                         await cs.WriteCell(txn, ColumnFx.Loc(slot), ColumnFx.Id, BigInt(slot + 1));
                     }
                     await cs.WriteCell(txn, ColumnFx.Loc(2049), ColumnFx.NameMember, 'last');
-                    await new Compactor().CompactChunk(txn, 0, ColumnFx.Type, ColumnFx.Id, 0n);
+                    await new Compactor(cs).CompactChunk(txn, 0, ColumnFx.Type, ColumnFx.Id, 0n);
                 });
                 const names = await ColumnFx.Scan(store, cs, ColumnFx.NameMember);
                 assert.deepEqual(names, [
@@ -288,8 +316,9 @@ class ColumnFx
             {
                 const store = await open();
                 const cs = new ColumnStore();
-                await store.Write(async txn =>
+                await ColumnFx.Write(store, cs, async txn =>
                 {
+                    await ColumnFx.Alloc(cs, txn, 1);
                     await assert.rejects(cs.WriteCell(txn, ColumnFx.Loc(0), ColumnFx.RelMember, 1n));
                     await assert.rejects(cs.ReadCell(txn, ColumnFx.Loc(0), ColumnFx.RelMember));
                     await assert.rejects(cs.WriteCell(txn, ColumnFx.Loc(0), ColumnFx.NameMember, 5n));
@@ -304,16 +333,112 @@ class ColumnFx
             {
                 const store = await open();
                 const cs = new ColumnStore();
-                await assert.rejects(store.Write(async txn =>
+                await assert.rejects(ColumnFx.Write(store, cs, async txn =>
                 {
                     await cs.AllocateSlot(txn, 0, 5);
                     await cs.WriteCell(txn, ColumnFx.Loc(0), ColumnFx.NameMember, 'x');
+                    cs.Flush(txn);
                     throw new Error('boom');
                 }));
-                await store.Write(async txn =>
+                await ColumnFx.Write(store, cs, async txn =>
                 {
                     assert.equal(await cs.AllocateSlot(txn, 0, 5), 0);
                     assert.equal(await cs.ReadCell(txn, ColumnFx.Loc(0), ColumnFx.NameMember), null);
+                });
+                await store.dispose();
+            });
+
+            it('2,048 writes into one delta in one txn are fast (Int64 and String), and every value survives', async () =>
+            {
+                const store = await open();
+                const cs = new ColumnStore();
+                await ColumnFx.Write(store, cs, async txn => ColumnFx.Alloc(cs, txn, 2048));
+                const t0 = performance.now();
+                await ColumnFx.Write(store, cs, async txn =>
+                {
+                    for (let i = 2047; i >= 0; i--)
+                    {
+                        await cs.WriteCell(txn, ColumnFx.Loc(i), ColumnFx.AgeMember, BigInt(i));
+                        await cs.WriteCell(txn, ColumnFx.Loc(i), ColumnFx.NameMember, 'name-' + i);
+                    }
+                });
+                const writeMs = performance.now() - t0;
+                const r = await store.BeginRead();
+                assert.equal(await cs.ReadCell(r, ColumnFx.Loc(2000), ColumnFx.NameMember), 'name-2000');
+                const t1 = performance.now();
+                assert.equal(await cs.ReadCell(r, ColumnFx.Loc(1500), ColumnFx.NameMember), 'name-1500');
+                const readMs = performance.now() - t1;
+                for (const i of [0, 777, 2047])
+                {
+                    assert.equal(await cs.ReadCell(r, ColumnFx.Loc(i), ColumnFx.AgeMember), BigInt(i));
+                }
+                r.dispose();
+                console.log('[timing ' + name + '] 4096 writes (2048 Int64 + 2048 String): ' + writeMs.toFixed(0) + ' ms; ReadCell vs 2048-entry String delta: ' + readMs.toFixed(2) + ' ms');
+                assert.ok(writeMs < 2000, 'writes took ' + writeMs);
+                assert.ok(readMs < 25, 'read took ' + readMs);
+                await store.dispose();
+            });
+
+            it('a same-txn write then compact through the shared cache loses nothing; same-txn reads and scans see pending writes', async () =>
+            {
+                const store = await open();
+                const cs = new ColumnStore();
+                const comp = new Compactor(cs);
+                await ColumnFx.Write(store, cs, async txn =>
+                {
+                    await ColumnFx.Alloc(cs, txn, 4);
+                    await cs.WriteCell(txn, ColumnFx.Loc(0), ColumnFx.Id, 1n);
+                    await cs.WriteCell(txn, ColumnFx.Loc(1), ColumnFx.Id, 2n);
+                    await cs.WriteCell(txn, ColumnFx.Loc(0), ColumnFx.NameMember, 'a');
+                    await cs.WriteCell(txn, ColumnFx.Loc(1), ColumnFx.NameMember, 'b');
+                    assert.equal(await cs.ReadCell(txn, ColumnFx.Loc(1), ColumnFx.NameMember), 'b');
+                    const seen: CellValue[] = [];
+                    for await (const e of cs.ScanColumn(txn, 0, ColumnFx.Type, ColumnFx.NameMember))
+                    {
+                        seen.push(e.Value);
+                    }
+                    assert.deepEqual(seen, ['a', 'b']);
+                    await comp.CompactChunk(txn, 0, ColumnFx.Type, ColumnFx.NameMember, 0n);
+                    await cs.WriteCell(txn, ColumnFx.Loc(2), ColumnFx.NameMember, 'c');
+                    assert.equal(await cs.ReadCell(txn, ColumnFx.Loc(0), ColumnFx.NameMember), 'a');
+                });
+                const r = await store.BeginRead();
+                assert.equal(await cs.ReadCell(r, ColumnFx.Loc(0), ColumnFx.NameMember), 'a');
+                assert.equal(await cs.ReadCell(r, ColumnFx.Loc(1), ColumnFx.NameMember), 'b');
+                assert.equal(await cs.ReadCell(r, ColumnFx.Loc(2), ColumnFx.NameMember), 'c');
+                r.dispose();
+                await store.dispose();
+            });
+
+            it('Flush is what persists pending deltas', async () =>
+            {
+                const store = await open();
+                const cs = new ColumnStore();
+                await store.Write(async txn =>
+                {
+                    await ColumnFx.Alloc(cs, txn, 1);
+                    await cs.WriteCell(txn, ColumnFx.Loc(0), ColumnFx.NameMember, 'x');
+                });
+                const r = await store.BeginRead();
+                assert.equal(await cs.ReadCell(r, ColumnFx.Loc(0), ColumnFx.NameMember), null);
+                r.dispose();
+                await store.dispose();
+            });
+
+            it('enforces nullability except for member 0, and rejects never-allocated slots', async () =>
+            {
+                const store = await open();
+                const cs = new ColumnStore();
+                const required: MemberDef = { ...ColumnFx.NameMember, Id: 9, Nullable: false };
+                await ColumnFx.Write(store, cs, async txn =>
+                {
+                    await ColumnFx.Alloc(cs, txn, 2);
+                    await assert.rejects(cs.WriteCell(txn, ColumnFx.Loc(0), required, null));
+                    await cs.WriteCell(txn, ColumnFx.Loc(0), required, 'ok');
+                    await cs.WriteCell(txn, ColumnFx.Loc(0), ColumnFx.Id, 7n);
+                    await cs.WriteCell(txn, ColumnFx.Loc(0), ColumnFx.Id, null);
+                    await assert.rejects(cs.WriteCell(txn, ColumnFx.Loc(2), ColumnFx.NameMember, 'x'), RangeError);
+                    await assert.rejects(cs.WriteCell(txn, ColumnFx.Loc(0, 77), ColumnFx.NameMember, 'x'), RangeError);
                 });
                 await store.dispose();
             });
@@ -322,8 +447,12 @@ class ColumnFx
             {
                 const store = await open();
                 const cs = new ColumnStore();
-                await store.Write(async txn => cs.WriteCell(txn, ColumnFx.Loc(0), ColumnFx.Id, InternalId.Max));
-                await store.Write(async txn => new Compactor().CompactChunk(txn, 0, ColumnFx.Type, ColumnFx.Id, 0n));
+                await ColumnFx.Write(store, cs, async txn =>
+                {
+                    await ColumnFx.Alloc(cs, txn, 1);
+                    await cs.WriteCell(txn, ColumnFx.Loc(0), ColumnFx.Id, InternalId.Max);
+                });
+                await ColumnFx.Write(store, cs, async txn => new Compactor(cs).CompactChunk(txn, 0, ColumnFx.Type, ColumnFx.Id, 0n));
                 const r = await store.BeginRead();
                 assert.equal(await cs.ReadCell(r, ColumnFx.Loc(0), ColumnFx.Id), (1n << 63n) - 1n);
                 r.dispose();

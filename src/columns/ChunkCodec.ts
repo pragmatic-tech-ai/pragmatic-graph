@@ -71,6 +71,12 @@ export class ChunkCodec
         }
     }
 
+    /** Number of slots a chunk covers (validated header). */
+    public static SlotCount(chunk: Uint8Array): number
+    {
+        return ChunkCodec.ReadHeader(chunk).Count;
+    }
+
     public static DecodeAll(type: ValueType, chunk: Uint8Array): CellValue[]
     {
         const header = ChunkCodec.ReadHeader(chunk);

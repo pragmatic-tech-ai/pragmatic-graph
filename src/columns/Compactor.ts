@@ -4,23 +4,26 @@ import type { IWriteTransaction } from '../kv/KeyValue.js';
 import { Keyspace } from '../kv/Keyspace.js';
 import { CellValue } from './CellValue.js';
 import { ChunkCodec } from './ChunkCodec.js';
-import { ChunkDelta } from './ChunkDelta.js';
 import { ColumnStore } from './ColumnStore.js';
 
-/** Folds a chunk's delta into its column chunk (re-encoded with the best encoding) and deletes the delta. */
+/**
+ * Folds a chunk's delta into its column chunk (re-encoded with the best encoding) and deletes the delta.
+ * Works through the ColumnStore it is given, so same-transaction pending writes are included.
+ */
 export class Compactor
 {
+    public constructor(private readonly columns: ColumnStore)
+    {
+    }
+
     public async CompactChunk(txn: IWriteTransaction, partition: number, typeId: number, member: MemberDef, chunk: bigint): Promise<void>
     {
         const type = ColumnStore.RequireType(member);
-        ColumnStore.RequirePartition(partition);
-        const deltaKey = FormatKeys.Delta(partition, typeId, member.Id, chunk);
-        const deltaBytes = await txn.Get(Keyspace.Deltas, deltaKey);
-        if (deltaBytes === undefined)
+        const entries = await this.columns.TakeDelta(txn, partition, typeId, member, chunk);
+        if (entries === undefined)
         {
             return;
         }
-        const entries = ChunkDelta.Parse(type, deltaBytes);
         const columnKey = FormatKeys.Column(partition, typeId, member.Id, chunk);
         const chunkBytes = await txn.Get(Keyspace.Columns, columnKey);
         const cells: CellValue[] = chunkBytes === undefined ? [] : ChunkCodec.DecodeAll(type, chunkBytes);
@@ -37,6 +40,5 @@ export class Compactor
         {
             txn.Put(Keyspace.Columns, columnKey, ChunkCodec.Encode(type, cells, ChunkCodec.ChooseEncoding(type, cells)));
         }
-        txn.Delete(Keyspace.Deltas, deltaKey);
     }
 }

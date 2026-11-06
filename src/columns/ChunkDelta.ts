@@ -54,7 +54,7 @@ export class ChunkDelta
             }
             else if (present === ChunkDelta.Present)
             {
-                const decoded = ValueCodec.DecodeAt(type, bytes, at);
+                const decoded = ValueCodec.DecodeAt(type, bytes, at, view);
                 at = decoded.End;
                 entries.push({ Slot: slot, Value: decoded.Value });
             }
@@ -66,43 +66,76 @@ export class ChunkDelta
         return entries;
     }
 
-    /** Entries must already be sorted by slot with no duplicates. */
+    /** Entries must already be sorted by slot with no duplicates. Encodes (and so validates) each value once. */
     public static Serialize(type: ValueType, entries: readonly IDeltaEntry[]): Uint8Array
     {
-        const parts: Uint8Array[] = [];
+        const values: Array<Uint8Array | null> = [];
         let total = 0;
         for (const e of entries)
         {
-            const value = e.Value === null ? new Uint8Array(0) : ChunkCodec.EncodeValue(type, e.Value);
-            const part = new Uint8Array(ChunkDelta.HeaderBytes + value.length);
-            new DataView(part.buffer).setUint16(0, e.Slot, true);
-            part[ChunkDelta.SlotBytes] = e.Value === null ? ChunkDelta.Absent : ChunkDelta.Present;
-            part.set(value, ChunkDelta.HeaderBytes);
-            parts.push(part);
-            total += part.length;
+            const value = e.Value === null ? null : ChunkCodec.EncodeValue(type, e.Value);
+            values.push(value);
+            total += ChunkDelta.HeaderBytes + (value === null ? 0 : value.length);
         }
         const out = new Uint8Array(total);
+        const view = new DataView(out.buffer);
         let at = 0;
-        for (const p of parts)
+        for (let i = 0; i < entries.length; i++)
         {
-            out.set(p, at);
-            at += p.length;
+            const value = values[i]!;
+            view.setUint16(at, entries[i]!.Slot, true);
+            out[at + ChunkDelta.SlotBytes] = value === null ? ChunkDelta.Absent : ChunkDelta.Present;
+            at += ChunkDelta.HeaderBytes;
+            if (value !== null)
+            {
+                out.set(value, at);
+                at += value.length;
+            }
         }
         return out;
     }
 
-    /** Returns a new sorted list with the slot's entry added or replaced. */
-    public static With(entries: readonly IDeltaEntry[], slot: number, value: CellValue): IDeltaEntry[]
+    /**
+     * Finds one slot's entry by walking the framing only (slot, present, value length), stopping once past
+     * the slot, and decoding just the hit. Entries are sorted, so no later entry can match.
+     */
+    public static Lookup(type: ValueType, bytes: Uint8Array, slot: number): IDeltaEntry | undefined
     {
-        const out = entries.filter(e => e.Slot !== slot);
-        out.push({ Slot: slot, Value: value });
-        out.sort((a, b) => a.Slot - b.Slot);
-        return out;
-    }
-
-    /** Finds the entry for a slot, or undefined when the delta does not touch it. */
-    public static Find(entries: readonly IDeltaEntry[], slot: number): IDeltaEntry | undefined
-    {
-        return entries.find(e => e.Slot === slot);
+        const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.length);
+        let at = 0;
+        while (at < bytes.length)
+        {
+            if (at + ChunkDelta.HeaderBytes > bytes.length)
+            {
+                throw ChunkCodecError.Corrupt(ChunkDelta.TruncatedEntry);
+            }
+            const entrySlot = view.getUint16(at, true);
+            const present = bytes[at + ChunkDelta.SlotBytes];
+            at += ChunkDelta.HeaderBytes;
+            if (entrySlot > slot)
+            {
+                return undefined;
+            }
+            if (present === ChunkDelta.Absent)
+            {
+                if (entrySlot === slot)
+                {
+                    return { Slot: slot, Value: null };
+                }
+            }
+            else if (present === ChunkDelta.Present)
+            {
+                if (entrySlot === slot)
+                {
+                    return { Slot: slot, Value: ValueCodec.DecodeAt(type, bytes, at, view).Value };
+                }
+                at += ValueCodec.ValueLength(type, bytes, at, view);
+            }
+            else
+            {
+                throw ChunkCodecError.Corrupt(ChunkDelta.BadPresent);
+            }
+        }
+        return undefined;
     }
 }
