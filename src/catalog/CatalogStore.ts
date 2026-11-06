@@ -22,6 +22,7 @@ export class CatalogStore
     private static readonly CorruptMessage = 'Corrupt catalog: ';
     private static readonly NotParsableMessage = 'not valid JSON';
     private static readonly BadShapeMessage = 'unexpected shape';
+    private static readonly CounterMessage = 'id counter below largest used id or below 1: ';
     private static readonly DuplicateTypeIdMessage = 'duplicate type id ';
     private static readonly DuplicateMemberIdMessage = 'duplicate member id ';
 
@@ -31,10 +32,10 @@ export class CatalogStore
         const raw = await txn.Get(Keyspace.Catalog, FormatKeys.CatalogRoot());
         if (raw === undefined)
         {
-            return CatalogSnapshot.Build(version, []);
+            return CatalogSnapshot.Build(version, [], 1, 1);
         }
         const stored = CatalogStore.Parse(raw);
-        CatalogStore.CheckUniqueIds(stored.Definitions);
+        CatalogStore.CheckIds(stored);
         return CatalogSnapshot.Build(
             version,
             stored.Definitions.map(d => CatalogStore.FreezeDefinition(d)),
@@ -76,14 +77,52 @@ export class CatalogStore
         const o = value as Partial<IStoredCatalog> | null;
         if (typeof o !== 'object' || o === null
             || !Number.isInteger(o.NextTypeId) || !Number.isInteger(o.NextMemberId) || !Array.isArray(o.Definitions)
-            || o.Definitions.some(d => typeof d !== 'object' || d === null || !Array.isArray(d.Members) || !Array.isArray(d.Aspects)))
+            || !o.Definitions.every(d => CatalogStore.IsDefinition(d)))
         {
             throw CatalogStore.Corrupt(CatalogStore.BadShapeMessage);
         }
         return o as IStoredCatalog;
     }
 
-    private static CheckUniqueIds(defs: readonly TypeDefinition[]): void
+    private static IsObject(v: unknown): v is Record<string, unknown>
+    {
+        return typeof v === 'object' && v !== null && !Array.isArray(v);
+    }
+
+    private static IsDefinition(v: unknown): boolean
+    {
+        return CatalogStore.IsObject(v)
+            && typeof v.Name === 'string'
+            && Number.isInteger(v.TypeId)
+            && Array.isArray(v.Aspects)
+            && Array.isArray(v.Members)
+            && v.Members.every((m: unknown) => CatalogStore.IsMember(m));
+    }
+
+    private static IsMember(v: unknown): boolean
+    {
+        return CatalogStore.IsObject(v)
+            && typeof v.Name === 'string'
+            && Number.isInteger(v.Id)
+            && Number.isInteger(v.Kind)
+            && (v.EdgeProperties === undefined
+                || (Array.isArray(v.EdgeProperties) && v.EdgeProperties.every((m: unknown) => CatalogStore.IsMember(m))));
+    }
+
+    private static CheckIds(stored: IStoredCatalog): void
+    {
+        const maxType = CatalogStore.CheckUniqueIds(stored.Definitions);
+        if (stored.NextTypeId < 1 || stored.NextTypeId < maxType.Type + 1)
+        {
+            throw CatalogStore.Corrupt(CatalogStore.CounterMessage + 'NextTypeId ' + stored.NextTypeId);
+        }
+        if (stored.NextMemberId < 1 || stored.NextMemberId < maxType.Member + 1)
+        {
+            throw CatalogStore.Corrupt(CatalogStore.CounterMessage + 'NextMemberId ' + stored.NextMemberId);
+        }
+    }
+
+    private static CheckUniqueIds(defs: readonly TypeDefinition[]): { Type: number; Member: number }
     {
         const typeIds = new Set<number>();
         const memberIds = new Set<number>();
@@ -96,6 +135,7 @@ export class CatalogStore
             typeIds.add(d.TypeId);
             CatalogStore.CheckMemberIds(d.Members, memberIds);
         }
+        return { Type: Math.max(0, ...typeIds), Member: Math.max(0, ...memberIds) };
     }
 
     private static CheckMemberIds(members: readonly MemberDef[], seen: Set<number>): void

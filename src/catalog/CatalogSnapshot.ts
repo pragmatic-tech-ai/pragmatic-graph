@@ -63,7 +63,7 @@ export class CatalogSnapshot
     }
 
     /** Validates the definitions and builds a snapshot; throws CatalogError on any type-model violation. */
-    public static Build(version: number, defs: readonly TypeDefinition[], nextTypeId = 1, nextMemberId = 1): CatalogSnapshot
+    public static Build(version: number, defs: readonly TypeDefinition[], nextTypeId: number, nextMemberId: number): CatalogSnapshot
     {
         const byName = new Map(defs.map(d => [d.Name, d]));
         CatalogSnapshot.CheckReferences(defs, byName);
@@ -86,7 +86,27 @@ export class CatalogSnapshot
         {
             isaSets.set(c, set);
         }
-        return new CatalogSnapshot(version, defs, effective, isaSets, nextTypeId, nextMemberId);
+        let minType = 1;
+        let minMember = 1;
+        for (const d of defs)
+        {
+            minType = Math.max(minType, d.TypeId + 1);
+            for (const m of d.Members)
+            {
+                minMember = Math.max(minMember, CatalogSnapshot.MaxMemberId(m) + 1);
+            }
+        }
+        return new CatalogSnapshot(version, defs, effective, isaSets, Math.max(nextTypeId, minType), Math.max(nextMemberId, minMember));
+    }
+
+    private static MaxMemberId(member: MemberDef): number
+    {
+        let max = member.Id;
+        for (const e of member.EdgeProperties ?? [])
+        {
+            max = Math.max(max, CatalogSnapshot.MaxMemberId(e));
+        }
+        return max;
     }
 
     public Definitions(): readonly TypeDefinition[]

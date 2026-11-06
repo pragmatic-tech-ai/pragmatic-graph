@@ -245,5 +245,50 @@ for (const [name, open] of backends)
             assert.equal(loaded.TypeId('Person'), person.TypeId);
             await store.dispose();
         });
+
+        it('counters below the largest used id plus one, or below 1, throw CorruptCatalog', async () =>
+        {
+            const defs = CatalogFx.Sample().Definitions();
+            const store = await open();
+            const cases = [
+                { NextTypeId: 0, NextMemberId: 100, Definitions: defs },
+                { NextTypeId: 50, NextMemberId: -1, Definitions: defs },
+                { NextTypeId: 1, NextMemberId: 100, Definitions: defs },
+                { NextTypeId: 50, NextMemberId: 2, Definitions: defs },
+                { NextTypeId: 1, NextMemberId: 1, Definitions: [] },
+            ];
+            for (const c of cases.slice(0, 4))
+            {
+                await CatalogFx.PutObject(store, c);
+                await assert.rejects(CatalogFx.Load(store), CatalogFx.Corrupt);
+            }
+            await CatalogFx.PutObject(store, cases[4]);
+            assert.equal((await CatalogFx.Load(store)).Definitions().length, 0);
+            await store.dispose();
+        });
+
+        it('deeply mis-shaped definitions throw CorruptCatalog, not TypeError', async () =>
+        {
+            const ok = { Name: 'T', IsAspect: false, TypeId: 1, Parent: null, Aspects: [], Members: [] as unknown[] };
+            const member = { Id: 1, Name: 'm', Kind: 1, Type: 4, Nullable: false, DeclaredBy: 'T' };
+            const bad: unknown[] = [
+                [{ ...ok, Members: [null] }],
+                [{ ...ok, Name: 5 }],
+                [{ ...ok, TypeId: 'x' }],
+                [{ ...ok, Members: [{ ...member, Id: 'x' }] }],
+                [{ ...ok, Members: [{ ...member, Name: 7 }] }],
+                [{ ...ok, Members: [{ ...member, Kind: 'p' }] }],
+                [{ ...ok, Members: [{ ...member, EdgeProperties: [null] }] }],
+                [{ ...ok, Members: [{ ...member, EdgeProperties: [{ ...member, Id: 2, Name: 3 }] }] }],
+                [42],
+            ];
+            const store = await open();
+            for (const defs of bad)
+            {
+                await CatalogFx.PutObject(store, { NextTypeId: 10, NextMemberId: 10, Definitions: defs });
+                await assert.rejects(CatalogFx.Load(store), CatalogFx.Corrupt);
+            }
+            await store.dispose();
+        });
     });
 }
