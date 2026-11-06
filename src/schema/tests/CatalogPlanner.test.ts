@@ -69,6 +69,7 @@ describe('CatalogPlanner', () =>
         const plan = CatalogPlanner.Plan(stored, Fx.Base());
         assert.equal(plan.Catalog, stored);
         assert.ok(plan.Diff.IsEmpty);
+        assert.equal(plan.Changed, false);
     });
 
     it('added concept gets new ids, kept ids stable', () =>
@@ -203,7 +204,95 @@ describe('CatalogPlanner', () =>
         const d = Fx.Base();
         const plan = CatalogPlanner.Plan(stored, Fx.Desc([{ ...d.Definitions[0]!, Options: { AggregateRoot: 'File' } }]));
         assert.ok(plan.Diff.IsEmpty);
+        assert.equal(plan.Changed, true);
         assert.equal(plan.Catalog.Version, stored.Version + 1);
         assert.equal(plan.Catalog.Definitions()[0]!.AggregateRoot, 'File');
+    });
+
+    it('a member hoisted from two siblings keeps the compatible old id; the other sibling reports its old member removed', () =>
+    {
+        const stored = Fx.Stored(Fx.Desc([
+            Fx.Concept('P', []),
+            Fx.Concept('A', [Fx.Prop('x', ValueType.Int64, true)], 'P'),
+            Fx.Concept('B', [Fx.Prop('x', ValueType.String)], 'P'),
+        ]));
+        const oldA = Fx.MemberId(stored, 'A', 'x');
+        const oldB = Fx.MemberId(stored, 'B', 'x');
+        const plan = CatalogPlanner.Plan(stored, Fx.Desc([
+            Fx.Concept('P', [Fx.Prop('x', ValueType.Int64, true)]),
+            Fx.Concept('A', [], 'P'),
+            Fx.Concept('B', [], 'P'),
+        ]));
+        assert.equal(Fx.MemberId(plan.Catalog, 'P', 'x'), oldA);
+        assert.equal(Fx.MemberId(plan.Catalog, 'B', 'x'), oldA);
+        assert.deepEqual(plan.Diff.RemovedMembers.map(r => [r.Type, r.Member.Id]), [['B', oldB]]);
+    });
+
+    it('members removed from an aspect no concept carries are reported against the aspect', () =>
+    {
+        const stored = Fx.Stored(Fx.Desc([Fx.Aspect('Loose', [Fx.Prop('a', ValueType.Int64), Fx.Prop('b', ValueType.String)])]));
+        const plan = CatalogPlanner.Plan(stored, Fx.Desc([Fx.Aspect('Loose', [Fx.Prop('a', ValueType.Int64), Fx.Prop('b', ValueType.Int64)])]));
+        assert.deepEqual(plan.Diff.RemovedMembers.map(r => [r.Type, r.Member.Name]), [['Loose', 'b']]);
+        assert.ok(plan.Changed);
+    });
+
+    it('a Where-only change is remove plus add', () =>
+    {
+        const defs = Fx.Base().Definitions;
+        const make = (n: bigint): IIndexDescription => ({ Name: 'BySize', On: 'File', Members: ['size'], Where: new Compare('size', CompareOp.Gt, n) });
+        const stored = Fx.Stored(Fx.Desc(defs, [make(0n)]));
+        const plan = CatalogPlanner.Plan(stored, Fx.Desc(defs, [make(1n)]));
+        assert.equal(plan.Diff.RemovedIndexes.length, 1);
+        assert.equal(plan.Diff.AddedIndexes.length, 1);
+        assert.equal(CatalogPlanner.Plan(stored, Fx.Desc(defs, [make(0n)])).Catalog, stored);
+    });
+
+    it('index validation rejects a relationship member, an empty member list and a repeated member', () =>
+    {
+        const defs = [Fx.Concept('File', [
+            Fx.Prop('size', ValueType.Int64),
+            { Name: 'parent', Kind: MemberKind.Relationship, Targets: ['File'] },
+        ])];
+        const empty = Fx.Stored(Fx.Desc(defs));
+        const code = (members: string[]): CatalogErrorCode | undefined =>
+            Fx.Code(() => CatalogPlanner.Plan(empty, Fx.Desc(defs, [{ Name: 'I', On: 'File', Members: members }])));
+        assert.equal(code(['parent']), CatalogErrorCode.UnknownMember);
+        assert.equal(code([]), CatalogErrorCode.InvalidMember);
+        assert.equal(code(['size', 'size']), CatalogErrorCode.InvalidMember);
+        assert.equal(code(['size']), undefined);
+    });
+
+    it('a hierarchy change that drops an inherited member lists it in RemovedMembers', () =>
+    {
+        const stored = Fx.Stored(Fx.Desc([Fx.Concept('A', [Fx.Prop('x', ValueType.Int64)]), Fx.Concept('C', [], 'A')]));
+        const oldX = Fx.MemberId(stored, 'C', 'x');
+        const plan = CatalogPlanner.Plan(stored, Fx.Desc([Fx.Concept('A', [Fx.Prop('x', ValueType.Int64)]), Fx.Concept('C', [])]));
+        assert.deepEqual(plan.Diff.RemovedMembers.map(r => [r.Type, r.Member.Id]), [['C', oldX]]);
+        assert.deepEqual(plan.Diff.ChangedHierarchy, ['C']);
+        assert.equal(Fx.MemberId(plan.Catalog, 'A', 'x'), oldX);
+    });
+
+    it('an edge-property change retypes the relationship member', () =>
+    {
+        const rel = (since: ValueType): MemberInput => ({
+            Name: 'knows', Kind: MemberKind.Relationship, Targets: ['P'], Many: true,
+            EdgeProperties: [{ Name: 'since', Kind: MemberKind.Property, Type: since }],
+        });
+        const stored = Fx.Stored(Fx.Desc([Fx.Concept('P', [rel(ValueType.Date)])]));
+        const same = CatalogPlanner.Plan(stored, Fx.Desc([Fx.Concept('P', [rel(ValueType.Date)])]));
+        assert.equal(same.Catalog, stored);
+        const plan = CatalogPlanner.Plan(stored, Fx.Desc([Fx.Concept('P', [rel(ValueType.String)])]));
+        assert.notEqual(Fx.MemberId(plan.Catalog, 'P', 'knows'), Fx.MemberId(stored, 'P', 'knows'));
+        assert.equal(plan.Diff.RemovedMembers.length, 1);
+    });
+
+    it('a definition changing between concept and aspect is removed plus added with a new TypeId', () =>
+    {
+        const stored = Fx.Stored(Fx.Desc([Fx.Concept('X', [Fx.Prop('v', ValueType.Int64)])]));
+        const plan = CatalogPlanner.Plan(stored, Fx.Desc([Fx.Aspect('X', [Fx.Prop('v', ValueType.Int64)])]));
+        assert.deepEqual(plan.Diff.RemovedTypes.map(t => t.Name), ['X']);
+        assert.deepEqual(plan.Diff.AddedTypes.map(t => t.Name), ['X']);
+        assert.notEqual(plan.Catalog.TypeId('X'), stored.TypeId('X'));
+        assert.ok(plan.Catalog.IsAspect('X'));
     });
 });

@@ -126,6 +126,32 @@ for (const [name, open] of backends)
             await old.dispose();
         });
 
+        it('corrupt Indexes or NextIndexId on load raise CorruptCatalog, never a TypeError', async () =>
+        {
+            const goodIndex = { Id: 1, Name: 'I', On: 'Thing', Members: [1], Unique: false };
+            const thing = { Name: 'Thing', IsAspect: false, TypeId: 1, Parent: null, Aspects: [], Placement: 2,
+                Members: [{ Id: 1, Name: 'id', Kind: 1, Type: 2, Nullable: false, DeclaredBy: 'Thing' }] };
+            const bad: Array<Record<string, unknown>> = [
+                { Indexes: 'x', NextIndexId: 2 },
+                { Indexes: [goodIndex], NextIndexId: 'x' },
+                { Indexes: [goodIndex], NextIndexId: 1 },
+                { Indexes: [goodIndex, goodIndex], NextIndexId: 3 },
+                { Indexes: [{ ...goodIndex, Where: null }], NextIndexId: 2 },
+                { Indexes: [{ ...goodIndex, Where: 5 }], NextIndexId: 2 },
+                { Indexes: [{ ...goodIndex, Where: { Kind: 999 } }], NextIndexId: 2 },
+                { Indexes: [{ ...goodIndex, Members: 'x' }], NextIndexId: 2 },
+                { Indexes: [{ ...goodIndex, Unique: 1 }], NextIndexId: 2 },
+                { Indexes: [null], NextIndexId: 2 },
+            ];
+            for (const extra of bad)
+            {
+                const store = await open();
+                await CatalogFx.PutObject(store, { NextTypeId: 2, NextMemberId: 2, Definitions: [thing], ...extra });
+                await assert.rejects(() => CatalogFx.Load(store), (e: unknown) => CatalogFx.Corrupt(e), JSON.stringify(extra));
+                await store.dispose();
+            }
+        });
+
         it('an empty store loads an empty catalog at version 0', async () =>
         {
             const store = await open();

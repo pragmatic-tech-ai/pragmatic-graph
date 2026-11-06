@@ -5,7 +5,6 @@ import { TupleCodec } from '../format/TupleCodec.js';
 import { CatalogError, CatalogErrorCode } from './CatalogError.js';
 import { CatalogSnapshot } from './CatalogSnapshot.js';
 import { PredicateCodec } from '../predicate/PredicateCodec.js';
-import { PredicateError } from '../predicate/PredicateError.js';
 import type { IndexDef, MemberDef, TypeDefinition } from './CatalogTypes.js';
 import { Placement } from './ValueType.js';
 
@@ -102,13 +101,10 @@ export class CatalogStore
         {
             where = stored.Where === undefined ? undefined : PredicateCodec.FromJson(stored.Where);
         }
-        catch (e)
+        catch
         {
-            if (e instanceof PredicateError)
-            {
-                throw CatalogStore.Corrupt(CatalogStore.BadIndexMessage + stored.Name);
-            }
-            throw e;
+            // Any codec failure (PredicateError or a malformed shape it did not anticipate) is a corrupt catalog.
+            throw CatalogStore.Corrupt(CatalogStore.BadIndexMessage + stored.Name);
         }
         return Object.freeze({
             Id: stored.Id,
@@ -199,7 +195,6 @@ export class CatalogStore
             && CatalogStore.IsPlacement(v);
     }
 
-    /** Placement and AggregateRoot (ruling F5): optional on concepts (Placement defaults to Partitioned on load), absent on aspects. */
     private static IsIndex(v: unknown): boolean
     {
         return CatalogStore.IsObject(v)
@@ -207,9 +202,11 @@ export class CatalogStore
             && typeof v.Name === 'string'
             && typeof v.On === 'string'
             && Array.isArray(v.Members) && v.Members.every((x: unknown) => Number.isInteger(x))
-            && typeof v.Unique === 'boolean';
+            && typeof v.Unique === 'boolean'
+            && (v.Where === undefined || CatalogStore.IsObject(v.Where));
     }
 
+    /** Placement and AggregateRoot (ruling F5): optional on concepts (Placement defaults to Partitioned on load), absent on aspects. */
     private static IsPlacement(v: Record<string, unknown>): boolean
     {
         if (v.IsAspect === true)

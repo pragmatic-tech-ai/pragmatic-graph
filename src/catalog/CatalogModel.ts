@@ -46,11 +46,7 @@ export class CatalogModel
 
     public static FromSnapshot(snapshot: CatalogSnapshot): CatalogModel
     {
-        const model = new CatalogModel();
-        model.version = snapshot.Version;
-        model.nextTypeId = Math.max(1, snapshot.NextTypeId);
-        model.nextMemberId = Math.max(1, snapshot.NextMemberId);
-        model.nextIndexId = Math.max(1, snapshot.NextIndexId);
+        const model = CatalogModel.EmptyFrom(snapshot);
         for (const def of snapshot.Definitions())
         {
             model.definitions.set(def.Name, def);

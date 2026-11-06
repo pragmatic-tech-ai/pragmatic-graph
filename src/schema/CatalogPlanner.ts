@@ -20,6 +20,12 @@ export interface ICatalogPlan
     /** Version = stored.Version + 1, or the stored snapshot itself when nothing changed. */
     readonly Catalog: CatalogSnapshot;
     readonly Diff: CatalogDiff;
+    /**
+     * True iff `Catalog !== stored`, i.e. the plan must be persisted. Key off this, not `Diff.IsEmpty`:
+     * the diff only lists structural removals, additions and hierarchy changes, so a change such as
+     * Nullable false to true or a concept's options yields Changed with an empty diff (ruling R45).
+     */
+    readonly Changed: boolean;
 }
 
 /**
@@ -44,7 +50,7 @@ export class CatalogPlanner
         // Compare the whole catalog (options, nullability, declaring types included), not just the diff
         // lists: a change the diff does not describe still needs a new version.
         const result = CatalogPlanner.Canonical(catalog) === CatalogPlanner.Canonical(stored) ? stored : catalog;
-        return { Catalog: result, Diff: CatalogPlanner.ComputeDiff(stored, result) };
+        return { Catalog: result, Diff: CatalogPlanner.ComputeDiff(stored, result), Changed: result !== stored };
     }
 
     private readonly storedDefs: ReadonlyMap<string, TypeDefinition>;
@@ -131,7 +137,7 @@ export class CatalogPlanner
     private AssignMember(member: MemberDef, declaring: TypeDefinition, oldDeclaring: TypeDefinition | undefined): void
     {
         const old = this.FindOld(member, declaring, oldDeclaring);
-        if (old !== undefined && CatalogPlanner.Compatible(old, member))
+        if (old !== undefined)
         {
             this.usedOld.add(old.Id);
             this.MapKept(member, old);
@@ -142,17 +148,19 @@ export class CatalogPlanner
 
     private FindOld(member: MemberDef, declaring: TypeDefinition, oldDeclaring: TypeDefinition | undefined): MemberDef | undefined
     {
+        // Try every concept the member is effective on and keep the first old member that is still compatible
+        // (a member hoisted from two siblings to a parent can keep only one of the two old ids).
         for (const concept of this.effectiveOn.get(member.Id) ?? [])
         {
             const old = this.storedEffective.get(concept)?.get(member.Name);
-            if (old !== undefined && !this.usedOld.has(old.Id))
+            if (old !== undefined && !this.usedOld.has(old.Id) && CatalogPlanner.Compatible(old, member))
             {
                 return old;
             }
         }
         // Effective on no concept (an aspect nobody carries): fall back to the same declaring type.
         const same = oldDeclaring?.Members.find(m => m.Name === member.Name);
-        return same !== undefined && !this.usedOld.has(same.Id) && declaring.Name === oldDeclaring?.Name ? same : undefined;
+        return same !== undefined && !this.usedOld.has(same.Id) && declaring.Name === oldDeclaring?.Name && CatalogPlanner.Compatible(same, member) ? same : undefined;
     }
 
     private MapKept(member: MemberDef, old: MemberDef): void
@@ -284,6 +292,26 @@ export class CatalogPlanner
         });
     }
 
+    /**
+     * Members of a kept aspect that no concept carried disappear from no concept's effective list, so they
+     * are reported against the aspect itself. A carried aspect's members are reported per concept instead.
+     */
+    private static AddRemovedAspectMembers(stored: CatalogSnapshot, old: TypeDefinition, next: TypeDefinition, into: IRemovedMember[]): void
+    {
+        if (stored.ConceptsMatching(old.Name).length > 0)
+        {
+            return;
+        }
+        const kept = new Set(next.Members.map(m => m.Id));
+        for (const m of old.Members)
+        {
+            if (!kept.has(m.Id))
+            {
+                into.push({ Type: old.Name, Member: m });
+            }
+        }
+    }
+
     private static ComputeDiff(stored: CatalogSnapshot, next: CatalogSnapshot): CatalogDiff
     {
         const oldTypeIds = new Set(stored.Definitions().map(d => d.TypeId));
@@ -294,8 +322,13 @@ export class CatalogPlanner
         for (const d of next.Definitions())
         {
             const old = oldById.get(d.TypeId);
-            if (old === undefined || d.IsAspect)
+            if (old === undefined)
             {
+                continue;
+            }
+            if (d.IsAspect)
+            {
+                CatalogPlanner.AddRemovedAspectMembers(stored, old, d, removedMembers);
                 continue;
             }
             const kept = new Set(next.EffectiveMembers(d.Name).map(m => m.Id));
