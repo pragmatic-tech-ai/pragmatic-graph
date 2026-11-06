@@ -83,7 +83,7 @@ nullBitmap: ceil(slotCount / 8) bytes, bit i = byte i/8, bit (i % 8) (LSB first)
 payload   : encoding-specific cell bytes
 ```
 
-Columns read by traversal use only random-access encodings (0, 1, 2). A reader reads one cell from the header, its null bit and the bytes of that cell alone. Cell count is 1..2048; a chunk whose header says otherwise, whose encoding id is unknown, or whose payload is too short for the cell read is corrupt and rejected.
+Columns read by traversal use only random-access encodings (0, 1, 2). A reader reads one cell from the header, its null bit and the bytes of that cell alone. Cell count is 1..2048; a chunk whose header says otherwise, whose encoding id is unknown, or whose payload is too short for the cell read is corrupt and rejected. A whole-chunk decode additionally requires the payload to have exactly its encoding's expected length (no trailing bytes) and the unused high bits of the last bitmap byte to be zero.
 
 Null cells still occupy their slot in the payload (zero bytes, or code 0 / delta 0), so slot positions never shift. Value domains: Boolean; Int64 signed 64-bit; Float64 IEEE-754 binary64 (-0 and infinities are preserved; NaN is stored as canonical quiet NaN 0x7FF8000000000000; readers accept any NaN pattern); String is well-formed Unicode stored as UTF-8 (a lone surrogate is rejected on encode, invalid UTF-8 is corrupt on read); Date is `i32` days since 1970-01-01; DateTime is `i64` UTC microseconds plus a non-empty IANA zone name of at most 65,535 UTF-8 bytes; Duration is `i32 months, i32 days, i64 microseconds`. All integers little-endian.
 
