@@ -35,7 +35,7 @@ Keys are `(name, ...qualifiers)`. Names defined so far:
 
 - `("format")`: the format version, stored as a tuple-encoded single integer `(1)`. `FormatMeta.Verify` throws `FormatVersionMismatchError` if absent or not `1`.
 - `("catalogVersion")`: the catalog version, a tuple-encoded single integer `(n)`; absent means `0` (empty catalog).
-- `("nextBlock")`: the next unallocated id block number, a tuple-encoded single integer `(n)`; absent means `0`. The allocator reserves a block by committing `(n + 1)` in its own write before handing out any id from block `n`, so a block is durable before use and a rolled-back caller can waste ids but never duplicate them.
+- `("nextBlock")`: the next unreserved id block number, a tuple-encoded single integer `(n)`; absent means `0`. The allocator reserves 16 blocks at a time by committing `(n + 16)` in its own write before handing out any id from blocks `n .. n + 15` (ruling F6), so a block is durable before use and a rolled-back caller (or a restart, which forgets unused reserved blocks) can waste ids but never duplicate them.
 
 Names added by later tasks, each with its value layout completed by that task:
 
@@ -64,7 +64,7 @@ Values: `PublicToInternal` holds the internal id as a tuple-encoded single integ
 
 ### Rows (row index)
 
-The row index is global (ruling F5): it maps every internal id to its location, whatever partition holds the node, so its key is the row block number alone and each entry carries the partition. A block covers 4,096 consecutive internal ids: `block = id / 4096`, entry index `id % 4096`. The value is 4,096 entries of 12 bytes (49,152 bytes), entry `i` at byte offset `12 * i`:
+The row index is global (ruling F5): it maps every internal id to its location, whatever partition holds the node, so its key is the row block number alone and each entry carries the partition. A row block covers 512 consecutive internal ids, independent of the 4,096-id allocation block (ruling F6): `block = id / 512`, entry index `id % 512`. The value is 512 entries of 12 bytes (6,144 bytes), entry `i` at byte offset `12 * i`:
 
 ```
 partition : u32 little-endian
@@ -72,7 +72,7 @@ typeId    : u32 little-endian
 slot      : u32 little-endian
 ```
 
-An entry is unassigned iff all three of `partition`, `typeId` and `slot` are `0xFFFFFFFF`; therefore `0xFFFFFFFF` is reserved and is never a valid partition, type id or slot. A missing block means all of its entries are unassigned. The row entry is an index only: it locates the node's cells; it never copies data. Edges point to internal ids, never slots.
+An entry is unassigned iff all three of `partition`, `typeId` and `slot` are `0xFFFFFFFF`; therefore `0xFFFFFFFF` is reserved and is never a valid partition, type id or slot. The index is sparse: a missing block means all of its entries are unassigned. A write transaction writes each changed block once (at the committer's flush), not once per entry change. The row entry is an index only: it locates the node's cells; it never copies data. Edges point to internal ids, never slots.
 
 ### Columns
 

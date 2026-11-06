@@ -102,7 +102,7 @@ interface IGroupOutcome
  * (2) allocates internal ids for every CreateNode BEFORE entering the store's write (ruling R16), then
  * (3) in ONE store.Write applies the batches in submission order, validating each against the write sets
  * of the batches accepted before it in the same group, compacts deltas over CompactThreshold, flushes
- * the column store, appends each accepted batch to the log and sets Meta("commit") (ruling R25).
+ * the column store and the row index (each dirty chunk delta and row block written once), appends each accepted batch to the log and sets Meta("commit") (ruling R25).
  * A batch that is semantically invalid (CommitError) aborts that store.Write; only it is rejected and
  * the rest of the group re-runs in a fresh Write, so its partial writes leave no trace. Any other error
  * rejects the whole group. Commit numbers follow submission order. CommitApplied is raised once per
@@ -403,6 +403,8 @@ export class Committer
         await this.Compact(txn, index);
         this.columns.Flush(txn);
         this.columns.AssertFlushed(txn);
+        this.rows.Flush(txn);
+        this.rows.AssertFlushed(txn);
         let commit = this.history.Last;
         for (const a of accepted)
         {

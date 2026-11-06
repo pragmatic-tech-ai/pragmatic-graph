@@ -10,9 +10,10 @@ interface IOpenBlock
 }
 
 /**
- * Allocates internal ids from 4,096-id blocks. Each block reservation is its own short
- * store.Write that bumps Meta("nextBlock"), so a block is durable before any id from it is
- * handed out: a rolled-back caller transaction can waste ids but never duplicate them.
+ * Allocates internal ids from 4,096-id blocks. Blocks are reserved ReserveBlocks (16) at a time by one
+ * short store.Write that bumps Meta("nextBlock") by 16 (ruling F6), and then handed out locally, so a
+ * block is durable before any id from it is handed out: a rolled-back caller transaction (or a restart,
+ * which forgets the unused reserved blocks) can waste ids but never duplicate them.
  *
  * Next must NOT be called from inside a Write on the same store: the single-writer mutex
  * would deadlock. Allocate ids before entering the group Write.
@@ -30,12 +31,17 @@ export class IdAllocator
 {
     public static readonly BlockSize = 4096;
     public static readonly MaxOpenHints = 1024;
+    /** Blocks reserved per allocator Write. */
+    public static readonly ReserveBlocks = 16n;
     private static readonly BlockSizeBig = BigInt(IdAllocator.BlockSize);
     private static readonly ErrMaxHints = 'MaxOpenHints must be a positive safe integer: ';
     private static readonly NextBlockName = 'nextBlock';
 
     private readonly hints = new Map<string, IOpenBlock>();
     private defaultBlock: IOpenBlock | undefined;
+    /** Reserved, durable, not yet handed out: blocks nextReserved .. reservedEnd - 1. */
+    private nextReserved = 0n;
+    private reservedEnd = 0n;
     private chain: Promise<unknown> = Promise.resolve();
 
     private constructor(
@@ -114,14 +120,21 @@ export class IdAllocator
 
     private async OpenBlock(): Promise<IOpenBlock>
     {
-        const key = FormatKeys.Meta(IdAllocator.NextBlockName);
-        const block = await this.store.Write(async txn =>
+        if (this.nextReserved >= this.reservedEnd)
         {
-            const raw = await txn.Get(Keyspace.Meta, key);
-            const next = raw === undefined ? 0n : (TupleCodec.Decode(raw)[0] as bigint);
-            txn.Put(Keyspace.Meta, key, TupleCodec.Encode([next + 1n]));
-            return next;
-        });
+            const key = FormatKeys.Meta(IdAllocator.NextBlockName);
+            const first = await this.store.Write(async txn =>
+            {
+                const raw = await txn.Get(Keyspace.Meta, key);
+                const next = raw === undefined ? 0n : (TupleCodec.Decode(raw)[0] as bigint);
+                txn.Put(Keyspace.Meta, key, TupleCodec.Encode([next + IdAllocator.ReserveBlocks]));
+                return next;
+            });
+            this.nextReserved = first;
+            this.reservedEnd = first + IdAllocator.ReserveBlocks;
+        }
+        const block = this.nextReserved;
+        this.nextReserved += 1n;
         // Id 0 is reserved, so block 0 starts at offset 1.
         return { Block: block, Used: block === 0n ? 1 : 0 };
     }

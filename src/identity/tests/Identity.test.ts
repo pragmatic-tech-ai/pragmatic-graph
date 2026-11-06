@@ -11,6 +11,7 @@ import { PublicIdIndex, PublicIdTooLongError } from '../PublicIdIndex.js';
 import { RowIndex } from '../RowIndex.js';
 import { FormatKeys } from '../../format/FormatKeys.js';
 import { Keyspace } from '../../kv/Keyspace.js';
+import { TupleCodec } from '../../format/TupleCodec.js';
 import { InternalId } from '../InternalId.js';
 
 class IdentityFx
@@ -247,12 +248,13 @@ class IdentityFx
                     assert.equal(await rows.Locate(txn, 5n), undefined);
                     await rows.Assign(txn, 5n, IdentityFx.Loc(3, 9));
                     assert.deepEqual(await rows.Locate(txn, 5n), IdentityFx.Loc(3, 9));
+                    rows.Flush(txn);
                 });
                 const r = await store.BeginRead();
                 assert.deepEqual(await rows.Locate(r, 5n), IdentityFx.Loc(3, 9));
                 assert.equal(await rows.Locate(r, 6n), undefined);
                 r.dispose();
-                await store.Write(async txn => rows.Clear(txn, 5n));
+                await store.Write(async txn => { await rows.Clear(txn, 5n); rows.Flush(txn); });
                 const r2 = await store.BeginRead();
                 assert.equal(await rows.Locate(r2, 5n), undefined);
                 r2.dispose();
@@ -268,8 +270,9 @@ class IdentityFx
                     await rows.Assign(txn, 1n, IdentityFx.Loc(1, 1));
                     await rows.Assign(txn, 2n, IdentityFx.Loc(1, 2));
                     await rows.Assign(txn, 5000n, IdentityFx.Loc(2, 0));
+                    rows.Flush(txn);
                 });
-                await store.Write(async txn => rows.Assign(txn, 1n, IdentityFx.Loc(4, 7)));
+                await store.Write(async txn => { await rows.Assign(txn, 1n, IdentityFx.Loc(4, 7)); rows.Flush(txn); });
                 const r = await store.BeginRead();
                 assert.deepEqual(await rows.Locate(r, 1n), IdentityFx.Loc(4, 7));
                 assert.deepEqual(await rows.Locate(r, 2n), IdentityFx.Loc(1, 2));
@@ -282,10 +285,10 @@ class IdentityFx
             {
                 const store = await open();
                 const rows = new RowIndex();
-                await store.Write(async txn => rows.Assign(txn, 1n, IdentityFx.Loc(1, 1)));
+                await store.Write(async txn => { await rows.Assign(txn, 1n, IdentityFx.Loc(1, 1)); rows.Flush(txn); });
                 const old = await store.BeginRead();
                 assert.deepEqual(await rows.Locate(old, 1n), IdentityFx.Loc(1, 1));
-                await store.Write(async txn => rows.Assign(txn, 1n, IdentityFx.Loc(9, 9)));
+                await store.Write(async txn => { await rows.Assign(txn, 1n, IdentityFx.Loc(9, 9)); rows.Flush(txn); });
                 assert.deepEqual(await rows.Locate(old, 1n), IdentityFx.Loc(1, 1));
                 old.dispose();
                 const fresh = await store.BeginRead();
@@ -301,6 +304,7 @@ class IdentityFx
                 await store.Write(async txn =>
                 {
                     await rows.Assign(txn, 3n, IdentityFx.Loc(7, 9));
+                    rows.Flush(txn);
                 });
                 const r = await store.BeginRead();
                 const block = await r.Get(Keyspace.Rows, FormatKeys.RowBlock(0n)) as Uint8Array;
@@ -309,6 +313,65 @@ class IdentityFx
                 const view = new DataView(block.buffer, block.byteOffset, block.byteLength);
                 assert.deepEqual([view.getUint32(36, true), view.getUint32(40, true), view.getUint32(44, true)], [0, 7, 9]);
                 assert.deepEqual([view.getUint32(24, true), view.getUint32(28, true), view.getUint32(32, true)], [0xffffffff, 0xffffffff, 0xffffffff]);
+                await store.dispose();
+            });
+
+            it('keeps dirty row blocks per write txn and writes each once at Flush; blocks hold 512 entries (F6)', async () =>
+            {
+                const store = await open();
+                const rows = new RowIndex();
+                let puts = 0;
+                await store.Write(async txn =>
+                {
+                    const counting = new Proxy(txn, { get: (target, name) => name === 'Put' ? (...args: Parameters<typeof txn.Put>) => { puts++; target.Put(...args); } : Reflect.get(target, name).bind?.(target) ?? Reflect.get(target, name) });
+                    for (let id = 1n; id <= 300n; id++)
+                    {
+                        await rows.Assign(counting, id, IdentityFx.Loc(1, Number(id)));
+                    }
+                    await rows.Assign(counting, 600n, IdentityFx.Loc(2, 0));
+                    await rows.Clear(counting, 7n);
+                    assert.equal(puts, 0, 'Assign and Clear only touch the in-memory block');
+                    assert.equal(await txn.Get(Keyspace.Rows, FormatKeys.RowBlock(0n)), undefined);
+                    assert.throws(() => rows.AssertFlushed(counting), /Flush/);
+                    rows.Flush(counting);
+                    rows.Flush(counting);
+                    assert.equal(puts, 2, 'one Put per dirty block, Flush is idempotent');
+                    rows.AssertFlushed(counting);
+                    assert.equal(rows.HasPendingWrites(counting), false);
+                });
+                const r = await store.BeginRead();
+                assert.equal(RowIndex.BlockEntries, 512);
+                assert.equal((await r.Get(Keyspace.Rows, FormatKeys.RowBlock(0n)))?.length, 512 * 12);
+                assert.equal((await r.Get(Keyspace.Rows, FormatKeys.RowBlock(1n)))?.length, 512 * 12);
+                assert.deepEqual(await rows.Locate(r, 600n), IdentityFx.Loc(2, 0));
+                assert.equal(await rows.Locate(r, 7n), undefined);
+                assert.equal(await rows.Locate(r, 100000n), undefined, 'a missing block is unassigned');
+                r.dispose();
+                await store.dispose();
+            });
+
+            it('reserves 16 id blocks per allocator Write and hands them out locally (F6)', async () =>
+            {
+                const store = await open();
+                let writes = 0;
+                const counting: IKeyValueStore = {
+                    BeginRead: () => store.BeginRead(),
+                    Write: work => { writes++; return store.Write(work); },
+                    dispose: () => store.dispose(),
+                };
+                const alloc = await IdAllocator.Open(counting);
+                const seen = new Set<bigint>();
+                for (let i = 0; i < 16 * 4096 - 1; i++)
+                {
+                    seen.add(await alloc.Next());
+                }
+                assert.equal(writes, 1, 'one Write reserved 16 blocks');
+                const r = await store.BeginRead();
+                assert.deepEqual(await r.Get(Keyspace.Meta, FormatKeys.Meta('nextBlock')), TupleCodec.Encode([16n]));
+                r.dispose();
+                seen.add(await alloc.Next());
+                assert.equal(writes, 2);
+                assert.equal(seen.size, 16 * 4096);
                 await store.dispose();
             });
 
