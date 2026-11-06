@@ -18,21 +18,17 @@ export class ChunkCodec
     private static readonly Applicable: readonly Encoding[] = [Encoding.Plain, Encoding.BitPacked, Encoding.Dictionary];
     private static readonly TruncatedHeader = 'chunk header or null bitmap truncated';
     private static readonly BadSlotCount = 'slot count is not 1..2048';
+    private static readonly PaddingBits = 'null bitmap padding bits are set';
+    private static readonly BadPayloadLength = 'payload length does not match its encoding';
     private static readonly UnknownEncoding = 'unknown encoding id';
 
     public static Encode(type: ValueType, cells: readonly CellValue[], encoding?: Encoding): Uint8Array
     {
-        if (cells.length < 1 || cells.length > ChunkCodec.SlotsPerChunk)
+        if (encoding !== undefined && !ChunkCodec.Applicable.includes(encoding))
         {
-            throw ChunkCodecError.BadCellCount(cells.length);
+            throw ChunkCodecError.BadEncodingArgument(encoding);
         }
-        for (const c of cells)
-        {
-            if (c !== null)
-            {
-                ValueCodec.Check(type, c);
-            }
-        }
+        ValueCodec.CheckCells(type, cells, ChunkCodec.SlotsPerChunk);
         const chosen = encoding ?? ChunkCodec.ChooseEncoding(type, cells);
         const payload = ChunkCodec.WritePayload(type, cells, chosen);
         const n = cells.length;
@@ -77,7 +73,9 @@ export class ChunkCodec
 
     public static DecodeAll(type: ValueType, chunk: Uint8Array): CellValue[]
     {
-        const count = ChunkCodec.ReadHeader(chunk).Count;
+        const header = ChunkCodec.ReadHeader(chunk);
+        const count = header.Count;
+        ChunkCodec.VerifyShape(type, chunk, header);
         const cells: CellValue[] = [];
         for (let i = 0; i < count; i++)
         {
@@ -89,6 +87,7 @@ export class ChunkCodec
     /** Smallest applicable encoding; ties go to the lower encoding id. */
     public static ChooseEncoding(type: ValueType, cells: readonly CellValue[]): Encoding
     {
+        ValueCodec.CheckCells(type, cells, ChunkCodec.SlotsPerChunk);
         let best = Encoding.Plain;
         let bestSize = ChunkCodec.WritePayload(type, cells, Encoding.Plain).length;
         for (const candidate of ChunkCodec.Applicable)
@@ -116,6 +115,34 @@ export class ChunkCodec
     public static DecodeValue(type: ValueType, bytes: Uint8Array): CellValue
     {
         return ValueCodec.Decode(type, bytes);
+    }
+
+    /** Whole-chunk checks: bitmap padding bits are zero and the payload has exactly its expected length. */
+    private static VerifyShape(type: ValueType, chunk: Uint8Array, header: { Encoding: Encoding; Count: number; PayloadAt: number }): void
+    {
+        const tail = header.Count % 8;
+        if (tail !== 0 && ((chunk[header.PayloadAt - 1]! >> tail) !== 0))
+        {
+            throw ChunkCodecError.Corrupt(ChunkCodec.PaddingBits);
+        }
+        const payload = chunk.subarray(header.PayloadAt);
+        let expected: number;
+        switch (header.Encoding)
+        {
+            case Encoding.Plain:
+                expected = PlainLayout.ExactLength(type, payload, header.Count);
+                break;
+            case Encoding.BitPacked:
+                expected = BitPackedLayout.ExactLength(type, payload, header.Count);
+                break;
+            default:
+                expected = DictionaryLayout.ExactLength(type, payload, header.Count);
+                break;
+        }
+        if (payload.length !== expected)
+        {
+            throw ChunkCodecError.Corrupt(ChunkCodec.BadPayloadLength);
+        }
     }
 
     private static IsApplicable(type: ValueType, encoding: Encoding, cells: readonly CellValue[]): boolean

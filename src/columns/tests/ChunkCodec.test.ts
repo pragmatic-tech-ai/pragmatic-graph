@@ -209,4 +209,75 @@ describe('ChunkCodec', () =>
         assert.throws(() => ChunkCodec.DecodeValue(ValueType.Boolean, Uint8Array.of(1, 0)), ChunkCodecError);
         assert.throws(() => ChunkCodec.DecodeValue(ValueType.Boolean, Uint8Array.of(2)), ChunkCodecError);
     });
+
+    it('stores NaN as the canonical quiet NaN whatever the input pattern', () =>
+    {
+        const scratch = new DataView(new ArrayBuffer(8));
+        scratch.setUint32(4, 0x7FF00000, true);
+        scratch.setUint32(0, 1, true);
+        const odd = scratch.getFloat64(0, true);
+        assert.ok(Number.isNaN(odd));
+        const canonical = Uint8Array.of(0, 0, 0, 0, 0, 0, 0xF8, 0x7F);
+        assert.deepStrictEqual(ChunkCodec.EncodeValue(ValueType.Float64, odd), canonical);
+        const plain = ChunkCodec.Encode(ValueType.Float64, [odd], Encoding.Plain);
+        assert.deepStrictEqual(plain.subarray(4), canonical);
+        const dict = ChunkCodec.Encode(ValueType.Float64, [odd, NaN, odd], Encoding.Dictionary);
+        assert.equal(new DataView(dict.buffer, dict.byteOffset).getUint16(4, true), 1);
+        assert.deepStrictEqual(dict.subarray(dict.length - 8), canonical);
+        const anyNan = new DataView(new ArrayBuffer(8));
+        anyNan.setUint32(4, 0xFFF80000, true);
+        assert.ok(Number.isNaN(ChunkCodec.DecodeValue(ValueType.Float64, new Uint8Array(anyNan.buffer)) as number));
+    });
+
+    it('reports an invalid encoding argument as caller misuse, not corruption', () =>
+    {
+        assert.throws(() => ChunkCodec.Encode(ValueType.Int64, [1n], 99 as Encoding), (e: Error) => e instanceof ChunkCodecError && !/corrupt/i.test(e.message) && /encoding/i.test(e.message));
+    });
+
+    it('validates cells in ChooseEncoding', () =>
+    {
+        assert.throws(() => ChunkCodec.ChooseEncoding(ValueType.Int64, [1]), ChunkCodecError);
+        assert.throws(() => ChunkCodec.ChooseEncoding(ValueType.Date, [new DateValue(1.5)]), ChunkCodecError);
+        assert.throws(() => ChunkCodec.ChooseEncoding(ValueType.String, []), ChunkCodecError);
+    });
+
+    it('DecodeAll rejects trailing bytes for every type and encoding', () =>
+    {
+        for (const type of types)
+        {
+            for (const encoding of Fixtures.Applicable(type))
+            {
+                const chunk = ChunkCodec.Encode(type, Fixtures.Make(type, 50, 5), encoding);
+                const longer = new Uint8Array(chunk.length + 1);
+                longer.set(chunk);
+                assert.throws(() => ChunkCodec.DecodeAll(type, longer), ChunkCodecError, `${ValueType[type]} ${Encoding[encoding]}`);
+                assert.doesNotThrow(() => ChunkCodec.DecodeAll(type, chunk));
+            }
+        }
+    });
+
+    it('DecodeAll rejects set bitmap padding bits', () =>
+    {
+        const chunk = ChunkCodec.Encode(ValueType.Int64, [1n, 2n, 3n], Encoding.Plain);
+        chunk[3] = (chunk[3] ?? 0) | 0x20;
+        assert.throws(() => ChunkCodec.DecodeAll(ValueType.Int64, chunk), ChunkCodecError);
+    });
+
+    it('bit-packs every width 1..63 at the extremes of the Int64 range', () =>
+    {
+        const min = -(2n ** 63n);
+        const max = 2n ** 63n - 1n;
+        for (let w = 1; w <= 63; w++)
+        {
+            const span = 2n ** BigInt(w) - 1n;
+            const ranges: [bigint, bigint][] = [[min, min + span], [max - span, max], [-1n, span - 1n]];
+            for (const [lo, hi] of ranges)
+            {
+                const cells: CellValue[] = [lo, hi, null, lo + span / 2n, hi, lo];
+                const chunk = ChunkCodec.Encode(ValueType.Int64, cells, Encoding.BitPacked);
+                assert.equal(chunk[4 + 8], w);
+                assert.deepStrictEqual(ChunkCodec.DecodeAll(ValueType.Int64, chunk), cells, `width ${w}`);
+            }
+        }
+    });
 });

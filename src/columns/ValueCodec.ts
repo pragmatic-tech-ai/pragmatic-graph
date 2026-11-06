@@ -28,6 +28,22 @@ export class ValueCodec
     private static readonly TrailingBytes = 'trailing bytes after value';
     private static readonly UnknownType = 'unknown column type';
     private static readonly NullHasNoBytes = 'null has no value bytes';
+    private static readonly ExpectedBoolean = 'expected boolean';
+    private static readonly ExpectedBigInt = 'expected bigint';
+    private static readonly ExpectedNumber = 'expected number';
+    private static readonly ExpectedString = 'expected string';
+    private static readonly ExpectedDate = 'expected DateValue';
+    private static readonly ExpectedDateTime = 'expected DateTimeValue';
+    private static readonly ExpectedDuration = 'expected DurationValue';
+    private static readonly OutOfI64 = 'out of signed 64-bit range';
+    private static readonly MicrosOutOfI64 = 'Micros out of signed 64-bit range';
+    private static readonly LoneSurrogateString = 'string contains a lone surrogate';
+    private static readonly LoneSurrogateZone = 'zone contains a lone surrogate';
+    private static readonly ZoneTooLong = 'zone name too long';
+    private static readonly NotI32Suffix = 'is not a signed 32-bit integer';
+    private static readonly FieldDays = 'Days';
+    private static readonly FieldMonths = 'Months';
+    private static readonly CanonicalNaNHigh = 0x7FF80000;
 
     /** Throws ChunkCodecError unless the (non-null) value is valid for the type. */
     public static Check(type: ValueType, value: CellValue): void
@@ -35,44 +51,60 @@ export class ValueCodec
         switch (type)
         {
             case ValueType.Boolean:
-                ValueCodec.Require(typeof value === 'boolean', type, 'expected boolean');
+                ValueCodec.Require(typeof value === 'boolean', type, ValueCodec.ExpectedBoolean);
                 return;
             case ValueType.Int64:
-                ValueCodec.Require(typeof value === 'bigint', type, 'expected bigint');
-                ValueCodec.Require(BigInt.asIntN(64, value as bigint) === value, type, 'out of signed 64-bit range');
+                ValueCodec.Require(typeof value === 'bigint', type, ValueCodec.ExpectedBigInt);
+                ValueCodec.Require(BigInt.asIntN(64, value as bigint) === value, type, ValueCodec.OutOfI64);
                 return;
             case ValueType.Float64:
-                ValueCodec.Require(typeof value === 'number', type, 'expected number');
+                ValueCodec.Require(typeof value === 'number', type, ValueCodec.ExpectedNumber);
                 return;
             case ValueType.String:
-                ValueCodec.Require(typeof value === 'string', type, 'expected string');
-                ValueCodec.Require(!ValueCodec.LoneSurrogate.test(value as string), type, 'string contains a lone surrogate');
+                ValueCodec.Require(typeof value === 'string', type, ValueCodec.ExpectedString);
+                ValueCodec.Require(!ValueCodec.LoneSurrogate.test(value as string), type, ValueCodec.LoneSurrogateString);
                 return;
             case ValueType.Date:
-                ValueCodec.Require(value instanceof DateValue, type, 'expected DateValue');
-                ValueCodec.RequireI32((value as DateValue).Days, type, 'Days');
+                ValueCodec.Require(value instanceof DateValue, type, ValueCodec.ExpectedDate);
+                ValueCodec.RequireI32((value as DateValue).Days, type, ValueCodec.FieldDays);
                 return;
             case ValueType.DateTime:
             {
-                ValueCodec.Require(value instanceof DateTimeValue, type, 'expected DateTimeValue');
+                ValueCodec.Require(value instanceof DateTimeValue, type, ValueCodec.ExpectedDateTime);
                 const dt = value as DateTimeValue;
-                ValueCodec.Require(typeof dt.Micros === 'bigint' && BigInt.asIntN(64, dt.Micros) === dt.Micros, type, 'Micros out of signed 64-bit range');
+                ValueCodec.Require(typeof dt.Micros === 'bigint' && BigInt.asIntN(64, dt.Micros) === dt.Micros, type, ValueCodec.MicrosOutOfI64);
                 ValueCodec.Require(typeof dt.Zone === 'string' && dt.Zone.length > 0, type, ValueCodec.EmptyZone);
-                ValueCodec.Require(!ValueCodec.LoneSurrogate.test(dt.Zone), type, 'zone contains a lone surrogate');
-                ValueCodec.Require(ValueCodec.Encoder.encode(dt.Zone).length <= ValueCodec.MaxU16, type, 'zone name too long');
+                ValueCodec.Require(!ValueCodec.LoneSurrogate.test(dt.Zone), type, ValueCodec.LoneSurrogateZone);
+                ValueCodec.Require(ValueCodec.Encoder.encode(dt.Zone).length <= ValueCodec.MaxU16, type, ValueCodec.ZoneTooLong);
                 return;
             }
             case ValueType.Duration:
             {
-                ValueCodec.Require(value instanceof DurationValue, type, 'expected DurationValue');
+                ValueCodec.Require(value instanceof DurationValue, type, ValueCodec.ExpectedDuration);
                 const du = value as DurationValue;
-                ValueCodec.RequireI32(du.Months, type, 'Months');
-                ValueCodec.RequireI32(du.Days, type, 'Days');
-                ValueCodec.Require(typeof du.Micros === 'bigint' && BigInt.asIntN(64, du.Micros) === du.Micros, type, 'Micros out of signed 64-bit range');
+                ValueCodec.RequireI32(du.Months, type, ValueCodec.FieldMonths);
+                ValueCodec.RequireI32(du.Days, type, ValueCodec.FieldDays);
+                ValueCodec.Require(typeof du.Micros === 'bigint' && BigInt.asIntN(64, du.Micros) === du.Micros, type, ValueCodec.MicrosOutOfI64);
                 return;
             }
             default:
                 throw ChunkCodecError.TypeMismatch(type, ValueCodec.UnknownType);
+        }
+    }
+
+    /** Throws ChunkCodecError unless 1..2048 cells are given and every non-null cell is valid for the type. */
+    public static CheckCells(type: ValueType, cells: readonly CellValue[], maxCount: number): void
+    {
+        if (cells.length < 1 || cells.length > maxCount)
+        {
+            throw ChunkCodecError.BadCellCount(cells.length);
+        }
+        for (const c of cells)
+        {
+            if (c !== null)
+            {
+                ValueCodec.Check(type, c);
+            }
         }
     }
 
@@ -97,7 +129,7 @@ export class ValueCodec
             case ValueType.Float64:
             {
                 const out = new Uint8Array(8);
-                new DataView(out.buffer).setFloat64(0, value as number, true);
+                ValueCodec.WriteFloat64(new DataView(out.buffer), 0, value as number);
                 return out;
             }
             case ValueType.String:
@@ -209,6 +241,18 @@ export class ValueCodec
         }
     }
 
+    /** Writes a Float64; every NaN is stored as the canonical quiet NaN 0x7FF8000000000000. */
+    public static WriteFloat64(view: DataView, offset: number, value: number): void
+    {
+        if (Number.isNaN(value))
+        {
+            view.setUint32(offset, 0, true);
+            view.setUint32(offset + 4, ValueCodec.CanonicalNaNHigh, true);
+            return;
+        }
+        view.setFloat64(offset, value, true);
+    }
+
     /** UTF-8 encodes text (already validated). */
     public static EncodeText(text: string): Uint8Array
     {
@@ -238,6 +282,6 @@ export class ValueCodec
 
     private static RequireI32(n: number, type: ValueType, field: string): void
     {
-        ValueCodec.Require(Number.isInteger(n) && n >= ValueCodec.MinI32 && n <= ValueCodec.MaxI32, type, `${field} is not a signed 32-bit integer`);
+        ValueCodec.Require(Number.isInteger(n) && n >= ValueCodec.MinI32 && n <= ValueCodec.MaxI32, type, `${field} ${ValueCodec.NotI32Suffix}`);
     }
 }

@@ -19,6 +19,7 @@ export class DictionaryLayout
     private static readonly Truncated = 'dictionary payload truncated';
     private static readonly BadWidth = 'dictionary code width is invalid';
     private static readonly BadCode = 'dictionary code outside dictionary';
+    private static readonly NaNKey = 'NaN';
     private static readonly KeySeparator = '|';
 
     public static Supports(type: ValueType): boolean
@@ -90,6 +91,23 @@ export class DictionaryLayout
         return PlainLayout.Read(type, payload.subarray(DictionaryLayout.HeaderBytes + codesBytes), dictCount, code);
     }
 
+    /** Exact byte length the payload must have for `count` slots. */
+    public static ExactLength(type: ValueType, payload: Uint8Array, count: number): number
+    {
+        if (payload.length < DictionaryLayout.HeaderBytes)
+        {
+            throw ChunkCodecError.Corrupt(DictionaryLayout.Truncated);
+        }
+        const dictCount = new DataView(payload.buffer, payload.byteOffset, payload.length).getUint16(0, true);
+        const width = payload[2]!;
+        if (width > DictionaryLayout.MaxWidth)
+        {
+            throw ChunkCodecError.Corrupt(DictionaryLayout.BadWidth);
+        }
+        const before = DictionaryLayout.HeaderBytes + PackedBits.ByteLength(count, width);
+        return before + PlainLayout.ExactLength(type, payload.subarray(before), dictCount);
+    }
+
     /** Equality key: Float64 compares by bit pattern so -0 and 0 stay distinct. */
     private static Key(type: ValueType, cell: CellValue): string | bigint | number
     {
@@ -101,6 +119,10 @@ export class DictionaryLayout
                 return cell as string;
             case ValueType.Float64:
             {
+                if (Number.isNaN(cell as number))
+                {
+                    return DictionaryLayout.NaNKey;
+                }
                 DictionaryLayout.Float64Bits.setFloat64(0, cell as number, true);
                 return DictionaryLayout.Float64Bits.getBigUint64(0, true).toString();
             }

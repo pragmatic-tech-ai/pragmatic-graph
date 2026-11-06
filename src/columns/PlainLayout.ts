@@ -32,7 +32,7 @@ export class PlainLayout
             {
                 const out = new Uint8Array(8 * n);
                 const view = new DataView(out.buffer);
-                cells.forEach((c, i) => view.setFloat64(8 * i, (c as number | null) ?? 0, true));
+                cells.forEach((c, i) => ValueCodec.WriteFloat64(view, 8 * i, (c as number | null) ?? 0));
                 return out;
             }
             case ValueType.Date:
@@ -87,6 +87,35 @@ export class PlainLayout
                 return PlainLayout.ReadString(payload, view, count, slot);
             default:
                 return PlainLayout.ReadDateTime(payload, view, count, slot);
+        }
+    }
+
+    /** Exact byte length the payload must have for `count` slots; rejects payloads too short to tell. */
+    public static ExactLength(type: ValueType, payload: Uint8Array, count: number): number
+    {
+        const view = new DataView(payload.buffer, payload.byteOffset, payload.length);
+        switch (type)
+        {
+            case ValueType.Boolean:
+                return Math.ceil(count / 8);
+            case ValueType.Int64:
+            case ValueType.Float64:
+                return 8 * count;
+            case ValueType.Date:
+                return 4 * count;
+            case ValueType.Duration:
+                return 16 * count;
+            case ValueType.String:
+                PlainLayout.Need(payload, 4 * count);
+                return 4 * count + (count === 0 ? 0 : view.getUint32(4 * (count - 1), true));
+            default:
+            {
+                PlainLayout.Need(payload, 10 * count + 2);
+                const zoneCount = view.getUint16(10 * count, true);
+                const heapAt = 10 * count + 2 + 4 * zoneCount;
+                PlainLayout.Need(payload, heapAt);
+                return heapAt + (zoneCount === 0 ? 0 : view.getUint32(10 * count + 2 + 4 * (zoneCount - 1), true));
+            }
         }
     }
 

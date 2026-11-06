@@ -111,6 +111,25 @@ export class BitPackedLayout
         return new DateValue(Number(value));
     }
 
+    /** Exact byte length the payload must have for `count` slots. */
+    public static ExactLength(type: ValueType, payload: Uint8Array, count: number): number
+    {
+        if (type === ValueType.Boolean)
+        {
+            return PlainLayout.ExactLength(type, payload, count);
+        }
+        if (payload.length < BitPackedLayout.HeaderBytes)
+        {
+            throw ChunkCodecError.Corrupt(BitPackedLayout.Truncated);
+        }
+        const width = payload[8]!;
+        if (width > BitPackedLayout.MaxWidth)
+        {
+            throw ChunkCodecError.Corrupt(BitPackedLayout.BadWidth);
+        }
+        return BitPackedLayout.HeaderBytes + PackedBits.ByteLength(count, width);
+    }
+
     private static ToBigInt(type: ValueType, cell: CellValue): bigint
     {
         switch (type)
