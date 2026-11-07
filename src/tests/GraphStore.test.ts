@@ -13,7 +13,6 @@ import type { GraphContext } from '../GraphContext.js';
 import { EngineInternals } from './EngineInternals.js';
 import { Linearity } from '../kv/tests/Linearity.js';
 import type { Committer } from '../txn/Committer.js';
-import type { ReadSet } from '../txn/ReadSet.js';
 import type { IScanProbe } from '../kv/KeyValue.js';
 import type { Location } from '../identity/Location.js';
 import * as Api from '../index.js';
@@ -303,7 +302,7 @@ class GraphFx
                 const other = await g.Begin(AccessScope.System);
                 assert.equal((await GraphFx.Scan(scan, 'file', 'path')).length, 500);
                 await GraphFx.Scan(other, 'file', 'path');
-                const reads = (scan as unknown as { Reads: ReadSet }).Reads;
+                const reads = EngineInternals.Reads(scan);
                 assert.ok(reads.KeyCount <= 5, 'scan recorded ' + reads.KeyCount + ' keys');
                 scan.SetProperty('c1', 'name', 'a');
                 other.SetProperty('c1', 'name', 'b');

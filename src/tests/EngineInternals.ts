@@ -62,6 +62,12 @@ export class EngineInternals
         return EngineInternals.Committer(store) as unknown as ICommitterInternals;
     }
 
+    /** A transaction's recorded read set (protected on GraphReader). */
+    public static Reads(transaction: GraphTransaction): ReadSet
+    {
+        return (transaction as unknown as ITransactionInternals).Reads;
+    }
+
     /**
      * The engine side of a write-through without connectors (ruling R71): the transaction's schema check
      * and write gate, then Committer.Prepare on its recorded writes and read set. Ends the transaction
