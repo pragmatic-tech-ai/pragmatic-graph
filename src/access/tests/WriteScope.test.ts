@@ -9,7 +9,7 @@ import { GraphError, GraphErrorCode } from '../../errors/GraphError.js';
 import { EdgeDirection } from '../../format/FormatKeys.js';
 import { GraphStore } from '../../GraphStore.js';
 import type { GraphTransaction } from '../../GraphTransaction.js';
-import { Compare, CompareOp, Not, type Predicate, Related, Seeded, TruePredicate } from '../../predicate/Predicate.js';
+import { And, Compare, CompareOp, FalsePredicate, Not, OwnerIs, type Predicate, Reachable, Related, Seeded, TruePredicate } from '../../predicate/Predicate.js';
 import type { ISchemaDescription } from '../../schema/SchemaDescription.js';
 import type { ICommitApplied } from '../../txn/LogEntry.js';
 import { CommitError } from '../../txn/CommitError.js';
@@ -19,7 +19,7 @@ import { AccessDefault, AccessScope, type IWriteRules } from '../AccessScope.js'
 
 /**
  * Schema and helpers for the write-scope tests. Aspect Secret { level }; Person (carries Secret)
- * { name, status, email, manages -> Person* }; Team { name, member -> Person* }; Ticket { status,
+ * { name, status, email, manages -> Person* }; Team { name, member -> Person* ordered }; Ticket { status,
  * title, about -> Person }. Seed: one Team 'seedTeam'.
  */
 class WriteFx
@@ -63,9 +63,9 @@ class WriteFx
         return { Name: name, Kind: MemberKind.Property, Type: type, Nullable: true };
     }
 
-    public static Rel(name: string, target: string, many: boolean): MemberInput
+    public static Rel(name: string, target: string, many: boolean, ordered = false): MemberInput
     {
-        return { Name: name, Kind: MemberKind.Relationship, Targets: [target], Many: many };
+        return { Name: name, Kind: MemberKind.Relationship, Targets: [target], Many: many, Ordered: ordered };
     }
 
     public static Description(): ISchemaDescription
@@ -82,7 +82,7 @@ class WriteFx
                         WriteFx.Rel(WriteFx.Manages, WriteFx.Person, true),
                     ],
                 },
-                { Name: WriteFx.Team, IsAspect: false, Parent: null, Aspects: [], Members: [WriteFx.Prop(WriteFx.Name, ValueType.String), WriteFx.Rel(WriteFx.Member, WriteFx.Person, true)] },
+                { Name: WriteFx.Team, IsAspect: false, Parent: null, Aspects: [], Members: [WriteFx.Prop(WriteFx.Name, ValueType.String), WriteFx.Rel(WriteFx.Member, WriteFx.Person, true, true)] },
                 {
                     Name: WriteFx.Ticket, IsAspect: false, Parent: null, Aspects: [], Members: [
                         WriteFx.Prop(WriteFx.Status, ValueType.String),
@@ -151,6 +151,12 @@ class WriteFx
     public static Allowed(result: unknown): void
     {
         assert.equal(typeof result, 'bigint', 'expected a commit, got ' + String(result));
+    }
+
+    /** Rows that hide every Person named 'secret' (and any Person with no name: Ne on null is Unknown). */
+    public static HideSecret(writes?: ReadonlyMap<string, IWriteRules>): AccessScope
+    {
+        return AccessScope.Build({ Default: AccessDefault.Allow, Rows: new Map<string, Predicate>([[WriteFx.Person, new Compare(WriteFx.Name, CompareOp.Ne, WriteFx.Secretive)]]), Writes: writes ?? new Map() });
     }
 
     public static async Value(g: GraphStore, id: string, member: string): Promise<unknown>
@@ -456,6 +462,201 @@ class WriteFx
                 await assert.rejects(t1.Commit(), (e: unknown) => e instanceof GraphError && e.GraphCode === GraphErrorCode.Disposed);
                 assert.equal(await WriteFx.Setup(g, t => t.CreateNode('q', WriteFx.Person)), before + 1n);
                 assert.equal(seen.length, 1);
+                await g.dispose();
+            });
+
+            it('Link siblings must be visible', async () =>
+            {
+                const g = await WriteFx.Ready(open);
+                await WriteFx.Setup(g, t =>
+                {
+                    t.CreateNode('team', WriteFx.Team);
+                    for (const [id, name] of [['shown', 'visible'], ['hidden', WriteFx.Secretive], ['outsider', WriteFx.Secretive]] as const)
+                    {
+                        t.CreateNode(id, WriteFx.Person);
+                        t.SetProperty(id, WriteFx.Name, name);
+                    }
+                    t.Link('team', WriteFx.Member, 'shown');
+                    t.Link('team', WriteFx.Member, 'hidden');
+                    t.CreateNode('extra', WriteFx.Person);
+                    t.SetProperty('extra', WriteFx.Name, 'visible');
+                });
+                const scope = WriteFx.HideSecret();
+                // An invisible sibling that is a target, and one that is not: both read as invisible.
+                WriteFx.Denied(await WriteFx.Try(g, scope, t => t.Link('team', WriteFx.Member, 'extra', { AfterSibling: 'hidden' })), AccessErrorCode.InvisibleNode, 'op 0', 'team', WriteFx.Team, 'hidden');
+                WriteFx.Denied(await WriteFx.Try(g, scope, t => t.Link('team', WriteFx.Member, 'extra', { BeforeSibling: 'outsider' })), AccessErrorCode.InvisibleNode, 'outsider');
+                WriteFx.Denied(await WriteFx.Try(g, scope, t => t.Link('team', WriteFx.Member, 'extra', { BeforeSibling: 'nobody' })), AccessErrorCode.InvisibleNode, 'nobody');
+                // Under System the committer still tells them apart.
+                assert.ok((await WriteFx.Try(g, AccessScope.System, t => t.Link('team', WriteFx.Member, 'extra', { BeforeSibling: 'outsider' }))) instanceof CommitError);
+                WriteFx.Allowed(await WriteFx.Try(g, scope, t =>
+                {
+                    t.Link('team', WriteFx.Member, 'extra', { BeforeSibling: 'shown' });
+                    t.CreateNode('fresh', WriteFx.Person);
+                    t.Link('team', WriteFx.Member, 'fresh');
+                    t.CreateNode('fresher', WriteFx.Person);
+                    t.Link('team', WriteFx.Member, 'fresher', { AfterSibling: 'fresh' });
+                }));
+                await g.dispose();
+            });
+
+            it('Create rules see the op owner and Seeded as false', async () =>
+            {
+                const g = await WriteFx.Ready(open);
+                const owned = WriteFx.Writes([[WriteFx.Team, { Create: new OwnerIs(new Set(['m1'])) }]]);
+                WriteFx.Allowed(await WriteFx.Try(g, owned, t => t.CreateNode('mine', WriteFx.Team, { Owner: 'm1' })));
+                WriteFx.Denied(await WriteFx.Try(g, owned, t => t.CreateNode('theirs', WriteFx.Team, { Owner: 'm2' })), AccessErrorCode.CreateDenied, 'theirs', WriteFx.Team);
+                WriteFx.Denied(await WriteFx.Try(g, owned, t => t.CreateNode('none', WriteFx.Team)), AccessErrorCode.CreateDenied, 'none');
+                const unowned = WriteFx.Writes([[WriteFx.Team, { Create: new OwnerIs(new Set([''])) }]]);
+                WriteFx.Allowed(await WriteFx.Try(g, unowned, t => t.CreateNode('none', WriteFx.Team)));
+                WriteFx.Denied(await WriteFx.Try(g, WriteFx.Writes([[WriteFx.Team, { Create: new Seeded() }]]), t => t.CreateNode('s1', WriteFx.Team)), AccessErrorCode.CreateDenied, 's1');
+                WriteFx.Allowed(await WriteFx.Try(g, WriteFx.Writes([[WriteFx.Team, { Create: new And([new Not(new Seeded()), new OwnerIs(new Set(['m1']))]) }]]), t => t.CreateNode('s2', WriteFx.Team, { Owner: 'm1' })));
+                // Reachable (like Related) needs the graph: not node-local.
+                const reach = WriteFx.Writes([[WriteFx.Team, { Create: new Not(new Reachable(new Set(['x']), [{ Relationship: WriteFx.Member, Direction: EdgeDirection.Out }], 1)) }]]);
+                WriteFx.Denied(await WriteFx.Try(g, reach, t => t.CreateNode('r', WriteFx.Team)), AccessErrorCode.CreateDenied, 'not node-local');
+                await g.dispose();
+            });
+
+            it('Update and Delete rules keyed on an aspect apply to carriers', async () =>
+            {
+                const g = await WriteFx.Ready(open);
+                await WriteFx.Setup(g, t =>
+                {
+                    for (const [id, level] of [['low', 1n], ['high', 2n]] as const)
+                    {
+                        t.CreateNode(id, WriteFx.Person);
+                        t.SetProperty(id, WriteFx.Level, level);
+                    }
+                });
+                const rule = new Compare(WriteFx.Level, CompareOp.Le, 1n);
+                const scope = WriteFx.Writes([[WriteFx.Secret, { Update: rule, Delete: rule }]]);
+                WriteFx.Denied(await WriteFx.Try(g, scope, t => t.SetProperty('high', WriteFx.Name, 'x')), AccessErrorCode.UpdateDenied, 'high', WriteFx.Person);
+                WriteFx.Denied(await WriteFx.Try(g, scope, t => t.DeleteNode('high')), AccessErrorCode.DeleteDenied, 'high');
+                WriteFx.Allowed(await WriteFx.Try(g, scope, t => t.SetProperty('low', WriteFx.Name, 'x')));
+                WriteFx.Allowed(await WriteFx.Try(g, scope, t => t.DeleteNode('low')));
+                await g.dispose();
+            });
+
+            it('concept and aspect rules must both hold', async () =>
+            {
+                const g = await WriteFx.Ready(open);
+                await WriteFx.Setup(g, t =>
+                {
+                    for (const [id, name, level] of [['both', 'ok', 1n], ['aspectFails', 'ok', 2n], ['conceptFails', 'no', 1n]] as const)
+                    {
+                        t.CreateNode(id, WriteFx.Person);
+                        t.SetProperty(id, WriteFx.Name, name);
+                        t.SetProperty(id, WriteFx.Level, level);
+                    }
+                });
+                const scope = WriteFx.Writes([
+                    [WriteFx.Person, { Update: new Compare(WriteFx.Name, CompareOp.Eq, 'ok') }],
+                    [WriteFx.Secret, { Update: new Compare(WriteFx.Level, CompareOp.Le, 1n) }],
+                ]);
+                WriteFx.Allowed(await WriteFx.Try(g, scope, t => t.SetProperty('both', WriteFx.Status, WriteFx.Open)));
+                WriteFx.Denied(await WriteFx.Try(g, scope, t => t.SetProperty('aspectFails', WriteFx.Status, WriteFx.Open)), AccessErrorCode.UpdateDenied, 'aspectFails');
+                WriteFx.Denied(await WriteFx.Try(g, scope, t => t.SetProperty('conceptFails', WriteFx.Status, WriteFx.Open)), AccessErrorCode.UpdateDenied, 'conceptFails');
+                await g.dispose();
+            });
+
+            it('stale visibility conflicts in both directions', async () =>
+            {
+                const g = await WriteFx.Ready(open);
+                await WriteFx.Setup(g, t =>
+                {
+                    t.CreateNode('shown', WriteFx.Person);
+                    t.SetProperty('shown', WriteFx.Name, 'visible');
+                    t.CreateNode('hidden', WriteFx.Person);
+                    t.SetProperty('hidden', WriteFx.Name, WriteFx.Secretive);
+                });
+                const scope = WriteFx.HideSecret();
+                // Visible at the snapshot, hidden by a later commit: the gate allowed it, Submit conflicts.
+                const t1 = await g.Begin(scope);
+                t1.SetProperty('shown', WriteFx.Status, WriteFx.Open);
+                await WriteFx.Setup(g, t => t.SetProperty('shown', WriteFx.Name, WriteFx.Secretive));
+                await assert.rejects(t1.Commit(), (e: unknown) => e instanceof ConflictError);
+                // Hidden at the snapshot, shown by a later commit: the denial was stale, so it is a conflict.
+                const t2 = await g.Begin(scope);
+                t2.SetProperty('hidden', WriteFx.Status, WriteFx.Open);
+                await WriteFx.Setup(g, t => t.SetProperty('hidden', WriteFx.Name, 'visible'));
+                await assert.rejects(t2.Commit(), (e: unknown) => e instanceof ConflictError);
+                // Unchanged reads keep the denial.
+                const t3 = await g.Begin(scope);
+                t3.SetProperty('shown', WriteFx.Status, WriteFx.Open);
+                await WriteFx.Setup(g, t => t.CreateNode('unrelated', WriteFx.Ticket));
+                WriteFx.Denied(await t3.Commit().then(() => undefined, (e: unknown) => e), AccessErrorCode.InvisibleNode, 'shown');
+                await g.dispose();
+            });
+
+            it('a missing id that appears concurrently conflicts', async () =>
+            {
+                const g = await WriteFx.Ready(open);
+                const scope = WriteFx.HideSecret();
+                const t1 = await g.Begin(scope);
+                t1.SetProperty('ghost', WriteFx.Status, WriteFx.Open);
+                await WriteFx.Setup(g, t =>
+                {
+                    t.CreateNode('ghost', WriteFx.Person);
+                    t.SetProperty('ghost', WriteFx.Name, 'visible');
+                });
+                await assert.rejects(t1.Commit(), (e: unknown) => e instanceof ConflictError);
+                await g.dispose();
+            });
+
+            it('delete-then-recreate and create-delete-reuse orderings', async () =>
+            {
+                const g = await WriteFx.Ready(open);
+                await WriteFx.Setup(g, t =>
+                {
+                    t.CreateNode('x', WriteFx.Ticket);
+                    t.SetProperty('x', WriteFx.Status, WriteFx.Closed);
+                });
+                const isOpen = new Compare(WriteFx.Status, CompareOp.Eq, WriteFx.Open);
+                const scope = WriteFx.Writes([[WriteFx.Ticket, { Create: isOpen, Update: isOpen, Delete: TruePredicate.Instance }]]);
+                // Re-created after its delete: the new node is exempt from Update and judged by Create.
+                WriteFx.Denied(await WriteFx.Try(g, scope, t =>
+                {
+                    t.DeleteNode('x');
+                    t.CreateNode('x', WriteFx.Ticket);
+                    t.SetProperty('x', WriteFx.Status, WriteFx.Closed);
+                }), AccessErrorCode.CreateDenied, 'op 1', 'x');
+                WriteFx.Allowed(await WriteFx.Try(g, scope, t =>
+                {
+                    t.DeleteNode('x');
+                    t.CreateNode('x', WriteFx.Ticket);
+                    t.SetProperty('x', WriteFx.Status, WriteFx.Open);
+                    t.SetProperty('x', WriteFx.Title, 'again');
+                }));
+                assert.equal(await WriteFx.Value(g, 'x', WriteFx.Title), 'again');
+                // Each creation of a reused id is judged on its own values only.
+                WriteFx.Denied(await WriteFx.Try(g, scope, t =>
+                {
+                    t.CreateNode('y', WriteFx.Ticket);
+                    t.SetProperty('y', WriteFx.Status, WriteFx.Open);
+                    t.DeleteNode('y');
+                    t.CreateNode('y', WriteFx.Ticket);
+                }), AccessErrorCode.CreateDenied, 'op 3', 'y');
+                WriteFx.Denied(await WriteFx.Try(g, scope, t =>
+                {
+                    t.CreateNode('y', WriteFx.Ticket);
+                    t.SetProperty('y', WriteFx.Status, WriteFx.Closed);
+                    t.DeleteNode('y');
+                    t.CreateNode('y', WriteFx.Ticket);
+                    t.SetProperty('y', WriteFx.Status, WriteFx.Open);
+                }), AccessErrorCode.CreateDenied, 'op 0', 'y');
+                await g.dispose();
+            });
+
+            it('CreateNode of an unknown concept is left to the committer', async () =>
+            {
+                const g = await WriteFx.Ready(open);
+                const scope = AccessScope.Build({ Default: AccessDefault.Deny, Writes: new Map([[WriteFx.Ticket, { Create: FalsePredicate.Instance }]]) });
+                const unknown = await WriteFx.Try(g, scope, t =>
+                {
+                    t.CreateNode('u', 'Nonexistent');
+                    t.SetProperty('u', WriteFx.Name, 'x');
+                });
+                assert.ok(unknown instanceof CommitError, 'expected a CommitError, got ' + String(unknown));
+                assert.ok((await WriteFx.Try(g, scope, t => t.CreateNode('a', WriteFx.Secret))) instanceof CommitError);
                 await g.dispose();
             });
         });

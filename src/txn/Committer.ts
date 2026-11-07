@@ -288,6 +288,16 @@ export class Committer
         return this.history.Last;
     }
 
+    /**
+     * The conflict for `readSet`, taken at `snapshotCommit`, against the commits recorded since, or
+     * undefined; commits nothing. Lets a transaction tell a decision made on stale reads (its write gate's
+     * denial) from one that would stand at commit time (ruling R70).
+     */
+    public CheckReads(readSet: ReadSet, snapshotCommit: bigint): ConflictError | undefined
+    {
+        return this.history.Check(readSet, snapshotCommit);
+    }
+
     /** Diagnostics: commits after this one still have their write sets retained for validation. */
     public get HistoryFloor(): bigint
     {

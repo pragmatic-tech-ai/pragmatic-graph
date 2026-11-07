@@ -1,4 +1,5 @@
 import type { AccessScope } from './access/AccessScope.js';
+import { AccessError } from './access/AccessError.js';
 import { WriteGate } from './access/WriteGate.js';
 import type { CellValue } from './columns/CellValue.js';
 import type { GraphContext, ReadSnapshot } from './GraphContext.js';
@@ -103,14 +104,27 @@ export class GraphTransaction extends GraphReader
     /**
      * The write gate (ruling R68): throws AccessError when the scope does not allow a recorded write.
      * Runs before anything leaves the transaction (Submit now, Prepare later), so a denied commit consumes
-     * no commit number and raises no CommitApplied. Its reads land in this transaction's ReadSet. A scope
-     * that restricts nothing (System) skips it at no cost.
+     * no commit number and raises no CommitApplied. Its reads land in this transaction's ReadSet. A
+     * denial decided on reads a later commit changed is a ConflictError instead (ruling R70): a retry may
+     * be allowed. A scope that restricts nothing (System) skips it at no cost.
      */
     private async Authorize(): Promise<void>
     {
-        if (!this.Scope.WritesUnrestricted)
+        if (this.Scope.WritesUnrestricted)
+        {
+            return;
+        }
+        try
         {
             await WriteGate.Check(this.WriteEvaluator(), this.batch, this.snapshot.Index.Catalog);
+        }
+        catch (error)
+        {
+            if (error instanceof AccessError)
+            {
+                throw this.context.Committer.CheckReads(this.Reads, this.ValidationCommit()) ?? error;
+            }
+            throw error;
         }
     }
 

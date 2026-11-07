@@ -1,14 +1,14 @@
 import type { CatalogSnapshot } from '../catalog/CatalogSnapshot.js';
 import type { CellValue } from '../columns/CellValue.js';
-import { NodeEvaluator } from '../predicate/NodeEvaluator.js';
-import type { Predicate } from '../predicate/Predicate.js';
+import { NodeEvaluator, Truth } from '../predicate/NodeEvaluator.js';
+import { type And, type Not, type Or, type OwnerIs, type Predicate, PredicateKind } from '../predicate/Predicate.js';
 import type { IReadNode } from '../RecordedReads.js';
 import { type BatchOp, type WriteBatch, WriteOp } from '../txn/WriteBatch.js';
 import { AccessError, AccessErrorCode } from './AccessError.js';
 import { AccessDefault, type IWriteRules } from './AccessScope.js';
 import type { ScopeEvaluator } from './ScopeEvaluator.js';
 
-/** A node the batch creates: its concept and the values the batch sets on it (last wins). */
+/** A node the batch creates: its concept, owner ('' for none) and the values the batch sets on it (last wins). */
 class CreatedNode
 {
     public readonly Values = new Map<string, CellValue>();
@@ -16,17 +16,103 @@ class CreatedNode
     /** False for an unknown or aspect concept: the committer rejects the op itself, so the gate skips it. */
     public readonly Known: boolean;
 
-    public constructor(public readonly Concept: string, catalog: CatalogSnapshot)
+    public constructor(public readonly PublicId: string, public readonly Concept: string, public readonly Owner: string, catalog: CatalogSnapshot)
     {
         this.Known = catalog.Has(Concept) && !catalog.IsAspect(Concept);
     }
 }
 
-/** What one op writes to: the node the batch created (when it did, at that point), else a snapshot node by id. */
+/**
+ * What one op addresses, each slot the node the batch created (when it did, live at that point) or
+ * undefined for a snapshot node: the source (or the node itself), a Link/Unlink target and the
+ * AfterSibling/BeforeSibling a Link names.
+ */
 class OpTargets
 {
-    public constructor(public readonly Source: CreatedNode | undefined, public readonly Target: CreatedNode | undefined)
+    public constructor(
+        public readonly Source: CreatedNode | undefined,
+        public readonly Target: CreatedNode | undefined = undefined,
+        public readonly After: CreatedNode | undefined = undefined,
+        public readonly Before: CreatedNode | undefined = undefined)
     {
+    }
+}
+
+/**
+ * Evaluates a Create rule on a node that exists only in the batch (ruling R69): node-local subtrees by
+ * NodeEvaluator on the end-of-batch values, OwnerIs against the CreateNode op's owner, Seeded as false
+ * (a transaction never seeds); Kleene logic across the tree, collapsed at the top. Related and Reachable
+ * would need the graph, which a batch is not (R30): such a rule is refused before evaluation.
+ */
+class CreateEvaluator
+{
+    /** True iff `p` can be decided on a created node alone (no Related or Reachable anywhere). */
+    public static Decidable(p: Predicate): boolean
+    {
+        switch (p.Kind)
+        {
+            case PredicateKind.Related:
+            case PredicateKind.Reachable:
+                return false;
+            case PredicateKind.And:
+            case PredicateKind.Or:
+                return (p as And | Or).Terms.every(t => CreateEvaluator.Decidable(t));
+            case PredicateKind.Not:
+                return CreateEvaluator.Decidable((p as Not).Term);
+            default:
+                return true;
+        }
+    }
+
+    public static Holds(p: Predicate, node: CreatedNode): boolean
+    {
+        return CreateEvaluator.Eval(p, node) === Truth.True;
+    }
+
+    private static Eval(p: Predicate, node: CreatedNode): Truth
+    {
+        if (p.IsNodeLocal)
+        {
+            return NodeEvaluator.Evaluate(p, node.Values, node.PublicId);
+        }
+        switch (p.Kind)
+        {
+            case PredicateKind.Seeded:
+                return Truth.False;
+            case PredicateKind.OwnerIs:
+                return (p as OwnerIs).Owners.has(node.Owner) ? Truth.True : Truth.False;
+            case PredicateKind.Not:
+            {
+                const inner = CreateEvaluator.Eval((p as Not).Term, node);
+                return inner === Truth.Unknown ? Truth.Unknown : inner === Truth.True ? Truth.False : Truth.True;
+            }
+            case PredicateKind.And:
+                return CreateEvaluator.Combine((p as And).Terms, node, Truth.False, Truth.True);
+            case PredicateKind.Or:
+                return CreateEvaluator.Combine((p as Or).Terms, node, Truth.True, Truth.False);
+            default:
+                // Unreachable: Decidable refused Related and Reachable before evaluation.
+                return Truth.False;
+        }
+    }
+
+    /** Kleene And (dominant False) or Or (dominant True): the dominant value wins, else Unknown if any, else `identity`. */
+    private static Combine(terms: readonly Predicate[], node: CreatedNode, dominant: Truth, identity: Truth): Truth
+    {
+        let result = identity;
+        for (const term of terms)
+        {
+            const t = CreateEvaluator.Eval(term, node);
+            if (t === dominant)
+            {
+                return dominant;
+            }
+            if (t === Truth.Unknown)
+            {
+                result = Truth.Unknown;
+            }
+        }
+        return result;
     }
 }
 
@@ -44,11 +130,12 @@ enum RuleKind
  * the op index, the public id and the concept.
  *
  * - CreateNode: every applicable Create predicate holds on the node's end-of-batch values (set in the
- *   batch, unset = null). Create predicates must be node-local; one that is not denies the create.
+ *   batch, unset = null), its op's owner (OwnerIs) and Seeded = false (CreateEvaluator). A Create
+ *   predicate using Related or Reachable is not node-local and denies the create.
  * - SetProperty, Link, Unlink (the node is the edge's source): the node must be visible and every
  *   applicable Update predicate hold on its snapshot values (R30); a node the batch created is exempt.
- *   The member written must not be hidden on the node's concept. A Link/Unlink target must be visible
- *   (or created by the batch).
+ *   The member written must not be hidden on the node's concept. A Link/Unlink target and a Link's
+ *   AfterSibling/BeforeSibling must be visible (or created by the batch and live at that op).
  * - DeleteNode: the node must be visible and every applicable Delete predicate hold on its snapshot
  *   values; deleting a node the batch created is exempt.
  *
@@ -59,7 +146,7 @@ enum RuleKind
  */
 export class WriteGate
 {
-    private static readonly ErrNotNodeLocal = 'its Create predicate is not node-local (Create rules may read only the new node\'s own values)';
+    private static readonly ErrNotNodeLocal = 'its Create predicate is not node-local (Create rules may read only the new node\'s own values, owner and seededness)';
     private static readonly ErrCreate = 'a Create rule does not hold on the new node\'s values';
     private static readonly ErrUpdate = 'an Update rule does not hold on the node';
     private static readonly ErrDelete = 'a Delete rule does not hold on the node';
@@ -67,6 +154,8 @@ export class WriteGate
     private static readonly ErrHidden = 'the scope hides member ';
     private static readonly ErrInvisible = 'the node is not visible under the scope';
     private static readonly ErrInvisibleTarget = 'the target is not visible under the scope: ';
+    private static readonly ErrInvisibleSibling = 'the sibling is not visible under the scope: ';
+    private static readonly NoOwner = '';
     private static readonly AccessDenied = 'Access denied: op ';
     private static readonly Open = ' (';
     private static readonly Close = ')';
@@ -75,7 +164,6 @@ export class WriteGate
     private static readonly Colon = ': ';
     private static readonly NotVisible = 'concept not visible';
 
-    private readonly created = new Map<string, CreatedNode>();
     private readonly targets: OpTargets[] = [];
     private readonly updates = new Map<bigint, boolean>();
 
@@ -105,23 +193,29 @@ export class WriteGate
             {
                 case WriteOp.CreateNode:
                 {
-                    const node = new CreatedNode(op.Concept, this.catalog);
+                    const node = new CreatedNode(op.PublicId, op.Concept, op.Owner ?? WriteGate.NoOwner, this.catalog);
                     live.set(op.PublicId, node);
-                    this.targets.push(new OpTargets(node, undefined));
+                    this.targets.push(new OpTargets(node));
                     break;
                 }
                 case WriteOp.SetProperty:
                 {
                     const node = live.get(op.PublicId);
                     node?.Values.set(op.Member, op.Value);
-                    this.targets.push(new OpTargets(node, undefined));
+                    this.targets.push(new OpTargets(node));
                     break;
                 }
                 case WriteOp.DeleteNode:
-                    this.targets.push(new OpTargets(live.get(op.PublicId), undefined));
+                    this.targets.push(new OpTargets(live.get(op.PublicId)));
                     live.delete(op.PublicId);
                     break;
                 case WriteOp.Link:
+                {
+                    const after = op.Options?.AfterSibling;
+                    const before = op.Options?.BeforeSibling;
+                    this.targets.push(new OpTargets(live.get(op.From), live.get(op.To), after === undefined ? undefined : live.get(after), before === undefined ? undefined : live.get(before)));
+                    break;
+                }
                 case WriteOp.Unlink:
                     this.targets.push(new OpTargets(live.get(op.From), live.get(op.To)));
                     break;
@@ -144,15 +238,34 @@ export class WriteGate
             case WriteOp.Unlink:
             {
                 const concept = await this.CheckWrite(index, op.Op, op.From, op.Relationship, targets.Source);
-                if (targets.Target === undefined && (await this.VisibleNode(op.To)) === undefined)
+                await this.CheckReferenced(index, op.Op, op.From, concept, op.To, targets.Target, WriteGate.ErrInvisibleTarget);
+                if (op.Op === WriteOp.Link)
                 {
-                    throw this.Denied(AccessErrorCode.InvisibleNode, index, op.Op, op.From, concept, WriteGate.ErrInvisibleTarget + op.To);
+                    // The committer resolves siblings unscoped: an unchecked one would be an existence oracle.
+                    const options = op.Options;
+                    if (options?.AfterSibling !== undefined)
+                    {
+                        await this.CheckReferenced(index, op.Op, op.From, concept, options.AfterSibling, targets.After, WriteGate.ErrInvisibleSibling);
+                    }
+                    if (options?.BeforeSibling !== undefined)
+                    {
+                        await this.CheckReferenced(index, op.Op, op.From, concept, options.BeforeSibling, targets.Before, WriteGate.ErrInvisibleSibling);
+                    }
                 }
                 break;
             }
             case WriteOp.DeleteNode:
                 await this.CheckDelete(index, op.PublicId, targets.Source);
                 break;
+        }
+    }
+
+    /** A node a Link/Unlink names besides its source must be created by the batch or visible (a recorded read). */
+    private async CheckReferenced(index: number, op: WriteOp, from: string, concept: string, publicId: string, created: CreatedNode | undefined, reason: string): Promise<void>
+    {
+        if (created === undefined && (await this.VisibleNode(publicId)) === undefined)
+        {
+            throw this.Denied(AccessErrorCode.InvisibleNode, index, op, from, concept, reason + publicId);
         }
     }
 
@@ -173,13 +286,13 @@ export class WriteGate
             return;
         }
         // The restriction is reported whatever the other rules say, so it never depends on entry order.
-        if (rules.some(rule => !rule.IsNodeLocal))
+        if (rules.some(rule => !CreateEvaluator.Decidable(rule)))
         {
             throw this.Denied(AccessErrorCode.CreateDenied, index, op, publicId, node.Concept, WriteGate.ErrNotNodeLocal);
         }
         for (const rule of rules)
         {
-            if (!NodeEvaluator.Matches(rule, node.Values, publicId))
+            if (!CreateEvaluator.Holds(rule, node))
             {
                 throw this.Denied(AccessErrorCode.CreateDenied, index, op, publicId, node.Concept, WriteGate.ErrCreate);
             }
