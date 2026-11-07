@@ -201,7 +201,8 @@ export class GraphReader implements IGraphDisposable
     /**
      * True iff the node exists, is visible and was placed by the schema's seed (it has a seed marker,
      * spec 4.3): false for runtime nodes and when no visible node has the public id. Records the node's
-     * binding, which every seed write to the node also writes.
+     * binding, which every seed commit that writes the node's data or marker also writes; a marker-only
+     * seed run is no commit and does not invalidate the read (ruling R53).
      */
     public async IsSeeded(publicId: string): Promise<boolean>
     {

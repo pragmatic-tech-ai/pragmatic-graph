@@ -21,10 +21,11 @@ import { BatchApplier } from '../../txn/BatchApplier.js';
 import { CommitError, CommitErrorCode } from '../../txn/CommitError.js';
 import { ConflictError } from '../../txn/ConflictError.js';
 import { CommitKind, type ICommitApplied } from '../../txn/LogEntry.js';
-import { WriteBatch } from '../../txn/WriteBatch.js';
+import { WriteBatch, WriteOp } from '../../txn/WriteBatch.js';
 import type { DataPurger, IPurgeStats } from '../DataPurger.js';
-import type { IDefinitionDescription, ISchemaDescription, ISeedLink, ISeedNode } from '../SchemaDescription.js';
+import type { IBindingDescription, IDefinitionDescription, ISchemaDescription, ISeedLink, ISeedNode } from '../SchemaDescription.js';
 import { SeedHash } from '../SeedHash.js';
+import { FakeConnector } from '../../connectors/tests/FakeConnector.js';
 
 /**
  * Descriptions and probes for the seed tests. Schema: Server { name?, port: Int64?, hosts -> [App] many
@@ -42,6 +43,7 @@ class SeedFx
     public static readonly Hosts = 'hosts';
     public static readonly Uses = 'uses';
     public static readonly Abort = 'abort';
+    public static readonly A = 'A';
 
     public static Dir(): string
     {
@@ -113,10 +115,13 @@ class SeedFx
         return SeedFx.Seed1().flatMap(n => n.PublicId !== publicId ? [n] : node === undefined ? [] : [node]);
     }
 
-    public static Desc(version: string, seed: readonly ISeedNode[], defs: IDefinitionDescription[] = SeedFx.Defs()): ISchemaDescription
+    public static Desc(version: string, seed: readonly ISeedNode[], defs: IDefinitionDescription[] = SeedFx.Defs(), bindings: readonly IBindingDescription[] = []): ISchemaDescription
     {
-        return { Version: version, Definitions: defs, Indexes: [], Seed: seed, Bindings: [] };
+        return { Version: version, Definitions: defs, Indexes: [], Seed: seed, Bindings: bindings };
     }
+
+    /** Model `base` written through connector A. */
+    public static readonly BaseToA: readonly IBindingDescription[] = [{ Model: SeedFx.Base, Connector: SeedFx.A }];
 
     public static V1(): ISchemaDescription
     {
@@ -336,6 +341,72 @@ class SeedFx
                 const entries = await SeedFx.Changes(g, last);
                 assert.deepEqual(entries.map(e => e.Kind), [CommitKind.Batch]);
                 assert.deepEqual(entries[0]?.CreatedIds, []);
+                await g.dispose();
+            });
+
+            it('a changed seed writes only what differs from the stored node', async () =>
+            {
+                const g = await SeedFx.Ready(open);
+                await SeedFx.Commit(g, t =>
+                {
+                    t.SetProperty('s1', 'name', 'edited');
+                    t.SetProperty('s1', 'port', 8080n);
+                });
+                const seen = SeedFx.Capture(g);
+                const result = await g.Upgrade(SeedFx.Desc('v2', SeedFx.With('s1', SeedFx.Node('s1', 'Server', { name: 'alpha', port: 8080n }, SeedFx.Hosting('a1', 'a2')))));
+                assert.notEqual(result.SeedCommit, undefined);
+                assert.equal(seen.length, 1);
+                const ops = seen[0]?.Batch.Ops().map(o => ({ ...o })) ?? [];
+                assert.deepEqual(ops, [{ Op: WriteOp.SetProperty, PublicId: 's1', Member: 'name', Value: 'alpha' }], 'port and the hosts edges already match: untouched');
+                assert.deepEqual(await SeedFx.Hosted(g, 's1'), ['a1', 'a2']);
+                await g.dispose();
+            });
+
+            it('a dev save after a connector write is a no-op: no Batch entry, no CommitApplied, open readers keep their snapshot valid', async () =>
+            {
+                const g = await SeedFx.Ready(open);
+                const a = new FakeConnector(SeedFx.A, []);
+                await g.Upgrade(SeedFx.Desc('v2', SeedFx.Seed1(), SeedFx.Defs(), SeedFx.BaseToA), [a]);
+                await SeedFx.Commit(g, t =>
+                {
+                    t.SetProperty('s1', 'name', 'gamma');
+                    t.SetProperty('s1', 'port', 9n);
+                    t.CreateNode('a3', 'App', { Owner: SeedFx.Base });
+                    t.SetProperty('a3', 'label', 'three');
+                    t.Link('s1', SeedFx.Hosts, 'a3');
+                });
+                assert.equal(a.Applied.length, 1, 'the write went through the connector');
+                // The dev host regenerates the seed from what the connector now holds.
+                const saved = [
+                    ...SeedFx.With('s1', SeedFx.Node('s1', 'Server', { name: 'gamma', port: 9n }, SeedFx.Hosting('a1', 'a2', 'a3'))),
+                    SeedFx.Node('a3', 'App', { label: 'three' }),
+                ];
+                const open1 = await g.Begin(AccessScope.System);
+                assert.equal(await open1.GetProperty('s1', 'name'), 'gamma');
+                assert.deepEqual(await open1.Neighbors('s1', SeedFx.Hosts, EdgeDirection.Out), ['a1', 'a2', 'a3']);
+                assert.equal(await open1.GetProperty('a3', 'label'), 'three');
+                open1.CreateNode('z1', 'App');
+                const last = SeedFx.Context(g).Committer.LastCommit();
+                const seen = SeedFx.Capture(g);
+                const result = await g.Upgrade(SeedFx.Desc('v3', saved, SeedFx.Defs(), SeedFx.BaseToA), [a]);
+                assert.equal(result.Changed, false);
+                assert.equal(result.SeedCommit, undefined, 'nothing differs: no Batch entry');
+                assert.equal(seen.length, 0, 'and no CommitApplied');
+                assert.equal(SeedFx.Context(g).Committer.LastCommit(), last);
+                assert.equal((await SeedFx.Changes(g, last)).length, 0);
+                assert.equal(await g.SchemaVersion(), 'v3');
+                assert.deepEqual(await SeedFx.Markers(g), ['a1', 'a2', 'a3', 'b1', 's1'], 'the markers are updated');
+                await SeedFx.Read(g, async r =>
+                {
+                    assert.equal(await r.IsSeeded('a3'), true);
+                    assert.equal(await r.GetProperty('s1', 'name'), 'gamma');
+                });
+                assert.deepEqual(await SeedFx.Hosted(g, 's1'), ['a1', 'a2', 'a3']);
+                await open1.Commit();
+                assert.equal(a.Applied.length, 1, 'the upgrade wrote nothing through the connector');
+                // The next identical save takes the same path: the hashes now match and nothing is written.
+                const again = await g.Upgrade(SeedFx.Desc('v4', saved, SeedFx.Defs(), SeedFx.BaseToA), [a]);
+                assert.equal(again.SeedCommit, undefined);
                 await g.dispose();
             });
 

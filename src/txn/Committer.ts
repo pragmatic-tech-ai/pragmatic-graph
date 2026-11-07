@@ -50,7 +50,7 @@ export interface IUpgradeCommit
     readonly Catalog: CatalogSnapshot;
     /** True iff a new catalog was saved and logged (ICatalogPlan.Changed). */
     readonly Changed: boolean;
-    /** The seed's Batch entry commit number, when the seed changed anything (ruling R53). */
+    /** The seed's Batch entry commit number, when the seed had a data op (ruling R53; marker-only changes are no commit). */
     readonly SeedCommit?: bigint;
 }
 
@@ -593,7 +593,7 @@ export class Committer
      * catalog, writes Meta("schemaVersion"), appends an Upgrade log entry and raises CommitApplied; the
      * purge's write keys conflict open transactions, which also fail on the catalog version. When the
      * version differs or the catalog changed, the same Write then applies the description's seed
-     * (SeedSynchronizer, ruling R53) and, iff it changed anything, logs it as a Batch entry with the next
+     * (SeedSynchronizer, ruling R53) and, iff it has a data op, logs it as a Batch entry with the next
      * commit number (SeedCommit) and raises it after the Upgrade entry. An unchanged catalog with an
      * unchanged seed only rewrites a differing Meta("schemaVersion"): no commit, no entry, no signal
      * (ruling R48). A planning error (CatalogError) or a seed error (CommitError) rejects only this
@@ -728,7 +728,7 @@ export class Committer
     /**
      * Plans against the current catalog. Nothing to do when the catalog and the stored version are both
      * unchanged (a read decides: no write transaction). Otherwise one Write purges and saves a changed
-     * catalog (Upgrade entry), applies the seed (Batch entry, when it changes anything) and writes the
+     * catalog (Upgrade entry), applies the seed (Batch entry, when it has a data op; markers alone are no entry) and writes the
      * version. Seed ids come from a pre-pass outside the Write (ruling R16); when the purge removed a node
      * the pre-pass saw, the upgrade re-runs once with those ids too, and a second miss is Internal.
      */
@@ -777,7 +777,7 @@ export class Committer
         const txn = await this.store.BeginRead();
         try
         {
-            const view = new TransactionSeedView(txn, index, this.rows, this.ids, this.edges);
+            const view = new TransactionSeedView(txn, index, this.rows, this.ids, this.edges, this.columns);
             needed = await SeedSynchronizer.IdsNeeded(view, seed, await SeedMarkers.ReadAll(txn));
         }
         finally
@@ -877,15 +877,18 @@ export class Committer
     /**
      * Builds the seed batch against the post-purge state and applies it like a transaction's batch
      * (BatchApplier: the same validation and edge rules), then writes and removes seed markers; every
-     * marker change also writes the node's Node key (IsSeeded records it). Undefined when the seed
-     * changes nothing (no op, no marker change): then there is no Batch entry.
+     * marker change also writes the node's Node key (IsSeeded records it). Undefined when the seed has
+     * no data op (ruling R53): its marker changes, if any, are written in this same Write but are not a
+     * commit (markers are not in the log), so there is no Batch entry, no CommitApplied, no history
+     * record and no reservation invalidated.
      */
     private async ApplySeed(txn: IWriteTransaction, index: CatalogIndex, seed: readonly ISeedNode[], ids: ReadonlyMap<string, bigint>, change: ISeedCatalogChange | undefined): Promise<ISeedCommit | undefined>
     {
-        const view = new TransactionSeedView(txn, index, this.rows, this.ids, this.edges);
+        const view = new TransactionSeedView(txn, index, this.rows, this.ids, this.edges, this.columns);
         const plan = await new SeedSynchronizer(index).Build(view, seed, await SeedMarkers.ReadAll(txn), change);
-        if (plan.Batch.Count === 0 && plan.Hashes.size === 0 && plan.Removed.length === 0)
+        if (plan.Batch.Count === 0)
         {
+            Committer.WriteMarkers(txn, plan.Hashes, plan.Removed);
             return undefined;
         }
         const batch = plan.Batch.Seal();
@@ -912,17 +915,25 @@ export class Committer
             throw new SeedIdMiss(missing);
         }
         const keys = await new BatchApplier(index, this.columns, this.edges, this.rows, this.ids, this.indexes).Apply(txn, batch, created);
-        for (const [publicId, hash] of plan.Hashes)
+        for (const publicId of Committer.WriteMarkers(txn, plan.Hashes, plan.Removed))
         {
-            SeedMarkers.Write(txn, publicId, hash);
-            keys.Add(ConflictKeys.NodeSpace, ConflictKeys.Node(publicId));
-        }
-        for (const publicId of plan.Removed)
-        {
-            SeedMarkers.Delete(txn, publicId);
             keys.Add(ConflictKeys.NodeSpace, ConflictKeys.Node(publicId));
         }
         return { Bytes: batch.Serialize(), Ids: created, Keys: keys };
+    }
+
+    /** Writes the new seed markers and deletes the removed ones; returns every public id whose marker changed. */
+    private static WriteMarkers(txn: IWriteTransaction, hashes: ReadonlyMap<string, Uint8Array>, removed: readonly string[]): string[]
+    {
+        for (const [publicId, hash] of hashes)
+        {
+            SeedMarkers.Write(txn, publicId, hash);
+        }
+        for (const publicId of removed)
+        {
+            SeedMarkers.Delete(txn, publicId);
+        }
+        return [...hashes.keys(), ...removed];
     }
 
     private async StoredSchemaVersion(): Promise<string | undefined>

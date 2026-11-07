@@ -89,7 +89,7 @@ export class GraphStore
      * The catalog is planned against the current one (CatalogPlanner); data that no longer fits is
      * discarded in the same commit, which is logged as an Upgrade entry and raised on CommitApplied. The
      * description's seed is then applied in the same write (seed wins for seeded nodes, spec 4.3) and,
-     * when it changed anything, logged and raised as the next Batch commit (SeedCommit). An unchanged
+     * when it has a data op, logged and raised as the next Batch commit (SeedCommit); an overwritten seed node writes only what differs from the stored node, and a seed whose only effect is its markers (data a connector write already put in the engine) writes them in the same write as no commit, no log entry and no CommitApplied. An unchanged
      * catalog with a new Version and an unchanged seed only records the version (Changed false, no
      * commit). A planning failure (CatalogError) or seed failure (CommitError) leaves the store
      * unchanged. Transactions begun before a changing upgrade fail Commit with ConflictError.
