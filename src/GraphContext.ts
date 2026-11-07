@@ -98,7 +98,7 @@ export class GraphContext
      * `timeoutMs` bounds each write-through's connector phase (default Committer.DefaultPrepareTimeoutMs).
      * GraphError InvalidArgument when a binding or the default names a connector not given (other than
      * BindingTable.EngineStorage), two connectors share a name, a connector uses the reserved name, or
-     * the timeout is not a finite non-negative number.
+     * the timeout is not a finite positive number.
      */
     public SetConnectors(bindings: BindingTable, connectors: readonly IGraphConnector[], timeoutMs: number = Committer.DefaultPrepareTimeoutMs): void
     {

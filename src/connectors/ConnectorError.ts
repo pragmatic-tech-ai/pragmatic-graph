@@ -8,6 +8,8 @@ export enum ConnectorPhase
     Commit = 'Commit',
     /** The engine's own Finalize after every connector committed (Connector is BindingTable.EngineStorage). */
     Finalize = 'Finalize',
+    /** The engine's Prepare did not return before the write-through deadline (Connector is BindingTable.EngineStorage). */
+    Prepare = 'Prepare',
 }
 
 /**
@@ -23,7 +25,7 @@ export class ConnectorError extends GraphError
     private static readonly MessageMiddle = ' failed in ';
 
     public constructor(
-        /** The connector whose call failed; BindingTable.EngineStorage for a Finalize failure. */
+        /** The connector whose call failed; BindingTable.EngineStorage for a Finalize failure or a Prepare timeout. */
         public readonly Connector: string,
         public readonly Phase: ConnectorPhase,
         cause: unknown,

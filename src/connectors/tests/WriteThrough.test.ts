@@ -8,13 +8,14 @@ import { AccessError } from '../../access/AccessError.js';
 import { CatalogModel } from '../../catalog/CatalogModel.js';
 import { MemberKind, ValueType } from '../../catalog/ValueType.js';
 import { GraphError, GraphErrorCode } from '../../errors/GraphError.js';
-import { EdgeDirection } from '../../format/FormatKeys.js';
+import type { GraphContext } from '../../GraphContext.js';
 import { GraphStore } from '../../GraphStore.js';
 import type { GraphTransaction } from '../../GraphTransaction.js';
 import { FalsePredicate } from '../../predicate/Predicate.js';
 import type { IBindingDescription } from '../../schema/SchemaDescription.js';
 import { CommitError } from '../../txn/CommitError.js';
 import { ConflictError } from '../../txn/ConflictError.js';
+import type { PreparedCommit } from '../../txn/PreparedCommit.js';
 import { WriteOp } from '../../txn/WriteBatch.js';
 import { BindingTable } from '../BindingTable.js';
 import { ConnectorError, ConnectorPhase } from '../ConnectorError.js';
@@ -36,6 +37,12 @@ class ThroughFx
     public static readonly Tracked = 'tracked';
     public static readonly Ticket = 'ticket';
     public static readonly Bug = 'bug';
+    public static readonly Logged = 'logged';
+    public static readonly Audited = 'audited';
+    public static readonly Flagged = 'flagged';
+    public static readonly Pinned = 'pinned';
+    public static readonly Entry = 'entry';
+    public static readonly SubEntry = 'subEntry';
     public static readonly Name = 'name';
     public static readonly Next = 'next';
     public static readonly Crm = 'crm';
@@ -60,6 +67,12 @@ class ThroughFx
         m.DefineAspect(ThroughFx.Tracked, [], [{ Name: 'tag', Kind: MemberKind.Property, Type: ValueType.String, Nullable: true }]);
         m.DefineConcept(ThroughFx.Ticket, null, [ThroughFx.Tracked], []);
         m.DefineConcept(ThroughFx.Bug, ThroughFx.Ticket, [], []);
+        m.DefineAspect(ThroughFx.Logged, [], []);
+        m.DefineAspect(ThroughFx.Audited, [ThroughFx.Logged], []);
+        m.DefineAspect(ThroughFx.Flagged, [], []);
+        m.DefineAspect(ThroughFx.Pinned, [], []);
+        m.DefineConcept(ThroughFx.Entry, null, [ThroughFx.Audited, ThroughFx.Flagged], []);
+        m.DefineConcept(ThroughFx.SubEntry, ThroughFx.Entry, [ThroughFx.Pinned], []);
     }
 
     public static Catalog(): ReturnType<CatalogModel['Seal']>
@@ -153,6 +166,18 @@ class ThroughFx
         {
             r.dispose();
         }
+    }
+
+    /** The store's internal context. */
+    public static Context(g: GraphStore): GraphContext
+    {
+        return (g as unknown as { context: GraphContext }).context;
+    }
+
+    /** The changes each connector received, flattened, as plain objects. */
+    public static Changes(c: FakeConnector): object[]
+    {
+        return c.Applied.flatMap(set => set.Changes.map(ch => ({ ...ch })));
     }
 
     public static Wait(ms: number): Promise<void>
@@ -278,6 +303,53 @@ class ThroughFx
                     { Op: WriteOp.DeleteNode, PublicId: 'y', Owner: ThroughFx.Crm, Concept: ThroughFx.Item },
                 ]);
                 assert.deepEqual(fx.Log, ['A.Begin', 'A.Apply', 'A.Commit']);
+                await g.dispose();
+            });
+
+            it('delete then re-create routes by the new owner and concept', async () =>
+            {
+                const g = await ThroughFx.Ready(open);
+                const fx = ThroughFx.Install(g, ThroughFx.TwoModels);
+                await ThroughFx.Commit(g, t =>
+                {
+                    t.DeleteNode('x');
+                    t.CreateNode('x', ThroughFx.Doc, { Owner: ThroughFx.Hr });
+                    t.SetProperty('x', ThroughFx.Name, ThroughFx.Written);
+                });
+                assert.deepEqual(ThroughFx.Changes(fx.A), [
+                    { Op: WriteOp.DeleteNode, PublicId: 'x', Owner: ThroughFx.Crm, Concept: ThroughFx.Item },
+                ]);
+                assert.deepEqual(ThroughFx.Changes(fx.B), [
+                    { Op: WriteOp.CreateNode, PublicId: 'x', Concept: ThroughFx.Doc, Owner: ThroughFx.Hr },
+                    { Op: WriteOp.SetProperty, PublicId: 'x', Member: ThroughFx.Name, Value: ThroughFx.Written, Owner: ThroughFx.Hr, Concept: ThroughFx.Doc },
+                ]);
+                const r = await g.BeginRead(AccessScope.System);
+                assert.equal(await r.ConceptOf('x'), ThroughFx.Doc);
+                assert.equal(await r.OwnerOf('x'), ThroughFx.Hr);
+                r.dispose();
+                await g.dispose();
+            });
+
+            it('create, delete, create in one batch routes each op by the latest create', async () =>
+            {
+                const g = await ThroughFx.Ready(open);
+                const fx = ThroughFx.Install(g, ThroughFx.TwoModels);
+                await ThroughFx.Commit(g, t =>
+                {
+                    t.CreateNode('n', ThroughFx.Item, { Owner: ThroughFx.Crm });
+                    t.DeleteNode('n');
+                    t.CreateNode('n', ThroughFx.Doc, { Owner: ThroughFx.Hr });
+                    t.SetProperty('n', ThroughFx.Name, ThroughFx.Written);
+                });
+                assert.deepEqual(ThroughFx.Changes(fx.A), [
+                    { Op: WriteOp.CreateNode, PublicId: 'n', Concept: ThroughFx.Item, Owner: ThroughFx.Crm },
+                    { Op: WriteOp.DeleteNode, PublicId: 'n', Owner: ThroughFx.Crm, Concept: ThroughFx.Item },
+                ]);
+                assert.deepEqual(ThroughFx.Changes(fx.B), [
+                    { Op: WriteOp.CreateNode, PublicId: 'n', Concept: ThroughFx.Doc, Owner: ThroughFx.Hr },
+                    { Op: WriteOp.SetProperty, PublicId: 'n', Member: ThroughFx.Name, Value: ThroughFx.Written, Owner: ThroughFx.Hr, Concept: ThroughFx.Doc },
+                ]);
+                assert.equal(await ThroughFx.Value(g, 'n'), ThroughFx.Written);
                 await g.dispose();
             });
 
@@ -446,6 +518,63 @@ class ThroughFx
                 await g.dispose();
             });
 
+            it('a timeout during Prepare is reported as the engine prepare and the late prepared commit is aborted', async () =>
+            {
+                const g = await ThroughFx.Ready(open);
+                const fx = ThroughFx.Install(g, ThroughFx.TwoModels, undefined, ThroughFx.TimeoutMs);
+                const committer = ThroughFx.Context(g).Committer;
+                const prepare = committer.Prepare.bind(committer);
+                let release: () => void = () => undefined;
+                const gate = new Promise<void>(resolve => { release = resolve; });
+                let late: Promise<PreparedCommit> | undefined;
+                committer.Prepare = (...args: Parameters<typeof committer.Prepare>) =>
+                {
+                    late = gate.then(() => prepare(...args));
+                    return late;
+                };
+                const e = await ThroughFx.Rejection(ThroughFx.Commit(g, t => ThroughFx.WriteBoth(t)));
+                assert.ok(ThroughFx.IsConnectorError(e, BindingTable.EngineStorage, ConnectorPhase.Prepare));
+                assert.deepEqual(fx.Log, [], 'no connector began');
+                committer.Prepare = prepare;
+                release();
+                const prepared = await (late as Promise<PreparedCommit>);
+                await ThroughFx.Wait(10);
+                assert.equal(committer.ReservationCount, 0, 'the late prepared commit was aborted');
+                await ThroughFx.Rejection(prepared.Finalize());
+                assert.equal(await ThroughFx.Value(g, 'x'), null);
+                await ThroughFx.Commit(g, t => ThroughFx.WriteBoth(t));
+                assert.equal(await ThroughFx.Value(g, 'x'), ThroughFx.Changed);
+                await g.dispose();
+            });
+
+            it('a revert hanging at the deadline finishes on the late path', async () =>
+            {
+                const g = await ThroughFx.Ready(open);
+                const fx = ThroughFx.Install(g, ThroughFx.TwoModels, undefined, ThroughFx.TimeoutMs);
+                const raised: ConnectorError[] = [];
+                const sub = g.ConnectorRevertFailed.Subscribe(err => raised.push(err));
+                fx.B.FailAt = FakeStep.Apply;
+                fx.A.HangAt = FakeStep.Revert;
+                const revertFailure = new Error('A revert failed late');
+                fx.A.Failure = revertFailure;
+                fx.A.FailAt = FakeStep.Revert;
+                const e = await ThroughFx.Rejection(ThroughFx.Commit(g, t => ThroughFx.WriteBoth(t)));
+                assert.ok(ThroughFx.IsConnectorError(e, ThroughFx.B, ConnectorPhase.Apply));
+                assert.equal(e.cause, fx.B.Failure, 'the pending revert is not awaited past the deadline');
+                assert.deepEqual(fx.Log, ['A.Begin', 'B.Begin', 'A.Apply', 'B.Apply', 'B.Revert', 'A.Revert']);
+                assert.deepEqual(raised, []);
+                fx.A.Release();
+                await fx.A.Reverted;
+                await ThroughFx.Wait(10);
+                assert.equal(raised.length, 1);
+                const reported: unknown = raised[0];
+                assert.ok(ThroughFx.IsConnectorError(reported, ThroughFx.A, ConnectorPhase.Apply));
+                assert.equal(reported.cause, revertFailure);
+                assert.equal(await ThroughFx.Value(g, 'x'), null);
+                sub.dispose();
+                await g.dispose();
+            });
+
             it('revert failure surfaces', async () =>
             {
                 const g = await ThroughFx.Ready(open);
@@ -494,6 +623,8 @@ class ThroughFx
                 assert.throws(() => g.SetConnectors(new BindingTable([]), [a, new FakeConnector(ThroughFx.A, [])]), invalid);
                 assert.throws(() => g.SetConnectors(new BindingTable([]), [new FakeConnector(BindingTable.EngineStorage, [])]), invalid);
                 assert.throws(() => g.SetConnectors(new BindingTable([]), [a], -1), invalid);
+                assert.throws(() => g.SetConnectors(new BindingTable([]), [a], 0), invalid);
+                assert.throws(() => g.SetConnectors(new BindingTable([]), [a], Number.POSITIVE_INFINITY), invalid);
                 assert.throws(() => new BindingTable([{ Model: ThroughFx.Crm, Connector: ThroughFx.A }, { Model: ThroughFx.Crm, Connector: ThroughFx.B }]), invalid);
                 g.SetConnectors(new BindingTable([{ Model: ThroughFx.Crm, Connector: ThroughFx.A }, { Model: ThroughFx.Hr, Connector: BindingTable.EngineStorage }]), [a]);
                 await g.dispose();
@@ -534,6 +665,33 @@ describe('BindingTable.Resolve', () =>
         const aspectOnly = new BindingTable([{ Model: ThroughFx.Crm, Concept: ThroughFx.Tracked, Connector: ThroughFx.A }]);
         assert.equal(aspectOnly.Resolve(ThroughFx.Crm, ThroughFx.Bug, catalog), ThroughFx.A, 'aspect binding applies to carriers');
         assert.equal(aspectOnly.Resolve(ThroughFx.Crm, ThroughFx.Item, catalog), undefined);
+    });
+
+    it('an aspect declared by an ancestor applies; own aspects come before the ancestors\' aspects', () =>
+    {
+        const ancestorDeclared = new BindingTable([{ Model: ThroughFx.Crm, Concept: ThroughFx.Flagged, Connector: ThroughFx.A }]);
+        assert.equal(ancestorDeclared.Resolve(ThroughFx.Crm, ThroughFx.SubEntry, catalog), ThroughFx.A);
+        const ownFirst = new BindingTable([
+            { Model: ThroughFx.Crm, Concept: ThroughFx.Audited, Connector: ThroughFx.A },
+            { Model: ThroughFx.Crm, Concept: ThroughFx.Pinned, Connector: ThroughFx.B },
+        ]);
+        assert.equal(ownFirst.Resolve(ThroughFx.Crm, ThroughFx.SubEntry, catalog), ThroughFx.B);
+        assert.equal(ownFirst.Resolve(ThroughFx.Crm, ThroughFx.Entry, catalog), ThroughFx.A);
+    });
+
+    it('an included aspect follows its includer depth-first, before the next declared aspect', () =>
+    {
+        const table = new BindingTable([
+            { Model: ThroughFx.Crm, Concept: ThroughFx.Flagged, Connector: ThroughFx.B },
+            { Model: ThroughFx.Crm, Concept: ThroughFx.Logged, Connector: ThroughFx.A },
+        ]);
+        assert.equal(table.Resolve(ThroughFx.Crm, ThroughFx.Entry, catalog), ThroughFx.A, 'audited → logged precede flagged');
+        assert.equal(table.Resolve(ThroughFx.Crm, ThroughFx.SubEntry, catalog), ThroughFx.A, 'also through an ancestor');
+        const includerFirst = new BindingTable([
+            { Model: ThroughFx.Crm, Concept: ThroughFx.Logged, Connector: ThroughFx.A },
+            { Model: ThroughFx.Crm, Concept: ThroughFx.Audited, Connector: ThroughFx.C },
+        ]);
+        assert.equal(includerFirst.Resolve(ThroughFx.Crm, ThroughFx.Entry, catalog), ThroughFx.C, 'the includer precedes what it includes');
     });
 });
 

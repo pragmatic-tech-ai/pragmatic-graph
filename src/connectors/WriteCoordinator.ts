@@ -27,13 +27,13 @@ export class ConnectorSetup
     private static readonly ErrUnknown = 'A binding names a connector that is not installed: ';
     private static readonly ErrDuplicate = 'Two installed connectors share the name: ';
     private static readonly ErrReserved = 'A connector cannot use the reserved name: ';
-    private static readonly ErrTimeout = 'Connector timeout must be a finite non-negative number of milliseconds: ';
+    private static readonly ErrTimeout = 'Connector timeout must be a finite positive number of milliseconds: ';
 
     public readonly Connectors: ReadonlyMap<string, IGraphConnector>;
 
     public constructor(public readonly Bindings: BindingTable, connectors: readonly IGraphConnector[], public readonly TimeoutMs: number)
     {
-        if (!Number.isFinite(TimeoutMs) || TimeoutMs < 0)
+        if (!Number.isFinite(TimeoutMs) || TimeoutMs <= 0)
         {
             throw new GraphError(GraphErrorCode.InvalidArgument, ConnectorSetup.ErrTimeout + TimeoutMs);
         }
@@ -72,20 +72,25 @@ interface IHungCall
     readonly Txn: IConnectorTransaction | undefined;
 }
 
+/** How a revert ended: undefined when it succeeded, else its error (boxed, so a thrown `undefined` still counts). */
+type RevertOutcome = { readonly Error: unknown } | undefined;
+
 /**
  * Write-through of one transaction (spec §6, ruling R72). Route groups the batch's ops by the connector
  * that holds each node's binding; Run then drives: Prepare (engine) → Begin each participant (sorted by
  * name) → Apply each → Commit each → Finalize (engine). Calls run one at a time, never inside a
- * store.Write. The connector phase (from the start of Prepare to the last Commit) is bounded by the
- * setup's timeout. On any failure or the timeout the prepared commit is aborted and every connector
- * that began is reverted, in reverse order of Begin (committed ones too: compensation); the caller then
- * gets a ConnectorError. A call still hanging at the timeout is reverted once it returns; the caller is
- * answered at the timeout, and a failure of that late revert is raised on `lateFailures`. An engine
- * rejection at Prepare is rethrown as-is (no connector began).
+ * store.Write. One deadline (the setup's timeout, from the start of Prepare) bounds Prepare, every
+ * connector call and the reverts. On any failure or the timeout the prepared commit is aborted and every
+ * connector that began is reverted, in reverse order of Begin (committed ones too: compensation); the
+ * caller then gets a ConnectorError. A timeout during Prepare is ConnectorError (engine, Prepare) and the
+ * commit is aborted once Prepare returns. Past the deadline nothing more is awaited: a call still hanging
+ * is reverted once it returns, reverts still pending (or not yet started, which then start at once)
+ * finish on that late path, and their failures are raised on `lateFailures`. An engine rejection at
+ * Prepare is rethrown as-is (no connector began).
  */
 export class WriteCoordinator
 {
-    private static readonly ErrTimedOut = 'Connector call timed out after ms: ';
+    private static readonly ErrTimedOut = 'Write-through timed out after ms: ';
     private static readonly ErrReverts = 'The write-through failed and reverting a connector failed too';
     private static readonly TimedOut: unique symbol = Symbol('TimedOut');
     /** The owner of a node created without one (as GraphReader.OwnerOf reports it). */
@@ -96,6 +101,8 @@ export class WriteCoordinator
     private deadline: Promise<typeof WriteCoordinator.TimedOut> = new Promise(() => undefined);
     private timer: ReturnType<typeof setTimeout> | undefined;
     private hung: IHungCall | undefined;
+    /** The connector call last started, for wrapping a non-connector error should one ever escape. */
+    private current: { readonly Connector: string; readonly Phase: ConnectorPhase } = { Connector: BindingTable.EngineStorage, Phase: ConnectorPhase.Prepare };
 
     public constructor(private readonly setup: ConnectorSetup, private readonly lateFailures: Signal<ConnectorError>)
     {
@@ -104,8 +111,11 @@ export class WriteCoordinator
     /**
      * Per participating connector, its change set (in batch op order), keyed in connector-name order.
      * CreateNode / SetProperty / DeleteNode route by the node's owner and concept, Link / Unlink by the
-     * source node's; a node the batch creates routes by its CreateNode, any other by `origins` (each
-     * looked up once). A node found nowhere routes nowhere (the engine rejects the op at Prepare).
+     * source node's. An op routes by the latest CreateNode of its id earlier in the batch, else by the
+     * node in the snapshot (`origins`, each id looked up once). DeleteNode does not change an id's
+     * origin: an op on a deleted, not re-created id routes like the deleted node (the engine rejects it at
+     * Prepare anyway, before any connector begins); a re-created id routes by its new CreateNode. A node
+     * found nowhere routes nowhere (the engine rejects the op at Prepare).
      */
     public static async Route(batch: WriteBatch, table: BindingTable, catalog: CatalogSnapshot, origins: INodeOrigins): Promise<ReadonlyMap<string, ConnectorChangeSet>>
     {
@@ -117,10 +127,7 @@ export class WriteCoordinator
             if (op.Op === WriteOp.CreateNode)
             {
                 origin = { Owner: op.Owner ?? WriteCoordinator.NoOwner, Concept: op.Concept };
-                if (!known.has(op.PublicId))
-                {
-                    known.set(op.PublicId, origin);
-                }
+                known.set(op.PublicId, origin);
             }
             else
             {
@@ -167,16 +174,19 @@ export class WriteCoordinator
                 resolve(WriteCoordinator.TimedOut);
             }, this.setup.TimeoutMs);
         });
-        let prepared: PreparedCommit;
         try
         {
-            prepared = await prepare();
+            return await this.Drive(prepare, sets);
         }
-        catch (error)
+        finally
         {
             clearTimeout(this.timer);
-            throw error;
         }
+    }
+
+    private async Drive(prepare: () => Promise<PreparedCommit>, sets: ReadonlyMap<string, ConnectorChangeSet>): Promise<bigint>
+    {
+        const prepared = await this.Prepared(prepare);
         try
         {
             const participants = [...sets.keys()].map(name => this.setup.Connectors.get(name)!);
@@ -196,11 +206,9 @@ export class WriteCoordinator
         }
         catch (error)
         {
-            clearTimeout(this.timer);
             prepared.Abort();
-            throw await this.Failed(error as ConnectorError);
+            throw await this.Failed(error instanceof ConnectorError ? error : new ConnectorError(this.current.Connector, this.current.Phase, error));
         }
-        clearTimeout(this.timer);
         try
         {
             return await prepared.Finalize();
@@ -209,6 +217,22 @@ export class WriteCoordinator
         {
             throw await this.Failed(new ConnectorError(BindingTable.EngineStorage, ConnectorPhase.Finalize, error));
         }
+    }
+
+    /**
+     * Prepare raced against the deadline. Its own rejection is rethrown as-is; at the deadline it is
+     * ConnectorError (engine, Prepare), and the commit is aborted whenever Prepare still resolves.
+     */
+    private async Prepared(prepare: () => Promise<PreparedCommit>): Promise<PreparedCommit>
+    {
+        const pending = prepare();
+        const result = await Promise.race([pending, this.deadline]);
+        if (result !== WriteCoordinator.TimedOut)
+        {
+            return result;
+        }
+        pending.then(p => p.Abort(), () => undefined);
+        throw this.Timeout(BindingTable.EngineStorage, ConnectorPhase.Prepare);
     }
 
     /** The public id an op other than CreateNode routes by: the written node, or a link's source. */
@@ -223,9 +247,10 @@ export class WriteCoordinator
      */
     private async Call<T>(connector: IGraphConnector, phase: ConnectorPhase, txn: IConnectorTransaction | undefined, call: () => Promise<T>): Promise<T>
     {
+        this.current = { Connector: connector.Name, Phase: phase };
         if (this.expired)
         {
-            throw this.Timeout(connector, phase);
+            throw this.Timeout(connector.Name, phase);
         }
         let pending: Promise<T>;
         try
@@ -248,19 +273,20 @@ export class WriteCoordinator
         if (result === WriteCoordinator.TimedOut)
         {
             this.hung = { Connector: connector, Phase: phase, Call: pending, Txn: txn };
-            throw this.Timeout(connector, phase);
+            throw this.Timeout(connector.Name, phase);
         }
         return result;
     }
 
-    private Timeout(connector: IGraphConnector, phase: ConnectorPhase): ConnectorError
+    private Timeout(connector: string, phase: ConnectorPhase): ConnectorError
     {
-        return new ConnectorError(connector.Name, phase, new GraphError(GraphErrorCode.ConnectorFailed, WriteCoordinator.ErrTimedOut + this.setup.TimeoutMs));
+        return new ConnectorError(connector, phase, new GraphError(GraphErrorCode.ConnectorFailed, WriteCoordinator.ErrTimedOut + this.setup.TimeoutMs));
     }
 
     /**
      * Reverts every connector that began, in reverse order (a hung one later, once its call returns),
      * and returns the error to throw: `failure`, its cause wrapped with the revert errors when any.
+     * Reverts are awaited only until the deadline; the rest start at once and finish on the late path.
      */
     private async Failed(failure: ConnectorError): Promise<ConnectorError>
     {
@@ -276,13 +302,20 @@ export class WriteCoordinator
             {
                 continue;
             }
-            try
+            const outcome = WriteCoordinator.Revert(Txn);
+            if (this.expired)
             {
-                await Txn.Revert();
+                this.ReportLate(Connector, failure.Phase, outcome);
+                continue;
             }
-            catch (error)
+            const result = await Promise.race([outcome, this.deadline]);
+            if (result === WriteCoordinator.TimedOut)
             {
-                errors.push(error);
+                this.ReportLate(Connector, failure.Phase, outcome);
+            }
+            else if (result !== undefined)
+            {
+                errors.push(result.Error);
             }
         }
         if (errors.length === 0)
@@ -292,7 +325,21 @@ export class WriteCoordinator
         return new ConnectorError(failure.Connector, failure.Phase, new AggregateError([failure.cause, ...errors], WriteCoordinator.ErrReverts));
     }
 
-    /** Waits for the hung call, then reverts its connector's transaction; a failure is raised on lateFailures. */
+    /** Starts the transaction's Revert; never rejects (a throw, synchronous or not, becomes the outcome). */
+    private static async Revert(txn: IConnectorTransaction): Promise<RevertOutcome>
+    {
+        try
+        {
+            await txn.Revert();
+            return undefined;
+        }
+        catch (error)
+        {
+            return { Error: error };
+        }
+    }
+
+    /** Waits for the hung call, then reverts its connector's transaction on the late path. */
     private async RevertLate(hung: IHungCall): Promise<void>
     {
         let txn = hung.Txn;
@@ -308,24 +355,29 @@ export class WriteCoordinator
         {
             // The call's own failure is moot: the caller already has the timeout. A failed Begin began nothing.
         }
-        if (txn === undefined)
+        if (txn !== undefined)
         {
-            return;
+            this.ReportLate(hung.Connector, hung.Phase, WriteCoordinator.Revert(txn));
         }
-        try
+    }
+
+    /** Raises a late revert's failure on lateFailures once it settles. */
+    private ReportLate(connector: IGraphConnector, phase: ConnectorPhase, outcome: Promise<RevertOutcome>): void
+    {
+        void outcome.then(result =>
         {
-            await txn.Revert();
-        }
-        catch (error)
-        {
+            if (result === undefined)
+            {
+                return;
+            }
             try
             {
-                this.lateFailures.Raise(new ConnectorError(hung.Connector.Name, hung.Phase, error));
+                this.lateFailures.Raise(new ConnectorError(connector.Name, phase, result.Error));
             }
             catch
             {
                 // A throwing subscriber has nowhere to report to on this detached path (Signal aggregates handler errors).
             }
-        }
+        });
     }
 }
