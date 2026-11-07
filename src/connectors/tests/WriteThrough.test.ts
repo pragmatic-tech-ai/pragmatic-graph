@@ -9,6 +9,7 @@ import { CatalogModel } from '../../catalog/CatalogModel.js';
 import { MemberKind, ValueType } from '../../catalog/ValueType.js';
 import { GraphError, GraphErrorCode } from '../../errors/GraphError.js';
 import type { GraphContext } from '../../GraphContext.js';
+import { EngineInternals } from '../../tests/EngineInternals.js';
 import { GraphStore } from '../../GraphStore.js';
 import type { GraphTransaction } from '../../GraphTransaction.js';
 import { FalsePredicate } from '../../predicate/Predicate.js';
@@ -171,7 +172,7 @@ class ThroughFx
     /** The store's internal context. */
     public static Context(g: GraphStore): GraphContext
     {
-        return (g as unknown as { context: GraphContext }).context;
+        return EngineInternals.Context(g);
     }
 
     /** The changes each connector received, flattened, as plain objects. */

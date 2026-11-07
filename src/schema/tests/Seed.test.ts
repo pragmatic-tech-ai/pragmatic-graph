@@ -8,38 +8,23 @@ import type { MemberInput } from '../../catalog/CatalogTypes.js';
 import { MemberKind, ValueType } from '../../catalog/ValueType.js';
 import type { CellValue } from '../../columns/CellValue.js';
 import { DateValue } from '../../columns/CellValue.js';
-import type { ColumnStore } from '../../columns/ColumnStore.js';
-import type { EdgeStore } from '../../edges/EdgeStore.js';
 import { GraphError, GraphErrorCode } from '../../errors/GraphError.js';
 import { EdgeDirection } from '../../format/FormatKeys.js';
 import { TupleCodec } from '../../format/TupleCodec.js';
 import type { GraphContext } from '../../GraphContext.js';
+import { EngineInternals } from '../../tests/EngineInternals.js';
 import type { GraphReader } from '../../GraphReader.js';
 import { GraphStore } from '../../GraphStore.js';
 import type { GraphTransaction } from '../../GraphTransaction.js';
-import type { PublicIdIndex } from '../../identity/PublicIdIndex.js';
-import type { RowIndex } from '../../identity/RowIndex.js';
 import { Keyspace } from '../../kv/Keyspace.js';
 import { BatchApplier } from '../../txn/BatchApplier.js';
 import { CommitError, CommitErrorCode } from '../../txn/CommitError.js';
 import { ConflictError } from '../../txn/ConflictError.js';
 import { CommitKind, type ICommitApplied } from '../../txn/LogEntry.js';
-import type { IndexStore } from '../../indexes/IndexStore.js';
 import { WriteBatch } from '../../txn/WriteBatch.js';
 import type { DataPurger, IPurgeStats } from '../DataPurger.js';
 import type { IDefinitionDescription, ISchemaDescription, ISeedLink, ISeedNode } from '../SchemaDescription.js';
 import { SeedHash } from '../SeedHash.js';
-
-/** The committer's private building blocks, reached by cast for the purge test seam (ruling R52). */
-interface ICommitterInternals
-{
-    purger: DataPurger;
-    readonly columns: ColumnStore;
-    readonly edges: EdgeStore;
-    readonly rows: RowIndex;
-    readonly ids: PublicIdIndex;
-    readonly indexes: IndexStore;
-}
 
 /**
  * Descriptions and probes for the seed tests. Schema: Server { name?, port: Int64?, hosts -> [App] many
@@ -147,12 +132,7 @@ class SeedFx
 
     public static Context(g: GraphStore): GraphContext
     {
-        return (g as unknown as { context: GraphContext }).context;
-    }
-
-    public static Internals(g: GraphStore): ICommitterInternals
-    {
-        return SeedFx.Context(g).Committer as unknown as ICommitterInternals;
+        return EngineInternals.Context(g);
     }
 
     public static async Commit(g: GraphStore, build: (t: GraphTransaction) => void): Promise<bigint>
@@ -257,7 +237,7 @@ class SeedFx
      */
     public static Sabotage(g: GraphStore, victims: string[]): { Calls: () => number; Restore: () => void }
     {
-        const host = SeedFx.Internals(g);
+        const host = EngineInternals.CommitterParts(g);
         const real = host.purger;
         let calls = 0;
         host.purger = {

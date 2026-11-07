@@ -12,6 +12,7 @@ import { AccessError } from '../../access/AccessError.js';
 import { FalsePredicate } from '../../predicate/Predicate.js';
 import { GraphError, GraphErrorCode } from '../../errors/GraphError.js';
 import { GraphStore } from '../../GraphStore.js';
+import { EngineInternals } from '../../tests/EngineInternals.js';
 import { IdAllocator } from '../../identity/IdAllocator.js';
 import { PublicIdIndex } from '../../identity/PublicIdIndex.js';
 import type { IKeyValueStore, IReadTransaction, IWriteTransaction } from '../../kv/KeyValue.js';
@@ -792,7 +793,7 @@ class PrepFx
     }
 }
 
-/** GraphTransaction.Prepare: the write gate runs first, then the committer prepares the batch. */
+/** The engine side of a write-through (EngineInternals.Prepare): the write gate runs first, then the committer prepares the batch. */
 class TxnPrepFx
 {
     private static readonly Person = 'Person';
@@ -810,7 +811,8 @@ class TxnPrepFx
                 g.CommitApplied.Subscribe(e => events.push(e));
                 const t = await g.Begin(AccessScope.System);
                 t.CreateNode('p', TxnPrepFx.Person);
-                const prepared = await t.Prepare();
+                assert.equal(Reflect.get(t, 'Prepare'), undefined, 'no public Prepare: nothing bypasses write-through routing');
+                const prepared = await EngineInternals.Prepare(t);
                 assert.throws(() => t.CreateNode('q', TxnPrepFx.Person), (e: unknown) => e instanceof GraphError && e.GraphCode === GraphErrorCode.Disposed);
                 assert.equal(events.length, 0);
                 const commit = await prepared.Finalize();
@@ -826,7 +828,7 @@ class TxnPrepFx
                 const scope = AccessScope.Build({ Default: AccessDefault.Allow, Writes: new Map([[TxnPrepFx.Person, { Create: FalsePredicate.Instance }]]) });
                 const t = await g.Begin(scope);
                 t.CreateNode('p', TxnPrepFx.Person);
-                await assert.rejects(t.Prepare(), (e: unknown) => e instanceof AccessError);
+                await assert.rejects(EngineInternals.Prepare(t), (e: unknown) => e instanceof AccessError);
                 // Nothing was reserved: the same create commits.
                 const s = await g.Begin(AccessScope.System);
                 s.CreateNode('p', TxnPrepFx.Person);

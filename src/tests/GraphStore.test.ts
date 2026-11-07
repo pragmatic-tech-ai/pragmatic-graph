@@ -10,6 +10,7 @@ import { TupleCodec } from '../format/TupleCodec.js';
 import { Keyspace } from '../kv/Keyspace.js';
 import { LmdbStore } from '../kv/lmdb/LmdbStore.js';
 import type { GraphContext } from '../GraphContext.js';
+import { EngineInternals } from './EngineInternals.js';
 import { Linearity } from '../kv/tests/Linearity.js';
 import type { Committer } from '../txn/Committer.js';
 import type { ReadSet } from '../txn/ReadSet.js';
@@ -126,7 +127,7 @@ class GraphFx
     /** The store's internal context. */
     public static Context(g: GraphStore): GraphContext
     {
-        return (g as unknown as { context: GraphContext }).context;
+        return EngineInternals.Context(g);
     }
 
     public static async Read<T>(g: GraphStore, work: (r: GraphReader) => Promise<T>): Promise<T>

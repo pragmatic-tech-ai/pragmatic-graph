@@ -8,7 +8,6 @@ import { GraphError, GraphErrorCode } from './errors/GraphError.js';
 import { GraphReader } from './GraphReader.js';
 import { ConflictError } from './txn/ConflictError.js';
 import type { ISnapshotHandle } from './txn/ConflictHistory.js';
-import type { PreparedCommit } from './txn/PreparedCommit.js';
 import { ReadSet } from './txn/ReadSet.js';
 import { type ICreateNodeOptions, type LinkOptions, WriteBatch } from './txn/WriteBatch.js';
 
@@ -117,29 +116,6 @@ export class GraphTransaction extends GraphReader
     }
 
     /**
-     * @internal The engine side of a write-through (ruling R71): runs the same schema check and write gate
-     * as Commit, then Committer.Prepare on the recorded writes and read set, and resolves with the
-     * PreparedCommit whose Finalize commits them. Ends the transaction like Commit. A transaction that
-     * recorded no writes is prepared too (its reads stay reserved until Finalize, which then consumes a
-     * commit number like any Submit of an empty batch).
-     */
-    public async Prepare(timeoutMs?: number): Promise<PreparedCommit>
-    {
-        this.RequireActive();
-        this.committing = true;
-        try
-        {
-            const began = this.RequireCatalog();
-            await this.Authorize();
-            return await this.context.Committer.Prepare(this.batch, this.Reads, this.ValidationCommit(), began, timeoutMs);
-        }
-        finally
-        {
-            this.dispose();
-        }
-    }
-
-    /**
      * The catalog version the transaction began with, when it is still current. Early check, so the gate
      * never judges writes against a schema that has since changed; the authoritative check is still inside
      * the commit group against the group's catalog (ruling F4).
@@ -156,7 +132,7 @@ export class GraphTransaction extends GraphReader
 
     /**
      * The write gate (ruling R68): throws AccessError when the scope does not allow a recorded write.
-     * Runs before anything leaves the transaction (Submit now, Prepare later), so a denied commit consumes
+     * Runs before anything leaves the transaction (Submit, or the write-through's Prepare), so a denied commit consumes
      * no commit number and raises no CommitApplied. Its reads land in this transaction's ReadSet. A
      * denial decided on reads a later commit changed is a ConflictError instead (ruling R70): a retry may
      * be allowed. A scope that restricts nothing (System) skips it at no cost.

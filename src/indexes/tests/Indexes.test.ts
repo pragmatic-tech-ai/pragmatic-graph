@@ -12,6 +12,7 @@ import { GraphError, GraphErrorCode } from '../../errors/GraphError.js';
 import { EdgeDirection } from '../../format/FormatKeys.js';
 import { TupleCodec } from '../../format/TupleCodec.js';
 import type { GraphContext } from '../../GraphContext.js';
+import { EngineInternals } from '../../tests/EngineInternals.js';
 import type { GraphReader } from '../../GraphReader.js';
 import { GraphStore } from '../../GraphStore.js';
 import type { GraphTransaction } from '../../GraphTransaction.js';
@@ -146,7 +147,7 @@ class IndexFx
 
     public static Context(g: GraphStore): GraphContext
     {
-        return (g as unknown as { context: GraphContext }).context;
+        return EngineInternals.Context(g);
     }
 
     /** Every key of the Index keyspace, decoded. */

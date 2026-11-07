@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { FormatKeys, IdsTag } from '../format/FormatKeys.js';
 import { TupleCodec } from '../format/TupleCodec.js';
 import { Keyspace } from '../kv/Keyspace.js';
-import type { GraphContext } from '../GraphContext.js';
+import { EngineInternals } from './EngineInternals.js';
 import { AccessScope, CatalogModel, ConflictError, GraphReader, GraphStore, GraphTransaction, MemberKind, ValueType } from '../index.js';
 
 /** Schema and helpers for the node-level read tests. */
@@ -83,7 +83,7 @@ class NodeFx
     /** Number of Owner entries in the raw Ids keyspace. */
     public static async OwnerEntries(g: GraphStore): Promise<number>
     {
-        const context = (g as unknown as { context: GraphContext }).context;
+        const context = EngineInternals.Context(g);
         const txn = await context.Store.BeginRead();
         try
         {

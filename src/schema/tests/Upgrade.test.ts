@@ -11,6 +11,7 @@ import { EdgeDirection, IdsTag } from '../../format/FormatKeys.js';
 import { TupleCodec } from '../../format/TupleCodec.js';
 import { GraphError, GraphErrorCode } from '../../errors/GraphError.js';
 import type { GraphContext } from '../../GraphContext.js';
+import { EngineInternals } from '../../tests/EngineInternals.js';
 import type { GraphReader } from '../../GraphReader.js';
 import { GraphStore } from '../../GraphStore.js';
 import type { GraphTransaction } from '../../GraphTransaction.js';
@@ -154,7 +155,7 @@ class UpgradeFx
 
     public static Context(g: GraphStore): GraphContext
     {
-        return (g as unknown as { context: GraphContext }).context;
+        return EngineInternals.Context(g);
     }
 
     public static async Read<T>(g: GraphStore, work: (r: GraphReader) => Promise<T>): Promise<T>
@@ -669,7 +670,7 @@ class UpgradeFx
                 const before = await UpgradeFx.Snapshot(g);
                 // Test seam: the committer's private purger is replaced by one that purges, then fails,
                 // so the Write aborts after the purge has written into its transaction.
-                const host = committer as unknown as { purger: DataPurger };
+                const host = EngineInternals.CommitterParts(g);
                 const real = host.purger;
                 host.purger = {
                     Purge: async (...args: Parameters<DataPurger['Purge']>): Promise<IPurgeStats> =>
