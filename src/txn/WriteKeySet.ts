@@ -28,6 +28,18 @@ export class WriteKeySet
         }
     }
 
+    /** Adds every written key to `reads` as an exact key, except keys of the `skip` keyspaces. */
+    public AddTo(reads: ReadSet, skip?: ReadonlySet<Keyspace>): void
+    {
+        for (const [space, key] of this.entries)
+        {
+            if (skip?.has(space) !== true)
+            {
+                reads.AddKey(space, key);
+            }
+        }
+    }
+
     /** True when any written key lies in the read set (exact key or inside a read range). */
     public Intersects(reads: ReadSet): boolean
     {

@@ -24,7 +24,9 @@ import { ConflictError } from './ConflictError.js';
 import { ConflictHistory, type ISnapshotHandle } from './ConflictHistory.js';
 import { ConflictKeys } from './ConflictKeys.js';
 import { CommitKind, type ICommitApplied, LogEntry } from './LogEntry.js';
-import type { ReadSet } from './ReadSet.js';
+import { PreparedCommit } from './PreparedCommit.js';
+import { ReadSet } from './ReadSet.js';
+import { Reservation, ReservationState, Reservations } from './Reservations.js';
 import { Signal } from './Signal.js';
 import { WriteBatch, WriteOp } from './WriteBatch.js';
 import { WriteKeySet } from './WriteKeySet.js';
@@ -70,7 +72,8 @@ class PendingCommit
 
     /**
      * `CatalogVersion`: the version the submitter's transaction began with; checked inside the group
-     * against the group's catalog (ruling F4). Undefined: no check.
+     * against the group's catalog (ruling F4). Undefined: no check. `Finalizes`: the reservation of the
+     * prepared commit this batch finalizes (ruling R71); settling the batch ends it.
      */
     public constructor(
         public readonly Bytes: Uint8Array,
@@ -80,26 +83,83 @@ class PendingCommit
         private readonly resolve: (commit: bigint) => void,
         private readonly reject: (error: unknown) => void,
         public readonly CatalogVersion?: number,
+        public readonly Finalizes?: Reservation,
     )
     {
     }
 
     public Resolve(commit: bigint): void
     {
-        if (!this.settled)
+        if (this.Settle())
         {
-            this.settled = true;
+            this.Finalizes?.End(ReservationState.Finalized);
             this.resolve(commit);
         }
     }
 
     public Reject(error: unknown): void
     {
-        if (!this.settled)
+        if (this.Settle())
         {
-            this.settled = true;
+            this.Finalizes?.End(ReservationState.Failed);
             this.reject(error);
         }
+    }
+
+    /** True the first time only. */
+    protected Settle(): boolean
+    {
+        if (this.settled)
+        {
+            return false;
+        }
+        this.settled = true;
+        return true;
+    }
+}
+
+/** A Prepare waiting for its group: validated and dry-run after the group's commits, never applied. */
+class PendingPrepare extends PendingCommit
+{
+    public constructor(
+        bytes: Uint8Array,
+        batch: WriteBatch,
+        reads: ReadSet,
+        snapshot: bigint,
+        private readonly prepared: (prepared: PreparedCommit) => void,
+        reject: (error: unknown) => void,
+        catalogVersion: number | undefined,
+        public readonly TimeoutMs: number,
+    )
+    {
+        super(bytes, batch, reads, snapshot, PendingPrepare.Unused, reject, catalogVersion);
+    }
+
+    public ResolvePrepared(prepared: PreparedCommit): void
+    {
+        if (this.Settle())
+        {
+            this.prepared(prepared);
+        }
+    }
+
+    /** A prepare resolves with a PreparedCommit (ResolvePrepared), never with a commit number. */
+    private static Unused(): void
+    {
+    }
+}
+
+/**
+ * The internal sentinel that ends a prepare's dry-run: thrown from inside its store.Write so the Write is
+ * aborted and leaves no trace, carrying what the dry-run learned (ruling R71).
+ */
+class DryRunOutcome extends Error
+{
+    private static readonly Text = 'Prepare dry-run (aborted on purpose)';
+
+    public constructor(public readonly Keys: WriteKeySet, public readonly Dependencies: ReadSet)
+    {
+        super(DryRunOutcome.Text);
     }
 }
 
@@ -178,10 +238,14 @@ interface ISeedCommit
     readonly Keys: WriteKeySet;
 }
 
-/** A batch that failed semantically while its group was applying; aborts the group's store.Write. */
+/**
+ * A batch rejected while its group was applying, after it had written into the group's store.Write: it
+ * failed semantically (CommitError) or its applied write keys hit a prepared commit's reservation
+ * (ConflictError, ruling R71). Aborts the Write; the rest of the group re-runs.
+ */
 class BatchFailure extends Error
 {
-    public constructor(public readonly Pending: PendingCommit, public readonly Failure: CommitError)
+    public constructor(public readonly Pending: PendingCommit, public readonly Failure: CommitError | ConflictError)
     {
         super(Failure.message);
     }
@@ -217,6 +281,13 @@ interface IGroupOutcome
  * rejects the whole group. Commit numbers follow submission order. CommitApplied is raised once per
  * commit, in order, after the store.Write resolved; a throwing subscriber does not affect the commit.
  *
+ * Prepare / Finalize (ruling R71) split a commit so external connectors can commit in between:
+ * Prepare validates and dry-runs a batch and reserves its keys; while reserved, a group batch whose
+ * applied write keys hit the reservation is rejected through the BatchFailure re-run (ConflictError),
+ * and one that writes after reading the prepared write keys is rejected before applying. Finalize
+ * applies the prepared batch with its prepared ids and cannot fail on a conflict while the reservation
+ * holds and the catalog is unchanged.
+ *
  * Snapshots: a transaction (never a plain reader, ruling F3) calls RegisterSnapshot() and only THEN
  * opens its store read transaction, so the
  * data it reads is at least as new as the registered commit (validation is then conservative, never
@@ -226,6 +297,8 @@ export class Committer
 {
     /** A chunk delta holding more entries than this after a group is folded into its chunk in the same Write. */
     public static readonly CompactThreshold = 512;
+    /** How long a prepared commit holds its reservation when Prepare is given no timeout. */
+    public static readonly DefaultPrepareTimeoutMs = 30000;
 
     private static readonly ErrSnapshot = 'Snapshot commit is after the last commit: ';
     private static readonly ErrStale = 'Stored last commit does not match the committer (another writer, or not opened with Committer.Open): stored ';
@@ -237,6 +310,9 @@ export class Committer
     private static readonly ErrSchemaNow = ', now ';
     private static readonly ErrSchemaVersion = 'Schema version must be well-formed UTF-16 (no lone surrogates)';
     private static readonly ErrSeedIds = 'Seed still needs unallocated ids after the retry: ';
+    private static readonly ErrTimeout = 'Prepare timeout must be a finite, non-negative number of milliseconds: ';
+    private static readonly ErrForeign = 'The prepared commit belongs to another committer';
+    private static readonly ErrDryRun = 'Prepare dry-run ended without its outcome';
     private static readonly Comma = ', ';
     private static readonly EmptyBatch = new WriteBatch().Seal();
     private static readonly Encoder = new TextEncoder();
@@ -254,6 +330,7 @@ export class Committer
     private readonly history: ConflictHistory;
     private readonly purger = new DataPurger(this.columns, this.edges, this.rows, this.ids, this.indexes);
     private readonly queue: Array<PendingCommit | IExclusiveCommit> = [];
+    private readonly reservations = new Reservations();
     private index: CatalogIndex;
     private allocator: Promise<IdAllocator> | undefined;
     /** The running Pump (undefined when idle); dispose() awaits it. */
@@ -333,18 +410,10 @@ export class Committer
      */
     public Submit(batch: WriteBatch, readSet: ReadSet, snapshotCommit: bigint, catalogVersion?: number): Promise<bigint>
     {
-        if (this.disposed)
-        {
-            return Promise.reject(new GraphError(GraphErrorCode.Disposed, Committer.ErrDisposed));
-        }
-        if (snapshotCommit > this.history.Last || snapshotCommit < 0n)
-        {
-            return Promise.reject(new GraphError(GraphErrorCode.InvalidArgument, Committer.ErrSnapshot + snapshotCommit));
-        }
         let bytes: Uint8Array;
         try
         {
-            bytes = batch.Serialize();
+            bytes = this.Capture(batch, snapshotCommit);
         }
         catch (error)
         {
@@ -352,9 +421,96 @@ export class Committer
         }
         return new Promise<bigint>((resolve, reject) =>
         {
-            this.queue.push(new PendingCommit(bytes, WriteBatch.Deserialize(bytes).Seal(), readSet.Clone(), snapshotCommit, resolve, reject, catalogVersion));
-            this.pump ??= this.Pump();
+            this.Push(new PendingCommit(bytes, WriteBatch.Deserialize(bytes).Seal(), readSet.Clone(), snapshotCommit, resolve, reject, catalogVersion));
         });
+    }
+
+    /**
+     * Validates and reserves a batch without committing it (ruling R71). Queued like Submit; in its group
+     * turn (after the group's commits) the read set is checked against history and the catalog version
+     * against the committer's, ids are allocated (outside any Write, ruling R16), and the batch is
+     * dry-run inside a store.Write that is then aborted, so semantic errors surface now and its write keys
+     * are known. Rejects exactly as Submit would (ConflictError, CommitError, GraphError InvalidArgument),
+     * and with ConflictError when it reads keys another prepared commit writes or writes keys another
+     * reserved. Resolves with a PreparedCommit holding a reservation for `timeoutMs` (default
+     * DefaultPrepareTimeoutMs): until it finalizes, aborts or expires, a commit that writes what it read,
+     * depends on or writes, or that writes after reading what it writes, fails with ConflictError.
+     * Unrelated commits proceed. The batch and read set are captured now.
+     */
+    public Prepare(batch: WriteBatch, readSet: ReadSet, snapshotCommit: bigint, catalogVersion?: number, timeoutMs: number = Committer.DefaultPrepareTimeoutMs): Promise<PreparedCommit>
+    {
+        let bytes: Uint8Array;
+        try
+        {
+            if (!Number.isFinite(timeoutMs) || timeoutMs < 0)
+            {
+                throw new GraphError(GraphErrorCode.InvalidArgument, Committer.ErrTimeout + timeoutMs);
+            }
+            bytes = this.Capture(batch, snapshotCommit);
+        }
+        catch (error)
+        {
+            return Promise.reject(error);
+        }
+        return new Promise<PreparedCommit>((resolve, reject) =>
+        {
+            this.Push(new PendingPrepare(bytes, WriteBatch.Deserialize(bytes).Seal(), readSet.Clone(), snapshotCommit, resolve, reject, catalogVersion, timeoutMs));
+        });
+    }
+
+    /**
+     * @internal PreparedCommit.Finalize: queues the prepared batch as a group commit with its prepared
+     * ids. It skips history validation (the reservation kept every later commit off its keys) and is not
+     * checked against other reservations (each was checked against it when it prepared); the catalog
+     * version is checked as for any batch. ConflictError after Abort or expiry (ruling R71).
+     */
+    public SubmitPrepared(prepared: PreparedCommit): Promise<bigint>
+    {
+        if (this.disposed)
+        {
+            return Promise.reject(new GraphError(GraphErrorCode.Disposed, Committer.ErrDisposed));
+        }
+        if (!prepared.Reservation.BelongsTo(this.reservations))
+        {
+            return Promise.reject(new GraphError(GraphErrorCode.InvalidArgument, Committer.ErrForeign));
+        }
+        const refused = prepared.Reservation.BeginFinalize();
+        if (refused !== undefined)
+        {
+            return Promise.reject(refused);
+        }
+        return new Promise<bigint>((resolve, reject) =>
+        {
+            const pending = new PendingCommit(prepared.Bytes, prepared.Batch, new ReadSet(), this.history.Last, resolve, reject, prepared.CatalogVersion, prepared.Reservation);
+            pending.Ids = [...prepared.Ids];
+            this.Push(pending);
+        });
+    }
+
+    /** Diagnostics: prepared commits whose reservations currently block other commits. */
+    public get ReservationCount(): number
+    {
+        return this.reservations.Count;
+    }
+
+    /** The checks Submit and Prepare share; returns the batch's serialized bytes. */
+    private Capture(batch: WriteBatch, snapshotCommit: bigint): Uint8Array
+    {
+        if (this.disposed)
+        {
+            throw new GraphError(GraphErrorCode.Disposed, Committer.ErrDisposed);
+        }
+        if (snapshotCommit > this.history.Last || snapshotCommit < 0n)
+        {
+            throw new GraphError(GraphErrorCode.InvalidArgument, Committer.ErrSnapshot + snapshotCommit);
+        }
+        return batch.Serialize();
+    }
+
+    private Push(pending: PendingCommit): void
+    {
+        this.queue.push(pending);
+        this.pump ??= this.Pump();
     }
 
     /**
@@ -400,8 +556,8 @@ export class Committer
     }
 
     /**
-     * Stops accepting work: every queued Submit not yet in a group and every later Submit rejects;
-     * CommitApplied subscribers are dropped. A group already writing finishes (its commits are durable
+     * Stops accepting work: every queued Submit, Prepare or Finalize not yet in a group and every later
+     * one rejects; every held reservation is released; CommitApplied subscribers are dropped. A group already writing finishes (its commits are durable
      * and its promises settle) but raises no signal; no new group starts. Resolves once that group has
      * settled, so the store can then be closed. Idempotent: every call resolves at the same point.
      */
@@ -418,6 +574,7 @@ export class Committer
         {
             p.Reject(error);
         }
+        this.reservations.Clear();
         this.CommitApplied.dispose();
         await this.pump;
     }
@@ -617,10 +774,12 @@ export class Committer
         if (upgradeCommit !== undefined)
         {
             this.history.Record(upgradeCommit, keys);
+            this.reservations.Invalidate(keys);
         }
         if (seed !== undefined)
         {
             this.history.Record(seedCommit, seed.Keys);
+            this.reservations.Invalidate(seed.Keys);
         }
         this.history.Prune();
         this.index = next;
@@ -739,13 +898,116 @@ export class Committer
         }
     }
 
+    /** Releases expired reservations, commits the group's batches, then runs its Prepares in order. */
     private async RunGroup(group: PendingCommit[]): Promise<void>
+    {
+        this.reservations.Sweep();
+        const commits = group.filter(p => !(p instanceof PendingPrepare));
+        if (commits.length > 0)
+        {
+            await this.RunCommits(commits);
+        }
+        for (const p of group)
+        {
+            if (p instanceof PendingPrepare)
+            {
+                await this.RunPrepare(p);
+            }
+        }
+    }
+
+    /**
+     * One prepare, after every commit of its group published: the history, catalog-version and
+     * reservation read checks, ids, the dry-run, the reservation write check, then the reservation.
+     */
+    private async RunPrepare(p: PendingPrepare): Promise<void>
+    {
+        const index = this.index;
+        const version = index.Catalog.Version;
+        const early = this.history.Check(p.Reads, p.Snapshot)
+            ?? Committer.VersionConflict(p.CatalogVersion, version)
+            ?? (p.Batch.Count > 0 ? this.reservations.ReadConflict(p.Reads) : undefined);
+        if (early !== undefined)
+        {
+            p.Reject(early);
+            return;
+        }
+        let outcome: DryRunOutcome;
+        try
+        {
+            await this.AllocateIds([p]);
+            outcome = await this.DryRun(index, p);
+        }
+        catch (error)
+        {
+            p.Reject(error);
+            return;
+        }
+        if (this.disposed)
+        {
+            p.Reject(new GraphError(GraphErrorCode.Disposed, Committer.ErrDisposed));
+            return;
+        }
+        const clash = this.reservations.WriteConflict(outcome.Keys);
+        if (clash !== undefined)
+        {
+            p.Reject(clash);
+            return;
+        }
+        const reservation = this.reservations.Reserve(p.Reads, outcome.Dependencies, outcome.Keys, p.TimeoutMs);
+        p.ResolvePrepared(new PreparedCommit(this, p.Batch, p.Bytes, p.Ids ?? [], version, reservation));
+    }
+
+    /**
+     * Applies the batch inside a store.Write and aborts that Write with the DryRunOutcome sentinel, so
+     * nothing is stored and the per-transaction caches (keyed by the aborted transaction) are dropped.
+     */
+    private async DryRun(index: CatalogIndex, p: PendingCommit): Promise<DryRunOutcome>
+    {
+        try
+        {
+            await this.store.Write(async txn =>
+            {
+                await this.RequireCurrent(txn);
+                const dependencies = new ReadSet();
+                const applier = new BatchApplier(index, this.columns, this.edges, this.rows, this.ids, this.indexes, dependencies);
+                const keys = await applier.Apply(txn, p.Batch, p.Ids ?? []);
+                throw new DryRunOutcome(keys, dependencies);
+            });
+        }
+        catch (error)
+        {
+            if (error instanceof DryRunOutcome)
+            {
+                return error;
+            }
+            throw error;
+        }
+        throw new GraphError(GraphErrorCode.Internal, Committer.ErrDryRun);
+    }
+
+    /** The ConflictError for a batch begun on catalog `began` when the catalog is now `now`; undefined when unchecked or equal. */
+    private static VersionConflict(began: number | undefined, now: number): ConflictError | undefined
+    {
+        return began === undefined || began === now ? undefined : new ConflictError(Committer.ErrSchema + began + Committer.ErrSchemaNow + now);
+    }
+
+    private async RunCommits(group: PendingCommit[]): Promise<void>
     {
         const index = this.index;
         let candidates: PendingCommit[] = [];
         for (const p of group)
         {
-            const conflict = this.history.Check(p.Reads, p.Snapshot);
+            // A finalize skips history: its reservation kept every later commit off its keys (ruling R71).
+            let conflict: ConflictError | undefined;
+            if (p.Finalizes === undefined)
+            {
+                conflict = this.history.Check(p.Reads, p.Snapshot);
+            }
+            else if (p.Finalizes.Invalidated)
+            {
+                conflict = Reservation.InvalidatedError();
+            }
             if (conflict === undefined)
             {
                 candidates.push(p);
@@ -837,16 +1099,25 @@ export class Committer
         const accepted: IAccepted[] = [];
         const conflicts: Array<readonly [PendingCommit, Error]> = [];
         const version = index.Catalog.Version;
+        // Reservations finalized earlier in this group no longer block the batches after them.
+        const finalized = new Set<Reservation>();
         for (const p of candidates)
         {
-            if (p.CatalogVersion !== undefined && p.CatalogVersion !== version)
+            const stale = Committer.VersionConflict(p.CatalogVersion, version);
+            if (stale !== undefined)
             {
-                conflicts.push([p, new ConflictError(Committer.ErrSchema + p.CatalogVersion + Committer.ErrSchemaNow + version)]);
+                conflicts.push([p, stale]);
                 continue;
             }
             if (groupKeys.Intersects(p.Reads))
             {
                 conflicts.push([p, new ConflictError(Committer.ErrInGroup)]);
+                continue;
+            }
+            const reserved = p.Finalizes === undefined && p.Batch.Count > 0 ? this.reservations.ReadConflict(p.Reads, finalized) : undefined;
+            if (reserved !== undefined)
+            {
+                conflicts.push([p, reserved]);
                 continue;
             }
             let keys: WriteKeySet;
@@ -861,6 +1132,18 @@ export class Committer
                     throw new BatchFailure(p, error);
                 }
                 throw error;
+            }
+            if (p.Finalizes === undefined)
+            {
+                const clash = this.reservations.WriteConflict(keys, finalized);
+                if (clash !== undefined)
+                {
+                    throw new BatchFailure(p, clash);
+                }
+            }
+            else
+            {
+                finalized.add(p.Finalizes);
             }
             groupKeys.AddAll(keys);
             accepted.push({ Pending: p, Keys: keys });

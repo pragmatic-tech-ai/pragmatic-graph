@@ -157,6 +157,23 @@ export class ReadSet
         return reads.Keys.has(hex) || reads.InRange(key);
     }
 
+    /** Adds every key and range of `other` (ranges are immutable once stored, so they are shared). */
+    public AddAll(other: ReadSet): void
+    {
+        for (const [space, reads] of other.spaces)
+        {
+            const mine = this.For(space);
+            for (const k of reads.Keys)
+            {
+                mine.Keys.add(k);
+            }
+            for (const r of reads.Ranges)
+            {
+                mine.AddRange(r);
+            }
+        }
+    }
+
     public Clone(): ReadSet
     {
         const copy = new ReadSet();

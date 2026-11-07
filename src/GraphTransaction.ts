@@ -7,6 +7,7 @@ import { GraphError, GraphErrorCode } from './errors/GraphError.js';
 import { GraphReader } from './GraphReader.js';
 import { ConflictError } from './txn/ConflictError.js';
 import type { ISnapshotHandle } from './txn/ConflictHistory.js';
+import type { PreparedCommit } from './txn/PreparedCommit.js';
 import { ReadSet } from './txn/ReadSet.js';
 import { type ICreateNodeOptions, type LinkOptions, WriteBatch } from './txn/WriteBatch.js';
 
@@ -80,13 +81,7 @@ export class GraphTransaction extends GraphReader
         this.committing = true;
         try
         {
-            const began = this.snapshot.Index.Catalog.Version;
-            // Early check, so the gate never judges writes against a schema that has since changed; the
-            // authoritative check is still inside the commit group against the group's catalog (ruling F4).
-            if (began !== this.context.CatalogVersion)
-            {
-                throw new ConflictError(GraphTransaction.ErrSchema + began + GraphTransaction.ErrSchemaNow + this.context.CatalogVersion);
-            }
+            const began = this.RequireCatalog();
             if (this.batch.Count === 0)
             {
                 return this.SnapshotCommit;
@@ -99,6 +94,44 @@ export class GraphTransaction extends GraphReader
             // Only now: the registered snapshot must pin conflict history until the batch was validated.
             this.dispose();
         }
+    }
+
+    /**
+     * @internal The engine side of a write-through (ruling R71): runs the same schema check and write gate
+     * as Commit, then Committer.Prepare on the recorded writes and read set, and resolves with the
+     * PreparedCommit whose Finalize commits them. Ends the transaction like Commit. A transaction that
+     * recorded no writes is prepared too (its reads stay reserved until Finalize, which then consumes a
+     * commit number like any Submit of an empty batch).
+     */
+    public async Prepare(timeoutMs?: number): Promise<PreparedCommit>
+    {
+        this.RequireActive();
+        this.committing = true;
+        try
+        {
+            const began = this.RequireCatalog();
+            await this.Authorize();
+            return await this.context.Committer.Prepare(this.batch, this.Reads, this.ValidationCommit(), began, timeoutMs);
+        }
+        finally
+        {
+            this.dispose();
+        }
+    }
+
+    /**
+     * The catalog version the transaction began with, when it is still current. Early check, so the gate
+     * never judges writes against a schema that has since changed; the authoritative check is still inside
+     * the commit group against the group's catalog (ruling F4).
+     */
+    private RequireCatalog(): number
+    {
+        const began = this.snapshot.Index.Catalog.Version;
+        if (began !== this.context.CatalogVersion)
+        {
+            throw new ConflictError(GraphTransaction.ErrSchema + began + GraphTransaction.ErrSchemaNow + this.context.CatalogVersion);
+        }
+        return began;
     }
 
     /**

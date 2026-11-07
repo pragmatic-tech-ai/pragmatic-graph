@@ -13,6 +13,7 @@ import { NodeEvaluator } from '../predicate/NodeEvaluator.js';
 import { Predicate } from '../predicate/Predicate.js';
 import { CommitError, CommitErrorCode } from '../txn/CommitError.js';
 import { ConflictKeys } from '../txn/ConflictKeys.js';
+import type { ReadSet } from '../txn/ReadSet.js';
 import type { WriteKeySet } from '../txn/WriteKeySet.js';
 import { IndexKey } from './IndexKey.js';
 
@@ -126,9 +127,10 @@ export class IndexStore
      * Applies an entry diff: deletes every removed entry first, then adds each added one after its
      * unique check (so values moving between nodes in one batch do not collide). Every entry touched is
      * a written conflict key. CommitError UniqueViolation when a unique entry would duplicate another
-     * node's value tuple.
+     * node's value tuple. With `dependencies`, each unique check's scanned range is recorded there too (a
+     * prepare's dry-run, ruling R71).
      */
-    public async Apply(txn: IWriteTransaction, removed: readonly IIndexEntry[], added: readonly IIndexEntry[], keys: WriteKeySet): Promise<void>
+    public async Apply(txn: IWriteTransaction, removed: readonly IIndexEntry[], added: readonly IIndexEntry[], keys: WriteKeySet, dependencies?: ReadSet): Promise<void>
     {
         for (const entry of removed)
         {
@@ -137,6 +139,10 @@ export class IndexStore
         }
         for (const entry of added)
         {
+            if (dependencies !== undefined && entry.UniqueRange !== undefined)
+            {
+                dependencies.AddRange(ConflictKeys.IndexSpace, ConflictKeys.IndexRange(entry.UniqueRange));
+            }
             await this.RequireUnique(txn, entry);
             txn.Put(Keyspace.Index, entry.Key, IndexStore.Empty);
             keys.Add(ConflictKeys.IndexSpace, ConflictKeys.IndexEntry(entry.Key));

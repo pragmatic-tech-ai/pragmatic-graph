@@ -19,6 +19,7 @@ import { GraphError, GraphErrorCode } from '../errors/GraphError.js';
 import type { CatalogIndex } from './CatalogIndex.js';
 import { CommitError, CommitErrorCode } from './CommitError.js';
 import { ConflictKeys } from './ConflictKeys.js';
+import type { ReadSet } from './ReadSet.js';
 import { type ICreateNodeOp, type IDeleteNodeOp, type ILinkOp, type ISetPropertyOp, type IUnlinkOp, WriteBatch, WriteOp } from './WriteBatch.js';
 import { WriteKeySet } from './WriteKeySet.js';
 
@@ -59,6 +60,13 @@ interface ICreatedNode
  * Secondary indexes are maintained at the end of the batch, per node, from its post-batch values (like
  * MissingRequired): every node the batch created, deleted, or set an indexed (or `Where`-read) member of
  * gets its entries recomputed; removed entries are deleted before added ones are unique-checked and put.
+ *
+ * With `dependencies` (a prepare's dry-run, ruling R71) the applier also records, as logical keys, the
+ * state its semantic checks and its write set depend on beyond the keys it writes: Node(publicId) of every
+ * node it resolves, Adjacency(rel, Out, from) of every Link (duplicates, cardinality, siblings, ordering),
+ * Adjacency of every relationship and direction a DeleteNode enumerates, the Cell keys an index diff reads
+ * and the key range of every unique check. While none of them nor the written keys change, re-applying the
+ * batch reaches the same outcome.
  */
 export class BatchApplier
 {
@@ -89,6 +97,7 @@ export class BatchApplier
         private readonly rows: RowIndex,
         private readonly ids: PublicIdIndex,
         private readonly indexes: IndexStore,
+        private readonly dependencies?: ReadSet,
     )
     {
     }
@@ -161,7 +170,18 @@ export class BatchApplier
         {
             return;
         }
-        const before = await this.indexes.EntriesOf(txn, this.index.IndexesFor(node.Concept), node.Location, node.Id, node.PublicId);
+        const indexes = this.index.IndexesFor(node.Concept);
+        if (this.dependencies !== undefined)
+        {
+            for (const m of this.index.Catalog.EffectiveMembers(node.Concept))
+            {
+                if (m.Kind === MemberKind.Property && indexes.some(i => i.Touches(m.Id)))
+                {
+                    this.dependencies.AddKey(ConflictKeys.CellSpace, ConflictKeys.Cell(node.Id, m.Id));
+                }
+            }
+        }
+        const before = await this.indexes.EntriesOf(txn, indexes, node.Location, node.Id, node.PublicId);
         touched.set(node.Id, { Node: node, Before: before, Live: true });
     }
 
@@ -178,7 +198,7 @@ export class BatchApplier
             removed.push(...t.Before.filter(e => !kept.has(e.Hex)));
             added.push(...after.filter(e => !had.has(e.Hex)));
         }
-        await this.indexes.Apply(txn, removed, added, keys);
+        await this.indexes.Apply(txn, removed, added, keys, this.dependencies);
     }
 
     /** R29: each non-nullable property of a newly created node was given a value by the batch. */
@@ -245,6 +265,7 @@ export class BatchApplier
         // Each edge is unlinked at the position its scan already found: no per-edge lookup (F9).
         for (const rel of members.filter(m => m.Kind === MemberKind.Relationship))
         {
+            this.DependOn(rel, node.Id, EdgeDirection.Out);
             for (const edge of await this.Adjacent(txn, rel, node.Id, EdgeDirection.Out))
             {
                 await this.edges.UnlinkAt(txn, rel, node.Id, edge.Node, edge.Position);
@@ -253,6 +274,7 @@ export class BatchApplier
         }
         for (const rel of this.index.IncomingRelationships(node.Concept))
         {
+            this.DependOn(rel, node.Id, EdgeDirection.In);
             for (const edge of await this.Adjacent(txn, rel, node.Id, EdgeDirection.In))
             {
                 await this.edges.UnlinkAt(txn, rel, edge.Node, node.Id, edge.Position);
@@ -284,6 +306,7 @@ export class BatchApplier
         const from = await this.Locate(txn, op.From);
         const rel = this.Relationship(from, op.Relationship);
         const to = await this.Locate(txn, op.To);
+        this.DependOn(rel, from.Id, EdgeDirection.Out);
         if (!this.index.Accepts(rel, to.Concept))
         {
             throw new CommitError(CommitErrorCode.TargetTypeMismatch, BatchApplier.ErrTarget + BatchApplier.Label(from, rel, to));
@@ -353,6 +376,12 @@ export class BatchApplier
         return out;
     }
 
+    /** Records the node's whole adjacency of `rel` in `direction` as a dependency (prepare dry-runs only). */
+    private DependOn(rel: MemberDef, node: bigint, direction: EdgeDirection): void
+    {
+        this.dependencies?.AddRange(ConflictKeys.EdgeSpace, ConflictKeys.Adjacency(rel.Id, direction, node));
+    }
+
     /** The member as nullable, so DeleteNode may null a required property of the deleted slot. */
     private static Erasable(member: MemberDef): MemberDef
     {
@@ -392,6 +421,7 @@ export class BatchApplier
     private async Locate(txn: IWriteTransaction, publicId: string): Promise<INode>
     {
         BatchApplier.RequirePublicId(publicId);
+        this.dependencies?.AddKey(ConflictKeys.NodeSpace, ConflictKeys.Node(publicId));
         const id = await this.ids.Resolve(txn, publicId);
         if (id === undefined)
         {
