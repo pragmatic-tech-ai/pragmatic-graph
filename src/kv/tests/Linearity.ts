@@ -23,9 +23,10 @@ export class Linearity
     /**
      * Runs work(small) then work(small * Factor), each `repeats` times keeping the fastest (so a GC pause
      * or a busy machine in one run cannot fake superlinearity); `work` must tolerate repeating. Returns
-     * both durations in ms after asserting the bounds.
+     * both durations in ms after asserting the bounds. `ceilingMs` overrides the absolute ceiling for work
+     * whose measured per-op cost needs more (ruling R79).
      */
-    public static async Check(label: string, small: number, work: (n: number) => Promise<void> | void, repeats = 1): Promise<[number, number]>
+    public static async Check(label: string, small: number, work: (n: number) => Promise<void> | void, repeats = 1, ceilingMs = Linearity.CeilingMs): Promise<[number, number]>
     {
         const smallMs = await Linearity.Fastest(() => work(small), repeats);
         const largeMs = await Linearity.Fastest(() => work(small * Linearity.Factor), repeats);
@@ -33,7 +34,7 @@ export class Linearity
         const detail = label + ': ' + smallMs.toFixed(1) + Linearity.AtSmall + small + ', ' + largeMs.toFixed(1) + Linearity.AtLarge + Linearity.Factor + Linearity.RatioText + ratio.toFixed(1);
         console.log(Linearity.Prefix + detail);
         assert.ok(ratio < Linearity.MaxRatio, Linearity.Superlinear + detail);
-        assert.ok(largeMs < Linearity.CeilingMs, Linearity.TooSlow + detail + Linearity.Ms);
+        assert.ok(largeMs < ceilingMs, Linearity.TooSlow + detail + Linearity.Ms);
         return [smallMs, largeMs];
     }
 

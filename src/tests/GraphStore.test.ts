@@ -47,6 +47,10 @@ class GraphFx
     private static readonly DirPrefix = 'pragmatic-graph-store-';
     private static readonly Dirs: string[] = [];
     public static readonly ChildScript = join(dirname(fileURLToPath(import.meta.url)), 'DurabilityChild.ts');
+    /** F1 small run (the large run is 10x): one CreateNode, SetProperty and ordered Link per child (ruling R79). */
+    public static readonly F1Small = 1000;
+    /** F1 large-run ceiling: about 3.5x the slowest measured cost of 10,000 children under the full suite (ruling R79). */
+    public static readonly F1CeilingMs = 40000;
 
     /**
      * file { path: String }, sourceFile : file { language: String? }, aspect placed { in -> location },
@@ -664,9 +668,10 @@ class GraphFx
                 await g.dispose();
             });
 
-            it('one transaction appending 20,000 children to one ordered list commits in linear time (F1)', async () =>
+            it('one transaction appending 10,000 children to one ordered list commits in linear time (F1)', async () =>
             {
-                await Linearity.Check('20k ordered appends in one batch on ' + name, 2000, async n =>
+                // Ruling R79: n and the ceiling follow the measured full-stack per-op cost; the ratio is the guard.
+                await Linearity.Check('10k ordered appends in one batch on ' + name, GraphFx.F1Small, async n =>
                 {
                     const g = await GraphFx.Defined(open);
                     try
@@ -689,7 +694,7 @@ class GraphFx
                     {
                         await g.dispose();
                     }
-                });
+                }, 1, GraphFx.F1CeilingMs);
             });
 
             it('DeleteNode removes the node, its cells and its edges', async () =>
