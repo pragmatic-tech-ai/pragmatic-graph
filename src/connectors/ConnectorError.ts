@@ -1,0 +1,35 @@
+import { GraphError, GraphErrorCode } from '../errors/GraphError.js';
+
+/** The step of a write-through that failed. */
+export enum ConnectorPhase
+{
+    Begin = 'Begin',
+    Apply = 'Apply',
+    Commit = 'Commit',
+    /** The engine's own Finalize after every connector committed (Connector is BindingTable.EngineStorage). */
+    Finalize = 'Finalize',
+}
+
+/**
+ * A write-through failed (spec §6): a connector call threw or timed out, or the engine could not finalize
+ * after the connectors committed. Every connector that began was reverted (a call still hanging at the
+ * timeout is reverted once it returns). `cause` is the failure; when a revert also failed it is an
+ * AggregateError holding the failure first, then each revert error. The engine is unchanged.
+ */
+export class ConnectorError extends GraphError
+{
+    private static readonly ErrorName = 'ConnectorError';
+    private static readonly MessageStart = 'Connector ';
+    private static readonly MessageMiddle = ' failed in ';
+
+    public constructor(
+        /** The connector whose call failed; BindingTable.EngineStorage for a Finalize failure. */
+        public readonly Connector: string,
+        public readonly Phase: ConnectorPhase,
+        cause: unknown,
+    )
+    {
+        super(GraphErrorCode.ConnectorFailed, ConnectorError.MessageStart + Connector + ConnectorError.MessageMiddle + Phase, cause);
+        this.name = ConnectorError.ErrorName;
+    }
+}

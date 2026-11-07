@@ -366,6 +366,12 @@ export class CatalogSnapshot
         return this.byName.has(name);
     }
 
+    /** The concept or aspect of that name, or undefined when none is defined. */
+    public Definition(name: string): TypeDefinition | undefined
+    {
+        return this.byName.get(name);
+    }
+
     public IsA(concept: string, conceptOrAspect: string): boolean
     {
         this.RequireConcept(concept);

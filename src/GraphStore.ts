@@ -2,6 +2,9 @@ import { AccessScope } from './access/AccessScope.js';
 import { CatalogModel } from './catalog/CatalogModel.js';
 import type { CatalogSnapshot } from './catalog/CatalogSnapshot.js';
 import { CatalogStore } from './catalog/CatalogStore.js';
+import type { BindingTable } from './connectors/BindingTable.js';
+import type { ConnectorError } from './connectors/ConnectorError.js';
+import type { IGraphConnector } from './connectors/GraphConnector.js';
 import { GraphError, GraphErrorCode } from './errors/GraphError.js';
 import { FormatMeta } from './format/FormatMeta.js';
 import { GraphContext, type ReadSnapshot } from './GraphContext.js';
@@ -35,12 +38,18 @@ export class GraphStore
 
     /** Raised once per applied commit, in commit order, after the commit is durable. Subscribe-only. */
     public readonly CommitApplied: ISignal<ICommitApplied>;
+    /**
+     * Raised when a connector call that was still hanging at a write-through's timeout returned and
+     * reverting its transaction then failed (the commit itself had already failed with ConnectorError).
+     */
+    public readonly ConnectorRevertFailed: ISignal<ConnectorError>;
 
     private disposing: Promise<void> | undefined;
 
     private constructor(private readonly context: GraphContext)
     {
         this.CommitApplied = new SignalView(context.Committer.CommitApplied);
+        this.ConnectorRevertFailed = new SignalView(context.ConnectorRevertFailed);
     }
 
     /**
@@ -90,6 +99,19 @@ export class GraphStore
         const result = await this.context.Committer.SubmitUpgrade(description);
         this.context.SetCatalog(result.Catalog);
         return result;
+    }
+
+    /**
+     * Internal (the engine host feeds it from the schema description): installs the connector bindings
+     * and the connectors they name, for commits that start afterwards. Writes routed to a connector are
+     * written through it (ruling R72); `timeoutMs` bounds the connector phase of each such commit (default
+     * Committer.DefaultPrepareTimeoutMs). GraphError InvalidArgument for a binding to a connector not
+     * given, duplicate or reserved connector names, or a bad timeout.
+     */
+    public SetConnectors(bindings: BindingTable, connectors: readonly IGraphConnector[], timeoutMs?: number): void
+    {
+        this.RequireLive();
+        this.context.SetConnectors(bindings, connectors, timeoutMs);
     }
 
     /** The Version of the description the last upgrade applied (Meta("schemaVersion")); undefined before any. */
@@ -251,6 +273,7 @@ export class GraphStore
     {
         await this.context.Committer.dispose();
         this.context.DisposeReaders();
+        this.context.ConnectorRevertFailed.dispose();
         await this.context.Store.dispose();
     }
 }

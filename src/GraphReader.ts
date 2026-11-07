@@ -336,6 +336,16 @@ export class GraphReader implements IGraphDisposable
         return this.evaluator ?? (this.writeEvaluator ??= new ScopeEvaluator(this.scope, this.recorded));
     }
 
+    /**
+     * The owner ('' for none) and concept of the live node with that public id, unscoped (a write-through
+     * routes by it whatever the scope may see); undefined when there is none. Records the node's binding.
+     */
+    protected async NodeOrigin(publicId: string): Promise<{ readonly Owner: string; readonly Concept: string } | undefined>
+    {
+        const node = await this.recorded.Locate(publicId);
+        return node === undefined ? undefined : { Owner: await this.recorded.Owner(node), Concept: node.Concept };
+    }
+
     protected RequireOpen(): void
     {
         if (this.disposed)

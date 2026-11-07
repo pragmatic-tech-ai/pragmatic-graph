@@ -2,6 +2,7 @@ import type { AccessScope } from './access/AccessScope.js';
 import { AccessError } from './access/AccessError.js';
 import { WriteGate } from './access/WriteGate.js';
 import type { CellValue } from './columns/CellValue.js';
+import { type INodeOrigins, WriteCoordinator } from './connectors/WriteCoordinator.js';
 import type { GraphContext, ReadSnapshot } from './GraphContext.js';
 import { GraphError, GraphErrorCode } from './errors/GraphError.js';
 import { GraphReader } from './GraphReader.js';
@@ -23,6 +24,11 @@ import { type ICreateNodeOptions, type LinkOptions, WriteBatch } from './txn/Wri
  * submitted; WriteGate); with CommitError when the writes are semantically invalid. Commit always ends
  * the transaction, whatever its outcome; retry on a new transaction. dispose() without Commit discards
  * the writes.
+ *
+ * When the store has connectors installed and the batch writes nodes bound to one (BindingTable), Commit
+ * is a write-through (ruling R72): the engine prepares, every participating connector begins, applies
+ * and commits, then the engine finalizes. Any connector failure, the timeout, or a failed Finalize
+ * reverts every connector that began, leaves the engine unchanged and fails with ConnectorError.
  */
 export class GraphTransaction extends GraphReader
 {
@@ -87,6 +93,18 @@ export class GraphTransaction extends GraphReader
                 return this.SnapshotCommit;
             }
             await this.Authorize();
+            const setup = this.context.Connectors;
+            if (setup !== undefined)
+            {
+                // Routing reads the snapshot unscoped and records it like any read (ruling R72).
+                const origins: INodeOrigins = { Origin: id => this.NodeOrigin(id) };
+                const sets = await WriteCoordinator.Route(this.batch, setup.Bindings, this.snapshot.Index.Catalog, origins);
+                if (sets.size > 0)
+                {
+                    const prepare = () => this.context.Committer.Prepare(this.batch, this.Reads, this.ValidationCommit(), began, setup.TimeoutMs);
+                    return await new WriteCoordinator(setup, this.context.ConnectorRevertFailed).Run(prepare, sets);
+                }
+            }
             return await this.context.Committer.Submit(this.batch, this.Reads, this.ValidationCommit(), began);
         }
         finally

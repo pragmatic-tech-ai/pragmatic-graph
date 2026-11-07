@@ -3,6 +3,10 @@ import { ScopeValidator } from './access/ScopeValidator.js';
 import type { CatalogSnapshot } from './catalog/CatalogSnapshot.js';
 import { CatalogStore } from './catalog/CatalogStore.js';
 import { ColumnStore } from './columns/ColumnStore.js';
+import type { BindingTable } from './connectors/BindingTable.js';
+import type { ConnectorError } from './connectors/ConnectorError.js';
+import type { IGraphConnector } from './connectors/GraphConnector.js';
+import { ConnectorSetup } from './connectors/WriteCoordinator.js';
 import { EdgeStore } from './edges/EdgeStore.js';
 import { PublicIdIndex } from './identity/PublicIdIndex.js';
 import { RowIndex } from './identity/RowIndex.js';
@@ -10,8 +14,9 @@ import { IndexStore } from './indexes/IndexStore.js';
 import type { IKeyValueStore, IReadTransaction } from './kv/KeyValue.js';
 import { CatalogIndex } from './txn/CatalogIndex.js';
 import { CommitLog } from './txn/CommitLog.js';
-import type { Committer } from './txn/Committer.js';
+import { Committer } from './txn/Committer.js';
 import type { ISnapshotHandle } from './txn/ConflictHistory.js';
+import { Signal } from './txn/Signal.js';
 
 /** Something the GraphStore must end when it is disposed (open readers and transactions). */
 export interface IGraphDisposable
@@ -62,11 +67,14 @@ export class GraphContext
     public readonly Rows = new RowIndex();
     public readonly Ids = new PublicIdIndex();
     public readonly Indexes = new IndexStore(this.Columns, this.Ids);
+    /** Raised when reverting a connector call that was still hanging at the write-through timeout failed (ruling R72). */
+    public readonly ConnectorRevertFailed = new Signal<ConnectorError>();
 
     private readonly open = new Set<IGraphDisposable>();
     /** Per scope, the catalog version it was last validated against (ruling R63). */
     private readonly validated = new WeakMap<AccessScope, number>();
     private index: CatalogIndex;
+    private connectors: ConnectorSetup | undefined;
 
     public constructor(public readonly Store: IKeyValueStore, public readonly Committer: Committer, catalog: CatalogSnapshot)
     {
@@ -77,6 +85,24 @@ export class GraphContext
     public get CatalogVersion(): number
     {
         return this.index.Catalog.Version;
+    }
+
+    /** The installed bindings and connectors; undefined (every write engine-only) until SetConnectors. */
+    public get Connectors(): ConnectorSetup | undefined
+    {
+        return this.connectors;
+    }
+
+    /**
+     * Installs the bindings and the connectors they name, for commits that start afterwards (ruling R72).
+     * `timeoutMs` bounds each write-through's connector phase (default Committer.DefaultPrepareTimeoutMs).
+     * GraphError InvalidArgument when a binding or the default names a connector not given (other than
+     * BindingTable.EngineStorage), two connectors share a name, a connector uses the reserved name, or
+     * the timeout is not a finite non-negative number.
+     */
+    public SetConnectors(bindings: BindingTable, connectors: readonly IGraphConnector[], timeoutMs: number = Committer.DefaultPrepareTimeoutMs): void
+    {
+        this.connectors = new ConnectorSetup(bindings, connectors, timeoutMs);
     }
 
     /** Makes a newly committed catalog current for later readers (the committer already applies it). Older versions are ignored. */

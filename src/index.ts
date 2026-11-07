@@ -33,6 +33,12 @@ export { EdgeError, EdgeErrorCode } from './edges/EdgeError.js';
 export { PublicIdTooLongError } from './identity/PublicIdIndex.js';
 export { FormatVersionMismatchError } from './format/FormatMeta.js';
 
+// Connectors: bindings and the write-through contract (spec §5, ruling R72).
+export type { IConnectorTransaction, IGraphConnector } from './connectors/GraphConnector.js';
+export { ConnectorChangeSet, type ConnectorChange } from './connectors/ConnectorChangeSet.js';
+export { BindingTable } from './connectors/BindingTable.js';
+export { ConnectorError, ConnectorPhase } from './connectors/ConnectorError.js';
+
 // Predicate language and node-local evaluation.
 export { And, Compare, CompareOp, FalsePredicate, IdIn, In, IsNull, Not, Or, OwnerIs, Predicate, PredicateKind, Reachable, Related, Seeded, TruePredicate, type IPathStep } from './predicate/Predicate.js';
 export { PredicateCodec } from './predicate/PredicateCodec.js';
