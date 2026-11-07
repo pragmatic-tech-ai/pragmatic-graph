@@ -353,7 +353,7 @@ export class Committer
     private disposed = false;
     /** The installed bindings and connectors (ruling R72); undefined: every write is engine-only. */
     private connectors: ConnectorSetup | undefined;
-    /** Bumped by every InstallConnectors; 0 while none was ever installed (ruling R77). */
+    /** Bumped by every InstallConnectors that changes the routing; 0 while none was ever installed (ruling R77). */
     private generation = 0;
 
     public constructor(private readonly store: IKeyValueStore, catalog: CatalogSnapshot, options?: ICommitterOptions)
@@ -422,15 +422,22 @@ export class Committer
     }
 
     /**
-     * Installs connector bindings for commits routed afterwards (ruling R77): a new generation, so every
-     * batch or prepare routed with the previous setup and not yet applied fails with ConflictError
-     * (retry-safe), and every reservation is invalidated (a prepared commit routed with the old setup
-     * fails Finalize with ConflictError, as after a schema change). SubmitUpgrade installs inside the
-     * upgrade's own turn instead.
+     * Installs connector bindings for commits routed afterwards (ruling R77). When the setup routes
+     * differently from the installed one (ConnectorSetup.RoutesLike): a new generation, so every batch or
+     * prepare routed with the previous setup and not yet applied fails with ConflictError (retry-safe),
+     * and every reservation is invalidated (a prepared commit routed with the old setup fails Finalize
+     * with ConflictError, as after a schema change). Identical routing (a dev host re-applying the same
+     * description on every save) keeps the generation and the reservations: commits in flight proceed.
+     * SubmitUpgrade installs inside the upgrade's own turn instead.
      */
     public InstallConnectors(setup: ConnectorSetup): void
     {
+        const same = this.connectors !== undefined && this.connectors.RoutesLike(setup);
         this.connectors = setup;
+        if (same)
+        {
+            return;
+        }
         this.generation++;
         this.reservations.InvalidateAll();
     }

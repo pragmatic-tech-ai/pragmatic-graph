@@ -89,6 +89,31 @@ export class BindingTable
         return byConcept.get(BindingTable.ModelWide) ?? this.DefaultConnector;
     }
 
+    /** True when `other` holds the same bindings (by model and concept) and the same DefaultConnector. */
+    public SameAs(other: BindingTable): boolean
+    {
+        if (this.DefaultConnector !== other.DefaultConnector || this.models.size !== other.models.size)
+        {
+            return false;
+        }
+        for (const [model, byConcept] of this.models)
+        {
+            const theirs = other.models.get(model);
+            if (theirs === undefined || theirs.size !== byConcept.size)
+            {
+                return false;
+            }
+            for (const [concept, connector] of byConcept)
+            {
+                if (theirs.get(concept) !== connector)
+                {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
     /** True when `connector` (a Resolve result) means engine-only. */
     public static IsEngineOnly(connector: string | undefined): boolean
     {

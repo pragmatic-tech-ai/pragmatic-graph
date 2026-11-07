@@ -59,6 +59,27 @@ export class ConnectorSetup
         }
         this.Connectors = byName;
     }
+
+    /**
+     * True when `other` routes every write exactly as this setup does: the same binding table (bindings
+     * and DefaultConnector, BindingTable.SameAs) and, per name, the same connector object. The timeout is
+     * not compared: it bounds a write-through but does not route it.
+     */
+    public RoutesLike(other: ConnectorSetup): boolean
+    {
+        if (!this.Bindings.SameAs(other.Bindings) || this.Connectors.size !== other.Connectors.size)
+        {
+            return false;
+        }
+        for (const [name, connector] of this.Connectors)
+        {
+            if (other.Connectors.get(name) !== connector)
+            {
+                return false;
+            }
+        }
+        return true;
+    }
 }
 
 /** The connector call in flight when the connector phase timed out. */

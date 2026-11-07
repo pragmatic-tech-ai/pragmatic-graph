@@ -361,6 +361,29 @@ class EngineFx
                 await engine.dispose();
             });
 
+            it('re-applying identical bindings keeps commits in flight valid', async () =>
+            {
+                const log: string[] = [];
+                const a = new FakeConnector(EngineFx.A, log);
+                const bound = (version: string): ISchemaDescription => D.Desc(version, true, [{ Model: EngineFx.Crm, Connector: EngineFx.A }, { Model: EngineFx.Crm, Concept: D.Item, Connector: EngineFx.A }], Api.BindingTable.EngineStorage);
+                const engine = await GraphEngine.Open({ Description: bound(D.V1Version), Storage: storage(), Connectors: [a] });
+                await EngineFx.Write(engine, t => t.CreateNode('c1', D.Item, { Owner: EngineFx.Crm }));
+                for (const version of [D.V1Version, 'v1-saved-again'])
+                {
+                    const t = await engine.Begin(AccessScope.System);
+                    t.SetProperty('c1', D.Name, version);
+                    const gate = EngineFx.HoldRouting(t);
+                    const commit = t.Commit();
+                    await gate.Reached;
+                    await engine.Upgrade(bound(version));
+                    gate.Release();
+                    await commit;
+                    assert.equal(await EngineFx.Value(engine, 'c1', D.Name), version, 'identical bindings: the commit in flight succeeds');
+                }
+                assert.equal(a.Applied.length, 3);
+                await engine.dispose();
+            });
+
             it('a prepared write-through finalizing after a bindings-only upgrade is reverted', async () =>
             {
                 const a = new FakeConnector(EngineFx.A, []);
