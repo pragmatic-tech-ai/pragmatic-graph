@@ -177,6 +177,32 @@ class GraphFx
     {
         describe('GraphStore on ' + name, () =>
         {
+            it('a CommitApplied handler of a schema change or upgrade already sees the new catalog: its transaction commits', async () =>
+            {
+                const g = await open();
+                const seen: Array<[number, number]> = [];
+                const work: Array<Promise<bigint>> = [];
+                g.CommitApplied.Subscribe(e =>
+                {
+                    if (e.Kind === CommitKind.Batch)
+                    {
+                        return;
+                    }
+                    seen.push([e.CatalogVersion, EngineInternals.Context(g).CatalogVersion]);
+                    work.push(GraphFx.Commit(g, t =>
+                    {
+                        t.CreateNode('n' + e.CatalogVersion, 'file');
+                        t.SetProperty('n' + e.CatalogVersion, 'path', '/n');
+                    }));
+                });
+                await g.DefineSchema(m => GraphFx.Define(m));
+                assert.equal(typeof (await work[0]), 'bigint', 'begun from the schema change handler');
+                await g.Upgrade({ Version: 'v1', Definitions: [{ Name: 'file', IsAspect: false, Parent: null, Aspects: [], Members: [{ Name: 'path', Kind: MemberKind.Property, Type: ValueType.String, Nullable: true }] }], Indexes: [], Seed: [], Bindings: [] });
+                assert.equal(typeof (await work[1]), 'bigint', 'begun from the upgrade handler');
+                assert.deepEqual(seen, [[1, 1], [2, 2]], 'the context catalog is the committer catalog when the signal is raised');
+                await g.dispose();
+            });
+
             it('a new reader sees committed values, edges in both directions and nothing for unknown nodes', async () =>
             {
                 const g = await GraphFx.Defined(open);

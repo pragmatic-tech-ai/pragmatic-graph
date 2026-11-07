@@ -1,6 +1,5 @@
 import type { AccessScope } from './access/AccessScope.js';
 import { ScopeValidator } from './access/ScopeValidator.js';
-import type { CatalogSnapshot } from './catalog/CatalogSnapshot.js';
 import { CatalogStore } from './catalog/CatalogStore.js';
 import { ColumnStore } from './columns/ColumnStore.js';
 import type { BindingTable } from './connectors/BindingTable.js';
@@ -56,9 +55,9 @@ export class ReadSnapshot
 }
 
 /**
- * Internal state shared by a GraphStore and its readers: the KV store, the committer, read-side
- * building blocks (stateless across transactions; their caches are keyed by transaction), the current
- * catalog and the set of open readers. Not part of the public API.
+ * Internal state shared by a GraphStore and its readers: the KV store, the committer (which holds the
+ * current catalog), read-side building blocks (stateless across transactions; their caches are keyed
+ * by transaction) and the set of open readers. Not part of the public API.
  */
 export class GraphContext
 {
@@ -73,17 +72,18 @@ export class GraphContext
     private readonly open = new Set<IGraphDisposable>();
     /** Per scope, the catalog version it was last validated against (ruling R63). */
     private readonly validated = new WeakMap<AccessScope, number>();
-    private index: CatalogIndex;
 
-    public constructor(public readonly Store: IKeyValueStore, public readonly Committer: Committer, catalog: CatalogSnapshot)
+    public constructor(public readonly Store: IKeyValueStore, public readonly Committer: Committer)
     {
-        this.index = new CatalogIndex(catalog);
     }
 
-    /** Version of the newest catalog the store has saved through this context. */
+    /**
+     * Version of the current catalog: the committer's (one source of truth), so a transaction begun from
+     * a CommitApplied handler of a schema change or an upgrade already sees the new version.
+     */
     public get CatalogVersion(): number
     {
-        return this.index.Catalog.Version;
+        return this.Committer.Catalog.Version;
     }
 
     /** The installed bindings and connectors (held by the committer); undefined (every write engine-only) until installed. */
@@ -103,16 +103,6 @@ export class GraphContext
     public SetConnectors(bindings: BindingTable, connectors: readonly IGraphConnector[], timeoutMs: number = Committer.DefaultPrepareTimeoutMs): void
     {
         this.Committer.InstallConnectors(new ConnectorSetup(bindings, connectors, timeoutMs));
-    }
-
-    /** Makes a newly committed catalog current for later readers (the committer already applies it). Older versions are ignored. */
-    public SetCatalog(snapshot: CatalogSnapshot): void
-    {
-        if (snapshot.Version <= this.index.Catalog.Version)
-        {
-            return;
-        }
-        this.index = new CatalogIndex(snapshot);
     }
 
     /**
@@ -170,7 +160,7 @@ export class GraphContext
     /** The catalog stored in the transaction's snapshot: the current one, or loaded when the snapshot predates it. */
     private async IndexFor(txn: IReadTransaction): Promise<CatalogIndex>
     {
-        const current = this.index;
+        const current = this.Committer.Index;
         if ((await CatalogStore.StoredVersion(txn)) === current.Catalog.Version)
         {
             return current;

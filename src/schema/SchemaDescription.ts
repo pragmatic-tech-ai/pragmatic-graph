@@ -12,10 +12,11 @@ export interface ISchemaDescription
     readonly Version: string;
     readonly Definitions: readonly IDefinitionDescription[];
     readonly Indexes: readonly IIndexDescription[];
-    /** Nodes created with the schema (consumed by a later task). */
+    /** Nodes created with the schema: applied by every upgrade that changes the version or the catalog (spec 4.3, seed wins for seeded nodes; ruling R53). */
     readonly Seed: readonly ISeedNode[];
-    /** Connector bindings (consumed by a later task). */
+    /** Connector bindings: which connector stores each (model, concept); installed by the upgrade that applies the description (rulings R72, R77). */
     readonly Bindings: readonly IBindingDescription[];
+    /** The connector for nodes no binding matches; absent means engine storage. */
     readonly DefaultConnector?: string;
 }
 

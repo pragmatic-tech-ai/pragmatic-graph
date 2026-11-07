@@ -21,10 +21,13 @@ import type { ISchemaDescription } from './schema/SchemaDescription.js';
 import { type ISignal, SignalView } from './txn/Signal.js';
 
 /**
- * The embedding API of the graph engine: one graph over one durable (LMDB) or in-memory store.
+ * The low-level store of the graph engine: one graph over one durable (LMDB) or in-memory store. Hosts
+ * use GraphEngine, which opens a GraphStore and gives it its schema through Upgrade (a schema
+ * description, with its seed and connector bindings); DefineSchema is the low-level schema path kept
+ * for tests and internals (ruling R74).
  *
- * Define the schema with DefineSchema, read with BeginRead (a snapshot), write with Begin (an
- * optimistic, serializable transaction) and listen to CommitApplied for every applied commit, in order.
+ * Read with BeginRead (a snapshot), write with Begin (an optimistic, serializable transaction) and
+ * listen to CommitApplied for every applied commit, in order.
  * Both take the AccessScope their reads are enforced under (AccessScope.System sees everything).
  * A commit is durable once its Commit() promise resolves. dispose() waits for a commit already being
  * written, ends open readers and transactions, and closes the store.
@@ -80,7 +83,6 @@ export class GraphStore
     {
         this.RequireLive();
         const result = await this.context.Committer.SubmitSchema(define);
-        this.context.SetCatalog(result.Catalog);
         return result.Commit;
     }
 
@@ -104,9 +106,7 @@ export class GraphStore
     {
         this.RequireLive();
         const setup = connectors === undefined ? undefined : new ConnectorSetup(new BindingTable(description.Bindings, description.DefaultConnector), connectors, timeoutMs);
-        const result = await this.context.Committer.SubmitUpgrade(description, setup);
-        this.context.SetCatalog(result.Catalog);
-        return result;
+        return await this.context.Committer.SubmitUpgrade(description, setup);
     }
 
     /**
@@ -114,8 +114,11 @@ export class GraphStore
      * and the connectors they name, for commits that start afterwards. Writes routed to a connector are
      * written through it (ruling R72); `timeoutMs` bounds the connector phase of each such commit (default
      * Committer.DefaultPrepareTimeoutMs). GraphError InvalidArgument for a binding to a connector not
-     * given, duplicate or reserved connector names, or a bad timeout. A commit routed with the previous
-     * bindings and not yet applied fails with ConflictError (ruling R77).
+     * given, duplicate or reserved connector names, or a bad timeout. When the new setup routes differently
+     * (ruling R77), in-flight work routed with the old setup conflicts: a commit not yet applied, a
+     * write-through whose prepare is queued or dry-running, and a prepared one at its Finalize (its
+     * connectors are then reverted) all fail with ConflictError (a ConnectorError Finalize wrapping it for
+     * the last); identical routing leaves them alone.
      */
     public SetConnectors(bindings: BindingTable, connectors: readonly IGraphConnector[], timeoutMs?: number): void
     {
@@ -176,7 +179,7 @@ export class GraphStore
 
     /**
      * A read-write transaction over a snapshot of the latest commit, reading under `scope` (validated as
-     * for BeginRead; writes are not gated by it yet).
+     * for BeginRead); Commit checks every write against the scope first (the write gate, ruling R68).
      */
     public async Begin(scope: AccessScope): Promise<GraphTransaction>
     {
@@ -209,7 +212,7 @@ export class GraphStore
                 read.dispose();
             }
             const committer = await Committer.Open(store, catalog);
-            return new GraphStore(new GraphContext(store, committer, catalog));
+            return new GraphStore(new GraphContext(store, committer));
         }
         catch (error)
         {

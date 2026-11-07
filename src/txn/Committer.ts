@@ -449,6 +449,15 @@ export class Committer
     }
 
     /**
+     * The current catalog's index: the single source of truth for the current catalog (GraphContext reads
+     * it), replaced before CommitApplied is raised for a schema change or an upgrade.
+     */
+    public get Index(): CatalogIndex
+    {
+        return this.index;
+    }
+
+    /**
      * Low-level: later groups apply batches against this catalog (a group already running keeps its
      * catalog). Bypasses the log; GraphStore changes the schema through SubmitSchema instead.
      */
@@ -998,8 +1007,9 @@ export class Committer
     }
 
     /**
-     * One prepare, after every commit of its group published: the history, catalog-version and
-     * reservation read checks, ids, the dry-run, the reservation write check, then the reservation.
+     * One prepare, after every commit of its group published: the history, catalog-version, binding
+     * generation and reservation read checks, ids, the dry-run, the generation again (a setup installed
+     * meanwhile), the reservation write check, then the reservation.
      */
     private async RunPrepare(p: PendingPrepare): Promise<void>
     {
@@ -1029,6 +1039,13 @@ export class Committer
         if (this.disposed)
         {
             p.Reject(new GraphError(GraphErrorCode.Disposed, Committer.ErrDisposed));
+            return;
+        }
+        // The setup may have been replaced while the dry-run awaited: its InvalidateAll ran before this reservation existed.
+        const replaced = this.GenerationConflict(p.BindingGeneration);
+        if (replaced !== undefined)
+        {
+            p.Reject(replaced);
             return;
         }
         // Its dependencies too: another prepared commit's Finalize may change what its own dry-run relied on.

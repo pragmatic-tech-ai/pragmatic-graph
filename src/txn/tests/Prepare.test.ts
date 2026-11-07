@@ -30,6 +30,9 @@ import { ReadSet } from '../ReadSet.js';
 import { PreparedCommit } from '../PreparedCommit.js';
 import { ReservationState, Reservations } from '../Reservations.js';
 import { WriteBatch } from '../WriteBatch.js';
+import { BindingTable } from '../../connectors/BindingTable.js';
+import { ConnectorSetup } from '../../connectors/WriteCoordinator.js';
+import { FakeConnector } from '../../connectors/tests/FakeConnector.js';
 
 /** A committer whose allocator counts every id it hands out. */
 class CountingCommitter extends Committer
@@ -137,6 +140,8 @@ class PrepFx
     public static readonly ByName = 'byName';
     public static readonly Friends = 'friends';
     public static readonly Skipped = 'skipped';
+    public static readonly Model = 'crm';
+    public static readonly ConnectorName = 'A';
     public static readonly Spaces: readonly Keyspace[] = Object.values(Keyspace);
 
     public static Catalog(): CatalogSnapshot
@@ -614,6 +619,25 @@ class PrepFx
                 await PrepFx.Commits(blocker);
                 await PrepFx.Commits(finalized);
                 assert.equal(c.ReservationCount, 0);
+                await c.dispose();
+                await inner.dispose();
+            });
+
+            it('a prepare whose routing setup is replaced during its dry-run fails with ConflictError', async () =>
+            {
+                const inner = await open();
+                const store = new GatedStore(inner);
+                const c = await PrepFx.Committer(store);
+                const generation = c.BindingGeneration;
+                // No CreateNode: no id allocation, so the held Write is the dry-run's.
+                store.Hold();
+                const prepare = PrepFx.Settle(c.Prepare(PrepFx.Batch(b => b.SetProperty('a', PrepFx.Age, 5n)), new ReadSet(), c.LastCommit(), c.Catalog.Version, undefined, generation));
+                await store.Entered;
+                c.InstallConnectors(new ConnectorSetup(new BindingTable([{ Model: PrepFx.Model, Connector: PrepFx.ConnectorName }]), [new FakeConnector(PrepFx.ConnectorName, [])], 1000));
+                assert.notEqual(c.BindingGeneration, generation);
+                store.Release();
+                assert.ok((await prepare) instanceof ConflictError, 'routed with the replaced setup');
+                assert.equal(c.ReservationCount, 0, 'nothing stays reserved');
                 await c.dispose();
                 await inner.dispose();
             });
