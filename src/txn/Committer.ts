@@ -73,7 +73,7 @@ class PendingCommit
     /**
      * `CatalogVersion`: the version the submitter's transaction began with; checked inside the group
      * against the group's catalog (ruling F4). Undefined: no check. `Finalizes`: the reservation of the
-     * prepared commit this batch finalizes (ruling R71); settling the batch ends it.
+     * prepared commit this batch finalizes (ruling R71), owned by `owner`; settling the batch ends it.
      */
     public constructor(
         public readonly Bytes: Uint8Array,
@@ -84,6 +84,7 @@ class PendingCommit
         private readonly reject: (error: unknown) => void,
         public readonly CatalogVersion?: number,
         public readonly Finalizes?: Reservation,
+        private readonly owner?: Reservations,
     )
     {
     }
@@ -92,7 +93,7 @@ class PendingCommit
     {
         if (this.Settle())
         {
-            this.Finalizes?.End(ReservationState.Finalized);
+            this.EndReservation(ReservationState.Finalized);
             this.resolve(commit);
         }
     }
@@ -101,8 +102,16 @@ class PendingCommit
     {
         if (this.Settle())
         {
-            this.Finalizes?.End(ReservationState.Failed);
+            this.EndReservation(ReservationState.Failed);
             this.reject(error);
+        }
+    }
+
+    private EndReservation(state: ReservationState): void
+    {
+        if (this.Finalizes !== undefined && this.owner !== undefined)
+        {
+            this.owner.End(this.Finalizes, state);
         }
     }
 
@@ -431,8 +440,8 @@ export class Committer
      * against the committer's, ids are allocated (outside any Write, ruling R16), and the batch is
      * dry-run inside a store.Write that is then aborted, so semantic errors surface now and its write keys
      * are known. Rejects exactly as Submit would (ConflictError, CommitError, GraphError InvalidArgument),
-     * and with ConflictError when it reads keys another prepared commit writes or writes keys another
-     * reserved. Resolves with a PreparedCommit holding a reservation for `timeoutMs` (default
+     * and with ConflictError when its reads or dry-run dependencies hit keys another prepared commit writes,
+     * or its write keys hit keys another reserved (also for an empty batch: its reads stay reserved). Resolves with a PreparedCommit holding a reservation for `timeoutMs` (default
      * DefaultPrepareTimeoutMs): until it finalizes, aborts or expires, a commit that writes what it read,
      * depends on or writes, or that writes after reading what it writes, fails with ConflictError.
      * Unrelated commits proceed. The batch and read set are captured now.
@@ -474,14 +483,14 @@ export class Committer
         {
             return Promise.reject(new GraphError(GraphErrorCode.InvalidArgument, Committer.ErrForeign));
         }
-        const refused = prepared.Reservation.BeginFinalize();
+        const refused = this.reservations.BeginFinalize(prepared.Reservation);
         if (refused !== undefined)
         {
             return Promise.reject(refused);
         }
         return new Promise<bigint>((resolve, reject) =>
         {
-            const pending = new PendingCommit(prepared.Bytes, prepared.Batch, new ReadSet(), this.history.Last, resolve, reject, prepared.CatalogVersion, prepared.Reservation);
+            const pending = new PendingCommit(prepared.Bytes, prepared.Batch, new ReadSet(), this.history.Last, resolve, reject, prepared.CatalogVersion, prepared.Reservation, this.reservations);
             pending.Ids = [...prepared.Ids];
             this.Push(pending);
         });
@@ -659,6 +668,8 @@ export class Committer
         this.history.Record(commit, new WriteKeySet());
         this.history.Prune();
         this.index = new CatalogIndex(sealed);
+        // Every prepared commit's Finalize can now only fail on the catalog version: release them now.
+        this.reservations.InvalidateAll();
         this.RaiseApplied({ Commit: commit, Kind: CommitKind.SchemaChange, CatalogVersion: sealed.Version, Batch: Committer.EmptyBatch, CreatedIds: Object.freeze([]), Catalog: sealed });
         return { Commit: commit, Catalog: sealed };
     }
@@ -774,7 +785,7 @@ export class Committer
         if (upgradeCommit !== undefined)
         {
             this.history.Record(upgradeCommit, keys);
-            this.reservations.Invalidate(keys);
+            this.reservations.InvalidateAll();
         }
         if (seed !== undefined)
         {
@@ -926,7 +937,8 @@ export class Committer
         const version = index.Catalog.Version;
         const early = this.history.Check(p.Reads, p.Snapshot)
             ?? Committer.VersionConflict(p.CatalogVersion, version)
-            ?? (p.Batch.Count > 0 ? this.reservations.ReadConflict(p.Reads) : undefined);
+            // A prepare's reads stay reserved even when it writes nothing, so it is always checked.
+            ?? this.reservations.ReadConflict(p.Reads);
         if (early !== undefined)
         {
             p.Reject(early);
@@ -948,13 +960,15 @@ export class Committer
             p.Reject(new GraphError(GraphErrorCode.Disposed, Committer.ErrDisposed));
             return;
         }
-        const clash = this.reservations.WriteConflict(outcome.Keys);
+        // Its dependencies too: another prepared commit's Finalize may change what its own dry-run relied on.
+        const reserved = Reservations.ReservedReads(p.Reads, outcome.Dependencies, outcome.Keys);
+        const clash = this.reservations.ReadConflict(reserved) ?? this.reservations.WriteConflict(outcome.Keys);
         if (clash !== undefined)
         {
             p.Reject(clash);
             return;
         }
-        const reservation = this.reservations.Reserve(p.Reads, outcome.Dependencies, outcome.Keys, p.TimeoutMs);
+        const reservation = this.reservations.Reserve(reserved, outcome.Keys, p.TimeoutMs);
         p.ResolvePrepared(new PreparedCommit(this, p.Batch, p.Bytes, p.Ids ?? [], version, reservation));
     }
 

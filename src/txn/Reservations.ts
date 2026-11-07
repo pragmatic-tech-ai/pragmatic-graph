@@ -22,30 +22,35 @@ export enum ReservationState
     Failed,
     /** The committer was disposed while the reservation was held. */
     Disposed,
-    /** An upgrade wrote keys it reserved without changing the catalog version (its seed commit). */
+    /** A schema change or upgrade committed since Prepare: Finalize can only fail. */
     Invalidated,
 }
 
 /**
- * The logical keys one prepared commit holds until it finalizes, aborts or expires (ruling R71). `Reads`
- * is what no other commit may write: the prepared batch's ReadSet, the dry-run's dependencies and its
- * write keys except the commutative aggregate families (Extent, Column). `Writes` is the dry-run's write
- * set, which no other commit that writes may have read.
+ * The logical keys one prepared commit holds until it finalizes, aborts or expires (ruling R71). Its
+ * reserved reads are what no other commit may write: the prepared batch's ReadSet, the dry-run's
+ * dependencies and its write keys except the commutative aggregate families (Extent, Column). Its writes
+ * are the dry-run's write set, which no other commit that writes, and no other prepare, may have read or
+ * depend on.
+ *
+ * A holder of the PreparedCommit may only Abort it and query it; every other transition takes the owning
+ * Reservations as a capability, which only the committer holds.
  */
 export class Reservation
 {
     private static readonly ErrExpired = 'The prepared commit expired before Finalize';
     private static readonly ErrReleased = 'The prepared commit was aborted or released';
     private static readonly ErrFinalized = 'Finalize was already called on this prepared commit';
-    private static readonly ErrInvalidated = 'An upgrade since Prepare wrote keys the prepared commit reserved';
+    private static readonly ErrInvalidated = 'A schema change or upgrade since Prepare wrote keys the prepared commit reserved';
+    private static readonly ErrOwner = 'Reservation transition by a container that does not own it';
 
     private state = ReservationState.Held;
     private invalidated = false;
 
     public constructor(
         private readonly owner: Reservations,
-        public readonly Reads: ReadSet,
-        public readonly Writes: WriteKeySet,
+        private readonly reads: ReadSet,
+        private readonly writes: WriteKeySet,
         public readonly Deadline: number,
     )
     {
@@ -68,7 +73,7 @@ export class Reservation
         return this.state === ReservationState.Expired || (this.state === ReservationState.Held && Date.now() >= this.Deadline);
     }
 
-    /** True once an upgrade wrote keys it reserved: its Finalize is then a ConflictError. */
+    /** True once a schema change or upgrade invalidated it: its Finalize is then a ConflictError. */
     public get Invalidated(): boolean
     {
         return this.invalidated;
@@ -80,35 +85,44 @@ export class Reservation
         return new ConflictError(Reservation.ErrInvalidated);
     }
 
-    /**
-     * Marks the reservation invalidated by writes that bypassed the reservation checks (an upgrade's
-     * commits). A held one is released at once; a finalizing one is rejected when its batch's group runs.
-     */
-    public Invalidate(): void
-    {
-        this.invalidated = true;
-        if (this.state === ReservationState.Held)
-        {
-            this.End(ReservationState.Invalidated);
-        }
-    }
-
     /** True when `owner` is the container that holds this reservation. */
     public BelongsTo(owner: Reservations): boolean
     {
         return this.owner === owner;
     }
 
+    /** True when any of the prepared write keys lies in `reads`. */
+    public WritesIntersect(reads: ReadSet): boolean
+    {
+        return this.writes.Intersects(reads);
+    }
+
+    /** True when any of `keys` lies in the reserved reads. */
+    public ReservesAny(keys: WriteKeySet): boolean
+    {
+        return keys.Intersects(this.reads);
+    }
+
+    /** Releases a held reservation; a no-op once Finalize was called or it already ended. */
+    public Abort(): void
+    {
+        if (this.state === ReservationState.Held)
+        {
+            this.Transition(ReservationState.Aborted);
+        }
+    }
+
     /**
      * Held and not expired → Finalizing (it no longer expires) and undefined. Otherwise the error Finalize
-     * rejects with: ConflictError when aborted, expired or disposed (an expired one is released now),
-     * InvalidArgument when Finalize was already called.
+     * rejects with: ConflictError when aborted, expired, invalidated or disposed (an expired one is
+     * released now), InvalidArgument when Finalize was already called.
      */
-    public BeginFinalize(): GraphError | undefined
+    public BeginFinalize(owner: Reservations): GraphError | undefined
     {
+        this.RequireOwner(owner);
         if (this.state === ReservationState.Held && Date.now() >= this.Deadline)
         {
-            this.End(ReservationState.Expired);
+            this.Transition(ReservationState.Expired);
         }
         switch (this.state)
         {
@@ -128,17 +142,28 @@ export class Reservation
         }
     }
 
-    /** Releases a held reservation; a no-op once Finalize was called or it already ended. */
-    public Abort(): void
+    /** Ends a blocking reservation with `state` and releases its keys; a no-op once it ended. */
+    public End(owner: Reservations, state: ReservationState): void
     {
+        this.RequireOwner(owner);
+        this.Transition(state);
+    }
+
+    /**
+     * Marks it invalidated by writes that bypassed the reservation checks (a schema change or an upgrade).
+     * A held one is released at once; a finalizing one is rejected when its batch's group runs.
+     */
+    public Invalidate(owner: Reservations): void
+    {
+        this.RequireOwner(owner);
+        this.invalidated = true;
         if (this.state === ReservationState.Held)
         {
-            this.End(ReservationState.Aborted);
+            this.Transition(ReservationState.Invalidated);
         }
     }
 
-    /** Ends a blocking reservation with `state` and releases its keys; a no-op once it ended. */
-    public End(state: ReservationState): void
+    private Transition(state: ReservationState): void
     {
         if (this.Blocking)
         {
@@ -146,12 +171,21 @@ export class Reservation
             this.owner.Remove(this);
         }
     }
+
+    private RequireOwner(owner: Reservations): void
+    {
+        if (owner !== this.owner)
+        {
+            throw new GraphError(GraphErrorCode.Internal, Reservation.ErrOwner);
+        }
+    }
 }
 
 /**
  * The reservations of a committer's outstanding prepared commits (ruling R71). A group candidate
- * conflicts when its applied write keys intersect a reservation's Reads, or when it writes and its reads
- * intersect a reservation's Writes. Expired reservations are released lazily (Sweep, at each group).
+ * conflicts when its applied write keys intersect a reservation's reserved reads, or when it writes and
+ * its reads intersect a reservation's writes; a prepare conflicts the same way, with its reads and
+ * dependencies as its reads, whether or not it writes. Expired reservations are released lazily (Sweep).
  */
 export class Reservations
 {
@@ -169,12 +203,21 @@ export class Reservations
         return this.held.size;
     }
 
-    /** Registers a reservation for a dry-run's outcome: reads ∪ dependencies ∪ non-aggregate write keys. */
-    public Reserve(reads: ReadSet, dependencies: ReadSet, writes: WriteKeySet, timeoutMs: number): Reservation
+    /**
+     * The reads a prepare reserves (and is checked with): its ReadSet, its dependencies and its write keys
+     * except the commutative aggregate families. A new set.
+     */
+    public static ReservedReads(reads: ReadSet, dependencies: ReadSet, writes: WriteKeySet): ReadSet
     {
         const reserved = reads.Clone();
         reserved.AddAll(dependencies);
         writes.AddTo(reserved, Reservations.Commutative);
+        return reserved;
+    }
+
+    /** Registers a reservation over `reserved` (see ReservedReads) and the dry-run's write keys. */
+    public Reserve(reserved: ReadSet, writes: WriteKeySet, timeoutMs: number): Reservation
+    {
         const reservation = new Reservation(this, reserved, writes, Date.now() + timeoutMs);
         this.held.add(reservation);
         return reservation;
@@ -188,12 +231,12 @@ export class Reservations
         {
             if (r.State === ReservationState.Held && now >= r.Deadline)
             {
-                r.End(ReservationState.Expired);
+                r.End(this, ReservationState.Expired);
             }
         }
     }
 
-    /** The conflict for a writing candidate whose reads intersect a reservation's write keys, or undefined. */
+    /** The conflict for a candidate whose reads intersect a reservation's write keys, or undefined. */
     public ReadConflict(reads: ReadSet, except?: ReadonlySet<Reservation>): ConflictError | undefined
     {
         if (reads.IsEmpty)
@@ -202,7 +245,7 @@ export class Reservations
         }
         for (const r of this.held)
         {
-            if (except?.has(r) !== true && r.Writes.Intersects(reads))
+            if (except?.has(r) !== true && r.WritesIntersect(reads))
             {
                 return new ConflictError(Reservations.ErrReservedRead);
             }
@@ -215,7 +258,7 @@ export class Reservations
     {
         for (const r of this.held)
         {
-            if (except?.has(r) !== true && keys.Intersects(r.Reads))
+            if (except?.has(r) !== true && r.ReservesAny(keys))
             {
                 return new ConflictError(Reservations.ErrReserved);
             }
@@ -223,18 +266,39 @@ export class Reservations
         return undefined;
     }
 
+    /** Held and not expired → Finalizing; otherwise the error Finalize rejects with (Reservation.BeginFinalize). */
+    public BeginFinalize(reservation: Reservation): GraphError | undefined
+    {
+        return reservation.BeginFinalize(this);
+    }
+
+    /** Ends a blocking reservation with `state` (its finalize batch settled). */
+    public End(reservation: Reservation, state: ReservationState): void
+    {
+        reservation.End(this, state);
+    }
+
     /**
-     * Invalidates every blocking reservation whose reserved keys `keys` intersect: an upgrade's commits
-     * are not checked against reservations, and a seed commit keeps the catalog version (ruling R71).
+     * Invalidates every blocking reservation whose reserved reads `keys` intersect: an upgrade's seed
+     * commit is not checked against reservations and keeps the catalog version.
      */
     public Invalidate(keys: WriteKeySet): void
     {
         for (const r of [...this.held])
         {
-            if (keys.Intersects(r.Reads))
+            if (r.ReservesAny(keys))
             {
-                r.Invalidate();
+                r.Invalidate(this);
             }
+        }
+    }
+
+    /** Invalidates every blocking reservation: the catalog version changed, so each Finalize can only fail. */
+    public InvalidateAll(): void
+    {
+        for (const r of [...this.held])
+        {
+            r.Invalidate(this);
         }
     }
 
@@ -245,12 +309,12 @@ export class Reservations
         {
             if (r.State === ReservationState.Held)
             {
-                r.End(ReservationState.Disposed);
+                r.End(this, ReservationState.Disposed);
             }
         }
     }
 
-    /** @internal Called by Reservation.End. */
+    /** @internal Called by Reservation when it stops blocking. */
     public Remove(reservation: Reservation): void
     {
         this.held.delete(reservation);

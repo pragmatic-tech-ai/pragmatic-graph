@@ -14,8 +14,9 @@ import { GraphError, GraphErrorCode } from '../../errors/GraphError.js';
 import { GraphStore } from '../../GraphStore.js';
 import { IdAllocator } from '../../identity/IdAllocator.js';
 import { PublicIdIndex } from '../../identity/PublicIdIndex.js';
-import type { IKeyValueStore } from '../../kv/KeyValue.js';
+import type { IKeyValueStore, IReadTransaction, IWriteTransaction } from '../../kv/KeyValue.js';
 import { Keyspace } from '../../kv/Keyspace.js';
+import { EdgeDirection } from '../../format/FormatKeys.js';
 import { LmdbStore } from '../../kv/lmdb/LmdbStore.js';
 import { MemoryStore } from '../../kv/memory/MemoryStore.js';
 import type { ISchemaDescription } from '../../schema/SchemaDescription.js';
@@ -25,6 +26,8 @@ import { ConflictError } from '../ConflictError.js';
 import { ConflictKeys } from '../ConflictKeys.js';
 import type { ICommitApplied } from '../LogEntry.js';
 import { ReadSet } from '../ReadSet.js';
+import { PreparedCommit } from '../PreparedCommit.js';
+import { ReservationState, Reservations } from '../Reservations.js';
 import { WriteBatch } from '../WriteBatch.js';
 
 /** A committer whose allocator counts every id it hands out. */
@@ -42,6 +45,55 @@ class CountingCommitter extends Committer
             return next(hint);
         };
         return allocator;
+    }
+}
+
+/** A store whose next Write blocks inside its work (after the transaction began) until Release(). */
+class GatedStore implements IKeyValueStore
+{
+    public Entered: Promise<void> = Promise.resolve();
+    private gate: Promise<void> | undefined;
+    private open: () => void = () => undefined;
+    private entered: () => void = () => undefined;
+
+    public constructor(private readonly inner: IKeyValueStore)
+    {
+    }
+
+    public Hold(): void
+    {
+        this.gate = new Promise<void>(resolve => { this.open = resolve; });
+        this.Entered = new Promise<void>(resolve => { this.entered = resolve; });
+    }
+
+    public Release(): void
+    {
+        this.open();
+    }
+
+    public BeginRead(): Promise<IReadTransaction>
+    {
+        return this.inner.BeginRead();
+    }
+
+    public Write<T>(work: (txn: IWriteTransaction) => Promise<T>): Promise<T>
+    {
+        const gate = this.gate;
+        this.gate = undefined;
+        return this.inner.Write(async txn =>
+        {
+            if (gate !== undefined)
+            {
+                this.entered();
+                await gate;
+            }
+            return work(txn);
+        });
+    }
+
+    public dispose(): Promise<void>
+    {
+        return this.inner.dispose();
     }
 }
 
@@ -82,6 +134,8 @@ class PrepFx
     public static readonly Knows = 'knows';
     public static readonly Best = 'best';
     public static readonly ByName = 'byName';
+    public static readonly Friends = 'friends';
+    public static readonly Skipped = 'skipped';
     public static readonly Spaces: readonly Keyspace[] = Object.values(Keyspace);
 
     public static Catalog(): CatalogSnapshot
@@ -92,6 +146,7 @@ class PrepFx
             { Name: PrepFx.Age, Kind: MemberKind.Property, Type: ValueType.Int64, Nullable: true },
             { Name: PrepFx.Knows, Kind: MemberKind.Relationship, Targets: [PrepFx.Person], Many: true },
             { Name: PrepFx.Best, Kind: MemberKind.Relationship, Targets: [PrepFx.Person] },
+            { Name: PrepFx.Friends, Kind: MemberKind.Relationship, Targets: [PrepFx.Person], Many: true, Ordered: true },
         ]);
         m.DefineIndex(PrepFx.ByName, PrepFx.Person, [PrepFx.Name], true);
         return m.Seal();
@@ -215,6 +270,7 @@ class PrepFx
             { Name: PrepFx.Age, Kind: MemberKind.Property, Type: ValueType.Int64, Nullable: true },
             { Name: PrepFx.Knows, Kind: MemberKind.Relationship, Targets: [PrepFx.Person], Many: true },
             { Name: PrepFx.Best, Kind: MemberKind.Relationship, Targets: [PrepFx.Person] },
+            { Name: PrepFx.Friends, Kind: MemberKind.Relationship, Targets: [PrepFx.Person], Many: true, Ordered: true },
         ] as const;
         const defs = [{ Name: PrepFx.Person, IsAspect: false, Parent: null, Aspects: [], Members: [...members] }];
         if (extra)
@@ -330,17 +386,23 @@ class PrepFx
                 await store.dispose();
             });
 
-            it('finalize cannot conflict while reserved (fuzz: 50 random concurrent submits)', async () =>
+            it('finalize cannot conflict while reserved (fuzz: 50 random concurrent submits and prepares, sibling links)', async () =>
             {
                 const people = ['p0', 'p1', 'p2', 'p3', 'p4', 'p5'];
                 const members = [PrepFx.Age, PrepFx.Name];
-                for (let seed = 1; seed <= 6; seed++)
+                for (let seed = 1; seed <= 12; seed++)
                 {
                     const rng = new Rng(seed);
                     const store = await open();
                     const c = new CountingCommitter(store, PrepFx.Catalog());
                     await c.Submit(PrepFx.Batch(b => people.forEach(p => b.CreateNode(p, PrepFx.Person))), new ReadSet(), 0n);
-                    await c.Submit(PrepFx.Batch(b => b.Link('p4', PrepFx.Knows, 'p5')), new ReadSet(), c.LastCommit());
+                    await c.Submit(PrepFx.Batch(b =>
+                    {
+                        b.Link('p4', PrepFx.Knows, 'p5');
+                        b.Link('p0', PrepFx.Friends, 'p1');
+                        b.Link('p0', PrepFx.Friends, 'p2');
+                        b.Link('p4', PrepFx.Friends, 'p5');
+                    }), new ReadSet(), c.LastCommit());
                     const reads = await PrepFx.ReadsCell(store, c, 'p5', PrepFx.Name);
                     const prepared = await c.Prepare(PrepFx.Batch(b =>
                     {
@@ -348,9 +410,11 @@ class PrepFx
                         b.Link('p1', PrepFx.Best, 'p2');
                         b.DeleteNode('p3');
                         b.Unlink('p4', PrepFx.Knows, 'p5');
+                        b.Link('p0', PrepFx.Friends, 'p5', { AfterSibling: 'p1' });
                         b.CreateNode('fresh', PrepFx.Person);
                     }), reads, c.LastCommit(), c.Catalog.Version);
                     const work: Array<Promise<unknown>> = [];
+                    const finals: Array<Promise<unknown>> = [];
                     let finalized: Promise<bigint> | undefined;
                     for (let i = 0; i < 50; i++)
                     {
@@ -359,13 +423,15 @@ class PrepFx
                             finalized = prepared.Finalize();
                         }
                         const r = new ReadSet();
-                        if (rng.Int(2) === 0)
+                        const readKind = rng.Int(3);
+                        const readId = await PrepFx.Id(store, rng.Pick(people));
+                        if (readId !== undefined && readKind === 0)
                         {
-                            const id = await PrepFx.Id(store, rng.Pick(people));
-                            if (id !== undefined)
-                            {
-                                r.AddKey(ConflictKeys.CellSpace, ConflictKeys.Cell(id, c.Catalog.Member(PrepFx.Person, rng.Pick(members)).Id));
-                            }
+                            r.AddKey(ConflictKeys.CellSpace, ConflictKeys.Cell(readId, c.Catalog.Member(PrepFx.Person, rng.Pick(members)).Id));
+                        }
+                        else if (readId !== undefined && readKind === 1)
+                        {
+                            r.AddRange(ConflictKeys.EdgeSpace, ConflictKeys.Adjacency(c.Catalog.Member(PrepFx.Person, PrepFx.Friends).Id, EdgeDirection.Out, readId));
                         }
                         const batch = PrepFx.Batch(b =>
                         {
@@ -373,7 +439,7 @@ class PrepFx
                             {
                                 const from = rng.Pick(people);
                                 const to = rng.Pick(people);
-                                switch (rng.Int(6))
+                                switch (rng.Int(9))
                                 {
                                     case 0:
                                         b.SetProperty(from, rng.Pick(members), rng.Pick(members) === PrepFx.Age ? BigInt(i) : 'v' + i);
@@ -390,6 +456,15 @@ class PrepFx
                                     case 4:
                                         b.DeleteNode(from);
                                         break;
+                                    case 5:
+                                        b.Link(from, PrepFx.Friends, to, rng.Int(2) === 0 ? { AfterSibling: rng.Pick(people) } : { BeforeSibling: rng.Pick(people) });
+                                        break;
+                                    case 6:
+                                        b.Link(from, PrepFx.Friends, to);
+                                        break;
+                                    case 7:
+                                        b.Unlink(from, PrepFx.Friends, to);
+                                        break;
                                     default:
                                         // Never p3: a create after the finalize could bring it back.
                                         b.CreateNode(rng.Pick(['p0', 'p1', 'p2', 'p4', 'p5', 'fresh', 'x' + i]), PrepFx.Person);
@@ -397,7 +472,50 @@ class PrepFx
                                 }
                             }
                         });
-                        work.push(PrepFx.Settle(c.Submit(batch, r, c.LastCommit(), c.Catalog.Version)));
+                        if (rng.Int(2) === 0)
+                        {
+                            // A concurrent second prepare: when it prepares, its Finalize must commit too.
+                            // Half of them are one op around p0's ordered friends (sibling placement,
+                            // unlinking or deleting a sibling), so prepares depend on each other's writes.
+                            const focused = PrepFx.Batch(b =>
+                            {
+                                const sibling = rng.Pick(['p1', 'p2', 'p5']);
+                                switch (rng.Int(4))
+                                {
+                                    case 0:
+                                        b.Link('p0', PrepFx.Friends, rng.Pick(['p3', 'p4', 'x' + i]), { AfterSibling: sibling });
+                                        break;
+                                    case 1:
+                                        b.Link('p0', PrepFx.Friends, rng.Pick(['p3', 'p4']), { BeforeSibling: sibling });
+                                        break;
+                                    case 2:
+                                        b.Unlink('p0', PrepFx.Friends, sibling);
+                                        break;
+                                    default:
+                                        b.DeleteNode(sibling);
+                                        break;
+                                }
+                            });
+                            const delay = 1 + rng.Int(4);
+                            const prep = PrepFx.Settle(c.Prepare(rng.Int(2) === 0 ? focused : batch, r, c.LastCommit(), c.Catalog.Version));
+                            finals.push(prep.then(async o =>
+                            {
+                                if (!(o instanceof PreparedCommit))
+                                {
+                                    assert.ok(o instanceof ConflictError || o instanceof CommitError, 'seed ' + seed + ': prepare ' + String(o));
+                                    return PrepFx.Skipped;
+                                }
+                                for (let k = 0; k < delay; k++)
+                                {
+                                    await PrepFx.Wait(1);
+                                }
+                                return PrepFx.Settle(o.Finalize());
+                            }));
+                        }
+                        else
+                        {
+                            work.push(PrepFx.Settle(c.Submit(batch, r, c.LastCommit(), c.Catalog.Version)));
+                        }
                         if (rng.Int(4) === 0)
                         {
                             await Promise.resolve();
@@ -405,15 +523,113 @@ class PrepFx
                     }
                     const outcome = await PrepFx.Settle(finalized as Promise<bigint>);
                     assert.equal(typeof outcome, 'bigint', 'seed ' + seed + ': finalize failed with ' + String(outcome));
+                    for (const o of await Promise.all(finals))
+                    {
+                        assert.ok(typeof o === 'bigint' || o === PrepFx.Skipped, 'seed ' + seed + ': a second finalize failed with ' + String(o));
+                    }
                     for (const o of await Promise.all(work))
                     {
                         assert.ok(typeof o === 'bigint' || o instanceof ConflictError || o instanceof CommitError, 'seed ' + seed + ': ' + String(o));
                     }
+                    assert.equal(c.ReservationCount, 0);
                     assert.equal(await PrepFx.Id(store, 'p3'), undefined);
                     assert.notEqual(await PrepFx.Id(store, 'fresh'), undefined);
                     await c.dispose();
                     await store.dispose();
                 }
+            });
+
+            it('a prepare whose dependencies another prepared commit writes conflicts (sibling unlinked, sibling deleted)', async () =>
+            {
+                const store = await open();
+                const c = await PrepFx.Committer(store);
+                await c.Submit(PrepFx.Batch(b => b.Link('a', PrepFx.Friends, 'b')), new ReadSet(), c.LastCommit());
+                const prepare = (build: (b: WriteBatch) => void): Promise<PreparedCommit> => c.Prepare(PrepFx.Batch(build), new ReadSet(), c.LastCommit(), c.Catalog.Version);
+                const sibling = (b: WriteBatch): void => b.Link('a', PrepFx.Friends, 'c', { AfterSibling: 'b' });
+                const unlink = await prepare(b => b.Unlink('a', PrepFx.Friends, 'b'));
+                await PrepFx.Conflicts(prepare(sibling));
+                unlink.Abort();
+                const del = await prepare(b => b.DeleteNode('b'));
+                await PrepFx.Conflicts(prepare(sibling));
+                del.Abort();
+                // And the other way round: the sibling link prepared first keeps both off.
+                const linked = await prepare(sibling);
+                await PrepFx.Conflicts(prepare(b => b.Unlink('a', PrepFx.Friends, 'b')));
+                await PrepFx.Conflicts(prepare(b => b.DeleteNode('b')));
+                await PrepFx.Commits(linked.Finalize());
+                await c.dispose();
+                await store.dispose();
+            });
+
+            it('an empty-batch prepare keeps its reads reserved', async () =>
+            {
+                const store = await open();
+                const c = await PrepFx.Committer(store);
+                const reads = await PrepFx.ReadsCell(store, c, 'a', PrepFx.Age);
+                const writer = await c.Prepare(PrepFx.Batch(b => b.SetProperty('a', PrepFx.Age, 5n)), new ReadSet(), c.LastCommit(), c.Catalog.Version);
+                // Reads a key a prepared commit writes: rejected even though it writes nothing.
+                await PrepFx.Conflicts(c.Prepare(new WriteBatch(), reads, c.LastCommit(), c.Catalog.Version));
+                writer.Abort();
+                const reader = await c.Prepare(new WriteBatch(), reads, c.LastCommit(), c.Catalog.Version);
+                await PrepFx.Conflicts(PrepFx.Set(c, 'a', PrepFx.Age, 6n));
+                await PrepFx.Conflicts(c.Prepare(PrepFx.Batch(b => b.SetProperty('a', PrepFx.Age, 7n)), new ReadSet(), c.LastCommit(), c.Catalog.Version));
+                await PrepFx.Commits(reader.Finalize());
+                await PrepFx.Commits(PrepFx.Set(c, 'a', PrepFx.Age, 6n));
+                await c.dispose();
+                await store.dispose();
+            });
+
+            it('a schema change or upgrade releases held reservations at once', async () =>
+            {
+                const store = await open();
+                const c = await PrepFx.Committer(store);
+                const prepared = await c.Prepare(PrepFx.Batch(b => b.SetProperty('a', PrepFx.Age, 5n)), new ReadSet(), c.LastCommit(), c.Catalog.Version);
+                await c.SubmitSchema(m => m.DefineConcept('Other', null, [], []));
+                assert.equal(c.ReservationCount, 0);
+                await PrepFx.Commits(PrepFx.Set(c, 'a', PrepFx.Age, 6n));
+                await PrepFx.Conflicts(prepared.Finalize());
+                const again = await c.Prepare(PrepFx.Batch(b => b.SetProperty('a', PrepFx.Age, 5n)), new ReadSet(), c.LastCommit(), c.Catalog.Version);
+                assert.equal((await c.SubmitUpgrade(PrepFx.Description('v2', true))).Changed, true);
+                assert.equal(c.ReservationCount, 0);
+                await PrepFx.Commits(PrepFx.Set(c, 'a', PrepFx.Age, 7n));
+                await PrepFx.Conflicts(again.Finalize());
+                await c.dispose();
+                await store.dispose();
+            });
+
+            it('a finalize called before the deadline commits even when its group runs after it', async () =>
+            {
+                const inner = await open();
+                const store = new GatedStore(inner);
+                const c = await PrepFx.Committer(store);
+                const prepared = await c.Prepare(PrepFx.Batch(b => b.SetProperty('a', PrepFx.Age, 5n)), new ReadSet(), c.LastCommit(), c.Catalog.Version, 30);
+                store.Hold();
+                const blocker = PrepFx.Set(c, 'b', PrepFx.Age, 1n);
+                await store.Entered;
+                const finalized = prepared.Finalize();
+                await PrepFx.Wait(60);
+                assert.equal(prepared.Expired, false, 'a finalizing reservation does not expire');
+                store.Release();
+                await PrepFx.Commits(blocker);
+                await PrepFx.Commits(finalized);
+                assert.equal(c.ReservationCount, 0);
+                await c.dispose();
+                await inner.dispose();
+            });
+
+            it('a PreparedCommit holder cannot end the reservation', async () =>
+            {
+                const store = await open();
+                const c = await PrepFx.Committer(store);
+                const prepared = await c.Prepare(PrepFx.Batch(b => b.SetProperty('a', PrepFx.Age, 5n)), new ReadSet(), c.LastCommit(), c.Catalog.Version);
+                const foreign = new Reservations();
+                assert.throws(() => prepared.Reservation.End(foreign, ReservationState.Aborted), (e: unknown) => e instanceof GraphError && e.GraphCode === GraphErrorCode.Internal);
+                assert.throws(() => prepared.Reservation.Invalidate(foreign), (e: unknown) => e instanceof GraphError && e.GraphCode === GraphErrorCode.Internal);
+                assert.throws(() => prepared.Reservation.BeginFinalize(foreign), (e: unknown) => e instanceof GraphError && e.GraphCode === GraphErrorCode.Internal);
+                assert.equal(c.ReservationCount, 1);
+                await PrepFx.Commits(prepared.Finalize());
+                await c.dispose();
+                await store.dispose();
             });
 
             it('what the dry-run depends on is reserved: resolved nodes, link adjacency, delete adjacency, unique ranges', async () =>
