@@ -30,12 +30,25 @@ This document is the contract between the TypeScript engine and the future Rust 
 | `catalog` | `(1)` catalog root | catalog definitions: UTF-8 JSON, see Catalog |
 | `ids` | `(1, publicId: string)` | internal id: tuple-encoded `(id: u64)` |
 | `ids` | `(2, id: u64)` | public id: UTF-8 bytes |
+| `ids` | `(3, id: u64)` | owner (model name): UTF-8 bytes, see Ids |
 | `rows` | `(block: u64)` | row block (global; entries carry the partition) |
 | `columns` | `(partition, typeId, memberId, chunk: u64)` | column chunk |
 | `deltas` | `(partition, typeId, memberId, chunk: u64)` | delta |
 | `edges` | `(partition, relationshipId, direction, node: u64, position: bytes, other: u64)` | Out: edge-property list; In: empty (see Edges) |
 | `log` | `(commit: u64)` | log entry |
 | `index` | `(indexId, ...values, internalId: u64)` | empty (see Index) |
+
+### Additions of the engine-core consolidation (format still version 1)
+
+The consolidation (Tasks 1–11, spec 2026-11-06) added, all additively (a store written before them reads as having none):
+
+- `index` keyspace: secondary-index entries `(indexId, ...values, internalId)`, see Index; index definitions and `NextIndexId` in the catalog root, see Catalog.
+- `ids` tag `3` Owner `(3, id)`: the model that holds a node, see Ids; CreateNode's owner flag in the serialized batch, see Log.
+- `meta` `("seed", publicId)`: seed markers (SHA-256 of the seed node last applied), see Meta.
+- `meta` `("schemaVersion")`: the Version of the description the last upgrade applied, see Meta.
+- `log` kind `3` Upgrade: a schema upgrade's entry (catalog version, schema version, complete catalog), see Log.
+
+Connector bindings, access scopes and the GraphEngine facade (Tasks 7–11) store nothing: bindings come from the description at every Open and Upgrade.
 
 ### Meta
 

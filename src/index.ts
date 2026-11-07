@@ -1,6 +1,10 @@
 // Public embedding API of @pragmatic-tech-ai/graph. Storage internals (KV stores, column and edge
 // stores, identity indexes, the committer) are deliberately not exported.
 
+// The engine facade: the single entry point hosts use (spec §4.2, §9).
+export { GraphEngine, StorageKind, type IEngineStorage, type IGraphEngineOptions } from './GraphEngine.js';
+
+// The low-level store underneath the facade.
 export { GraphStore } from './GraphStore.js';
 export type { ILmdbOptions } from './kv/lmdb/LmdbStore.js';
 export { GraphReader, type IScanRow } from './GraphReader.js';
