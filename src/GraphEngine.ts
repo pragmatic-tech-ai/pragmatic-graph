@@ -47,12 +47,14 @@ export interface IGraphEngineOptions
  * The single entry point hosts use (spec §4.2, §9): one graph, run from a schema description.
  *
  * Open checks the description's bindings against the connectors (before storage is touched), opens or
- * creates the store, upgrades it to the description (nothing happens, and nothing is raised, when the
- * stored schema version and catalog already match), installs the bindings and is then running. Read with
- * BeginRead, write with Begin (both under an AccessScope), follow commits on CommitApplied / ReadChanges.
- * Upgrade applies a new description while running (a dev recompile); the connectors are those given at
- * Open, so a new description may only bind to them. SchemaVersion and Catalog reflect the latest
- * committed state. dispose() closes the store.
+ * creates the store, upgrades it to the description and installs the bindings, and is then running. The
+ * upgrade does nothing (no commit, nothing raised) only when the stored schema version equals the
+ * description's Version AND the description plans to the stored catalog unchanged; a version match
+ * alone is not trusted (ruling R74, stricter than spec §4.2's "open as is"). Read with BeginRead, write
+ * with Begin (both under an AccessScope), follow commits on CommitApplied / ReadChanges. Upgrade applies
+ * a new description while running (a dev recompile); the connectors are those given at Open, so a new
+ * description may only bind to them. SchemaVersion and Catalog reflect the latest committed upgrade.
+ * dispose() closes the store.
  *
  * GraphStore remains the low-level store underneath; the engine never uses GraphStore.DefineSchema.
  */
@@ -60,6 +62,8 @@ export class GraphEngine
 {
     private static readonly ErrNoPath = 'LMDB storage needs a Path';
     private static readonly ErrKind = 'Unknown StorageKind: ';
+    private static readonly ErrDisposed = 'Graph engine has been disposed';
+    private static readonly ErrCleanup = 'Opening the engine failed and closing its store failed too';
 
     /** Raised once per applied commit, in commit order, after the commit is durable. Subscribe-only. */
     public readonly CommitApplied: ISignal<ICommitApplied>;
@@ -71,8 +75,9 @@ export class GraphEngine
 
     private version: string;
     private catalog: CatalogSnapshot;
-    /** Upgrades run one at a time, so bindings are installed in the order their upgrades committed. */
+    /** The chain of hot upgrades: they run one at a time, in call order, and dispose() waits for it. */
     private upgrading: Promise<unknown> = Promise.resolve();
+    private disposing: Promise<void> | undefined;
 
     private constructor(
         private readonly store: GraphStore,
@@ -93,23 +98,31 @@ export class GraphEngine
      * for a binding or DefaultConnector naming a connector not given (other than
      * BindingTable.EngineStorage), duplicate or reserved connector names, a bad PrepareTimeoutMs, an
      * unknown StorageKind or LMDB without a Path. A failure opening the store (Locked, Unsupported,
-     * Corrupt) is rethrown; an upgrade failure (CatalogError, CommitError) closes the store and is rethrown.
+     * Corrupt) is rethrown; an upgrade failure (CatalogError, CommitError) closes the store and is
+     * rethrown. Should closing the store fail too, the rejection is an AggregateError holding the upgrade
+     * failure first, then the close failure.
      */
     public static async Open(options: IGraphEngineOptions): Promise<GraphEngine>
     {
-        const connectors = [...(options.Connectors ?? [])];
+        const connectors = Object.freeze([...(options.Connectors ?? [])]);
         const timeoutMs = options.PrepareTimeoutMs ?? Committer.DefaultPrepareTimeoutMs;
-        const bindings = GraphEngine.Bindings(options.Description, connectors, timeoutMs);
+        GraphEngine.CheckBindings(options.Description, connectors, timeoutMs);
         const store = await GraphEngine.OpenStore(options.Storage);
         try
         {
-            const result = await store.Upgrade(options.Description);
-            store.SetConnectors(bindings, connectors, timeoutMs);
+            const result = await store.Upgrade(options.Description, connectors, timeoutMs);
             return new GraphEngine(store, connectors, timeoutMs, options.Description, result);
         }
         catch (error)
         {
-            await store.dispose();
+            try
+            {
+                await store.dispose();
+            }
+            catch (closeError)
+            {
+                throw new AggregateError([error, closeError], GraphEngine.ErrCleanup);
+            }
             throw error;
         }
     }
@@ -128,13 +141,19 @@ export class GraphEngine
 
     /**
      * Hot upgrade (a dev recompile): upgrades the store to `description` (GraphStore.Upgrade: plan,
-     * discard, seed, one commit) and, once that has committed, replaces the bindings with the
-     * description's, for commits that start afterwards. GraphError InvalidArgument, before anything is
-     * upgraded, when the new bindings name a connector not given at Open. A failed upgrade leaves the
-     * schema, SchemaVersion, Catalog and bindings as they were. Concurrent calls run in call order.
+     * discard, seed, one commit) and installs the description's bindings inside that upgrade's turn
+     * (ruling R77): a commit routed with the previous bindings and not yet applied fails with
+     * ConflictError (retry-safe), so no write is applied with stale routing. GraphError Disposed once
+     * dispose() was called; GraphError InvalidArgument, before anything is upgraded, when the new
+     * bindings name a connector not given at Open. A failed upgrade leaves the schema, SchemaVersion,
+     * Catalog and bindings as they were. Concurrent calls run in call order.
      */
     public Upgrade(description: ISchemaDescription): Promise<IUpgradeCommit>
     {
+        if (this.disposing !== undefined)
+        {
+            return Promise.reject(GraphEngine.Disposed());
+        }
         const run = this.upgrading.then(() => this.RunUpgrade(description));
         this.upgrading = run.catch(() => undefined);
         return run;
@@ -143,43 +162,67 @@ export class GraphEngine
     /** A read-only snapshot of the latest commit under `scope` (GraphStore.BeginRead). */
     public BeginRead(scope: AccessScope): Promise<GraphReader>
     {
+        if (this.disposing !== undefined)
+        {
+            return Promise.reject(GraphEngine.Disposed());
+        }
         return this.store.BeginRead(scope);
     }
 
     /** A read-write transaction under `scope` (GraphStore.Begin); writes are gated by the scope's write rules. */
     public Begin(scope: AccessScope): Promise<GraphTransaction>
     {
+        if (this.disposing !== undefined)
+        {
+            return Promise.reject(GraphEngine.Disposed());
+        }
         return this.store.Begin(scope);
     }
 
-    /** Every commit after `afterCommit`, in commit order (GraphStore.ReadChanges). */
-    public ReadChanges(afterCommit: bigint): AsyncIterable<ICommitApplied>
+    /** Every commit after `afterCommit`, in commit order (GraphStore.ReadChanges); GraphError Disposed on iteration once disposed. */
+    public async *ReadChanges(afterCommit: bigint): AsyncIterable<ICommitApplied>
     {
-        return this.store.ReadChanges(afterCommit);
+        if (this.disposing !== undefined)
+        {
+            throw GraphEngine.Disposed();
+        }
+        yield* this.store.ReadChanges(afterCommit);
     }
 
-    /** Closes the store (GraphStore.dispose). Idempotent; later calls reject with GraphError Disposed. */
+    /**
+     * Waits for the hot upgrades already called (a durable upgrade is reported with its result, and
+     * SchemaVersion / Catalog reflect it), then closes the store (GraphStore.dispose). Idempotent; once
+     * called, every other call rejects with GraphError Disposed.
+     */
     public dispose(): Promise<void>
     {
-        return this.store.dispose();
+        this.disposing ??= this.Teardown();
+        return this.disposing;
+    }
+
+    private async Teardown(): Promise<void>
+    {
+        await this.upgrading;
+        await this.store.dispose();
     }
 
     private async RunUpgrade(description: ISchemaDescription): Promise<IUpgradeCommit>
     {
-        const bindings = GraphEngine.Bindings(description, this.connectors, this.timeoutMs);
-        const result = await this.store.Upgrade(description);
-        this.store.SetConnectors(bindings, this.connectors, this.timeoutMs);
+        const result = await this.store.Upgrade(description, this.connectors, this.timeoutMs);
         this.version = description.Version;
         this.catalog = result.Catalog;
         return result;
     }
 
-    /** The description's binding table, checked against `connectors` and the timeout (ConnectorSetup) without installing it. */
-    private static Bindings(description: ISchemaDescription, connectors: readonly IGraphConnector[], timeoutMs: number): BindingTable
+    /** Checks the description's bindings against `connectors` and the timeout (as ConnectorSetup does) without installing them. */
+    private static CheckBindings(description: ISchemaDescription, connectors: readonly IGraphConnector[], timeoutMs: number): void
     {
-        const bindings = new BindingTable(description.Bindings, description.DefaultConnector);
-        new ConnectorSetup(bindings, connectors, timeoutMs);
-        return bindings;
+        void new ConnectorSetup(new BindingTable(description.Bindings, description.DefaultConnector), connectors, timeoutMs);
+    }
+
+    private static Disposed(): GraphError
+    {
+        return new GraphError(GraphErrorCode.Disposed, GraphEngine.ErrDisposed);
     }
 
     private static OpenStore(storage: IEngineStorage): Promise<GraphStore>

@@ -93,7 +93,9 @@ export class GraphTransaction extends GraphReader
                 return this.SnapshotCommit;
             }
             await this.Authorize();
+            // Read together: the committer rejects the batch if the setup it was routed with is replaced (R77).
             const setup = this.context.Connectors;
+            const generation = this.context.Committer.BindingGeneration;
             if (setup !== undefined)
             {
                 // Routing reads the snapshot unscoped and records it like any read (ruling R72).
@@ -101,11 +103,11 @@ export class GraphTransaction extends GraphReader
                 const sets = await WriteCoordinator.Route(this.batch, setup.Bindings, this.snapshot.Index.Catalog, origins);
                 if (sets.size > 0)
                 {
-                    const prepare = () => this.context.Committer.Prepare(this.batch, this.Reads, this.ValidationCommit(), began, setup.TimeoutMs);
+                    const prepare = () => this.context.Committer.Prepare(this.batch, this.Reads, this.ValidationCommit(), began, setup.TimeoutMs, generation);
                     return await new WriteCoordinator(setup, this.context.ConnectorRevertFailed).Run(prepare, sets);
                 }
             }
-            return await this.context.Committer.Submit(this.batch, this.Reads, this.ValidationCommit(), began);
+            return await this.context.Committer.Submit(this.batch, this.Reads, this.ValidationCommit(), began, generation);
         }
         finally
         {

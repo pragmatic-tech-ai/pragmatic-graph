@@ -2,9 +2,10 @@ import { AccessScope } from './access/AccessScope.js';
 import { CatalogModel } from './catalog/CatalogModel.js';
 import type { CatalogSnapshot } from './catalog/CatalogSnapshot.js';
 import { CatalogStore } from './catalog/CatalogStore.js';
-import type { BindingTable } from './connectors/BindingTable.js';
+import { BindingTable } from './connectors/BindingTable.js';
 import type { ConnectorError } from './connectors/ConnectorError.js';
 import type { IGraphConnector } from './connectors/GraphConnector.js';
+import { ConnectorSetup } from './connectors/WriteCoordinator.js';
 import { GraphError, GraphErrorCode } from './errors/GraphError.js';
 import { FormatMeta } from './format/FormatMeta.js';
 import { GraphContext, type ReadSnapshot } from './GraphContext.js';
@@ -92,11 +93,18 @@ export class GraphStore
      * catalog with a new Version and an unchanged seed only records the version (Changed false, no
      * commit). A planning failure (CatalogError) or seed failure (CommitError) leaves the store
      * unchanged. Transactions begun before a changing upgrade fail Commit with ConflictError.
+     *
+     * `connectors` (the engine host passes them): the description's Bindings and DefaultConnector are
+     * checked against them first (GraphError InvalidArgument as for SetConnectors, nothing upgraded) and
+     * installed inside the upgrade's turn once it succeeded (ruling R77): a commit routed with the
+     * previous bindings and not yet applied then fails with ConflictError. Without `connectors` the
+     * installed bindings stay as they are.
      */
-    public async Upgrade(description: ISchemaDescription): Promise<IUpgradeCommit>
+    public async Upgrade(description: ISchemaDescription, connectors?: readonly IGraphConnector[], timeoutMs: number = Committer.DefaultPrepareTimeoutMs): Promise<IUpgradeCommit>
     {
         this.RequireLive();
-        const result = await this.context.Committer.SubmitUpgrade(description);
+        const setup = connectors === undefined ? undefined : new ConnectorSetup(new BindingTable(description.Bindings, description.DefaultConnector), connectors, timeoutMs);
+        const result = await this.context.Committer.SubmitUpgrade(description, setup);
         this.context.SetCatalog(result.Catalog);
         return result;
     }
@@ -106,7 +114,8 @@ export class GraphStore
      * and the connectors they name, for commits that start afterwards. Writes routed to a connector are
      * written through it (ruling R72); `timeoutMs` bounds the connector phase of each such commit (default
      * Committer.DefaultPrepareTimeoutMs). GraphError InvalidArgument for a binding to a connector not
-     * given, duplicate or reserved connector names, or a bad timeout.
+     * given, duplicate or reserved connector names, or a bad timeout. A commit routed with the previous
+     * bindings and not yet applied fails with ConflictError (ruling R77).
      */
     public SetConnectors(bindings: BindingTable, connectors: readonly IGraphConnector[], timeoutMs?: number): void
     {

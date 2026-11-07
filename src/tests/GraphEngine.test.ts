@@ -14,6 +14,7 @@ import {
     CommitKind,
     ConnectorError,
     ConnectorPhase,
+    ConflictError,
     FalsePredicate,
     GraphEngine,
     GraphError,
@@ -51,6 +52,7 @@ class EngineFx
     public static readonly Crm = 'crm';
     public static readonly A = 'A';
     public static readonly B = 'B';
+    private static readonly NodeOrigin = 'NodeOrigin';
 
     public static Dir(): string
     {
@@ -120,6 +122,27 @@ class EngineFx
     public static CrmTo(connector: string): IBindingDescription[]
     {
         return [{ Model: EngineFx.Crm, Connector: connector }];
+    }
+
+    /**
+     * Holds `t`'s commit routing at its first snapshot lookup (the async step between reading the
+     * bindings and submitting) until Release(); Reached resolves once routing got there.
+     */
+    public static HoldRouting(t: Api.GraphTransaction): { readonly Reached: Promise<void>; Release(): void }
+    {
+        const target = t as unknown as Record<string, (id: string) => Promise<unknown>>;
+        const original = target[EngineFx.NodeOrigin]!.bind(t);
+        let reached: () => void = () => undefined;
+        let release: () => void = () => undefined;
+        const arrived = new Promise<void>(resolve => { reached = resolve; });
+        const held = new Promise<void>(resolve => { release = resolve; });
+        target[EngineFx.NodeOrigin] = async (id: string) =>
+        {
+            reached();
+            await held;
+            return original(id);
+        };
+        return { Reached: arrived, Release: () => release() };
     }
 
     public static Register(name: string, storage: () => IEngineStorage): void
@@ -264,15 +287,23 @@ class EngineFx
                 const a = new FakeConnector(EngineFx.A, []);
                 const engine = await GraphEngine.Open({ Description: D.Desc(D.V1Version, true, EngineFx.CrmTo(EngineFx.A)), Storage: storage(), Connectors: [a], PrepareTimeoutMs: 1000 });
                 const raised: ConnectorError[] = [];
-                const sub = engine.ConnectorRevertFailed.Subscribe(err => raised.push(err));
+                let reported: (err: ConnectorError) => void = () => undefined;
+                const first = new Promise<ConnectorError>(resolve => { reported = resolve; });
+                const sub = engine.ConnectorRevertFailed.Subscribe(err =>
+                {
+                    raised.push(err);
+                    reported(err);
+                });
                 a.HangAt = FakeStep.Apply;
                 a.FailAt = FakeStep.Revert;
                 await assert.rejects(EngineFx.Write(engine, t => t.CreateNode('c1', D.Item, { Owner: EngineFx.Crm })), ConnectorError);
+                assert.deepEqual(raised, []);
                 a.Release();
-                await a.Reverted;
-                await new Promise(resolve => setTimeout(resolve, 10));
+                const late = await first;
+                assert.equal(late.Connector, EngineFx.A);
+                assert.equal(late.Phase, ConnectorPhase.Apply);
+                assert.equal(late.cause, a.Failure);
                 assert.equal(raised.length, 1);
-                assert.equal(raised[0]!.Phase, ConnectorPhase.Apply);
                 sub.dispose();
                 await engine.dispose();
             });
@@ -282,12 +313,84 @@ class EngineFx
                 const a = new FakeConnector(EngineFx.A, []);
                 const invalid = EngineFx.IsCode(GraphErrorCode.InvalidArgument);
                 await assert.rejects(GraphEngine.Open({ Description: D.V1, Storage: storage(), Connectors: [a, new FakeConnector(EngineFx.A, [])] }), invalid);
-                await assert.rejects(GraphEngine.Open({ Description: D.V1, Storage: storage(), Connectors: [new FakeConnector('engine', [])] }), invalid);
+                await assert.rejects(GraphEngine.Open({ Description: D.V1, Storage: storage(), Connectors: [new FakeConnector(Api.BindingTable.EngineStorage, [])] }), invalid);
                 await assert.rejects(GraphEngine.Open({ Description: D.V1, Storage: storage(), PrepareTimeoutMs: 0 }), invalid);
                 const toEngine = await GraphEngine.Open({ Description: D.Desc(D.V1Version, true, [{ Model: EngineFx.Crm, Connector: Api.BindingTable.EngineStorage }]), Storage: storage() });
                 await EngineFx.Write(toEngine, t => t.CreateNode('c1', D.Item, { Owner: EngineFx.Crm }));
                 assert.equal(await EngineFx.Value(toEngine, 'c1', D.Name), null, 'binding to the engine itself is valid and engine-only');
                 await toEngine.dispose();
+            });
+
+            it('a commit routed before a bindings-only upgrade never applies stale routing (newly bound)', async () =>
+            {
+                const a = new FakeConnector(EngineFx.A, []);
+                const engine = await GraphEngine.Open({ Description: D.Desc(D.V1Version, true, []), Storage: storage(), Connectors: [a] });
+                await EngineFx.Write(engine, t => t.CreateNode('c1', D.Item, { Owner: EngineFx.Crm }));
+                const t = await engine.Begin(AccessScope.System);
+                t.SetProperty('c1', D.Name, 'stale');
+                const gate = EngineFx.HoldRouting(t);
+                const commit = t.Commit();
+                await gate.Reached;
+                await engine.Upgrade(D.Desc('v1b', true, EngineFx.CrmTo(EngineFx.A)));
+                gate.Release();
+                await assert.rejects(commit, ConflictError, 'routed engine-only under the old bindings');
+                assert.equal(await EngineFx.Value(engine, 'c1', D.Name), null);
+                assert.equal(a.Applied.length, 0);
+                await EngineFx.Write(engine, w => w.SetProperty('c1', D.Name, 'retried'));
+                assert.equal(a.Applied.length, 1, 'the retry routes by the new bindings');
+                await engine.dispose();
+            });
+
+            it('a commit routed before a bindings-only upgrade never applies stale routing (rebound)', async () =>
+            {
+                const a = new FakeConnector(EngineFx.A, []);
+                const b = new FakeConnector(EngineFx.B, []);
+                const engine = await GraphEngine.Open({ Description: D.Desc(D.V1Version, true, EngineFx.CrmTo(EngineFx.A)), Storage: storage(), Connectors: [a, b] });
+                await EngineFx.Write(engine, t => t.CreateNode('c1', D.Item, { Owner: EngineFx.Crm }));
+                const t = await engine.Begin(AccessScope.System);
+                t.SetProperty('c1', D.Name, 'stale');
+                const gate = EngineFx.HoldRouting(t);
+                const commit = t.Commit();
+                await gate.Reached;
+                await engine.Upgrade(D.Desc('v1b', true, EngineFx.CrmTo(EngineFx.B)));
+                gate.Release();
+                await assert.rejects(commit, ConflictError, 'routed to A under the old bindings');
+                assert.equal(a.Applied.length, 1, 'only the create reached A');
+                assert.equal(b.Applied.length, 0);
+                assert.equal(await EngineFx.Value(engine, 'c1', D.Name), null);
+                await engine.dispose();
+            });
+
+            it('a prepared write-through finalizing after a bindings-only upgrade is reverted', async () =>
+            {
+                const a = new FakeConnector(EngineFx.A, []);
+                const b = new FakeConnector(EngineFx.B, []);
+                const engine = await GraphEngine.Open({ Description: D.Desc(D.V1Version, true, EngineFx.CrmTo(EngineFx.A)), Storage: storage(), Connectors: [a, b] });
+                let upgraded: Promise<unknown> = Promise.resolve();
+                a.OnCommit = async () =>
+                {
+                    upgraded = engine.Upgrade(D.Desc('v1b', true, EngineFx.CrmTo(EngineFx.B)));
+                    await upgraded;
+                };
+                const e = await EngineFx.Write(engine, t => t.CreateNode('c1', D.Item, { Owner: EngineFx.Crm })).catch((err: unknown) => err);
+                await upgraded;
+                assert.ok(e instanceof ConnectorError && e.Phase === ConnectorPhase.Finalize, String(e));
+                assert.ok(e.cause instanceof ConflictError);
+                await a.Reverted;
+                assert.equal(await EngineFx.Value(engine, 'c1', D.Name), undefined, 'nothing was finalized');
+                await engine.dispose();
+            });
+
+            it('dispose waits for a hot upgrade already called', async () =>
+            {
+                const engine = await GraphEngine.Open({ Description: D.V1, Storage: storage() });
+                const upgrade = engine.Upgrade(D.V2);
+                const closed = engine.dispose();
+                const result = await upgrade;
+                assert.equal(result.Changed, true);
+                assert.equal(engine.SchemaVersion, D.V2Version);
+                assert.equal(engine.Catalog, result.Catalog);
+                await closed;
             });
 
             it('dispose is idempotent and later calls reject Disposed', async () =>
@@ -299,6 +402,7 @@ class EngineFx
                 await assert.rejects(engine.Begin(AccessScope.System), disposed);
                 await assert.rejects(engine.BeginRead(AccessScope.System), disposed);
                 await assert.rejects(engine.Upgrade(D.V2), disposed);
+                await assert.rejects(engine.Upgrade(D.Desc(D.V2Version, false, EngineFx.CrmTo('Z'))), disposed, 'liveness is checked before the bindings');
                 await assert.rejects(EngineFx.Changes(engine), disposed);
             });
         });

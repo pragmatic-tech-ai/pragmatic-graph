@@ -6,7 +6,7 @@ import type { WriteBatch } from './WriteBatch.js';
  * A batch the committer validated and dry-ran but did not apply (Committer.Prepare, ruling R71). Its
  * reservation keeps every other commit off the keys the batch read, depends on and writes, so Finalize
  * cannot fail on a conflict while the reservation holds and the catalog is unchanged; it can still fail
- * on storage trouble, on disposal, or (ConflictError) on a schema change or upgrade since Prepare.
+ * on storage trouble, on disposal, or (ConflictError) on a schema change, upgrade or binding change since Prepare.
  * Finalize after Abort or expiry is a ConflictError. Settle it promptly: until then the reserved keys
  * conflict for everyone else.
  */
@@ -25,6 +25,8 @@ export class PreparedCommit
         public readonly CatalogVersion: number,
         /** @internal */
         public readonly Reservation: Reservation,
+        /** @internal The connector-setup generation the batch was routed with; Finalize requires it unchanged (ruling R77). */
+        public readonly BindingGeneration?: number,
     )
     {
     }

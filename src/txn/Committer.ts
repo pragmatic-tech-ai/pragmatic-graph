@@ -3,6 +3,7 @@ import { CatalogSnapshot } from '../catalog/CatalogSnapshot.js';
 import { CatalogStore } from '../catalog/CatalogStore.js';
 import { ColumnStore } from '../columns/ColumnStore.js';
 import { Compactor } from '../columns/Compactor.js';
+import type { ConnectorSetup } from '../connectors/WriteCoordinator.js';
 import { EdgeStore } from '../edges/EdgeStore.js';
 import { IdAllocator } from '../identity/IdAllocator.js';
 import { PublicIdIndex } from '../identity/PublicIdIndex.js';
@@ -74,6 +75,8 @@ class PendingCommit
      * `CatalogVersion`: the version the submitter's transaction began with; checked inside the group
      * against the group's catalog (ruling F4). Undefined: no check. `Finalizes`: the reservation of the
      * prepared commit this batch finalizes (ruling R71), owned by `owner`; settling the batch ends it.
+     * `BindingGeneration`: the connector-setup generation the submitter routed with; checked inside the
+     * group against the committer's like the catalog version (ruling R77). Undefined: no check.
      */
     public constructor(
         public readonly Bytes: Uint8Array,
@@ -85,6 +88,7 @@ class PendingCommit
         public readonly CatalogVersion?: number,
         public readonly Finalizes?: Reservation,
         private readonly owner?: Reservations,
+        public readonly BindingGeneration?: number,
     )
     {
     }
@@ -139,9 +143,10 @@ class PendingPrepare extends PendingCommit
         reject: (error: unknown) => void,
         catalogVersion: number | undefined,
         public readonly TimeoutMs: number,
+        bindingGeneration: number | undefined,
     )
     {
-        super(bytes, batch, reads, snapshot, PendingPrepare.Unused, reject, catalogVersion);
+        super(bytes, batch, reads, snapshot, PendingPrepare.Unused, reject, catalogVersion, undefined, undefined, bindingGeneration);
     }
 
     public ResolvePrepared(prepared: PreparedCommit): void
@@ -317,6 +322,7 @@ export class Committer
     private static readonly ErrCompactMember = 'Delta for a member the catalog does not know: ';
     private static readonly ErrSchema = 'The schema changed after the transaction began: catalog version ';
     private static readonly ErrSchemaNow = ', now ';
+    private static readonly ErrBindings = 'The connector bindings changed after the commit was routed: generation ';
     private static readonly ErrSchemaVersion = 'Schema version must be well-formed UTF-16 (no lone surrogates)';
     private static readonly ErrSeedIds = 'Seed still needs unallocated ids after the retry: ';
     private static readonly ErrTimeout = 'Prepare timeout must be a finite, non-negative number of milliseconds: ';
@@ -345,6 +351,10 @@ export class Committer
     /** The running Pump (undefined when idle); dispose() awaits it. */
     private pump: Promise<void> | undefined;
     private disposed = false;
+    /** The installed bindings and connectors (ruling R72); undefined: every write is engine-only. */
+    private connectors: ConnectorSetup | undefined;
+    /** Bumped by every InstallConnectors; 0 while none was ever installed (ruling R77). */
+    private generation = 0;
 
     public constructor(private readonly store: IKeyValueStore, catalog: CatalogSnapshot, options?: ICommitterOptions)
     {
@@ -396,6 +406,35 @@ export class Committer
         return this.history.Register();
     }
 
+    /** The installed bindings and connectors; undefined (every write engine-only) until InstallConnectors. */
+    public get Connectors(): ConnectorSetup | undefined
+    {
+        return this.connectors;
+    }
+
+    /**
+     * The generation of the installed connector setup (0 before any install). A transaction reads it
+     * together with Connectors when it routes and hands it to Submit / Prepare (ruling R77).
+     */
+    public get BindingGeneration(): number
+    {
+        return this.generation;
+    }
+
+    /**
+     * Installs connector bindings for commits routed afterwards (ruling R77): a new generation, so every
+     * batch or prepare routed with the previous setup and not yet applied fails with ConflictError
+     * (retry-safe), and every reservation is invalidated (a prepared commit routed with the old setup
+     * fails Finalize with ConflictError, as after a schema change). SubmitUpgrade installs inside the
+     * upgrade's own turn instead.
+     */
+    public InstallConnectors(setup: ConnectorSetup): void
+    {
+        this.connectors = setup;
+        this.generation++;
+        this.reservations.InvalidateAll();
+    }
+
     /** The catalog later groups validate and apply against. */
     public get Catalog(): CatalogSnapshot
     {
@@ -416,8 +455,9 @@ export class Committer
      * commit; resolves with its commit number. Rejects with ConflictError on a read conflict (or a
      * snapshot older than the retained window), CommitError when the batch is semantically invalid, and
      * GraphError InvalidArgument when snapshotCommit is after LastCommit(). The batch and read set are captured now.
+     * `bindingGeneration`, when given, must still be BindingGeneration in the batch's group, else ConflictError.
      */
-    public Submit(batch: WriteBatch, readSet: ReadSet, snapshotCommit: bigint, catalogVersion?: number): Promise<bigint>
+    public Submit(batch: WriteBatch, readSet: ReadSet, snapshotCommit: bigint, catalogVersion?: number, bindingGeneration?: number): Promise<bigint>
     {
         let bytes: Uint8Array;
         try
@@ -430,7 +470,7 @@ export class Committer
         }
         return new Promise<bigint>((resolve, reject) =>
         {
-            this.Push(new PendingCommit(bytes, WriteBatch.Deserialize(bytes).Seal(), readSet.Clone(), snapshotCommit, resolve, reject, catalogVersion));
+            this.Push(new PendingCommit(bytes, WriteBatch.Deserialize(bytes).Seal(), readSet.Clone(), snapshotCommit, resolve, reject, catalogVersion, undefined, undefined, bindingGeneration));
         });
     }
 
@@ -444,9 +484,10 @@ export class Committer
      * or its write keys hit keys another reserved (also for an empty batch: its reads stay reserved). Resolves with a PreparedCommit holding a reservation for `timeoutMs` (default
      * DefaultPrepareTimeoutMs): until it finalizes, aborts or expires, a commit that writes what it read,
      * depends on or writes, or that writes after reading what it writes, fails with ConflictError.
-     * Unrelated commits proceed. The batch and read set are captured now.
+     * Unrelated commits proceed. The batch and read set are captured now. `bindingGeneration` is checked
+     * as for Submit, at the prepare's turn and again at Finalize.
      */
-    public Prepare(batch: WriteBatch, readSet: ReadSet, snapshotCommit: bigint, catalogVersion?: number, timeoutMs: number = Committer.DefaultPrepareTimeoutMs): Promise<PreparedCommit>
+    public Prepare(batch: WriteBatch, readSet: ReadSet, snapshotCommit: bigint, catalogVersion?: number, timeoutMs: number = Committer.DefaultPrepareTimeoutMs, bindingGeneration?: number): Promise<PreparedCommit>
     {
         let bytes: Uint8Array;
         try
@@ -463,7 +504,7 @@ export class Committer
         }
         return new Promise<PreparedCommit>((resolve, reject) =>
         {
-            this.Push(new PendingPrepare(bytes, WriteBatch.Deserialize(bytes).Seal(), readSet.Clone(), snapshotCommit, resolve, reject, catalogVersion, timeoutMs));
+            this.Push(new PendingPrepare(bytes, WriteBatch.Deserialize(bytes).Seal(), readSet.Clone(), snapshotCommit, resolve, reject, catalogVersion, timeoutMs, bindingGeneration));
         });
     }
 
@@ -490,7 +531,7 @@ export class Committer
         }
         return new Promise<bigint>((resolve, reject) =>
         {
-            const pending = new PendingCommit(prepared.Bytes, prepared.Batch, new ReadSet(), this.history.Last, resolve, reject, prepared.CatalogVersion, prepared.Reservation, this.reservations);
+            const pending = new PendingCommit(prepared.Bytes, prepared.Batch, new ReadSet(), this.history.Last, resolve, reject, prepared.CatalogVersion, prepared.Reservation, this.reservations, prepared.BindingGeneration);
             pending.Ids = [...prepared.Ids];
             this.Push(pending);
         });
@@ -550,8 +591,11 @@ export class Committer
      * unchanged seed only rewrites a differing Meta("schemaVersion"): no commit, no entry, no signal
      * (ruling R48). A planning error (CatalogError) or a seed error (CommitError) rejects only this
      * upgrade and changes nothing; a version that is not well-formed UTF-16 is GraphError InvalidArgument.
+     * `connectors`, when given, is installed (InstallConnectors) inside the upgrade's turn once it
+     * succeeded, before CommitApplied is raised, so no commit is ordered between the upgrade and the new
+     * bindings (ruling R77); a failed upgrade installs nothing.
      */
-    public SubmitUpgrade(description: ISchemaDescription): Promise<IUpgradeCommit>
+    public SubmitUpgrade(description: ISchemaDescription, connectors?: ConnectorSetup): Promise<IUpgradeCommit>
     {
         if (this.disposed)
         {
@@ -561,7 +605,7 @@ export class Committer
         {
             return Promise.reject(new GraphError(GraphErrorCode.InvalidArgument, Committer.ErrSchemaVersion));
         }
-        return this.Enqueue(() => this.RunUpgrade(description));
+        return this.Enqueue(() => this.RunUpgrade(description, connectors));
     }
 
     /**
@@ -681,12 +725,16 @@ export class Committer
      * version. Seed ids come from a pre-pass outside the Write (ruling R16); when the purge removed a node
      * the pre-pass saw, the upgrade re-runs once with those ids too, and a second miss is Internal.
      */
-    private async RunUpgrade(description: ISchemaDescription): Promise<IUpgradeCommit>
+    private async RunUpgrade(description: ISchemaDescription, connectors: ConnectorSetup | undefined): Promise<IUpgradeCommit>
     {
         const old = this.index;
         const plan = CatalogPlanner.Plan(old.Catalog, description);
         if (!plan.Changed && (await this.StoredSchemaVersion()) === description.Version)
         {
+            if (connectors !== undefined)
+            {
+                this.InstallConnectors(connectors);
+            }
             return { Commit: this.history.Last, Catalog: old.Catalog, Changed: false };
         }
         let missed: readonly string[] = [];
@@ -695,7 +743,7 @@ export class Committer
             const ids = await this.PreallocateSeed(old, description.Seed, missed);
             try
             {
-                return await this.WriteUpgrade(description, plan, ids);
+                return await this.WriteUpgrade(description, plan, ids, connectors);
             }
             catch (error)
             {
@@ -742,7 +790,7 @@ export class Committer
     }
 
     /** One upgrade attempt: a single store.Write, then history, catalog and signals. */
-    private async WriteUpgrade(description: ISchemaDescription, plan: ICatalogPlan, ids: ReadonlyMap<string, bigint>): Promise<IUpgradeCommit>
+    private async WriteUpgrade(description: ISchemaDescription, plan: ICatalogPlan, ids: ReadonlyMap<string, bigint>, connectors: ConnectorSetup | undefined): Promise<IUpgradeCommit>
     {
         const old = this.index;
         const next = plan.Changed ? new CatalogIndex(plan.Catalog) : old;
@@ -794,6 +842,10 @@ export class Committer
         }
         this.history.Prune();
         this.index = next;
+        if (connectors !== undefined)
+        {
+            this.InstallConnectors(connectors);
+        }
         if (upgradeCommit !== undefined)
         {
             this.RaiseApplied({
@@ -937,6 +989,7 @@ export class Committer
         const version = index.Catalog.Version;
         const early = this.history.Check(p.Reads, p.Snapshot)
             ?? Committer.VersionConflict(p.CatalogVersion, version)
+            ?? this.GenerationConflict(p.BindingGeneration)
             // A prepare's reads stay reserved even when it writes nothing, so it is always checked.
             ?? this.reservations.ReadConflict(p.Reads);
         if (early !== undefined)
@@ -969,7 +1022,7 @@ export class Committer
             return;
         }
         const reservation = this.reservations.Reserve(reserved, outcome.Keys, p.TimeoutMs);
-        p.ResolvePrepared(new PreparedCommit(this, p.Batch, p.Bytes, p.Ids ?? [], version, reservation));
+        p.ResolvePrepared(new PreparedCommit(this, p.Batch, p.Bytes, p.Ids ?? [], version, reservation, p.BindingGeneration));
     }
 
     /**
@@ -1004,6 +1057,12 @@ export class Committer
     private static VersionConflict(began: number | undefined, now: number): ConflictError | undefined
     {
         return began === undefined || began === now ? undefined : new ConflictError(Committer.ErrSchema + began + Committer.ErrSchemaNow + now);
+    }
+
+    /** The ConflictError for work routed with connector-setup generation `routed` when that is no longer current; undefined when unchecked or equal. */
+    private GenerationConflict(routed: number | undefined): ConflictError | undefined
+    {
+        return routed === undefined || routed === this.generation ? undefined : new ConflictError(Committer.ErrBindings + routed + Committer.ErrSchemaNow + this.generation);
     }
 
     private async RunCommits(group: PendingCommit[]): Promise<void>
@@ -1117,7 +1176,7 @@ export class Committer
         const finalized = new Set<Reservation>();
         for (const p of candidates)
         {
-            const stale = Committer.VersionConflict(p.CatalogVersion, version);
+            const stale = Committer.VersionConflict(p.CatalogVersion, version) ?? this.GenerationConflict(p.BindingGeneration);
             if (stale !== undefined)
             {
                 conflicts.push([p, stale]);

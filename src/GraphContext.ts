@@ -74,7 +74,6 @@ export class GraphContext
     /** Per scope, the catalog version it was last validated against (ruling R63). */
     private readonly validated = new WeakMap<AccessScope, number>();
     private index: CatalogIndex;
-    private connectors: ConnectorSetup | undefined;
 
     public constructor(public readonly Store: IKeyValueStore, public readonly Committer: Committer, catalog: CatalogSnapshot)
     {
@@ -87,10 +86,10 @@ export class GraphContext
         return this.index.Catalog.Version;
     }
 
-    /** The installed bindings and connectors; undefined (every write engine-only) until SetConnectors. */
+    /** The installed bindings and connectors (held by the committer); undefined (every write engine-only) until installed. */
     public get Connectors(): ConnectorSetup | undefined
     {
-        return this.connectors;
+        return this.Committer.Connectors;
     }
 
     /**
@@ -98,11 +97,12 @@ export class GraphContext
      * `timeoutMs` bounds each write-through's connector phase (default Committer.DefaultPrepareTimeoutMs).
      * GraphError InvalidArgument when a binding or the default names a connector not given (other than
      * BindingTable.EngineStorage), two connectors share a name, a connector uses the reserved name, or
-     * the timeout is not a finite positive number.
+     * the timeout is not a finite positive number. Work routed with the previous setup and not yet
+     * applied fails with ConflictError (Committer.InstallConnectors, ruling R77).
      */
     public SetConnectors(bindings: BindingTable, connectors: readonly IGraphConnector[], timeoutMs: number = Committer.DefaultPrepareTimeoutMs): void
     {
-        this.connectors = new ConnectorSetup(bindings, connectors, timeoutMs);
+        this.Committer.InstallConnectors(new ConnectorSetup(bindings, connectors, timeoutMs));
     }
 
     /** Makes a newly committed catalog current for later readers (the committer already applies it). Older versions are ignored. */
