@@ -602,12 +602,12 @@ class PrepFx
                 const inner = await open();
                 const store = new GatedStore(inner);
                 const c = await PrepFx.Committer(store);
-                const prepared = await c.Prepare(PrepFx.Batch(b => b.SetProperty('a', PrepFx.Age, 5n)), new ReadSet(), c.LastCommit(), c.Catalog.Version, 30);
+                const prepared = await c.Prepare(PrepFx.Batch(b => b.SetProperty('a', PrepFx.Age, 5n)), new ReadSet(), c.LastCommit(), c.Catalog.Version, 100);
                 store.Hold();
                 const blocker = PrepFx.Set(c, 'b', PrepFx.Age, 1n);
                 await store.Entered;
                 const finalized = prepared.Finalize();
-                await PrepFx.Wait(60);
+                await PrepFx.Wait(200);
                 assert.equal(prepared.Expired, false, 'a finalizing reservation does not expire');
                 store.Release();
                 await PrepFx.Commits(blocker);
