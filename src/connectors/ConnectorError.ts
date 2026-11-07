@@ -17,6 +17,11 @@ export enum ConnectorPhase
  * after the connectors committed. Every connector that began was reverted (a call still hanging at the
  * timeout is reverted once it returns). `cause` is the failure; when a revert also failed it is an
  * AggregateError holding the failure first, then each revert error. The engine is unchanged.
+ *
+ * Raised late on ConnectorRevertFailed (a revert that failed after the caller was answered): for the
+ * connector whose call was hanging, Phase is that call's phase; for any other connector whose revert
+ * finished late, Phase is the phase of the call that failed the write-through (the caller's
+ * ConnectorError.Phase), not a phase of the reverting connector's own.
  */
 export class ConnectorError extends GraphError
 {
