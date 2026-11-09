@@ -1,0 +1,29 @@
+import { test, describe } from 'node:test';
+import assert from 'node:assert/strict';
+import { CypherSyntaxError, CypherSemanticError, CypherError } from '../CypherError.js';
+import { RelDirection, ComparisonOp } from '../CypherEnums.js';
+
+describe('cypher errors + enums', () =>
+{
+    test('CypherSyntaxError carries line and column and is a CypherError', () =>
+    {
+        const e = new CypherSyntaxError('unexpected token', 2, 7);
+        assert.equal(e.Line, 2);
+        assert.equal(e.Column, 7);
+        assert.ok(e instanceof CypherError);
+        assert.match(e.message, /unexpected token/);
+    });
+
+    test('CypherSemanticError is a CypherError', () =>
+    {
+        assert.ok(new CypherSemanticError('nope') instanceof CypherError);
+    });
+
+    test('enums expose the SP1 value sets', () =>
+    {
+        const undirected = RelDirection.Undirected as RelDirection;
+        const eq = ComparisonOp.Eq as ComparisonOp;
+        assert.equal(undirected !== RelDirection.Outgoing, true);
+        assert.equal(eq !== ComparisonOp.Neq, true);
+    });
+});

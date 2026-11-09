@@ -1,4 +1,5 @@
-import { DateTimeValue, DateValue, DurationValue, type CellValue } from '../columns/CellValue.js';
+import { CellOrder } from '../columns/CellOrder.js';
+import { DurationValue, type CellValue } from '../columns/CellValue.js';
 import { And, Compare, CompareOp, IdIn, In, IsNull, Not, Or, Predicate, PredicateKind } from './Predicate.js';
 import { PredicateError, PredicateErrorCode } from './PredicateError.js';
 
@@ -152,7 +153,7 @@ export class NodeEvaluator
             }
             return (a.Equals(b) === (op === CompareOp.Eq)) ? Truth.True : Truth.False;
         }
-        const order = NodeEvaluator.Order(a, b);
+        const order = CellOrder.Order(a, b);
         if (order === undefined)
         {
             return Truth.False;
@@ -172,36 +173,5 @@ export class NodeEvaluator
             case CompareOp.Ge: return order >= 0;
             default: return false;
         }
-    }
-
-    /** Negative/zero/positive ordering of two non-null values, or undefined when they are not comparable. */
-    private static Order(a: CellValue, b: CellValue): number | undefined
-    {
-        if ((typeof a === 'bigint' || typeof a === 'number') && (typeof b === 'bigint' || typeof b === 'number'))
-        {
-            if (Number.isNaN(a) || Number.isNaN(b))
-            {
-                return undefined;
-            }
-            // Mixed bigint/number relational operators in JS compare the exact mathematical values.
-            return a < b ? -1 : a > b ? 1 : 0;
-        }
-        if (typeof a === 'string' && typeof b === 'string')
-        {
-            return Buffer.compare(Buffer.from(a, 'utf8'), Buffer.from(b, 'utf8'));
-        }
-        if (typeof a === 'boolean' && typeof b === 'boolean')
-        {
-            return Number(a) - Number(b);
-        }
-        if (a instanceof DateValue && b instanceof DateValue)
-        {
-            return Math.sign(a.Days - b.Days);
-        }
-        if (a instanceof DateTimeValue && b instanceof DateTimeValue)
-        {
-            return a.Micros < b.Micros ? -1 : a.Micros > b.Micros ? 1 : 0;
-        }
-        return undefined;
     }
 }
