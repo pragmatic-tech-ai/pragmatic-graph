@@ -101,9 +101,9 @@ export class GraphTransaction extends GraphReader
             const generation = this.context.Committer.BindingGeneration;
             if (setup !== undefined)
             {
-                // Routing reads the snapshot unscoped and records it like any read (ruling R72).
-                const origins: INodeOrigins = { Origin: id => this.NodeOrigin(id) };
-                const sets = await WriteCoordinator.Route(this.batch, setup.Bindings, this.snapshot.Index.Catalog, origins);
+                // Routing reads the snapshot unscoped and records it like any read (rulings R72, R89).
+                const origins: INodeOrigins = { Origin: id => this.NodeOrigin(id), Edges: id => this.NodeEdges(id) };
+                const sets = await WriteCoordinator.Route(this.batch, setup.Bindings, this.snapshot.Index, origins);
                 if (sets.size > 0)
                 {
                     const prepare = () => this.context.Committer.Prepare(this.batch, this.Reads, this.ValidationCommit(), began, setup.TimeoutMs, generation);

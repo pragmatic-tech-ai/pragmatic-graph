@@ -5,7 +5,9 @@ import type { ConnectorChangeSet } from './ConnectorChangeSet.js';
  * A commit that writes nodes bound to the connector runs one connector transaction (WriteCoordinator):
  * Begin, Apply its change set, Commit, all before the engine finalizes. What Revert achieves remotely
  * is the connector author's responsibility; the engine guarantees it is called on every failure.
- * Changes are the batch ops as recorded (ConnectorChange), including DeleteNode's `Strict` flag.
+ * Changes are the batch ops as recorded (ConnectorChange), including DeleteNode's `Strict` flag, plus
+ * one Unlink before a plain DeleteNode for every edge the delete removes whose source binds to the
+ * connector (ruling R89).
  */
 export interface IGraphConnector
 {

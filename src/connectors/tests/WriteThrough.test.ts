@@ -319,6 +319,8 @@ class ThroughFx
                     t.SetProperty('x', ThroughFx.Name, ThroughFx.Written);
                 });
                 assert.deepEqual(ThroughFx.Changes(fx.A), [
+                    // The delete's own edge x -next-> y is routed before it (ruling R89).
+                    { Op: WriteOp.Unlink, From: 'x', Relationship: ThroughFx.Next, To: 'y', Owner: ThroughFx.Crm, Concept: ThroughFx.Item },
                     { Op: WriteOp.DeleteNode, PublicId: 'x', Owner: ThroughFx.Crm, Concept: ThroughFx.Item },
                 ]);
                 assert.deepEqual(ThroughFx.Changes(fx.B), [

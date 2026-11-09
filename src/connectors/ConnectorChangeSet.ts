@@ -9,7 +9,11 @@ import type { BatchOp } from '../txn/WriteBatch.js';
  */
 export type ConnectorChange = BatchOp & { readonly Owner: string; readonly Concept: string };
 
-/** The writes of one transaction that one connector owns, in batch op order. Immutable. */
+/**
+ * The writes of one transaction that one connector owns, in batch op order. Immutable. A plain DeleteNode
+ * is preceded, in the change set of each connector its edges' sources bind to, by one Unlink per edge
+ * it removes (ruling R89), so every change set describes the storage effects, hidden edges included.
+ */
 export class ConnectorChangeSet
 {
     public readonly Changes: readonly ConnectorChange[];

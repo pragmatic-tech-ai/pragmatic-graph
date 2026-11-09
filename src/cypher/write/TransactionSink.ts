@@ -184,7 +184,8 @@ export class TransactionSink implements ICypherSink
             throw new CypherWriteError(TransactionSink.NodeHasRelationships, CypherWriteErrorCode.NodeHasRelationships);
         }
         for (const [from, relationship, to] of edges) await this.DeleteRelationship(from, relationship, to);
-        // Strict: hidden edges the query cannot see still fail the commit (NodeHasEdges).
+        // Strict: hidden edges the query cannot see still fail the commit (NodeHasEdges). DETACH: the engine
+        // removes the hidden ones too, and routes their Unlinks to connectors itself (ruling R89).
         this.pending.DeleteNode(publicId, detach ? undefined : { Strict: true });
         this.overlay.RecordDelete(publicId);
         this.Stats.NodesDeleted++;

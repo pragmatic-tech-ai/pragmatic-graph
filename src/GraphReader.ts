@@ -473,6 +473,38 @@ export class GraphReader implements IGraphDisposable
         return node === undefined ? undefined : { Owner: await this.recorded.Owner(node), Concept: node.Concept };
     }
 
+    /**
+     * Every edge of the live node with that public id, unscoped (a write-through routes the edges a delete
+     * removes whatever the scope may see, ruling R89): outgoing over its effective relationships in
+     * declaration order, then incoming over IncomingRelationships, each in stored edge order; a self-loop
+     * appears in both. None when there is no such node. Records the node's binding and every adjacency
+     * range it walks.
+     */
+    protected async NodeEdges(publicId: string): Promise<{ readonly From: string; readonly Relationship: string; readonly To: string }[]>
+    {
+        const out: { readonly From: string; readonly Relationship: string; readonly To: string }[] = [];
+        const node = await this.recorded.Locate(publicId);
+        if (node === undefined)
+        {
+            return out;
+        }
+        for (const rel of this.snapshot.Index.Catalog.EffectiveMembers(node.Concept).filter(m => m.Kind === MemberKind.Relationship))
+        {
+            for await (const id of this.recorded.Adjacent(rel, node.Id, EdgeDirection.Out))
+            {
+                out.push({ From: publicId, Relationship: rel.Name, To: await this.recorded.PublicIdOf(id) });
+            }
+        }
+        for (const rel of this.snapshot.Index.IncomingRelationships(node.Concept))
+        {
+            for await (const id of this.recorded.Adjacent(rel, node.Id, EdgeDirection.In))
+            {
+                out.push({ From: await this.recorded.PublicIdOf(id), Relationship: rel.Name, To: publicId });
+            }
+        }
+        return out;
+    }
+
     protected RequireOpen(): void
     {
         if (this.disposed)
