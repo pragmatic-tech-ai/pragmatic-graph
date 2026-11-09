@@ -111,6 +111,26 @@ export class GraphReader implements IGraphDisposable
     }
 
     /**
+     * True iff a node of `concept` with exactly these property values, no owner, no seed provenance and no relationships
+     * would pass this reader's scope Rows (ruling R95): how a host asks whether to show something that is not an engine
+     * instance (a schema-level node, say) without deciding visibility itself. Entries apply by the usual inheritance
+     * (ancestors, carried aspects) and ConceptIs names exactly `concept`; a missing property is null. Predicates that need
+     * stored identity or edges (IdIn, OwnerIs, Seeded, Related, Reachable) cannot hold, also under Not (fail closed).
+     * False for an unknown concept or an aspect name; true otherwise under a scope that restricts no read (System).
+     * Synchronous: reads nothing from the store and records nothing.
+     */
+    public Admits(concept: string, properties: ReadonlyMap<string, CellValue>): boolean
+    {
+        this.RequireOpen();
+        if (this.evaluator !== undefined)
+        {
+            return this.evaluator.Admits(concept, properties);
+        }
+        const catalog = this.Catalog;
+        return catalog.Has(concept) && !catalog.IsAspect(concept);
+    }
+
+    /**
      * The property's value (null for an unset nullable property or a member the scope hides), or
      * undefined when no visible node has the public id. Errors are GraphErrors with the codes a commit
      * uses for the same mistake (ruling F8): unknown members are a CatalogError and relationship members
