@@ -3,6 +3,10 @@
   "version": "0.1.1",
   "description": "Graph database storage engine: KV layer and graph layout",
   "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pragmatic-tech-ai/pragmatic-graph.git"
+  },
   "engines": {
     "node": ">=20"
   },
@@ -19,6 +23,10 @@
     "dist",
     "NOTICE"
   ],
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com",
+    "access": "public"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.build.json --noEmit && tsc -p tsconfig.json --noEmit",
