@@ -36,6 +36,9 @@ export class ScalarSemantics
     private static readonly DecimalPoint = '.';
     private static readonly FloatSuffix = '.0';
     private static readonly ExponentMarker = 'e';
+    private static readonly NonFinite: ReadonlyMap<string, number> = new Map([
+        [String(Number.NaN), Number.NaN], [String(Number.POSITIVE_INFINITY), Number.POSITIVE_INFINITY], [String(Number.NEGATIVE_INFINITY), Number.NEGATIVE_INFINITY],
+    ]);
 
     /** A JS number as a Cypher scalar: a safe integer is an Int64 (bigint), anything else a Float64. */
     public static FromNumber(n: number): bigint | number
@@ -49,6 +52,18 @@ export class ScalarSemantics
         if (typeof value === 'number') return ScalarSemantics.FromNumber(value);
         if (typeof value === 'bigint') return ScalarSemantics.CheckInt64(value);
         return value;
+    }
+
+    /** The text of a NaN or infinite Float64: 'NaN', 'Infinity' or '-Infinity' (the `$float` tag's payload). */
+    public static NonFiniteText(value: number): string
+    {
+        return String(value);
+    }
+
+    /** The NaN or infinite Float64 that NonFiniteText wrote, or undefined for any other text. */
+    public static ParseNonFinite(text: string): number | undefined
+    {
+        return ScalarSemantics.NonFinite.get(text);
     }
 
     /** Returns the value, or raises IntegerOverflow when it is outside the Int64 range. */
@@ -126,12 +141,22 @@ export class ScalarSemantics
         return ScalarRank.Duration;
     }
 
-    /** Deterministic order of two scalars of the same rank (ORDER BY); NaN ties with every number. */
+    /**
+     * Deterministic total order of two scalars of the same rank (ORDER BY, the implicit paging order). openCypher
+     * orderability: NaN equals NaN and sorts above every other number. Only here; `=` and `<` (Compare) keep NaN
+     * incomparable.
+     */
     public static TotalOrder(a: CypherScalar, b: CypherScalar): number
     {
         if (a instanceof DurationValue && b instanceof DurationValue)
         {
             return Math.sign(a.Months - b.Months) || Math.sign(a.Days - b.Days) || ScalarSemantics.BigSign(a.Micros - b.Micros);
+        }
+        const aNaN = Number.isNaN(a);
+        const bNaN = Number.isNaN(b);
+        if (aNaN || bNaN)
+        {
+            return aNaN === bNaN ? 0 : aNaN ? 1 : -1;
         }
         const order = CellOrder.Order(a, b) ?? 0;
         if (order === 0 && a instanceof DateTimeValue && b instanceof DateTimeValue)

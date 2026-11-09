@@ -79,7 +79,7 @@ describe('CypherCellCodec', () =>
     test('tag-shaped map is escaped', async () =>
     {
         const shapes: Record<string, CypherValueDto>[] = [
-            { $int: '5' }, { $date: '2026-11-09' }, { $duration: 'P1D' }, { $datetime: '2026-11-09T10:00:00Z', zone: 'UTC' }, { $map: 1 }, { $node: 1 },
+            { $int: '5' }, { $float: 'NaN' }, { $date: '2026-11-09' }, { $duration: 'P1D' }, { $datetime: '2026-11-09T10:00:00Z', zone: 'UTC' }, { $map: 1 }, { $node: 1 },
         ];
         for (const shape of shapes)
         {
@@ -158,6 +158,33 @@ describe('value cells', () =>
         assert.equal(CodecFixture.Scalar(1e300), 1e300);
         assert.equal(CodecFixture.Scalar(2 ** 60), 2 ** 60);
         assert.equal(CodecFixture.Scalar(2.0), 2n);
+    });
+
+    test('NaN and the infinities are $float tags, decode back and bind as parameters', () =>
+    {
+        const cases: [number, string][] = [[Number.NaN, 'NaN'], [Number.POSITIVE_INFINITY, 'Infinity'], [Number.NEGATIVE_INFINITY, '-Infinity']];
+        for (const [value, text] of cases)
+        {
+            assert.deepEqual(CypherCellCodec.Encode(new ScalarValue(value)), { $float: text });
+            // Through JSON text (CodecFixture.Scalar), which a bare NaN / Infinity would not survive.
+            assert.ok(Object.is(CodecFixture.Scalar(value), value), text);
+            assert.ok(Object.is((ParameterBinder.FromInput({ $float: text }) as ScalarValue).Value, value), text);
+        }
+        assert.equal(CypherCellCodec.Encode(new ScalarValue(-0)), -0);
+        for (const bad of [{ $float: 'nan' }, { $float: '1.5' }, { $float: 1 }, { $float: 'NaN', b: 1 }])
+        {
+            assert.throws(() => ParameterBinder.FromInput(bad as unknown as ParameterValue), CypherSemanticError, JSON.stringify(bad));
+        }
+    });
+
+    test('a node property holding NaN encodes as a $float tag', () =>
+    {
+        const node = new CypherNode('n', 'Item', '', new Map([['f', Number.NaN]]));
+        node.FillLinks([]);
+        const cell = CypherCellCodec.Encode(new NodeValue(node));
+        assert.deepEqual(CypherCellCodec.AsNode(cell)!.properties, { f: { $float: 'NaN' } });
+        const back = CypherCellCodec.Decode(JSON.parse(JSON.stringify(cell)) as CypherValueDto) as NodeValue;
+        assert.ok(Number.isNaN(back.Node.Properties.get('f')));
     });
 
     test('temporal cells encode as tags and decode exactly', () =>
@@ -244,7 +271,7 @@ describe('value cells', () =>
     test('malformed cells are a CypherError', () =>
     {
         const bad: unknown[] = [
-            { $int: 5 }, { $int: '1.5' }, { $int: '99999999999999999999' }, { $date: '2026-02-30' }, { $duration: 'P' },
+            { $int: 5 }, { $int: '1.5' }, { $int: '99999999999999999999' }, { $float: 1 }, { $float: '1.5' }, { $float: 'nan' }, { $float: 'inf' }, { $date: '2026-02-30' }, { $duration: 'P' },
             { $datetime: 'x', zone: 'UTC' }, { $datetime: '2026-11-09T10:00:00Z', zone: 5 }, { $map: 1 }, { $node: 1 },
             { $node: { id: 'x', concept: 'c', owner: '', properties: { p: [1] }, links: {} } },
             { $node: { id: 'x', concept: 'c', owner: '', properties: {}, links: { r: [1] } } },

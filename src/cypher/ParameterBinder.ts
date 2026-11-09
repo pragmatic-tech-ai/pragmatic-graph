@@ -1,4 +1,5 @@
 import { DateTimeValue, DateValue, DurationValue } from '../columns/CellValue.js';
+import { CypherCellCodec } from './CypherCellCodec.js';
 import { CypherSemanticError } from './CypherError.js';
 import { CypherValue, NullValue, ScalarValue, type ParameterValue } from './CypherValue.js';
 import { ScalarSemantics } from './ScalarSemantics.js';
@@ -9,12 +10,14 @@ import { TemporalText } from './TemporalText.js';
 // Numbers: a safe integer binds as an Int64 (bigint), any other number as a Float64; bigints must fit Int64.
 // Temporals: { $date: 'YYYY-MM-DD' }, { $datetime: '<ISO-8601 instant>', zone?: '<IANA>' } (an absent zone is UTC; a present zone must be a string)
 // and { $duration: '<ISO-8601 duration>' }, or engine DateValue/DateTimeValue/DurationValue instances.
+// Non-finite floats (which JSON cannot carry): { $float: 'NaN' | 'Infinity' | '-Infinity' }, the result-cell tag.
 // Lives apart from CypherValue because ListValue/MapValue import CypherValue.ts; a static on the abstract root would
 // create an import cycle.
 export class ParameterBinder
 {
     private static readonly Unsupported = 'unsupported parameter value: only scalars, null, arrays and plain objects are allowed';
     private static readonly MalformedTemporal = 'malformed temporal parameter: ';
+    private static readonly MalformedFloat = 'malformed float parameter: ';
     private static readonly DateKey = '$date';
     private static readonly DateTimeKey = '$datetime';
     private static readonly ZoneKey = 'zone';
@@ -33,8 +36,8 @@ export class ParameterBinder
             const proto = Object.getPrototypeOf(value);
             if (proto !== Object.prototype && proto !== null) throw new CypherSemanticError(ParameterBinder.Unsupported);
             const record = value as { readonly [key: string]: ParameterValue };
-            const temporal = ParameterBinder.Temporal(record);
-            if (temporal !== undefined) return temporal;
+            const tagged = ParameterBinder.Float(record) ?? ParameterBinder.Temporal(record);
+            if (tagged !== undefined) return tagged;
             const entries = new Map<string, CypherValue>();
             for (const [k, v] of Object.entries(record)) entries.set(k, ParameterBinder.FromInput(v));
             return new MapValue(entries);
@@ -47,6 +50,17 @@ export class ParameterBinder
         const out = new Map<string, CypherValue>();
         for (const [name, value] of parameters) out.set(name, ParameterBinder.FromInput(value));
         return out;
+    }
+
+    // A { $float } wrapper object, or undefined when the object has no $float key.
+    private static Float(record: { readonly [key: string]: ParameterValue }): ScalarValue | undefined
+    {
+        const keys = Object.keys(record);
+        if (!keys.includes(CypherCellCodec.FloatKey)) return undefined;
+        const text = record[CypherCellCodec.FloatKey];
+        const value = typeof text === 'string' && keys.length === 1 ? ScalarSemantics.ParseNonFinite(text) : undefined;
+        if (value === undefined) throw new CypherSemanticError(ParameterBinder.MalformedFloat + CypherCellCodec.FloatKey);
+        return new ScalarValue(value);
     }
 
     // A temporal wrapper object, or undefined when the object is an ordinary map.

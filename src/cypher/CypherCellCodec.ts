@@ -28,12 +28,13 @@ export type CypherValueDto = NodeCellDto | boolean | number | string | null | Cy
 /**
  * The engine-neutral, JSON-shaped encoding of result cells, and its inverse.
  *
- * Scalars: a boolean or string is itself; an Int64 within +-(2^53 - 1) and every Float64 is a JSON number; an
- * Int64 outside that range is `{ "$int": "<decimal>" }`; a Date `{ "$date": "YYYY-MM-DD" }`; a DateTime
+ * Scalars: a boolean or string is itself; an Int64 within +-(2^53 - 1) and every finite Float64 is a JSON number; an
+ * Int64 outside that range is `{ "$int": "<decimal>" }`; a NaN or infinite Float64 is
+ * `{ "$float": "NaN" | "Infinity" | "-Infinity" }` (JSON has no such numbers); a Date `{ "$date": "YYYY-MM-DD" }`; a DateTime
  * `{ "$datetime": "<ISO instant, UTC>", "zone": "<IANA>" }`; a Duration `{ "$duration": "<ISO-8601>" }`. Null is
  * null, a list an array, a relationship `{ from, type, to }`, a path `{ nodes, relationships }`, a node
  * `{ "$node": { id, concept, owner, properties, links } }` (its links must have been filled). A map is a plain
- * object, except a map whose keys have the shape of a tag (a sole `$node`, `$map`, `$int`, `$date` or
+ * object, except a map whose keys have the shape of a tag (a sole `$node`, `$map`, `$int`, `$float`, `$date` or
  * `$duration` key, or exactly `$datetime` and `zone`) is escaped as `{ "$map": entries }`, so nothing a query
  * builds can pass for a node or a typed scalar.
  *
@@ -46,6 +47,7 @@ export class CypherCellCodec
     public static readonly NodeKey = '$node';
     public static readonly MapKey = '$map';
     public static readonly IntKey = '$int';
+    public static readonly FloatKey = '$float';
     public static readonly DateKey = '$date';
     public static readonly DateTimeKey = '$datetime';
     public static readonly ZoneKey = 'zone';
@@ -53,7 +55,7 @@ export class CypherCellCodec
 
     private static readonly SafeMax = BigInt(Number.MAX_SAFE_INTEGER);
     private static readonly SoleTags: ReadonlySet<string> = new Set([
-        CypherCellCodec.NodeKey, CypherCellCodec.MapKey, CypherCellCodec.IntKey, CypherCellCodec.DateKey, CypherCellCodec.DurationKey,
+        CypherCellCodec.NodeKey, CypherCellCodec.MapKey, CypherCellCodec.IntKey, CypherCellCodec.FloatKey, CypherCellCodec.DateKey, CypherCellCodec.DurationKey,
     ]);
     private static readonly IntPattern = /^-?\d+$/;
     private static readonly LinksNotFilled = 'a result node must have its links filled before it is encoded: ';
@@ -89,6 +91,7 @@ export class CypherCellCodec
             const safe = cell <= CypherCellCodec.SafeMax && cell >= -CypherCellCodec.SafeMax;
             return safe ? Number(cell) : { [CypherCellCodec.IntKey]: cell.toString() };
         }
+        if (typeof cell === 'number' && !Number.isFinite(cell)) return { [CypherCellCodec.FloatKey]: ScalarSemantics.NonFiniteText(cell) };
         if (cell instanceof DateValue) return { [CypherCellCodec.DateKey]: TemporalText.FormatDate(cell) };
         if (cell instanceof DateTimeValue)
         {
@@ -203,6 +206,12 @@ export class CypherCellCodec
                 case CypherCellCodec.IntKey:
                     if (!CypherCellCodec.IntPattern.test(text)) break;
                     return ScalarSemantics.CheckInt64(BigInt(text));
+                case CypherCellCodec.FloatKey:
+                {
+                    const value = ScalarSemantics.ParseNonFinite(text);
+                    if (value === undefined) break;
+                    return value;
+                }
                 case CypherCellCodec.DateKey:
                     return TemporalText.ParseDate(text);
                 case CypherCellCodec.DurationKey:
@@ -253,7 +262,7 @@ export class CypherCellCodec
         return node;
     }
 
-    // Keys of a tag: a sole $node, $map, $int, $date or $duration key, or exactly $datetime and zone.
+    // Keys of a tag: a sole $node, $map, $int, $float, $date or $duration key, or exactly $datetime and zone.
     private static IsTagShape(keys: readonly string[]): boolean
     {
         if (keys.length === 1) return CypherCellCodec.SoleTags.has(keys[0]!);

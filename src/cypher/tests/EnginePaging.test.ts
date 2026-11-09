@@ -194,3 +194,31 @@ describe('Execute paging', () =>
         assert.deepEqual(pages.map((p) => p.HasMore), [true, true, false]);
     });
 });
+
+// openCypher orderability: NaN equals NaN and sorts above every other number; = and < keep NaN incomparable.
+describe('ORDER BY with NaN', () =>
+{
+    const Xs = new Map([['xs', [5, Number.NaN, 3, 1, 4, Number.NaN, 2, 0]]]);
+    const Ascending = [0n, 1n, 2n, 3n, 4n, 5n, Number.NaN, Number.NaN];
+    let e: EngineHarness;
+    before(async () => { e = await PagingFixture.Open(1); });
+    after(() => e.dispose());
+
+    test('ascending puts NaN last, descending first', async () =>
+    {
+        assert.deepEqual(PagingFixture.Col(await e.Execute('UNWIND $xs AS x RETURN x ORDER BY x', Xs)), Ascending);
+        assert.deepEqual(PagingFixture.Col(await e.Execute('UNWIND $xs AS x RETURN x ORDER BY x DESC', Xs)), [...Ascending].reverse());
+    });
+
+    test('the implicit paging order sorts NaN last', async () =>
+    {
+        const pages = await Promise.all([0, 3, 6].map((skip) => e.Execute('UNWIND $xs AS x RETURN x', Xs, { Skip: skip, RowCap: 3 })));
+        assert.deepEqual(pages.flatMap((p) => PagingFixture.Col(p)), Ascending);
+    });
+
+    test('predicates keep NaN incomparable', async () =>
+    {
+        assert.deepEqual(PagingFixture.Col(await e.Execute('UNWIND $xs AS x WITH x WHERE x = x RETURN count(*) AS c', Xs)), [6n]);
+        assert.deepEqual(PagingFixture.Col(await e.Execute('UNWIND $xs AS x WITH x WHERE x > 4 RETURN x', Xs)), [5n]);
+    });
+});
