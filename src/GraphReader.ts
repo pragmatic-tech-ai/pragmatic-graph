@@ -78,6 +78,12 @@ export class GraphReader implements IGraphDisposable
         return this.snapshot.Commit;
     }
 
+    /** The catalog this reader's snapshot was taken under (fixed for the reader's life). */
+    public get Catalog(): CatalogSnapshot
+    {
+        return this.snapshot.Index.Catalog;
+    }
+
     /** The access scope every read of this reader is enforced under. */
     public get Scope(): AccessScope
     {

@@ -4,6 +4,8 @@ import { CypherParser } from '../CypherParser.js';
 import { SetMode } from '../CypherEnums.js';
 import { CypherSyntaxError } from '../CypherError.js';
 import { ReferencedLabels } from '../ReferencedLabels.js';
+import { LogicalPlanner } from '../LogicalPlanner.js';
+import { CypherFixture } from './CypherFixture.js';
 import {
     CreateClause, MergeClause, MatchClause, SetClause, DeleteClause, RemoveClause, ProjectionClause,
 } from '../CypherQueryModel.js';
@@ -131,6 +133,23 @@ describe('cypher write parse', () =>
         const m = P.Parse('MATCH (n:shop.Customer {delete: true}) SET n.set = n.create REMOVE n.merge RETURN n.remove');
         assert.equal(m.Parts.length, 1);
         assert.throws(() => P.Parse('MATCH (set) RETURN set'), CypherSyntaxError);
+    });
+
+    it('an unexecutable write clause fails planning loudly', async () =>
+    {
+        // TODL planned over an empty stub graph; here an empty engine. Writes have no executor until Task 5.
+        const fx = await CypherFixture.Open([CypherFixture.Concept('Thing', [])], []);
+        try
+        {
+            await fx.Read(async s =>
+            {
+                assert.throws(() => new LogicalPlanner(s, new Map()).Plan(P.Parse('MATCH (n) DELETE n')));
+            });
+        }
+        finally
+        {
+            await fx.dispose();
+        }
     });
 
     it('ReferencedLabels includes CREATE/MERGE labels', () =>
