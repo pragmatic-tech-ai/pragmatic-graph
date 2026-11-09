@@ -3,6 +3,7 @@ import { ComparisonOp } from '../CypherEnums.js';
 import { CypherUnparser } from '../CypherUnparser.js';
 import type { ICypherSource } from '../CypherSource.js';
 import { NodeValue, ScalarValue, type CypherValue } from '../CypherValue.js';
+import { CancelProbe, type ICancellation } from '../ExecutionLimits.js';
 import { BooleanExpression, Comparison, PropertyAccess, type Expression } from '../Expression.js';
 import type { IOperator } from './IOperator.js';
 
@@ -10,7 +11,8 @@ import type { IOperator } from './IOperator.js';
  * Binds the nodes of a label whose member equals a value, through an index. The value expression (a literal or
  * a parameter) is evaluated once per pass, at run time. A null or non-scalar value matches nothing, exactly as
  * the `=` filter would; when the source has no usable index after all, the pass falls back to a label scan
- * filtered by the same equality, so the rows never depend on the index.
+ * filtered by the same equality, so the rows never depend on the index. The deadline is checked up front and per
+ * node read, on either path.
  */
 export class IndexSeek implements IOperator
 {
@@ -28,12 +30,15 @@ export class IndexSeek implements IOperator
         private readonly indexName: string,
         private readonly value: Expression,
         private readonly parameters: ReadonlyMap<string, CypherValue>,
+        private readonly cancel?: ICancellation,
     )
     {
     }
 
     public async *Rows(): AsyncIterable<Binding>
     {
+        const probe = new CancelProbe(this.cancel);
+        probe.Begin();
         const value = this.value.Evaluate(new EvalContext(new Binding(), this.parameters));
         if (!(value instanceof ScalarValue))
         {
@@ -44,6 +49,7 @@ export class IndexSeek implements IOperator
         {
             for await (const node of hits)
             {
+                probe.Tick();
                 yield new Binding().With(this.variable, new NodeValue(node));
             }
             return;
@@ -51,6 +57,7 @@ export class IndexSeek implements IOperator
         const equality = new Comparison(new PropertyAccess(this.variable, this.member), ComparisonOp.Eq, this.value);
         for await (const node of this.source.ScanLabel(this.label))
         {
+            probe.Tick();
             const row = new Binding().With(this.variable, new NodeValue(node));
             if (BooleanExpression.Truthy(equality.Evaluate(new EvalContext(row, this.parameters))))
             {

@@ -31,8 +31,9 @@ export interface ExecutionLimits
     readonly Cancel?: ICancellation;
 }
 
-// Per-execution cancellation probe used by buffering operators: Begin() checks once up front (so an
-// already-expired token aborts even over a tiny child); Tick() checks every CheckInterval rows.
+// Per-execution cancellation probe used by the leaf operators (per node or edge read), the buffering operators,
+// the result collectors and the link fill: Begin() checks once up front (so an already-expired token aborts even
+// over a tiny input); Tick() checks every CheckInterval reads or rows.
 export class CancelProbe
 {
     private static readonly CheckInterval = 1000;

@@ -8,6 +8,7 @@ import { CypherNode } from '../CypherNode.js';
 import { CypherQuery, Expr, Pattern, Return } from '../CypherQuery.js';
 import { CypherResult } from '../CypherResult.js';
 import { NodeValue, NullValue, ScalarValue } from '../CypherValue.js';
+import type { ICancellation } from '../ExecutionLimits.js';
 import { CypherWriteStats } from '../write/CypherWriteStats.js';
 import { CypherFixture } from './CypherFixture.js';
 import { EngineHarness } from './EngineHarness.js';
@@ -56,6 +57,22 @@ class EngineFixture
     public static Settle(): Promise<void>
     {
         return new Promise(resolve => setImmediate(resolve));
+    }
+}
+
+/** Counts Expired() calls; expires once more than `budget` checks have passed. */
+class CountingCancellation implements ICancellation
+{
+    public Calls = 0;
+
+    constructor(private readonly budget: number = Number.POSITIVE_INFINITY)
+    {
+    }
+
+    public Expired(): boolean
+    {
+        this.Calls++;
+        return this.Calls > this.budget;
     }
 }
 
@@ -441,26 +458,72 @@ describe('CypherEngine under an access scope', () =>
         }
     });
 
-    test('the deadline applies to the link fill; the reader is disposed', async () =>
+    test('an expired deadline aborts any query before it reads; the reader or transaction is disposed', async () =>
     {
         const h = await EngineFixture.Open();
         try
         {
             const spy = EngineFixture.Spy(h);
+            const commits = EngineFixture.Commits(h);
             const expired = { Expired: () => true };
-            // No buffering operator and no nodes: nothing checks the deadline, the query completes.
-            assert.equal((await h.Execute('MATCH (a:Service) RETURN a.name AS n', undefined, { Cancel: expired })).Rows.length, 2);
-            // The same rows as nodes need their links read: the fill checks the deadline first.
-            await assert.rejects(h.Execute('MATCH (a:Service) RETURN a', undefined, { Cancel: expired }), CypherTimeout);
+            // No buffering operator and no node cells: the scan and the collector still check the deadline.
+            await assert.rejects(h.Execute('MATCH (a:Service) RETURN a.name AS n', undefined, { Cancel: expired }), CypherTimeout);
+            await assert.rejects(h.Execute("CREATE (n:Service {name: 'late'}) RETURN n", undefined, { Cancel: expired }), CypherTimeout);
+            await EngineFixture.Settle();
+            assert.equal(commits.length, 0);
+            await assert.rejects(spy.Readers[0]!.ReadNode('a'), /disposed/);
+            await assert.rejects(spy.Transactions[0]!.ReadNode('a'), /disposed/);
+        }
+        finally
+        {
+            await h.dispose();
+        }
+    });
+
+    test('the deadline applies to the link fill of a read; the reader is disposed', async () =>
+    {
+        const h = await EngineFixture.Open();
+        try
+        {
+            const spy = EngineFixture.Spy(h);
+            const scalars = new CountingCancellation();
+            const nodes = new CountingCancellation();
+            await h.Execute('MATCH (a:Service) RETURN a.name AS n', undefined, { Cancel: scalars });
+            await h.Execute('MATCH (a:Service) RETURN a', undefined, { Cancel: nodes });
+            // Node cells add exactly the fill's up-front check.
+            assert.equal(nodes.Calls, scalars.Calls + 1);
+            // A token that expires only after every check the query itself makes: only the fill can see it.
+            await assert.rejects(h.Execute('MATCH (a:Service) RETURN a', undefined, { Cancel: new CountingCancellation(scalars.Calls) }), CypherTimeout);
             for (const reader of spy.Readers)
             {
                 await assert.rejects(reader.ReadNode('a'), /disposed/);
             }
+        }
+        finally
+        {
+            await h.dispose();
+        }
+    });
+
+    test('the deadline applies to the link fill of a write; nothing commits and the transaction is disposed', async () =>
+    {
+        const h = await EngineFixture.Open();
+        try
+        {
+            const spy = EngineFixture.Spy(h);
+            const scalars = new CountingCancellation();
+            const nodes = new CountingCancellation();
+            await h.Execute("CREATE (n:Service {name: 'one'}) RETURN n.name", undefined, { Cancel: scalars });
+            await h.Execute("CREATE (n:Service {name: 'two'}) RETURN n", undefined, { Cancel: nodes });
+            assert.equal(nodes.Calls, scalars.Calls + 1);
+            await EngineFixture.Settle();
             const commits = EngineFixture.Commits(h);
-            await assert.rejects(h.Execute("CREATE (n:Service {name: 'late'}) RETURN n", undefined, { Cancel: expired }), CypherTimeout);
+            // Run's checks all pass; the fill's check (after Run, before Commit) expires.
+            await assert.rejects(h.Execute("CREATE (n:Service {name: 'late'}) RETURN n", undefined, { Cancel: new CountingCancellation(scalars.Calls) }), CypherTimeout);
             await EngineFixture.Settle();
             assert.equal(commits.length, 0);
-            await assert.rejects(spy.Transactions[0]!.ReadNode('a'), /disposed/);
+            await assert.rejects(spy.Transactions[2]!.ReadNode('a'), /disposed/);
+            assert.equal((await h.Execute("MATCH (n:Service {name: 'late'}) RETURN n")).Rows.length, 0);
         }
         finally
         {

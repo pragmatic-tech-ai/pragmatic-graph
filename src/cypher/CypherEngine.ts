@@ -126,6 +126,7 @@ export class CypherEngine
         const rows: CypherValue[][] = [];
         let truncated = false;
         const probe = new CancelProbe(limits?.Cancel);
+        probe.Begin();
         for await (const binding of plan.Rows())
         {
             probe.Tick();
@@ -148,6 +149,7 @@ export class CypherEngine
         let skipped = 0;
         let hasMore = false;
         const probe = new CancelProbe(limits.Cancel);
+        probe.Begin();
         for await (const binding of plan.Rows())
         {
             probe.Tick();

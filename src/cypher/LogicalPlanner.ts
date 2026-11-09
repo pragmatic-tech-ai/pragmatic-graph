@@ -403,13 +403,13 @@ export class LogicalPlanner
                 // Reusing a variable reached by expansion: constrain the hop to the bound node (equality by
                 // identity) instead of rebinding it. Any label/property written on this reused occurrence is
                 // applied as a filter after the join; no re-bind here.
-                op = new ExpandInto(op, this.source, names[i]!, names[i + 1]!, rel.RelType, rel.Direction, rel.Variable);
+                op = new ExpandInto(op, this.source, names[i]!, names[i + 1]!, rel.RelType, rel.Direction, rel.Variable, this.cancel);
                 op = this.foldReusedConstraints(op, toNode, names[i + 1]!);
                 continue;
             }
             else
             {
-                op = new Expand(op, this.source, names[i]!, names[i + 1]!, rel.RelType, rel.Direction, toLabel, rel.Variable);
+                op = new Expand(op, this.source, names[i]!, names[i + 1]!, rel.RelType, rel.Direction, toLabel, rel.Variable, this.cancel);
             }
             op = this.foldNodeProperties(op, toNode, names[i + 1]!);
             if (toNode.Variable !== undefined) bound.add(toNode.Variable);
@@ -564,7 +564,7 @@ export class LogicalPlanner
     private anchor(node: NodePattern, name: string): IOperator
     {
         const label = this.resolve(node.Label);
-        return label === undefined ? new AllNodesScan(this.source, name) : new LabelScan(this.source, name, label);
+        return label === undefined ? new AllNodesScan(this.source, name, this.cancel) : new LabelScan(this.source, name, label, this.cancel);
     }
 
     // An index seek for a freshly bound labelled anchor: an inline property first, then a top-level WHERE equality on
@@ -578,7 +578,7 @@ export class LogicalPlanner
             const index = this.source.IndexFor(label, key);
             if (index !== undefined)
             {
-                return { Op: new IndexSeek(this.source, name, label, key, index, new Literal(value), this.parameters), InlineKey: key, Source: undefined };
+                return { Op: new IndexSeek(this.source, name, label, key, index, new Literal(value), this.parameters, this.cancel), InlineKey: key, Source: undefined };
             }
         }
         if (node.Variable === undefined) return undefined;
@@ -587,7 +587,7 @@ export class LogicalPlanner
             const index = seek.Variable === node.Variable ? this.source.IndexFor(label, seek.Property) : undefined;
             if (index !== undefined)
             {
-                return { Op: new IndexSeek(this.source, name, label, seek.Property, index, seek.Value, this.parameters), InlineKey: undefined, Source: seek.Source };
+                return { Op: new IndexSeek(this.source, name, label, seek.Property, index, seek.Value, this.parameters, this.cancel), InlineKey: undefined, Source: seek.Source };
             }
         }
         return undefined;
