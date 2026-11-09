@@ -34,12 +34,27 @@ import { Skip } from './operators/Skip.js';
 import { Sort } from './operators/Sort.js';
 import { Unwind } from './operators/Unwind.js';
 import { VarLengthExpand } from './operators/VarLengthExpand.js';
+import { CreateOperator } from './write/CreateOperator.js';
+import { DeleteOperator } from './write/DeleteOperator.js';
+import { EagerBarrier } from './write/EagerBarrier.js';
+import { MergeOperator } from './write/MergeOperator.js';
+import { RemoveOperator } from './write/RemoveOperator.js';
+import { SetApplier } from './write/SetApplier.js';
+import { SetOperator } from './write/SetOperator.js';
+import type { TransactionSink } from './write/TransactionSink.js';
 
 interface ISeekChoice
 {
     readonly Op: IOperator;
     readonly InlineKey: string | undefined;
     readonly Source: Expression | undefined;
+}
+
+/** A write query's plan: the whole mutating pipeline, and the final RETURN projection to run over its drained rows. */
+export interface IWritePlan
+{
+    readonly Mutations: IOperator;
+    readonly Projection: ProjectionClause | undefined;
 }
 
 export interface PlannerOptions
@@ -52,7 +67,9 @@ export interface PlannerOptions
 /**
  * Compiles a CypherQueryModel into an async operator tree over an ICypherSource. Planning is synchronous and
  * raises every semantic error (scope, labels, relationship types, SKIP/LIMIT) before any row is read: labels are
- * resolved here (exact name, else unique simple name). Write clauses are not executable yet (plan 2 Task 5).
+ * resolved here (exact name, else unique simple name). Write clauses compile only with a TransactionSink (whose
+ * View must be the planner's source): each is fenced by EagerBarriers (clause-at-a-time, rows refreshed through
+ * the overlay); without a sink they fail planning.
  */
 export class LogicalPlanner
 {
@@ -81,6 +98,8 @@ export class LogicalPlanner
         private readonly cancel?: ICancellation,
         // Paging needs a stable order: when set, an unordered final RETURN is sorted by all its columns (ascending).
         private readonly ensureOrder: boolean = false,
+        // Only write-capable plans (PlanForWrite) supply one; read planning omits it.
+        private readonly sink?: TransactionSink,
     )
     {
         this.maxVarLength = options?.MaxVarLength ?? LogicalPlanner.DefaultMaxVarLength;
@@ -116,6 +135,40 @@ export class LogicalPlanner
         }
         // Parse/fluent invariants guarantee at least one part, so op is always assigned.
         return op!;
+    }
+
+    /**
+     * Builds the full clause pipeline across all parts, but returns the FINAL part's projection separately so the
+     * caller runs it over the drained mutation rows (ProjectOver). Intermediate WITH projections stay inline.
+     */
+    public PlanForWrite(model: CypherQueryModel): IWritePlan
+    {
+        let inScope = new Set<string>();
+        const everBound = new Set<string>();
+        let op: IOperator | undefined = undefined;
+        let projection: ProjectionClause | undefined = undefined;
+        const last = model.Parts[model.Parts.length - 1];
+        for (const part of model.Parts)
+        {
+            const isFinal = part === last;
+            this.ensureUniqueColumns(part);
+            if (this.strictWithScope) this.checkStrictScope(part, inScope, everBound);
+            op = this.compilePart(part, op, inScope, isFinal, isFinal);
+            if (isFinal) projection = part.Projection;
+            for (const v of this.readingVariables(part)) everBound.add(v);
+            if (part.Projection === undefined) continue;
+            for (const item of part.Projection.Items) everBound.add(item.ColumnName());
+            if (!part.Projection.IsReturn)
+            {
+                inScope = new Set<string>(part.Projection.Items.map((i) => i.ColumnName()));
+            }
+        }
+        return { Mutations: op!, Projection: projection };
+    }
+
+    public ProjectOver(source: IOperator, projection: ProjectionClause): IOperator
+    {
+        return this.buildProjection(source, projection, this.ensureOrder);
     }
 
     // Planner-internal entry for OptionalMatchPlan (TypeScript has no friend access); not part of the planner API.
@@ -163,7 +216,7 @@ export class LogicalPlanner
         }
     }
 
-    private compilePart(part: QueryPart, input: IOperator | undefined, inScope: ReadonlySet<string>, isFinal: boolean): IOperator
+    private compilePart(part: QueryPart, input: IOperator | undefined, inScope: ReadonlySet<string>, isFinal: boolean, deferProjection: boolean = false): IOperator
     {
         const declared = new Set<string>(inScope);
         for (const v of this.readingVariables(part)) declared.add(v);
@@ -184,12 +237,39 @@ export class LogicalPlanner
             }
             else if (clause instanceof WritingClause)
             {
-                throw new CypherSemanticError(LogicalPlanner.WritesNotExecutable);
+                op = this.compileWrite(op, clause, pipelineBound);
             }
         }
         if (op === undefined) op = new SingleRow();
-        if (part.Projection === undefined) return op;
+        if (part.Projection === undefined || deferProjection) return op;
         return this.buildProjection(op, part.Projection, isFinal && this.ensureOrder);
+    }
+
+    // Reads feeding a write finish before it starts and the write finishes before anything above reads (EagerBarrier).
+    private compileWrite(input: IOperator | undefined, clause: WritingClause, bound: Set<string>): IOperator
+    {
+        const sink = this.sink;
+        if (sink === undefined) throw new CypherSemanticError(LogicalPlanner.WritesNotExecutable);
+        const view = sink.View;
+        const source = input === undefined ? new SingleRow() : input instanceof EagerBarrier ? input : new EagerBarrier(input, view, this.cancel);
+        let op: IOperator;
+        if (clause instanceof CreateClause)
+        {
+            op = new CreateOperator(source, clause, this.source, sink, bound);
+            for (const v of clause.DeclaredVariables()) bound.add(v);
+        }
+        else if (clause instanceof MergeClause)
+        {
+            const before = new Set<string>(bound);
+            const matcher = new OptionalMatchPlan(this, new MatchClause([clause.Pattern], undefined, false), before);
+            op = new MergeOperator(source, clause, this.source, sink, new SetApplier(sink, this.parameters), matcher, before);
+            for (const v of clause.DeclaredVariables()) bound.add(v);
+        }
+        else if (clause instanceof SetClause) op = new SetOperator(source, clause, new SetApplier(sink, this.parameters));
+        else if (clause instanceof DeleteClause) op = new DeleteOperator(source, clause, sink, this.parameters);
+        else if (clause instanceof RemoveClause) op = new RemoveOperator(source, clause, sink);
+        else throw new CypherSemanticError(LogicalPlanner.WritesNotExecutable);
+        return new EagerBarrier(op, view, this.cancel);
     }
 
     private static CollectSetItems(items: readonly SetItem[], referenced: Set<string>): void

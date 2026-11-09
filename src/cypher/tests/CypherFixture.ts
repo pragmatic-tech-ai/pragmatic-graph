@@ -1,6 +1,6 @@
 import {
     AccessScope, GraphEngine, MemberKind, StorageKind, ValueType,
-    type CellValue, type IDefinitionDescription, type IIndexDescription, type MemberInput, type ISeedNode,
+    type CellValue, type IBindingDescription, type IDefinitionDescription, type IGraphConnector, type IIndexDescription, type MemberInput, type ISeedNode,
 } from '../../index.js';
 import type { Binding } from '../Binding.js';
 import { CypherParser } from '../CypherParser.js';
@@ -26,11 +26,19 @@ export class CypherFixture
     {
     }
 
-    public static async Open(definitions: readonly IDefinitionDescription[], seed: readonly ISeedNode[], indexes: readonly IIndexDescription[] = []): Promise<CypherFixture>
+    /** `bindings` route owners to `connectors` (write-through tests); none by default. */
+    public static async Open(
+        definitions: readonly IDefinitionDescription[],
+        seed: readonly ISeedNode[],
+        indexes: readonly IIndexDescription[] = [],
+        bindings: readonly IBindingDescription[] = [],
+        connectors: readonly IGraphConnector[] = [],
+    ): Promise<CypherFixture>
     {
         const engine = await GraphEngine.Open({
-            Description: { Version: CypherFixture.Version, Definitions: definitions, Indexes: indexes, Seed: seed, Bindings: [] },
+            Description: { Version: CypherFixture.Version, Definitions: definitions, Indexes: indexes, Seed: seed, Bindings: bindings },
             Storage: { Kind: StorageKind.Memory },
+            Connectors: connectors,
         });
         return new CypherFixture(engine);
     }
@@ -55,6 +63,11 @@ export class CypherFixture
         return { Name: name, Kind: MemberKind.Property, Type: ValueType.Int64, Nullable: true };
     }
 
+    public static Required(name: string): MemberInput
+    {
+        return { Name: name, Kind: MemberKind.Property, Type: ValueType.String, Nullable: false };
+    }
+
     public static Float(name: string): MemberInput
     {
         return { Name: name, Kind: MemberKind.Property, Type: ValueType.Float64, Nullable: true };
@@ -66,9 +79,9 @@ export class CypherFixture
     }
 
     /** A seed node; links are [relationship, target] pairs. */
-    public static Node(id: string, concept: string, properties: Readonly<Record<string, CellValue>> = {}, links: readonly (readonly [string, string])[] = []): ISeedNode
+    public static Node(id: string, concept: string, properties: Readonly<Record<string, CellValue>> = {}, links: readonly (readonly [string, string])[] = [], owner: string = CypherFixture.NoOwner): ISeedNode
     {
-        return { PublicId: id, Concept: concept, Owner: CypherFixture.NoOwner, Properties: properties, Links: links.map(([r, to]) => ({ Relationship: r, To: to })) };
+        return { PublicId: id, Concept: concept, Owner: owner, Properties: properties, Links: links.map(([r, to]) => ({ Relationship: r, To: to })) };
     }
 
     public static async Collect(op: IOperator): Promise<Binding[]>
