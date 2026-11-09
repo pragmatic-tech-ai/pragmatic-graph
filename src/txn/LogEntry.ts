@@ -20,11 +20,16 @@ export interface ICommitApplied
 {
     readonly Commit: bigint;
     readonly Kind: CommitKind;
-    /** Batch: the catalog version the batch was validated and applied against. SchemaChange, Upgrade: the resulting version. */
+    /**
+     * Batch: the catalog version the batch was validated and applied against. SchemaChange, Upgrade: the resulting
+     * version.
+     */
     readonly CatalogVersion: number;
     /** The sealed, immutable batch; empty for a schema change or upgrade. */
     readonly Batch: WriteBatch;
-    /** The internal ids allocated for the batch's CreateNode ops, in op order (empty for a schema change or upgrade). */
+    /**
+     * The internal ids allocated for the batch's CreateNode ops, in op order (empty for a schema change or upgrade).
+     */
     readonly CreatedIds: readonly bigint[];
     /** SchemaChange and Upgrade: the complete catalog after the change. */
     readonly Catalog?: CatalogSnapshot;
@@ -40,7 +45,8 @@ export interface ICommitApplied
  *
  *   Batch:        kind u8 = 1, catalogVersion u32, idCount u32, ids idCount x u64, then the serialized WriteBatch
  *   SchemaChange: kind u8 = 2, catalogVersion u32 (resulting), then the catalog root JSON (UTF-8)
- *   Upgrade:      kind u8 = 3, catalogVersion u32 (resulting), versionLength u32, version UTF-8, then the catalog root JSON
+ *   Upgrade:      kind u8 = 3, catalogVersion u32 (resulting), versionLength u32, version UTF-8, then the catalog root
+ * JSON
  */
 export class LogEntry
 {

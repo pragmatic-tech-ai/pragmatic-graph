@@ -397,7 +397,8 @@ export class WriteCoordinator
             }
             catch
             {
-                // A throwing subscriber has nowhere to report to on this detached path (Signal aggregates handler errors).
+                // A throwing subscriber has nowhere to report to on this detached path (Signal aggregates handler
+                // errors).
             }
         });
     }

@@ -30,13 +30,13 @@ export type CypherValueDto = NodeCellDto | boolean | number | string | null | Cy
  *
  * Scalars: a boolean or string is itself; an Int64 within +-(2^53 - 1) and every finite Float64 is a JSON number; an
  * Int64 outside that range is `{ "$int": "<decimal>" }`; a NaN or infinite Float64 is
- * `{ "$float": "NaN" | "Infinity" | "-Infinity" }` (JSON has no such numbers); a Date `{ "$date": "YYYY-MM-DD" }`; a DateTime
- * `{ "$datetime": "<ISO instant, UTC>", "zone": "<IANA>" }`; a Duration `{ "$duration": "<ISO-8601>" }`. Null is
- * null, a list an array, a relationship `{ from, type, to }`, a path `{ nodes, relationships }`, a node
- * `{ "$node": { id, concept, owner, properties, links } }` (its links must have been filled). A map is a plain
- * object, except a map whose keys have the shape of a tag (a sole `$node`, `$map`, `$int`, `$float`, `$date` or
- * `$duration` key, or exactly `$datetime` and `zone`) is escaped as `{ "$map": entries }`, so nothing a query
- * builds can pass for a node or a typed scalar.
+ * `{ "$float": "NaN" | "Infinity" | "-Infinity" }` (JSON has no such numbers); a Date `{ "$date": "YYYY-MM-DD" }`; a
+ * DateTime `{ "$datetime": "<ISO instant, UTC>", "zone": "<IANA>" }`; a Duration `{ "$duration": "<ISO-8601>" }`. Null
+ * is null, a list an array, a relationship `{ from, type, to }`, a path `{ nodes, relationships }`, a node `{ "$node":
+ * { id, concept, owner, properties, links } }` (its links must have been filled). A map is a plain object, except a map
+ * whose keys have the shape of a tag (a sole `$node`, `$map`, `$int`, `$float`, `$date` or `$duration` key, or exactly
+ * `$datetime` and `zone`) is escaped as `{ "$map": entries }`, so nothing a query builds can pass for a node or a typed
+ * scalar.
  *
  * Decode inverts Encode exactly for every cell except what JSON cannot tell apart: a JSON number decodes as an
  * Int64 when it is a safe integer and as a Float64 otherwise (so an integral Float64 such as 2.0 comes back as
@@ -131,7 +131,10 @@ export class CypherCellCodec
         return keys.length === 1 && keys[0] === CypherCellCodec.NodeKey ? (cell as unknown as NodeCellDto).$node : undefined;
     }
 
-    /** A map cell's entries (unwrapping the `$map` escape); undefined for a node, a tagged scalar, a list, a scalar or null. */
+    /**
+     * A map cell's entries (unwrapping the `$map` escape); undefined for a node, a tagged scalar, a list, a scalar or
+     * null.
+     */
     public static AsMap(cell: unknown): { [k: string]: CypherValueDto } | undefined
     {
         if (!CypherCellCodec.IsObject(cell)) return undefined;
@@ -140,7 +143,10 @@ export class CypherCellCodec
         return keys[0] === CypherCellCodec.MapKey ? cell[CypherCellCodec.MapKey] as { [k: string]: CypherValueDto } : undefined;
     }
 
-    /** The value a cell encodes (see the class comment for the two JSON-inherent ambiguities). CypherError when malformed. */
+    /**
+     * The value a cell encodes (see the class comment for the two JSON-inherent ambiguities). CypherError when
+     * malformed.
+     */
     public static Decode(cell: CypherValueDto): CypherValue
     {
         if (cell === null) return NullValue.Instance;

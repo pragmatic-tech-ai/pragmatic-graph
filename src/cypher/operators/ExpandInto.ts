@@ -10,7 +10,8 @@ import { RelOrientation } from './RelOrientation.js';
  * Expands from an already-bound source into an already-bound target, constraining the reached node to equal the
  * target rather than rebinding it. Adds no node binding: it yields the row (plus the relationship variable, if
  * any) once when the target is reachable over the relationship, so a reused target variable (converging joins,
- * cycles) is constrained, never clobbered. The deadline is checked up front, per input row and per edge read.
+ * cycles) is constrained, never clobbered. The deadline is checked up front, per input row and per edge examined
+ * (hidden ones included).
  */
 export class ExpandInto implements IOperator
 {
@@ -37,9 +38,8 @@ export class ExpandInto implements IOperator
             const from = row.Get(this.fromVar);
             const to = row.Get(this.toVar);
             if (!(from instanceof NodeValue) || !(to instanceof NodeValue)) continue;
-            for await (const step of this.source.Expand(from.Id, this.relType, this.direction))
+            for await (const step of this.source.Expand(from.Id, this.relType, this.direction, probe))
             {
-                probe.Tick();
                 if (step.Target.PublicId === to.Id)
                 {
                     yield this.relVar === undefined ? row : row.With(this.relVar, RelOrientation.Oriented(this.direction, step.Relationship, from.Id, to.Id));

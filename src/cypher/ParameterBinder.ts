@@ -9,11 +9,11 @@ import { TemporalText } from './TemporalText.js';
 // Converts caller-supplied plain-JS (JSON-shaped) parameter trees into the engine's internal CypherValue currency.
 // Numbers: a safe integer binds as an Int64 (bigint), any other number as a Float64; bigints must fit Int64.
 // Strings (and map keys) are made well-formed: a lone surrogate binds as U+FFFD (ScalarSemantics.WellFormed).
-// Temporals: { $date: 'YYYY-MM-DD' }, { $datetime: '<ISO-8601 instant>', zone?: '<IANA>' } (an absent zone is UTC; a present zone must be a string)
-// and { $duration: '<ISO-8601 duration>' }, or engine DateValue/DateTimeValue/DurationValue instances.
-// Non-finite floats (which JSON cannot carry): { $float: 'NaN' | 'Infinity' | '-Infinity' }, the result-cell tag.
-// Lives apart from CypherValue because ListValue/MapValue import CypherValue.ts; a static on the abstract root would
-// create an import cycle.
+// Temporals: { $date: 'YYYY-MM-DD' }, { $datetime: '<ISO-8601 instant>', zone?: '<IANA>' } (an absent zone is UTC; a
+// present zone must be a string) and { $duration: '<ISO-8601 duration>' }, or engine
+// DateValue/DateTimeValue/DurationValue instances. Non-finite floats (which JSON cannot carry): { $float: 'NaN' |
+// 'Infinity' | '-Infinity' }, the result-cell tag. Lives apart from CypherValue because ListValue/MapValue import
+// CypherValue.ts; a static on the abstract root would create an import cycle.
 export class ParameterBinder
 {
     private static readonly Unsupported = 'unsupported parameter value: only scalars, null, arrays and plain objects are allowed';

@@ -66,7 +66,9 @@ export class GraphContext
     public readonly Rows = new RowIndex();
     public readonly Ids = new PublicIdIndex();
     public readonly Indexes = new IndexStore(this.Columns, this.Ids);
-    /** Raised when reverting a connector call that was still hanging at the write-through timeout failed (ruling R72). */
+    /**
+     * Raised when reverting a connector call that was still hanging at the write-through timeout failed (ruling R72).
+     */
     public readonly ConnectorRevertFailed = new Signal<ConnectorError>();
 
     private readonly open = new Set<IGraphDisposable>();
@@ -86,7 +88,10 @@ export class GraphContext
         return this.Committer.Catalog.Version;
     }
 
-    /** The installed bindings and connectors (held by the committer); undefined (every write engine-only) until installed. */
+    /**
+     * The installed bindings and connectors (held by the committer); undefined (every write engine-only) until
+     * installed.
+     */
     public get Connectors(): ConnectorSetup | undefined
     {
         return this.Committer.Connectors;

@@ -8,7 +8,7 @@ import { RelOrientation } from './RelOrientation.js';
 
 /**
  * Binds each node reached over one hop from the bound source (only those that are toLabel, when given). The
- * deadline is checked up front, per input row and per edge read.
+ * deadline is checked up front, per input row and per edge examined (hidden ones included).
  */
 export class Expand implements IOperator
 {
@@ -35,9 +35,8 @@ export class Expand implements IOperator
             probe.Tick();
             const from = row.Get(this.fromVar);
             if (!(from instanceof NodeValue)) continue;
-            for await (const step of this.source.Expand(from.Id, this.relType, this.direction))
+            for await (const step of this.source.Expand(from.Id, this.relType, this.direction, probe))
             {
-                probe.Tick();
                 if (this.toLabel !== undefined && !this.source.IsA(step.Target, this.toLabel)) continue;
                 const next = new NodeValue(step.Target);
                 const out = row.With(this.toVar, next);

@@ -179,7 +179,10 @@ export class ValueCodec
         return decoded.Value;
     }
 
-    /** Decodes one value starting at `offset`; End is the offset just past it. Pass `view` to avoid building one per call. */
+    /**
+     * Decodes one value starting at `offset`; End is the offset just past it. Pass `view` to avoid building one per
+     * call.
+     */
     public static DecodeAt(type: ValueType, bytes: Uint8Array, offset: number, view?: DataView): DecodedValue
     {
         view ??= new DataView(bytes.buffer, bytes.byteOffset, bytes.length);

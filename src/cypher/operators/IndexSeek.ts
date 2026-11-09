@@ -12,7 +12,7 @@ import type { IOperator } from './IOperator.js';
  * a parameter) is evaluated once per pass, at run time. A null or non-scalar value matches nothing, exactly as
  * the `=` filter would; when the source has no usable index after all, the pass falls back to a label scan
  * filtered by the same equality, so the rows never depend on the index. The deadline is checked up front and per
- * node read, on either path.
+ * stored entry examined (hidden ones included), on either path.
  */
 export class IndexSeek implements IOperator
 {
@@ -44,20 +44,18 @@ export class IndexSeek implements IOperator
         {
             return;
         }
-        const hits = this.source.SeekEqual(this.label, this.member, value.Value);
+        const hits = this.source.SeekEqual(this.label, this.member, value.Value, probe);
         if (hits !== undefined)
         {
             for await (const node of hits)
             {
-                probe.Tick();
                 yield new Binding().With(this.variable, new NodeValue(node));
             }
             return;
         }
         const equality = new Comparison(new PropertyAccess(this.variable, this.member), ComparisonOp.Eq, this.value);
-        for await (const node of this.source.ScanLabel(this.label))
+        for await (const node of this.source.ScanLabel(this.label, probe))
         {
-            probe.Tick();
             const row = new Binding().With(this.variable, new NodeValue(node));
             if (BooleanExpression.Truthy(equality.Evaluate(new EvalContext(row, this.parameters))))
             {

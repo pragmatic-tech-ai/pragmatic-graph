@@ -44,13 +44,19 @@ export interface ISchemaCommit
 /** The outcome of an upgrade (SubmitUpgrade). */
 export interface IUpgradeCommit
 {
-    /** The Upgrade entry's commit number; when the catalog is unchanged, LastCommit() at the upgrade's turn (before any seed commit). */
+    /**
+     * The Upgrade entry's commit number; when the catalog is unchanged, LastCommit() at the upgrade's turn (before any
+     * seed commit).
+     */
     readonly Commit: bigint;
     /** The catalog in force after the upgrade (the unchanged one when Changed is false). */
     readonly Catalog: CatalogSnapshot;
     /** True iff a new catalog was saved and logged (ICatalogPlan.Changed). */
     readonly Changed: boolean;
-    /** The seed's Batch entry commit number, when the seed had a data op (ruling R53; marker-only changes are no commit). */
+    /**
+     * The seed's Batch entry commit number, when the seed had a data op (ruling R53; marker-only changes are no
+     * commit).
+     */
     readonly SeedCommit?: bigint;
 }
 
@@ -289,11 +295,11 @@ interface IGroupOutcome
  * (2) allocates internal ids for every CreateNode BEFORE entering the store's write (ruling R16), then
  * (3) in ONE store.Write applies the batches in submission order, validating each against the write sets
  * of the batches accepted before it in the same group, compacts deltas over CompactThreshold, flushes
- * the column store and the row index (each dirty chunk delta and row block written once), appends each accepted batch to the log and sets Meta("commit") (ruling R25).
- * A batch that is semantically invalid (CommitError) aborts that store.Write; only it is rejected and
- * the rest of the group re-runs in a fresh Write, so its partial writes leave no trace. Any other error
- * rejects the whole group. Commit numbers follow submission order. CommitApplied is raised once per
- * commit, in order, after the store.Write resolved; a throwing subscriber does not affect the commit.
+ * the column store and the row index (each dirty chunk delta and row block written once), appends each accepted batch
+ * to the log and sets Meta("commit") (ruling R25). A batch that is semantically invalid (CommitError) aborts that
+ * store.Write; only it is rejected and the rest of the group re-runs in a fresh Write, so its partial writes leave no
+ * trace. Any other error rejects the whole group. Commit numbers follow submission order. CommitApplied is raised once
+ * per commit, in order, after the store.Write resolved; a throwing subscriber does not affect the commit.
  *
  * Prepare / Finalize (ruling R71) split a commit so external connectors can commit in between:
  * Prepare validates and dry-runs a batch and reserves its keys; while reserved, a group batch whose
@@ -497,11 +503,11 @@ export class Committer
      * dry-run inside a store.Write that is then aborted, so semantic errors surface now and its write keys
      * are known. Rejects exactly as Submit would (ConflictError, CommitError, GraphError InvalidArgument),
      * and with ConflictError when its reads or dry-run dependencies hit keys another prepared commit writes,
-     * or its write keys hit keys another reserved (also for an empty batch: its reads stay reserved). Resolves with a PreparedCommit holding a reservation for `timeoutMs` (default
-     * DefaultPrepareTimeoutMs): until it finalizes, aborts or expires, a commit that writes what it read,
-     * depends on or writes, or that writes after reading what it writes, fails with ConflictError.
-     * Unrelated commits proceed. The batch and read set are captured now. `bindingGeneration` is checked
-     * as for Submit, at the prepare's turn and again at Finalize.
+     * or its write keys hit keys another reserved (also for an empty batch: its reads stay reserved). Resolves with a
+     * PreparedCommit holding a reservation for `timeoutMs` (default DefaultPrepareTimeoutMs): until it finalizes,
+     * aborts or expires, a commit that writes what it read, depends on or writes, or that writes after reading what it
+     * writes, fails with ConflictError. Unrelated commits proceed. The batch and read set are captured now.
+     * `bindingGeneration` is checked as for Submit, at the prepare's turn and again at Finalize.
      */
     public Prepare(batch: WriteBatch, readSet: ReadSet, snapshotCommit: bigint, catalogVersion?: number, timeoutMs: number = Committer.DefaultPrepareTimeoutMs, bindingGeneration?: number): Promise<PreparedCommit>
     {
@@ -626,9 +632,9 @@ export class Committer
 
     /**
      * Stops accepting work: every queued Submit, Prepare or Finalize not yet in a group and every later
-     * one rejects; every held reservation is released; CommitApplied subscribers are dropped. A group already writing finishes (its commits are durable
-     * and its promises settle) but raises no signal; no new group starts. Resolves once that group has
-     * settled, so the store can then be closed. Idempotent: every call resolves at the same point.
+     * one rejects; every held reservation is released; CommitApplied subscribers are dropped. A group already writing
+     * finishes (its commits are durable and its promises settle) but raises no signal; no new group starts. Resolves
+     * once that group has settled, so the store can then be closed. Idempotent: every call resolves at the same point.
      */
     public async dispose(): Promise<void>
     {
@@ -737,8 +743,8 @@ export class Committer
     /**
      * Plans against the current catalog. Nothing to do when the catalog and the stored version are both
      * unchanged (a read decides: no write transaction). Otherwise one Write purges and saves a changed
-     * catalog (Upgrade entry), applies the seed (Batch entry, when it has a data op; markers alone are no entry) and writes the
-     * version. Seed ids come from a pre-pass outside the Write (ruling R16); when the purge removed a node
+     * catalog (Upgrade entry), applies the seed (Batch entry, when it has a data op; markers alone are no entry) and
+     * writes the version. Seed ids come from a pre-pass outside the Write (ruling R16); when the purge removed a node
      * the pre-pass saw, the upgrade re-runs once with those ids too, and a second miss is Internal.
      */
     private async RunUpgrade(description: ISchemaDescription, connectors: ConnectorSetup | undefined): Promise<IUpgradeCommit>
@@ -1041,7 +1047,8 @@ export class Committer
             p.Reject(new GraphError(GraphErrorCode.Disposed, Committer.ErrDisposed));
             return;
         }
-        // The setup may have been replaced while the dry-run awaited: its InvalidateAll ran before this reservation existed.
+        // The setup may have been replaced while the dry-run awaited: its InvalidateAll ran before this reservation
+        // existed.
         const replaced = this.GenerationConflict(p.BindingGeneration);
         if (replaced !== undefined)
         {
@@ -1088,13 +1095,19 @@ export class Committer
         throw new GraphError(GraphErrorCode.Internal, Committer.ErrDryRun);
     }
 
-    /** The ConflictError for a batch begun on catalog `began` when the catalog is now `now`; undefined when unchecked or equal. */
+    /**
+     * The ConflictError for a batch begun on catalog `began` when the catalog is now `now`; undefined when unchecked or
+     * equal.
+     */
     private static VersionConflict(began: number | undefined, now: number): ConflictError | undefined
     {
         return began === undefined || began === now ? undefined : new ConflictError(Committer.ErrSchema + began + Committer.ErrSchemaNow + now);
     }
 
-    /** The ConflictError for work routed with connector-setup generation `routed` when that is no longer current; undefined when unchecked or equal. */
+    /**
+     * The ConflictError for work routed with connector-setup generation `routed` when that is no longer current;
+     * undefined when unchecked or equal.
+     */
     private GenerationConflict(routed: number | undefined): ConflictError | undefined
     {
         return routed === undefined || routed === this.generation ? undefined : new ConflictError(Committer.ErrBindings + routed + Committer.ErrSchemaNow + this.generation);

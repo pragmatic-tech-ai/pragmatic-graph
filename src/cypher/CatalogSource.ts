@@ -1,7 +1,7 @@
 import type { CatalogSnapshot } from '../catalog/CatalogSnapshot.js';
 import type { IndexDef, MemberDef } from '../catalog/CatalogTypes.js';
 import type { CellValue } from '../columns/CellValue.js';
-import type { ILinkView } from '../GraphReader.js';
+import type { ILinkView, IReadProbe } from '../GraphReader.js';
 import type { RelDirection } from './CypherEnums.js';
 import type { CypherNode } from './CypherNode.js';
 import type { ICypherSource, IExpandRow } from './CypherSource.js';
@@ -46,12 +46,12 @@ export abstract class CatalogSource implements ICypherSource
         return this.FindIndex(this.labels.Resolve(label), member)?.Name;
     }
 
-    public abstract ScanLabel(label: string): AsyncIterable<CypherNode>;
-    public abstract ScanAll(): AsyncIterable<CypherNode>;
+    public abstract ScanLabel(label: string, probe?: IReadProbe): AsyncIterable<CypherNode>;
+    public abstract ScanAll(probe?: IReadProbe): AsyncIterable<CypherNode>;
     public abstract Node(publicId: string): Promise<CypherNode | undefined>;
-    public abstract Expand(publicId: string, relationship: string | undefined, direction: RelDirection): AsyncIterable<IExpandRow>;
+    public abstract Expand(publicId: string, relationship: string | undefined, direction: RelDirection, probe?: IReadProbe): AsyncIterable<IExpandRow>;
     public abstract OutLinks(publicId: string): Promise<readonly ILinkView[]>;
-    public abstract SeekEqual(label: string, member: string, value: CellValue): AsyncIterable<CypherNode> | undefined;
+    public abstract SeekEqual(label: string, member: string, value: CellValue, probe?: IReadProbe): AsyncIterable<CypherNode> | undefined;
 
     protected FindIndex(label: string, member: string): IndexDef | undefined
     {

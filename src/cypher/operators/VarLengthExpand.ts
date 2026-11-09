@@ -65,7 +65,7 @@ export class VarLengthExpand implements IOperator
         }
         if (depth >= this.max) return;
 
-        for await (const step of this.source.Expand(current.Id, this.relType, this.direction))
+        for await (const step of this.source.Expand(current.Id, this.relType, this.direction, probe))
         {
             const next = new NodeValue(step.Target);
             const key = this.StepKey(current.Id, step.Relationship, next.Id);

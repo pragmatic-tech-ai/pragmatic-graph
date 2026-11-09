@@ -117,6 +117,46 @@ class QueryFx
                 await g.dispose();
             });
 
+            it('a read probe ticks per stored entry examined, including those the scope filters out', async () =>
+            {
+                const g = await QueryFx.Defined(open);
+                await QueryFx.Commit(g, t =>
+                {
+                    for (const id of ['s1', 's2', 's3'])
+                    {
+                        t.CreateNode(id, QueryFx.Server);
+                    }
+                    t.Link('s1', QueryFx.Hosts, 's2');
+                    t.Link('s1', QueryFx.Hosts, 's3');
+                });
+                const scope = AccessScope.Build({ Default: AccessDefault.Allow, Rows: new Map([[QueryFx.Server, new IdIn(new Set(['s1']))]]) });
+                const probe = { Ticks: 0, Tick(): void { this.Ticks++; } };
+                await QueryFx.Read(g, scope, async r =>
+                {
+                    const ids: string[] = [];
+                    for await (const id of r.ScanNodes(QueryFx.Server, probe))
+                    {
+                        ids.push(id);
+                    }
+                    assert.deepEqual(ids, ['s1']);
+                    assert.equal(probe.Ticks, 3, 'one tick per slot, hidden ones included');
+                    probe.Ticks = 0;
+                    assert.deepEqual(await r.Links('s1', EdgeDirection.Out, QueryFx.Hosts, probe), []);
+                    assert.equal(probe.Ticks, 2, 'one tick per adjacency entry, invisible targets included');
+                    // A probe that throws aborts the read with its own error.
+                    const abort = new Error('deadline');
+                    const thrower = { Tick(): void { throw abort; } };
+                    await assert.rejects(async () =>
+                    {
+                        for await (const _ of r.ScanNodes(QueryFx.Server, thrower))
+                        {
+                            // drain
+                        }
+                    }, e => e === abort);
+                });
+                await g.dispose();
+            });
+
             it('ReadNode hides hidden members', async () =>
             {
                 const g = await QueryFx.Defined(open);

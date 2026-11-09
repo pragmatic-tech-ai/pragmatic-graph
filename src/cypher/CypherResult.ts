@@ -5,8 +5,8 @@ import type { CypherWriteStats, CypherWriteStatsDto } from './write/CypherWriteS
 /**
  * One query's result table. Truncated: RowCap cut the rows (no paging). HasMore: a page (Skip given) has a further
  * row. Stats: what a write query changed (absent for a read). Commit: the commit number of a write query that
- * committed changes (absent for a read and for a write that changed nothing, which commits nothing). Every node reachable in a row from
- * CypherEngine.Execute has its links filled, so CypherEngine.ToDto is synchronous.
+ * committed changes (absent for a read and for a write that changed nothing, which commits nothing). Every node
+ * reachable in a row from CypherEngine.Execute has its links filled, so CypherEngine.ToDto is synchronous.
  */
 export class CypherResult
 {

@@ -96,7 +96,9 @@ class CreateEvaluator
         }
     }
 
-    /** Kleene And (dominant False) or Or (dominant True): the dominant value wins, else Unknown if any, else `identity`. */
+    /**
+     * Kleene And (dominant False) or Or (dominant True): the dominant value wins, else Unknown if any, else `identity`.
+     */
     private static Combine(terms: readonly Predicate[], node: CreatedNode, dominant: Truth, identity: Truth): Truth
     {
         let result = identity;

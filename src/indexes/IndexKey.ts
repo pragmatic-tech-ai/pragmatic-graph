@@ -134,7 +134,9 @@ export class IndexKey
         return id;
     }
 
-    /** The smallest key greater than `key`: `key` followed by 0x00 (a seek that stopped at its Limit records up to it). */
+    /**
+     * The smallest key greater than `key`: `key` followed by 0x00 (a seek that stopped at its Limit records up to it).
+     */
     public static After(key: Uint8Array): Uint8Array
     {
         const out = new Uint8Array(key.length + 1);

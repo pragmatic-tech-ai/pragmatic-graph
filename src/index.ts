@@ -7,7 +7,7 @@ export { GraphEngine, StorageKind, type IEngineStorage, type IGraphEngineOptions
 // The low-level store underneath the facade.
 export { GraphStore } from './GraphStore.js';
 export type { ILmdbOptions } from './kv/lmdb/LmdbStore.js';
-export { GraphReader, type ILinkView, type INodeView, type IScanRow } from './GraphReader.js';
+export { GraphReader, type ILinkView, type INodeView, type IReadProbe, type IScanRow } from './GraphReader.js';
 export type { IIndexBound, IIndexRange } from './indexes/IndexKey.js';
 export { GraphTransaction } from './GraphTransaction.js';
 export { AccessDefault, AccessScope, type IAccessScopeOptions, type IWriteRules } from './access/AccessScope.js';

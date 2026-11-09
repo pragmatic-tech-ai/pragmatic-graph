@@ -39,6 +39,16 @@ export interface ILinkView
 }
 
 /**
+ * A read probe the caller passes to a scan, seek or link read: Tick() runs once per stored entry the
+ * reader examines (a slot, an index entry, an adjacency entry), visible or not, before the scope filters
+ * it. It may throw to abort the read (a query deadline, say); the error propagates unchanged.
+ */
+export interface IReadProbe
+{
+    Tick(): void;
+}
+
+/**
  * A consistent, read-only view of the graph at one commit (snapshot isolation): commits made after
  * the reader opened are not visible. Created by GraphStore.BeginRead; end it with dispose() (the store
  * disposes readers still open when it is disposed). Values returned are copies, never live storage.
@@ -160,8 +170,9 @@ export class GraphReader implements IGraphDisposable
      * none. Records the node's binding and the adjacency ranges, as Neighbors does. With `relationship`
      * only edges of that relationship are walked and only its adjacency ranges are recorded; a node whose
      * concept has no such relationship (in that direction) has none, rather than an error as in Neighbors.
+     * `probe` ticks once per adjacency entry examined.
      */
-    public async Links(publicId: string, direction: EdgeDirection, relationship?: string): Promise<readonly ILinkView[]>
+    public async Links(publicId: string, direction: EdgeDirection, relationship?: string, probe?: IReadProbe): Promise<readonly ILinkView[]>
     {
         this.RequireOpen();
         if (direction !== EdgeDirection.Out && direction !== EdgeDirection.In)
@@ -190,6 +201,7 @@ export class GraphReader implements IGraphDisposable
             for await (const id of this.recorded.Adjacent(rel, node.Id, direction))
             {
                 this.RequireOpen();
+                probe?.Tick();
                 if (evaluator === undefined)
                 {
                     out.push({ Relationship: rel.Name, PublicId: await this.recorded.PublicIdOf(id) });
@@ -324,8 +336,9 @@ export class GraphReader implements IGraphDisposable
     /**
      * Public ids of the visible live nodes whose concept is, inherits from, or carries `conceptOrAspect`,
      * per matching concept then in slot order. Disposing the reader ends the scan: the next id rejects.
+     * `probe` ticks once per slot examined, hidden or not.
      */
-    public async *ScanNodes(conceptOrAspect: string): AsyncIterable<string>
+    public async *ScanNodes(conceptOrAspect: string, probe?: IReadProbe): AsyncIterable<string>
     {
         this.RequireOpen();
         const index = this.snapshot.Index;
@@ -336,6 +349,7 @@ export class GraphReader implements IGraphDisposable
             for await (const row of this.context.Columns.ScanColumn(this.snapshot.Txn, GraphReader.Partition, typeId, CatalogSnapshot.NodeIdMember))
             {
                 this.RequireOpen();
+                probe?.Tick();
                 const publicId = await this.VisibleIdOf(row.NodeId);
                 this.RequireOpen();
                 if (publicId !== undefined)
@@ -371,9 +385,10 @@ export class GraphReader implements IGraphDisposable
      * the whole range, or, when Limit ids were produced, the range up to the last entry examined.
      * Errors: CatalogError UnknownMember for an unknown index; GraphError InvalidArgument for a prefix
      * longer than the index, a bound after a full prefix, a value that does not fit its member, or a
-     * non-integer Limit. Disposing the reader ends the seek: the next id rejects.
+     * non-integer Limit. Disposing the reader ends the seek: the next id rejects. `probe` ticks once per
+     * index entry examined, skipped or not.
      */
-    public async *SeekIndex(index: string, range: IIndexRange): AsyncIterable<string>
+    public async *SeekIndex(index: string, range: IIndexRange, probe?: IReadProbe): AsyncIterable<string>
     {
         this.RequireOpen();
         const catalog = this.snapshot.Index.Catalog;
@@ -397,6 +412,7 @@ export class GraphReader implements IGraphDisposable
             for await (const key of this.context.Indexes.Seek(this.snapshot.Txn, keys, seek))
             {
                 this.RequireOpen();
+                probe?.Tick();
                 last = key;
                 const publicId = evaluator === undefined
                     ? await this.recorded.PublicIdOf(IndexKey.InternalId(key))
@@ -547,7 +563,10 @@ export class GraphReader implements IGraphDisposable
         return reverse ? { Start: last, End: range.End } : { Start: range.Start, End: IndexKey.After(last) };
     }
 
-    /** Resolves the node when it exists and is visible, recording its binding (also when missing) and the visibility reads. */
+    /**
+     * Resolves the node when it exists and is visible, recording its binding (also when missing) and the visibility
+     * reads.
+     */
     private async Locate(publicId: string): Promise<IReadNode | undefined>
     {
         const node = await this.recorded.Locate(publicId);

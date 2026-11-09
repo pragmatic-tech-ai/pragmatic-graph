@@ -4,7 +4,10 @@ import { NodeValue } from '../CypherValue.js';
 import { CancelProbe, type ICancellation } from '../ExecutionLimits.js';
 import type { IOperator } from './IOperator.js';
 
-/** Binds every visible node to the variable, per concept then slot order; the deadline is checked up front and per node read. */
+/**
+ * Binds every visible node to the variable, per concept then slot order; the deadline is checked up front and per
+ * stored node examined, hidden ones included.
+ */
 export class AllNodesScan implements IOperator
 {
     private static readonly Name = 'AllNodesScan';
@@ -17,9 +20,8 @@ export class AllNodesScan implements IOperator
     {
         const probe = new CancelProbe(this.cancel);
         probe.Begin();
-        for await (const node of this.source.ScanAll())
+        for await (const node of this.source.ScanAll(probe))
         {
-            probe.Tick();
             yield new Binding().With(this.variable, new NodeValue(node));
         }
     }

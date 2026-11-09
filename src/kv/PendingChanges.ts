@@ -34,7 +34,9 @@ export class PendingChanges
         return this.size;
     }
 
-    /** Stages the change; `key` and `value` must already be private copies. A later change to the same key replaces it. */
+    /**
+     * Stages the change; `key` and `value` must already be private copies. A later change to the same key replaces it.
+     */
     public Set(key: Uint8Array, value: Uint8Array | null): void
     {
         const change: IPendingChange = { Key: key, Value: value };
@@ -177,10 +179,9 @@ export class PendingChanges
 
     /**
      * Lazily merges stored entries with staged changes (both in the same key order, ascending or with
-     * `reverse` descending, and restricted to one range):
-     * a change replaces or (null value) hides the stored entry with the same key. Stops pulling from
-     * either side as soon as `limit` entries were produced. Yields the source buffers uncopied; every
-     * entry pulled from either side is counted.
+     * `reverse` descending, and restricted to one range): a change replaces or (null value) hides the stored entry with
+     * the same key. Stops pulling from either side as soon as `limit` entries were produced. Yields the source buffers
+     * uncopied; every entry pulled from either side is counted.
      */
     public static *Merge(
         base: Iterable<readonly [Uint8Array, Uint8Array]>,

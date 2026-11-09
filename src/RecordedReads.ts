@@ -101,7 +101,9 @@ export class RecordedReads
         return (await SeedMarkers.Read(this.snapshot.Txn, node.PublicId)) !== undefined;
     }
 
-    /** Internal ids at the far end of the node's `rel` edges in `direction`, in edge order; records the adjacency range. */
+    /**
+     * Internal ids at the far end of the node's `rel` edges in `direction`, in edge order; records the adjacency range.
+     */
     public async *Adjacent(rel: MemberDef, node: bigint, direction: EdgeDirection): AsyncIterable<bigint>
     {
         this.Reads?.AddRange(ConflictKeys.EdgeSpace, ConflictKeys.Adjacency(rel.Id, direction, node));

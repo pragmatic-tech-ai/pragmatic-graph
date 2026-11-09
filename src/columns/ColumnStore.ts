@@ -272,7 +272,10 @@ export class ColumnStore
         }));
     }
 
-    /** Serializes every dirty delta once. Idempotent; a write after Flush marks its delta dirty again and needs another Flush. Call before the write transaction commits. */
+    /**
+     * Serializes every dirty delta once. Idempotent; a write after Flush marks its delta dirty again and needs another
+     * Flush. Call before the write transaction commits.
+     */
     public Flush(txn: IWriteTransaction): void
     {
         const state = this.states.get(txn);
@@ -341,7 +344,10 @@ export class ColumnStore
         txn.Delete(Keyspace.Meta, this.SlotsKey(partition, typeId));
     }
 
-    /** Live slots (member-0 cell non-null after overlay) in slot order, with this member's value and the slot's node id (member 0). */
+    /**
+     * Live slots (member-0 cell non-null after overlay) in slot order, with this member's value and the slot's node id
+     * (member 0).
+     */
     public async *ScanColumn(txn: IReadTransaction, partition: number, typeId: number, member: MemberDef): AsyncIterable<IColumnRow>
     {
         const type = ColumnStore.RequireType(member);

@@ -8,7 +8,9 @@ export enum ConnectorPhase
     Commit = 'Commit',
     /** The engine's own Finalize after every connector committed (Connector is BindingTable.EngineStorage). */
     Finalize = 'Finalize',
-    /** The engine's Prepare did not return before the write-through deadline (Connector is BindingTable.EngineStorage). */
+    /**
+     * The engine's Prepare did not return before the write-through deadline (Connector is BindingTable.EngineStorage).
+     */
     Prepare = 'Prepare',
 }
 

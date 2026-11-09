@@ -33,7 +33,8 @@ export interface ICypherRunOptions
 /**
  * Runs Cypher on a GraphEngine under an access scope. A read-only query runs on one GraphReader
  * (BeginRead(scope)); a query with write clauses on one GraphTransaction (Begin(scope)) that commits once at the
- * end: at most one CommitApplied (none when it changed nothing), its number in CypherResult.Commit. The reader or transaction is disposed in every outcome. Before the result is returned
+ * end: at most one CommitApplied (none when it changed nothing), its number in CypherResult.Commit. The reader or
+ * transaction is disposed in every outcome. Before the result is returned
  * every node reachable in a row (inside lists, maps and paths too) gets its outgoing links filled, once per
  * distinct node, through the same scoped reader (for a write, the query's own view of the graph), so ToDto is
  * synchronous and sees exactly what the scope may see.

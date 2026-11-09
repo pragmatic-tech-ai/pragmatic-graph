@@ -52,7 +52,9 @@ export class BindingTable
         }
     }
 
-    /** Every connector name the table can resolve to (DefaultConnector included), EngineStorage among them when used. */
+    /**
+     * Every connector name the table can resolve to (DefaultConnector included), EngineStorage among them when used.
+     */
     public ConnectorNames(): ReadonlySet<string>
     {
         const names = new Set<string>();

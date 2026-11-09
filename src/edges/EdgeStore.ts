@@ -213,7 +213,10 @@ export class EdgeStore
         }
     }
 
-    /** Position of the edge from -> to, or undefined when there is none. Cost depends on the relationship shape (see class comment). */
+    /**
+     * Position of the edge from -> to, or undefined when there is none. Cost depends on the relationship shape (see
+     * class comment).
+     */
     public async PositionOf(txn: IReadTransaction, relationship: MemberDef, from: bigint, to: bigint): Promise<Uint8Array | undefined>
     {
         EdgeStore.RequireRelationship(relationship);
@@ -416,7 +419,9 @@ export class EdgeStore
         }
     }
 
-    /** Out value: for each non-null property sorted by member id, u32 LE id, u32 LE value length, single-value bytes. */
+    /**
+     * Out value: for each non-null property sorted by member id, u32 LE id, u32 LE value length, single-value bytes.
+     */
     private static EncodeProperties(relationship: MemberDef, properties: ReadonlyMap<string, CellValue> | undefined): Uint8Array
     {
         const declared = relationship.EdgeProperties ?? [];

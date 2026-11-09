@@ -209,7 +209,8 @@ export class CypherUnparser
         return out;
     }
 
-    // A qualified label (shop.Customer) is rendered segment by segment as :ns.Concept, quoting any segment that needs it.
+    // A qualified label (shop.Customer) is rendered segment by segment as :ns.Concept, quoting any segment that needs
+    // it.
     private Node(node: NodePattern): string
     {
         let out = CypherUnparser.OpenParen + (node.Variable === undefined ? CypherUnparser.Empty : this.Ident(node.Variable));
@@ -284,7 +285,8 @@ export class CypherUnparser
         if (e instanceof MapLiteral) return this.MapText(e);
         if (e instanceof IndexAccess) return this.Expr(e.Target, Prec.Postfix) + CypherUnparser.OpenBracket + this.Expr(e.Index, Prec.Or) + CypherUnparser.CloseBracket;
         if (e instanceof FunctionCall) return this.CallText(e);
-        // Unreachable from the public fluent builder/parser (ValueLiteral is only constructed directly in tests): defensive, not a round-trip gap.
+        // Unreachable from the public fluent builder/parser (ValueLiteral is only constructed directly in tests):
+        // defensive, not a round-trip gap.
         if (e instanceof ValueLiteral) throw new CypherSemanticError(CypherUnparser.UnsupportedValueLiteral);
         throw new CypherSemanticError(e.constructor.name);
     }

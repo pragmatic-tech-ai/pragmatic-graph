@@ -1,6 +1,9 @@
 import { GraphError, GraphErrorCode } from '../errors/GraphError.js';
 
-/** What kind of failure a CypherError reports. Subclasses fix their own code; IntegerOverflow is raised as a plain CypherError. */
+/**
+ * What kind of failure a CypherError reports. Subclasses fix their own code; IntegerOverflow is raised as a plain
+ * CypherError.
+ */
 export enum CypherErrorCode
 {
     Error = 1,

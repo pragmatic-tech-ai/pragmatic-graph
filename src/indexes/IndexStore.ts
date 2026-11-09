@@ -66,7 +66,9 @@ export class ConceptIndex
     }
 }
 
-/** One stored index entry of one node. `Unique`: the entry is checked for uniqueness (a unique index, no null value). */
+/**
+ * One stored index entry of one node. `Unique`: the entry is checked for uniqueness (a unique index, no null value).
+ */
 export interface IIndexEntry
 {
     readonly Index: IndexDef;

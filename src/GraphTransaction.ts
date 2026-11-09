@@ -56,7 +56,10 @@ export class GraphTransaction extends GraphReader
         this.batch.SetProperty(publicId, member, value);
     }
 
-    /** Deletes the node and every edge it has; with Strict the commit instead fails while any edge remains (CommitError NodeHasEdges). */
+    /**
+     * Deletes the node and every edge it has; with Strict the commit instead fails while any edge remains (CommitError
+     * NodeHasEdges).
+     */
     public DeleteNode(publicId: string, options?: IDeleteNodeOptions): void
     {
         this.RequireActive();

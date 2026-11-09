@@ -104,7 +104,8 @@ export class PublicIdIndex
         {
             throw new PublicIdTooLongError();
         }
-        // Rejected so a 400-byte id always fits the 511-byte key limit (tuple strings escape 0x00 as two bytes; ruling F1).
+        // Rejected so a 400-byte id always fits the 511-byte key limit (tuple strings escape 0x00 as two bytes; ruling
+        // F1).
         if (publicId.includes(PublicIdIndex.Nul))
         {
             throw new GraphError(GraphErrorCode.InvalidArgument, PublicIdIndex.ErrNul);

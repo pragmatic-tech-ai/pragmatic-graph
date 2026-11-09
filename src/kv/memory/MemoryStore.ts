@@ -89,7 +89,10 @@ class LeafList
         }
     }
 
-    /** A new list with the sorted changes applied; leaves without changes are shared, touched ones rebuilt (and split when over capacity). */
+    /**
+     * A new list with the sorted changes applied; leaves without changes are shared, touched ones rebuilt (and split
+     * when over capacity).
+     */
     public Apply(changes: readonly IPendingChange[], stats: CommitStats): LeafList
     {
         if (changes.length === 0)
@@ -186,7 +189,10 @@ class Sorted
         return lo;
     }
 
-    /** Overlays sorted changes (null value = delete) on sorted entries in one linear merge (not a scan: uncounted); the result is in key order. */
+    /**
+     * Overlays sorted changes (null value = delete) on sorted entries in one linear merge (not a scan: uncounted); the
+     * result is in key order.
+     */
     public static *Merge(entries: readonly IEntry[], changes: Iterable<IPendingChange>): Iterable<IEntry>
     {
         for (const [key, value] of PendingChanges.Merge(Sorted.Pairs(entries), changes, new ScanCounter()))
@@ -272,7 +278,10 @@ class MemoryReadTransaction implements IReadTransaction
         return (this.snapshot.get(space) ?? LeafList.Empty).Get(key);
     }
 
-    /** Raw (uncopied) entries in range, in key order (descending with reverse), produced lazily from the binary-searched bound. */
+    /**
+     * Raw (uncopied) entries in range, in key order (descending with reverse), produced lazily from the binary-searched
+     * bound.
+     */
     protected Entries(space: Keyspace, range: IKeyRange, reverse: boolean): Iterable<readonly [Uint8Array, Uint8Array]>
     {
         if (KeyRanges.IsEmpty(range))
@@ -301,7 +310,10 @@ class MemoryWriteTransaction extends MemoryReadTransaction implements IWriteTran
         return super.Get(space, key);
     }
 
-    /** Lazy merge of the snapshot with this transaction's staged changes; stops as soon as `limit` entries were produced. */
+    /**
+     * Lazy merge of the snapshot with this transaction's staged changes; stops as soon as `limit` entries were
+     * produced.
+     */
     public override async *Scan(space: Keyspace, range: IKeyRange, options?: IScanOptions): AsyncIterable<[Uint8Array, Uint8Array]>
     {
         this.EnsureLive();

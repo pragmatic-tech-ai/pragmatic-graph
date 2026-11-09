@@ -92,10 +92,10 @@ export interface IReadTransaction
     Get(space: Keyspace, key: Uint8Array): Promise<Uint8Array | undefined>;
     /**
      * Entries with Start <= key < End in key order (descending with Reverse), at most Limit. Lazy: stops
-     * reading storage once Limit entries were produced. In a write transaction, do not Put or Delete anything in the same
-     * keyspace while a Scan of it is open (not finished, broken out of or returned): the scan's next step
-     * throws (collect first, then mutate). This covers replacing or deleting an already-staged key and
-     * the keyspace's first staged change. Writes to other keyspaces are allowed.
+     * reading storage once Limit entries were produced. In a write transaction, do not Put or Delete anything in the
+     * same keyspace while a Scan of it is open (not finished, broken out of or returned): the scan's next step throws
+     * (collect first, then mutate). This covers replacing or deleting an already-staged key and the keyspace's first
+     * staged change. Writes to other keyspaces are allowed.
      */
     Scan(space: Keyspace, range: IKeyRange, options?: IScanOptions): AsyncIterable<[Uint8Array, Uint8Array]>;
     dispose(): void;

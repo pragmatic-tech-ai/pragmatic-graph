@@ -91,6 +91,7 @@ export class AvgAggregator implements IAggregator
     }
 }
 
+/** min / max under the ORDER BY total order (CypherValue.Compare): nulls are skipped and NaN is the largest number. */
 abstract class ExtremeAggregator implements IAggregator
 {
     private best: CypherValue | null = null;

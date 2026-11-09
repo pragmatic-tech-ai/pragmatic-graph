@@ -11,7 +11,9 @@ export type CypherScalar = Exclude<CellValue, null>;
  */
 export type ParameterValue = CypherScalar | null | readonly ParameterValue[] | { readonly [key: string]: ParameterValue };
 
-/** Cross-type order of value kinds (ORDER BY): scalars by ScalarRank, then nodes, lists, maps, rels, paths; null last. */
+/**
+ * Cross-type order of value kinds (ORDER BY): scalars by ScalarRank, then nodes, lists, maps, rels, paths; null last.
+ */
 export enum ValueRank
 {
     Node = 6,
@@ -27,7 +29,8 @@ export abstract class CypherValue
     // Equivalence key (DISTINCT, grouping, joins): 2 and 2.0 share a key.
     public abstract GroupKey(): string;
 
-    // Type-exact identity key (expression structural keys): 2 and 2.0 differ. Same as GroupKey unless numbers are inside.
+    // Type-exact identity key (expression structural keys): 2 and 2.0 differ. Same as GroupKey unless numbers are
+    // inside.
     public TypedKey(): string
     {
         return this.GroupKey();

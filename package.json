@@ -3,6 +3,9 @@
   "version": "0.1.0",
   "description": "Graph database storage engine: KV layer and graph layout",
   "license": "Apache-2.0",
+  "engines": {
+    "node": ">=20"
+  },
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",

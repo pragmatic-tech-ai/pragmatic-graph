@@ -343,7 +343,10 @@ export class BatchApplier
         return rel;
     }
 
-    /** Position of the existing edge (from, rel, sibling), found from the sibling's In range (ruling R33); UnknownNode if the sibling does not exist, InvalidEdge if it is not linked. */
+    /**
+     * Position of the existing edge (from, rel, sibling), found from the sibling's In range (ruling R33); UnknownNode
+     * if the sibling does not exist, InvalidEdge if it is not linked.
+     */
     private async SiblingPosition(txn: IWriteTransaction, from: INode, rel: MemberDef, sibling: string): Promise<Uint8Array>
     {
         const target = await this.Locate(txn, sibling);

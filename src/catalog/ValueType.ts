@@ -1,4 +1,7 @@
-/** Scalar types of properties. Date = days since epoch; DateTime = UTC epoch microseconds plus IANA zone; Duration = months, days, microseconds. */
+/**
+ * Scalar types of properties. Date = days since epoch; DateTime = UTC epoch microseconds plus IANA zone; Duration =
+ * months, days, microseconds.
+ */
 export enum ValueType
 {
     Boolean = 1,

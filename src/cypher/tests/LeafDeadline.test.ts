@@ -1,6 +1,6 @@
 import { after, before, describe, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { AccessScope, type CellValue, type ISeedNode } from '../../index.js';
+import { AccessDefault, AccessScope, TruePredicate, type CellValue, type ISeedNode } from '../../index.js';
 import { Binding } from '../Binding.js';
 import { CypherEngine } from '../CypherEngine.js';
 import { RelDirection } from '../CypherEnums.js';
@@ -112,6 +112,29 @@ describe('leaf operators honour the deadline per node read', () =>
                 assert.ok(counting.Calls >= 2, `${name} checked ${counting.Calls} times`);
                 await assert.rejects(WideFixture.Drain(await build(s as ReaderSource, new CountingCancellation(1))), CypherTimeout);
             });
+        });
+    }
+
+    // Only the hub is visible: every Service slot, index entry and edge is examined and filtered out inside the
+    // reader, so no row ever reaches the operator; the deadline must still fire.
+    for (const [name, build] of cases)
+    {
+        test(`${name}: a token expiring mid-read aborts even when the scope hides every row`, async () =>
+        {
+            const scope = AccessScope.Build({ Default: AccessDefault.Deny, Rows: new Map([['Hub', TruePredicate.Instance]]) });
+            const reader = await fx.Engine.BeginRead(scope);
+            try
+            {
+                const source = new ReaderSource(reader);
+                const counting = new CountingCancellation();
+                await WideFixture.Drain(await build(source, counting));
+                assert.ok(counting.Calls >= 2, `${name} checked ${counting.Calls} times`);
+                await assert.rejects(WideFixture.Drain(await build(source, new CountingCancellation(1))), CypherTimeout);
+            }
+            finally
+            {
+                reader.dispose();
+            }
         });
     }
 

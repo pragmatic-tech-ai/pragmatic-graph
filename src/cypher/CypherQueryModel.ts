@@ -18,7 +18,8 @@ export abstract class ReadingClause
 {
 }
 
-// Marker base for clauses that mutate the graph. A WritingClause IS-A ReadingClause so it flows through QueryPart.Reading.
+// Marker base for clauses that mutate the graph. A WritingClause IS-A ReadingClause so it flows through
+// QueryPart.Reading.
 export abstract class WritingClause extends ReadingClause
 {
 }
@@ -81,7 +82,8 @@ export class MergeClause extends WritingClause
         public readonly Pattern: PatternPath,
         // ON CREATE SET items: applied only when this MERGE creates the node.
         public readonly OnCreate: readonly SetItem[] = [],
-        // ON MATCH SET items: applied only when this MERGE matches an existing node (incl. one this query created earlier).
+        // ON MATCH SET items: applied only when this MERGE matches an existing node (incl. one this query created
+        // earlier).
         public readonly OnMatch: readonly SetItem[] = [],
     )
     {

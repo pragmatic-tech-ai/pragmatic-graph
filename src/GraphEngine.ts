@@ -37,7 +37,9 @@ export interface IGraphEngineOptions
     /** The schema the engine runs: the store is upgraded to it at Open. Its Bindings route writes to Connectors. */
     readonly Description: ISchemaDescription;
     readonly Storage: IEngineStorage;
-    /** The connectors bindings name; unique names, none named BindingTable.EngineStorage. Fixed for the engine's life. */
+    /**
+     * The connectors bindings name; unique names, none named BindingTable.EngineStorage. Fixed for the engine's life.
+     */
     readonly Connectors?: readonly IGraphConnector[];
     /** Bounds the connector phase of each write-through (default Committer.DefaultPrepareTimeoutMs). */
     readonly PrepareTimeoutMs?: number;
@@ -179,7 +181,10 @@ export class GraphEngine
         return this.store.Begin(scope);
     }
 
-    /** Every commit after `afterCommit`, in commit order (GraphStore.ReadChanges); GraphError Disposed on iteration once disposed. */
+    /**
+     * Every commit after `afterCommit`, in commit order (GraphStore.ReadChanges); GraphError Disposed on iteration once
+     * disposed.
+     */
     public async *ReadChanges(afterCommit: bigint): AsyncIterable<ICommitApplied>
     {
         if (this.disposing !== undefined)
@@ -214,7 +219,10 @@ export class GraphEngine
         return result;
     }
 
-    /** Checks the description's bindings against `connectors` and the timeout (as ConnectorSetup does) without installing them. */
+    /**
+     * Checks the description's bindings against `connectors` and the timeout (as ConnectorSetup does) without
+     * installing them.
+     */
     private static CheckBindings(description: ISchemaDescription, connectors: readonly IGraphConnector[], timeoutMs: number): void
     {
         void new ConnectorSetup(new BindingTable(description.Bindings, description.DefaultConnector), connectors, timeoutMs);

@@ -16,7 +16,9 @@ export enum WriteOp
     StrictDeleteNode = 6,
 }
 
-/** Placement and properties of a new edge. Siblings are public ids of existing targets of the same (from, relationship). */
+/**
+ * Placement and properties of a new edge. Siblings are public ids of existing targets of the same (from, relationship).
+ */
 export interface LinkOptions
 {
     readonly AfterSibling?: string;
@@ -400,7 +402,10 @@ export class WriteBatch
         return w.Finish();
     }
 
-    /** Parses Serialize output; any malformed input (version, op, tag, truncation, trailing bytes, UTF-8) is a RangeError. */
+    /**
+     * Parses Serialize output; any malformed input (version, op, tag, truncation, trailing bytes, UTF-8) is a
+     * RangeError.
+     */
     public static Deserialize(bytes: Uint8Array): WriteBatch
     {
         const r = new ByteReader(bytes);

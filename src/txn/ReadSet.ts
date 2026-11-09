@@ -23,7 +23,9 @@ class SpaceReads
         return copy;
     }
 
-    /** Inserts the range, merging it with every range it overlaps or touches. Ranges added in key order cost O(log n). */
+    /**
+     * Inserts the range, merging it with every range it overlaps or touches. Ranges added in key order cost O(log n).
+     */
     public AddRange(range: IKeyRange): void
     {
         if (TupleCodec.Compare(range.Start, range.End) >= 0)

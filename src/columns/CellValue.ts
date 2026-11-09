@@ -40,5 +40,8 @@ export class DurationValue
     }
 }
 
-/** One cell of a column; temporal values are frozen instances. null is the null cell. Int64 is bigint, Float64 is number. */
+/**
+ * One cell of a column; temporal values are frozen instances. null is the null cell. Int64 is bigint, Float64 is
+ * number.
+ */
 export type CellValue = boolean | bigint | number | string | DateValue | DateTimeValue | DurationValue | null;

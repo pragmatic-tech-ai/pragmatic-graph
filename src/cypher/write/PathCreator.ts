@@ -19,7 +19,10 @@ export class PathCreator
     {
     }
 
-    /** Fail fast, before any write: every created relationship needs a type and a direction, and cannot be variable-length. */
+    /**
+     * Fail fast, before any write: every created relationship needs a type and a direction, and cannot be
+     * variable-length.
+     */
     public static ValidateRels(path: PatternPath): void
     {
         for (const rel of path.Rels)

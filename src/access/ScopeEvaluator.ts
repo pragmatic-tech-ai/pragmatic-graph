@@ -46,9 +46,9 @@ class Evaluation
  * cached, as are per-concept applicable entries and visibility results that did not depend on a guard
  * hit (only those are facts about the node rather than about one decision); guard-dependent results
  * are memoised within their Evaluation, so a node is decided at most once per top-level decision (work
- * linear in the nodes and edges reached), with a MaxDecisions budget as a fail-closed backstop. The snapshot never changes
- * under a reader (R30), so cached results stay correct for its lifetime; the cache holds one boolean
- * per node actually decided.
+ * linear in the nodes and edges reached), with a MaxDecisions budget as a fail-closed backstop. The snapshot never
+ * changes under a reader (R30), so cached results stay correct for its lifetime; the cache holds one boolean per node
+ * actually decided.
  */
 export class ScopeEvaluator
 {

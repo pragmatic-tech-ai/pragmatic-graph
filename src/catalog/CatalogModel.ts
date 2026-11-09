@@ -63,7 +63,10 @@ export class CatalogModel
         return model;
     }
 
-    /** A model with no definitions or indexes whose version and id counters continue from `snapshot` (for CatalogPlanner). */
+    /**
+     * A model with no definitions or indexes whose version and id counters continue from `snapshot` (for
+     * CatalogPlanner).
+     */
     public static EmptyFrom(snapshot: CatalogSnapshot): CatalogModel
     {
         const model = new CatalogModel();

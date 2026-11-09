@@ -7,8 +7,8 @@ import type { IExpandRow } from './CypherSource.js';
 
 /**
  * The source CypherEngine.Explain plans over: the engine's current catalog and the explained scope's hidden members
- * (none when Explain has no scope), so index choice matches a scoped Execute. Planning only resolves labels, relationships and indexes; every read refuses, so an explained
- * plan can never be run by mistake.
+ * (none when Explain has no scope), so index choice matches a scoped Execute. Planning only resolves labels,
+ * relationships and indexes; every read refuses, so an explained plan can never be run by mistake.
  */
 export class PlanSource extends CatalogSource
 {

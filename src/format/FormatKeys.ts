@@ -30,7 +30,9 @@ export class FormatKeys
         return TupleCodec.Encode([name, ...qualifiers]);
     }
 
-    /** Keyspace.Meta: the seed marker of a node the schema's seed placed: Meta("seed", publicId) -> 32-byte SeedHash. */
+    /**
+     * Keyspace.Meta: the seed marker of a node the schema's seed placed: Meta("seed", publicId) -> 32-byte SeedHash.
+     */
     public static Seed(publicId: string): Uint8Array
     {
         return FormatKeys.Meta(FormatKeys.SeedName, publicId);
@@ -79,7 +81,10 @@ export class FormatKeys
         return TupleCodec.Encode([partition, typeId, memberId, chunk]);
     }
 
-    /** Every column chunk key (Columns) or delta key (Deltas) of one type, all members: same tuple prefix in both keyspaces. */
+    /**
+     * Every column chunk key (Columns) or delta key (Deltas) of one type, all members: same tuple prefix in both
+     * keyspaces.
+     */
     public static TypeCellsRange(partition: number, typeId: number): IKeyRange
     {
         return FormatKeys.PrefixRange(TupleCodec.Encode([partition, typeId]));

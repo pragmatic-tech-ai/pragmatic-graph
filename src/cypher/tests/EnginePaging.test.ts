@@ -216,6 +216,20 @@ describe('ORDER BY with NaN', () =>
         assert.deepEqual(pages.flatMap((p) => PagingFixture.Col(p)), Ascending);
     });
 
+    test('min and max follow the same order: NaN is the largest number', async () =>
+    {
+        const q = 'UNWIND $xs AS x RETURN min(x) AS lo, max(x) AS hi';
+        const both = await e.Execute(q, Xs);
+        assert.deepEqual(EngineHarness.Col(both, 0), [0n]);
+        assert.ok(Number.isNaN(EngineHarness.Col(both, 1)[0]));
+        // Input order does not matter, and an all-NaN input gives NaN for both.
+        const late = await e.Execute(q, new Map([['xs', [Number.NaN, 2, 7]]]));
+        assert.deepEqual(EngineHarness.Col(late, 0), [2n]);
+        assert.ok(Number.isNaN(EngineHarness.Col(late, 1)[0]));
+        const only = await e.Execute(q, new Map([['xs', [Number.NaN, Number.NaN]]]));
+        assert.ok(Number.isNaN(EngineHarness.Col(only, 0)[0]) && Number.isNaN(EngineHarness.Col(only, 1)[0]));
+    });
+
     test('predicates keep NaN incomparable', async () =>
     {
         assert.deepEqual(PagingFixture.Col(await e.Execute('UNWIND $xs AS x WITH x WHERE x = x RETURN count(*) AS c', Xs)), [6n]);

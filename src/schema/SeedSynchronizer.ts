@@ -19,7 +19,10 @@ import { SeedHash } from './SeedHash.js';
 export interface ISeedView
 {
     Resolve(publicId: string): Promise<{ readonly Concept: string; readonly Owner: string } | undefined>;
-    /** Every out-edge of the node over its concept's relationships, per relationship in edge order, with its edge properties. */
+    /**
+     * Every out-edge of the node over its concept's relationships, per relationship in edge order, with its edge
+     * properties.
+     */
     OutEdges(publicId: string): Promise<readonly ISeedEdge[]>;
     /** The stored value of every effective property of the node (null when unset); empty when the node is absent. */
     Properties(publicId: string): Promise<ReadonlyMap<string, CellValue>>;

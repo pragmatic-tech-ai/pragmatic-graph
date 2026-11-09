@@ -193,7 +193,10 @@ class PurgeRun
         }
     }
 
-    /** Removed indexes go wholesale, stale entries one by one; then the slices to build are built over the surviving nodes. */
+    /**
+     * Removed indexes go wholesale, stale entries one by one; then the slices to build are built over the surviving
+     * nodes.
+     */
     private async RewriteIndexes(): Promise<void>
     {
         for (const removed of this.diff.RemovedIndexes)

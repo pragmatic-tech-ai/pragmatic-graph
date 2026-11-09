@@ -15,7 +15,10 @@ export enum GraphErrorCode
     Disposed = 4,
     /** Stored data is damaged or not in the expected format. */
     Corrupt = 5,
-    /** The request does not fit the schema: unknown type or member, wrong member kind, value type, target type, invalid definition. */
+    /**
+     * The request does not fit the schema: unknown type or member, wrong member kind, value type, target type, invalid
+     * definition.
+     */
     SchemaViolation = 6,
     /** A storage key exceeds the portable maximum key size (511 bytes). */
     KeyTooLong = 7,
@@ -29,7 +32,10 @@ export enum GraphErrorCode
     Internal = 11,
     /** The transaction's AccessScope does not allow a write it recorded (AccessError). */
     AccessDenied = 12,
-    /** A connector taking part in a write-through failed, timed out, or the engine could not finalize after it (ConnectorError). */
+    /**
+     * A connector taking part in a write-through failed, timed out, or the engine could not finalize after it
+     * (ConnectorError).
+     */
     ConnectorFailed = 13,
     /** A Cypher query failed to parse, plan or run (CypherError; its Code gives the Cypher category). */
     QueryFailed = 14,

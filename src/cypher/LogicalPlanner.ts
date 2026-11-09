@@ -468,7 +468,8 @@ export class LogicalPlanner
             : new Project(input, projection.Items, this.parameters);
 
         if (projection.Distinct) op = new Distinct(op, projection.Items.map((i) => i.ColumnName()), this.cancel);
-        // HAVING-style: WITH ... WHERE filters the projected/aggregated rows, then ORDER BY/SKIP/LIMIT paginate the filtered set.
+        // HAVING-style: WITH ... WHERE filters the projected/aggregated rows, then ORDER BY/SKIP/LIMIT paginate the
+        // filtered set.
         if (projection.Where !== undefined) op = new Filter(op, this.resolveWithWhere(projection), this.parameters);
         if (projection.OrderBy !== undefined)
         {
@@ -569,7 +570,8 @@ export class LogicalPlanner
     }
 
     // An index seek for a freshly bound labelled anchor: an inline property first, then a top-level WHERE equality on
-    // the anchor's variable, whichever has a usable index. The consumed inline key or WHERE conjunct is not filtered again.
+    // the anchor's variable, whichever has a usable index. The consumed inline key or WHERE conjunct is not filtered
+    // again.
     private trySeek(node: NodePattern, name: string, seeks: readonly SeekEquality[]): ISeekChoice | undefined
     {
         const label = this.resolve(node.Label);

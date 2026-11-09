@@ -2,7 +2,7 @@ import { ValueCodec } from '../columns/ValueCodec.js';
 import { ValueType } from '../catalog/ValueType.js';
 import { DateTimeValue, DateValue, type CellValue } from '../columns/CellValue.js';
 import { EdgeDirection } from '../format/FormatKeys.js';
-import type { GraphReader, ILinkView } from '../GraphReader.js';
+import type { GraphReader, ILinkView, IReadProbe } from '../GraphReader.js';
 import { CatalogSource } from './CatalogSource.js';
 import { RelDirection } from './CypherEnums.js';
 import { CypherSemanticError } from './CypherError.js';
@@ -29,19 +29,19 @@ export class ReaderSource extends CatalogSource
         super(reader.Catalog, reader.Scope.Hidden);
     }
 
-    public async *ScanLabel(label: string): AsyncIterable<CypherNode>
+    public async *ScanLabel(label: string, probe?: IReadProbe): AsyncIterable<CypherNode>
     {
-        yield* this.Scan(this.labels.Resolve(label));
+        yield* this.Scan(this.labels.Resolve(label), probe);
     }
 
     /** Root concepts in definition order, each with its subtypes (ScanNodes order): every concept exactly once. */
-    public async *ScanAll(): AsyncIterable<CypherNode>
+    public async *ScanAll(probe?: IReadProbe): AsyncIterable<CypherNode>
     {
         for (const def of this.catalog.Definitions())
         {
             if (!def.IsAspect && def.Parent === null)
             {
-                yield* this.Scan(def.Name);
+                yield* this.Scan(def.Name, probe);
             }
         }
     }
@@ -54,32 +54,34 @@ export class ReaderSource extends CatalogSource
 
     /**
      * Outgoing and Incoming map to the reader's Links (Out / In), narrowed to `relationship` when given (only
-     * that relationship's edges are read and recorded).
-     * Undirected walks Out then In and reports each (relationship, far node) pair once, so a self-loop, seen
-     * from both ends, appears once (TODL deduplicated by far node).
+     * that relationship's edges are read and recorded). Undirected walks Out then In and reports each (relationship,
+     * far node) pair once, so a self-loop, seen from both ends, appears once (TODL deduplicated by far node).
      */
-    public async *Expand(publicId: string, relationship: string | undefined, direction: RelDirection): AsyncIterable<IExpandRow>
+    public async *Expand(publicId: string, relationship: string | undefined, direction: RelDirection, probe?: IReadProbe): AsyncIterable<IExpandRow>
     {
         switch (direction)
         {
             case RelDirection.Outgoing:
-                yield* this.Walk(publicId, relationship, EdgeDirection.Out, undefined);
+                yield* this.Walk(publicId, relationship, EdgeDirection.Out, undefined, probe);
                 return;
             case RelDirection.Incoming:
-                yield* this.Walk(publicId, relationship, EdgeDirection.In, undefined);
+                yield* this.Walk(publicId, relationship, EdgeDirection.In, undefined, probe);
                 return;
             case RelDirection.Undirected:
             {
                 const seen = new Set<string>();
-                yield* this.Walk(publicId, relationship, EdgeDirection.Out, seen);
-                yield* this.Walk(publicId, relationship, EdgeDirection.In, seen);
+                yield* this.Walk(publicId, relationship, EdgeDirection.Out, seen, probe);
+                yield* this.Walk(publicId, relationship, EdgeDirection.In, seen, probe);
                 return;
             }
         }
         throw new CypherSemanticError(`${ReaderSource.UnknownDirection} "${String(direction)}"`);
     }
 
-    /** The node's outgoing links as the reader sees them (Links Out: hidden relationships and invisible targets omitted). */
+    /**
+     * The node's outgoing links as the reader sees them (Links Out: hidden relationships and invisible targets
+     * omitted).
+     */
     public OutLinks(publicId: string): Promise<readonly ILinkView[]>
     {
         return this.reader.Links(publicId, EdgeDirection.Out);
@@ -90,7 +92,7 @@ export class ReaderSource extends CatalogSource
      * index element type, then keeps the nodes that are the label (an index on an ancestor or an aspect covers
      * more nodes than the label). Values that cannot equal any stored value seek nothing.
      */
-    public SeekEqual(label: string, member: string, value: CellValue): AsyncIterable<CypherNode> | undefined
+    public SeekEqual(label: string, member: string, value: CellValue, probe?: IReadProbe): AsyncIterable<CypherNode> | undefined
     {
         const name = this.labels.Resolve(label);
         const index = this.FindIndex(name, member);
@@ -100,12 +102,12 @@ export class ReaderSource extends CatalogSource
         }
         const type = this.catalog.IndexMembers(index)[0]!.Type;
         const key = ReaderSource.SeekKey(type, value);
-        return key === undefined || !ReaderSource.Encodable(type!, key) ? ReaderSource.NoNodes() : this.Seek(index.Name, name, key);
+        return key === undefined || !ReaderSource.Encodable(type!, key) ? ReaderSource.NoNodes() : this.Seek(index.Name, name, key, probe);
     }
 
-    private async *Seek(index: string, label: string, key: CellValue): AsyncIterable<CypherNode>
+    private async *Seek(index: string, label: string, key: CellValue, probe: IReadProbe | undefined): AsyncIterable<CypherNode>
     {
-        for await (const publicId of this.reader.SeekIndex(index, { Prefix: [key] }))
+        for await (const publicId of this.reader.SeekIndex(index, { Prefix: [key] }, probe))
         {
             const node = await this.Node(publicId);
             if (node !== undefined && this.catalog.IsA(node.Concept, label))
@@ -168,9 +170,9 @@ export class ReaderSource extends CatalogSource
         }
     }
 
-    private async *Scan(name: string): AsyncIterable<CypherNode>
+    private async *Scan(name: string, probe: IReadProbe | undefined): AsyncIterable<CypherNode>
     {
-        for await (const publicId of this.reader.ScanNodes(name))
+        for await (const publicId of this.reader.ScanNodes(name, probe))
         {
             const node = await this.Node(publicId);
             if (node !== undefined)
@@ -180,9 +182,9 @@ export class ReaderSource extends CatalogSource
         }
     }
 
-    private async *Walk(publicId: string, relationship: string | undefined, direction: EdgeDirection, seen: Set<string> | undefined): AsyncIterable<IExpandRow>
+    private async *Walk(publicId: string, relationship: string | undefined, direction: EdgeDirection, seen: Set<string> | undefined, probe: IReadProbe | undefined): AsyncIterable<IExpandRow>
     {
-        for (const link of await this.reader.Links(publicId, direction, relationship))
+        for (const link of await this.reader.Links(publicId, direction, relationship, probe))
         {
             if (seen !== undefined)
             {

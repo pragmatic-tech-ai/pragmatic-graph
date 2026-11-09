@@ -1,5 +1,5 @@
 import type { CellValue } from '../../columns/CellValue.js';
-import type { ILinkView } from '../../GraphReader.js';
+import type { ILinkView, IReadProbe } from '../../GraphReader.js';
 import { Binding, EvalContext } from '../Binding.js';
 import { ComparisonOp, RelDirection } from '../CypherEnums.js';
 import type { CypherNode } from '../CypherNode.js';
@@ -44,27 +44,32 @@ export class OverlaySource implements ICypherSource
         return !this.overlay.IsDeleted(node.PublicId) && this.base.IsA(node, label);
     }
 
-    public async *ScanLabel(label: string): AsyncIterable<CypherNode>
+    public async *ScanLabel(label: string, probe?: IReadProbe): AsyncIterable<CypherNode>
     {
-        for await (const node of this.base.ScanLabel(label))
+        for await (const node of this.base.ScanLabel(label, probe))
         {
             const current = this.Current(node);
             if (current !== undefined) yield current;
         }
         for (const node of this.overlay.CreatedNodes())
         {
+            probe?.Tick();
             if (this.base.IsA(node, label)) yield node;
         }
     }
 
-    public async *ScanAll(): AsyncIterable<CypherNode>
+    public async *ScanAll(probe?: IReadProbe): AsyncIterable<CypherNode>
     {
-        for await (const node of this.base.ScanAll())
+        for await (const node of this.base.ScanAll(probe))
         {
             const current = this.Current(node);
             if (current !== undefined) yield current;
         }
-        yield* this.overlay.CreatedNodes();
+        for (const node of this.overlay.CreatedNodes())
+        {
+            probe?.Tick();
+            yield node;
+        }
     }
 
     public async Node(publicId: string): Promise<CypherNode | undefined>
@@ -74,18 +79,18 @@ export class OverlaySource implements ICypherSource
     }
 
     /** As ReaderSource.Expand (Undirected: Out then In, each (relationship, far node) once), over the overlay. */
-    public async *Expand(publicId: string, relationship: string | undefined, direction: RelDirection): AsyncIterable<IExpandRow>
+    public async *Expand(publicId: string, relationship: string | undefined, direction: RelDirection, probe?: IReadProbe): AsyncIterable<IExpandRow>
     {
         if (this.overlay.IsDeleted(publicId)) return;
         if (direction !== RelDirection.Undirected)
         {
-            yield* this.Directed(publicId, relationship, direction);
+            yield* this.Directed(publicId, relationship, direction, probe);
             return;
         }
         const seen = new Set<string>();
         for (const way of [RelDirection.Outgoing, RelDirection.Incoming])
         {
-            for await (const row of this.Directed(publicId, relationship, way))
+            for await (const row of this.Directed(publicId, relationship, way, probe))
             {
                 const key = row.Relationship + OverlaySource.StepSeparator + row.Target.PublicId;
                 if (seen.has(key)) continue;
@@ -123,10 +128,10 @@ export class OverlaySource implements ICypherSource
         return this.base.IndexFor(label, member);
     }
 
-    public SeekEqual(label: string, member: string, value: CellValue): AsyncIterable<CypherNode> | undefined
+    public SeekEqual(label: string, member: string, value: CellValue, probe?: IReadProbe): AsyncIterable<CypherNode> | undefined
     {
-        const hits = this.base.SeekEqual(label, member, value);
-        return hits === undefined ? undefined : this.MergedSeek(hits, label, member, value);
+        const hits = this.base.SeekEqual(label, member, value, probe);
+        return hits === undefined ? undefined : this.MergedSeek(hits, label, member, value, probe);
     }
 
     /**
@@ -172,12 +177,12 @@ export class OverlaySource implements ICypherSource
         return this.overlay.IsTouched(node.PublicId) ? this.overlay.Touched(node.PublicId) : node;
     }
 
-    private async *Directed(publicId: string, relationship: string | undefined, direction: RelDirection): AsyncIterable<IExpandRow>
+    private async *Directed(publicId: string, relationship: string | undefined, direction: RelDirection, probe: IReadProbe | undefined): AsyncIterable<IExpandRow>
     {
         const outgoing = direction === RelDirection.Outgoing;
         if (!this.overlay.IsCreated(publicId))
         {
-            for await (const row of this.base.Expand(publicId, relationship, direction))
+            for await (const row of this.base.Expand(publicId, relationship, direction, probe))
             {
                 const far = row.Target.PublicId;
                 const removed = outgoing ? this.overlay.IsRemoved(publicId, row.Relationship, far) : this.overlay.IsRemoved(far, row.Relationship, publicId);
@@ -188,6 +193,7 @@ export class OverlaySource implements ICypherSource
         }
         for (const edge of this.overlay.AddedEdges())
         {
+            probe?.Tick();
             if (relationship !== undefined && edge.Relationship !== relationship) continue;
             if ((outgoing ? edge.From : edge.To) !== publicId) continue;
             const target = await this.Node(outgoing ? edge.To : edge.From);
@@ -195,7 +201,7 @@ export class OverlaySource implements ICypherSource
         }
     }
 
-    private async *MergedSeek(hits: AsyncIterable<CypherNode>, label: string, member: string, value: CellValue): AsyncIterable<CypherNode>
+    private async *MergedSeek(hits: AsyncIterable<CypherNode>, label: string, member: string, value: CellValue, probe: IReadProbe | undefined): AsyncIterable<CypherNode>
     {
         for await (const node of hits)
         {
@@ -204,6 +210,7 @@ export class OverlaySource implements ICypherSource
         const equality = new Comparison(new PropertyAccess(OverlaySource.SeekVariable, member), ComparisonOp.Eq, new Literal(value));
         for (const node of this.overlay.TouchedNodes())
         {
+            probe?.Tick();
             if (!this.base.IsA(node, label)) continue;
             const row = new Binding().With(OverlaySource.SeekVariable, new NodeValue(node));
             if (BooleanExpression.Truthy(equality.Evaluate(new EvalContext(row, new Map())))) yield node;

@@ -29,7 +29,10 @@ interface IStoredIndex
     readonly Where?: unknown;
 }
 
-/** Persists the catalog: `{ NextTypeId, NextMemberId, Definitions }` as UTF-8 JSON under the catalog root, version under Meta("catalogVersion"). */
+/**
+ * Persists the catalog: `{ NextTypeId, NextMemberId, Definitions }` as UTF-8 JSON under the catalog root, version under
+ * Meta("catalogVersion").
+ */
 export class CatalogStore
 {
     private static readonly VersionKeyName = 'catalogVersion';
@@ -206,7 +209,10 @@ export class CatalogStore
             && (v.Where === undefined || CatalogStore.IsObject(v.Where));
     }
 
-    /** Placement and AggregateRoot (ruling F5): optional on concepts (Placement defaults to Partitioned on load), absent on aspects. */
+    /**
+     * Placement and AggregateRoot (ruling F5): optional on concepts (Placement defaults to Partitioned on load), absent
+     * on aspects.
+     */
     private static IsPlacement(v: Record<string, unknown>): boolean
     {
         if (v.IsAspect === true)

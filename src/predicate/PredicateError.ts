@@ -4,7 +4,9 @@ export enum PredicateErrorCode
 {
     /** A JSON document is not a well-formed predicate. */
     Malformed = 1,
-    /** A predicate that needs the graph reader (Related, Reachable, Seeded, OwnerIs) was evaluated against a node alone. */
+    /**
+     * A predicate that needs the graph reader (Related, Reachable, Seeded, OwnerIs) was evaluated against a node alone.
+     */
     NotNodeLocal,
 }
 

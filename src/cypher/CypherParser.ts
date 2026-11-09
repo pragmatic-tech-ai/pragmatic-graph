@@ -377,8 +377,9 @@ export class CypherParser
         const items = [this.parseReturnItem()];
         while (this.accept(TokenKind.Comma)) items.push(this.parseReturnItem());
 
-        // Deliberate position restriction: WITH ... WHERE is accepted only here, before ORDER BY/SKIP/LIMIT, matching the
-        // planner's HAVING semantics (filter, then order/paginate). Standard Cypher's after-LIMIT WHERE is a deferred nicety.
+        // Deliberate position restriction: WITH ... WHERE is accepted only here, before ORDER BY/SKIP/LIMIT, matching
+        // the planner's HAVING semantics (filter, then order/paginate). Standard Cypher's after-LIMIT WHERE is a
+        // deferred nicety.
         const where = this.peekKeyword(CypherParser.KwWhere) ? this.parseProjectionWhere(isReturn) : undefined;
 
         const orderBy = this.peekKeyword(CypherParser.KwOrder) ? this.parseOrderBy() : undefined;

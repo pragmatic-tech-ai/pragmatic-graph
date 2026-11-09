@@ -25,7 +25,10 @@ export class PreparedCommit
         public readonly CatalogVersion: number,
         /** @internal */
         public readonly Reservation: Reservation,
-        /** @internal The connector-setup generation the batch was routed with; Finalize requires it unchanged (ruling R77). */
+        /**
+         * @internal The connector-setup generation the batch was routed with; Finalize requires it unchanged (ruling
+         * R77).
+         */
         public readonly BindingGeneration?: number,
     )
     {

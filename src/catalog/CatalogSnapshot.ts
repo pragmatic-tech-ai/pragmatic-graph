@@ -3,7 +3,9 @@ import { IndexDef, MemberDef, TypeDefinition } from './CatalogTypes.js';
 import { Predicate } from '../predicate/Predicate.js';
 import { MemberKind, ValueType } from './ValueType.js';
 
-/** Immutable, validated catalog. Type ids and member ids are stable; pre-order intervals are recomputed per snapshot. */
+/**
+ * Immutable, validated catalog. Type ids and member ids are stable; pre-order intervals are recomputed per snapshot.
+ */
 export class CatalogSnapshot
 {
     public static readonly NodeIdMember: MemberDef = Object.freeze({
@@ -213,7 +215,10 @@ export class CatalogSnapshot
         }
     }
 
-    /** The property members, by id, of a concept (own, ancestors' and carried aspects') or of an aspect (own and included). */
+    /**
+     * The property members, by id, of a concept (own, ancestors' and carried aspects') or of an aspect (own and
+     * included).
+     */
     private static PropertiesOf(name: string, byName: ReadonlyMap<string, TypeDefinition>): ReadonlyMap<number, MemberDef>
     {
         const ids = new Map<number, MemberDef>();

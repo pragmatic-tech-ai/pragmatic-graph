@@ -427,7 +427,8 @@ export class LmdbStore implements IKeyValueStore, IScanProbe
         const shared = this.shared;
         if (shared !== undefined && shared.Users > 0 && shared.Generation === this.generation)
         {
-            // lmdb-js read transactions are reference counted: use() adds one, done() releases one (untyped in its .d.ts).
+            // lmdb-js read transactions are reference counted: use() adds one, done() releases one (untyped in its
+            // .d.ts).
             (shared.Txn as unknown as { use(): void }).use();
             shared.Users++;
             return new SnapshotLease(shared.Txn, shared);

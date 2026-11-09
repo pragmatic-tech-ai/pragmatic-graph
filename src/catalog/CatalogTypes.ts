@@ -36,7 +36,10 @@ export interface MemberDef
     readonly DeclaredBy: string;
 }
 
-/** A recorded concept or aspect with its assigned stable ids. Aspects = carried aspects (concept) or included aspects (aspect). */
+/**
+ * A recorded concept or aspect with its assigned stable ids. Aspects = carried aspects (concept) or included aspects
+ * (aspect).
+ */
 export interface TypeDefinition
 {
     readonly Name: string;
