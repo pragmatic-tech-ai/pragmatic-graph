@@ -56,6 +56,20 @@ export class PublicIdIndex
         }
     }
 
+    /** Replaces the owner of a live node (seed re-own, ruling R90); an empty owner deletes the key. */
+    public ReplaceOwner(txn: IWriteTransaction, id: bigint, owner: string): void
+    {
+        InternalId.Require(id);
+        if (owner.length > 0)
+        {
+            txn.Put(Keyspace.Ids, FormatKeys.NodeOwner(id), PublicIdIndex.Encoder.encode(owner));
+        }
+        else
+        {
+            txn.Delete(Keyspace.Ids, FormatKeys.NodeOwner(id));
+        }
+    }
+
     public async PublicIdOf(txn: IReadTransaction, id: bigint): Promise<string | undefined>
     {
         InternalId.Require(id);

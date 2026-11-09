@@ -20,7 +20,7 @@ import type { CatalogIndex } from './CatalogIndex.js';
 import { CommitError, CommitErrorCode } from './CommitError.js';
 import { ConflictKeys } from './ConflictKeys.js';
 import type { ReadSet } from './ReadSet.js';
-import { type ICreateNodeOp, type IDeleteNodeOp, type ILinkOp, type ISetPropertyOp, type IUnlinkOp, WriteBatch, WriteOp } from './WriteBatch.js';
+import { type ICreateNodeOp, type IDeleteNodeOp, type ILinkOp, type ISetOwnerOp, type ISetPropertyOp, type IUnlinkOp, WriteBatch, WriteOp } from './WriteBatch.js';
 import { WriteKeySet } from './WriteKeySet.js';
 
 /** A live node resolved from its public id inside the applying transaction. */
@@ -153,6 +153,9 @@ export class BatchApplier
                     break;
                 case WriteOp.Unlink:
                     await this.Unlink(txn, op, keys);
+                    break;
+                case WriteOp.SetOwner:
+                    await this.SetOwner(txn, op, keys);
                     break;
             }
         }
@@ -290,6 +293,17 @@ export class BatchApplier
             BatchApplier.AddCellKeys(keys, node.Id, node.Location.TypeId, m.Id);
         }
         return node.Id;
+    }
+
+    /**
+     * Re-owns the node in place (ruling R90): the owner key only, so identity, cells, edges, index entries
+     * and the seed marker stay. The owner is covered by the Node key (R36), which OwnerOf and OwnerIs record.
+     */
+    private async SetOwner(txn: IWriteTransaction, op: ISetOwnerOp, keys: WriteKeySet): Promise<void>
+    {
+        const node = await this.Locate(txn, op.PublicId);
+        this.ids.ReplaceOwner(txn, node.Id, op.Owner);
+        keys.Add(ConflictKeys.NodeSpace, ConflictKeys.Node(node.PublicId));
     }
 
     private async Link(txn: IWriteTransaction, op: ILinkOp, keys: WriteKeySet): Promise<void>

@@ -40,6 +40,7 @@ class SeedFx
     private static readonly Equals = '=';
     private static readonly SeedName = 'seed';
     public static readonly Base = 'base';
+    public static readonly Other = 'other';
     public static readonly Hosts = 'hosts';
     public static readonly Uses = 'uses';
     public static readonly Abort = 'abort';
@@ -427,10 +428,67 @@ class SeedFx
                     assert.equal(await r.GetProperty('x1', 'label'), null);
                     assert.equal(await r.IsSeeded('x2'), false);
                 });
-                // A differing owner cannot be taken over: owner is create-time.
-                const before = await SeedFx.Snapshot(g);
-                await assert.rejects(g.Upgrade(SeedFx.Desc('v3', [...SeedFx.Seed1(), SeedFx.Node('x2', 'App', {})])), SeedFx.IsCommit(CommitErrorCode.InvalidValue));
-                assert.deepEqual(await SeedFx.Snapshot(g), before);
+                // A differing owner is taken over too: the seed re-owns the node (ruling R90).
+                await g.Upgrade(SeedFx.Desc('v3', [...SeedFx.Seed1(), SeedFx.Node('x2', 'App', {})]));
+                await SeedFx.Read(g, async r =>
+                {
+                    assert.equal(await r.OwnerOf('x2'), SeedFx.Base);
+                    assert.equal(await r.IsSeeded('x2'), true);
+                });
+                await g.dispose();
+            });
+
+            it('a seed node whose owner changed is re-owned in place: identity, properties and edges kept (ruling R90)', async () =>
+            {
+                const g = await SeedFx.Ready(open);
+                const a = new FakeConnector(SeedFx.A, []);
+                await g.Upgrade(SeedFx.Desc('v2', SeedFx.Seed1(), SeedFx.Defs(), SeedFx.BaseToA), [a]);
+                await SeedFx.Commit(g, t =>
+                {
+                    t.CreateNode('r1', 'Server');
+                    t.Link('r1', SeedFx.Hosts, 'a1');
+                    t.CreateNode('r2', 'App', { Owner: SeedFx.Base });
+                });
+                const idOf = async (publicId: string): Promise<bigint | undefined> =>
+                {
+                    const txn = await SeedFx.Context(g).Store.BeginRead();
+                    try
+                    {
+                        return await SeedFx.Context(g).Ids.Resolve(txn, publicId);
+                    }
+                    finally
+                    {
+                        txn.dispose();
+                    }
+                };
+                const id = await idOf('a1');
+                const reader = await g.Begin(AccessScope.System);
+                assert.equal(await reader.OwnerOf('a1'), SeedFx.Base);
+                reader.SetProperty('b1', 'code', 'y');
+                const applied = a.Applied.length;
+                const seen = SeedFx.Capture(g);
+                const moved = SeedFx.Seed1().map(n => n.PublicId === 'a1' ? { ...n, Owner: SeedFx.Other } : n.PublicId === 'a2' ? { ...n, Owner: '' } : n);
+                const result = await g.Upgrade(SeedFx.Desc('v3', moved, SeedFx.Defs(), SeedFx.BaseToA), [a]);
+                assert.notEqual(result.SeedCommit, undefined, 're-owning is a seed change');
+                await SeedFx.Read(g, async r =>
+                {
+                    assert.equal(await r.OwnerOf('a1'), SeedFx.Other);
+                    assert.equal(await r.OwnerOf('a2'), '');
+                    assert.equal((await r.ReadNode('a1'))?.Owner, SeedFx.Other);
+                    assert.equal(await r.GetProperty('a1', 'label'), 'one');
+                    assert.equal(await r.IsSeeded('a1'), true);
+                    assert.deepEqual(await r.Neighbors('a1', SeedFx.Hosts, EdgeDirection.In), ['s1', 'r1'], 'the seeded and the runtime incoming edges survive');
+                    assert.equal(await r.OwnerOf('r2'), SeedFx.Base, 'a runtime node is untouched');
+                    assert.equal(await r.OwnerOf('s1'), SeedFx.Base);
+                });
+                assert.equal(await idOf('a1'), id, 'same internal id: not recreated');
+                assert.deepEqual(await SeedFx.Hosted(g, 's1'), ['a1', 'a2']);
+                const batch = seen.find(c => c.Kind === CommitKind.Batch)?.Batch?.Ops() ?? [];
+                assert.deepEqual(batch, [{ Op: WriteOp.SetOwner, PublicId: 'a1', Owner: SeedFx.Other }, { Op: WriteOp.SetOwner, PublicId: 'a2', Owner: '' }], 'only the owner changes are written');
+                const logged = (await SeedFx.Changes(g, result.SeedCommit! - 1n)).flatMap(c => c.Batch?.Ops() ?? []);
+                assert.deepEqual(logged, batch, 'the log entry replays the same ops');
+                assert.equal(a.Applied.length, applied, 'seed sync is not routed to connectors');
+                await assert.rejects(reader.Commit(), ConflictError, 'an OwnerOf read conflicts with the re-own');
                 await g.dispose();
             });
 
@@ -550,10 +608,18 @@ class SeedFx
                     assert.deepEqual(await r.Neighbors('s1', SeedFx.Uses, EdgeDirection.Out), ['a2'], 'the unchanged s1 re-links the recreated a2');
                 });
                 assert.deepEqual(await SeedFx.Hosted(g, 's1'), ['a1']);
-                // A differing owner is InvalidValue even when the concept changes too.
-                const before = await SeedFx.Snapshot(g);
-                await assert.rejects(g.Upgrade(SeedFx.Desc('v3', [...SeedFx.With('s1', uses()).filter(n => n.PublicId !== 'a2'), SeedFx.Node('a2', 'App', {}, [], 'other')])), SeedFx.IsCommit(CommitErrorCode.InvalidValue));
-                assert.deepEqual(await SeedFx.Snapshot(g), before);
+                // An owner change together with a concept change is a Recreate with the new owner (ruling R90).
+                const seen = SeedFx.Capture(g);
+                await g.Upgrade(SeedFx.Desc('v3', [...SeedFx.With('s1', uses()).filter(n => n.PublicId !== 'a2'), SeedFx.Node('a2', 'App', {}, [], SeedFx.Other)]));
+                await SeedFx.Read(g, async r =>
+                {
+                    assert.equal(await r.ConceptOf('a2'), 'App');
+                    assert.equal(await r.OwnerOf('a2'), SeedFx.Other);
+                    assert.deepEqual(await r.Neighbors('s1', SeedFx.Uses, EdgeDirection.Out), ['a2'], 'the seeded incoming link is restored');
+                });
+                const ops = seen.flatMap(c => c.Batch?.Ops() ?? []);
+                assert.ok(ops.some(o => o.Op === WriteOp.CreateNode && o.PublicId === 'a2' && o.Owner === SeedFx.Other));
+                assert.ok(!ops.some(o => o.Op === WriteOp.SetOwner), 'a recreate creates with the new owner');
                 await g.dispose();
             });
 

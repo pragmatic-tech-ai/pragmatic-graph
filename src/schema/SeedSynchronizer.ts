@@ -39,7 +39,7 @@ export interface ISeedEdge
 /** The seed's effect: one batch, the markers to write and the previously seeded ids to unmark. */
 export interface ISeedPlan
 {
-    /** Unlinks, deletes, creates, property sets, links, in that order. */
+    /** Unlinks, deletes, creates, owner changes, property sets, links, in that order. */
     readonly Batch: WriteBatch;
     /** New markers: every seed node the batch creates or overwrites. */
     readonly Hashes: ReadonlyMap<string, Uint8Array>;
@@ -63,7 +63,7 @@ enum SeedAction
     Create = 1,
     /** Present with another concept: deleted and created again. */
     Recreate = 2,
-    /** Present with the same concept: the properties and relationships that differ from the seed rewritten. */
+    /** Present with the same concept: the properties and relationships that differ from the seed rewritten, re-owned when the owner differs. */
     Overwrite = 3,
 }
 
@@ -73,6 +73,8 @@ interface ISeedStep
     /** Keep may be promoted to Overwrite (ruling R55). */
     Action: SeedAction;
     readonly Hash: Uint8Array;
+    /** An Overwrite of a node whose stored owner differs from the seed's: re-owned in place (ruling R90). */
+    readonly Reown?: true;
 }
 
 /** What an Overwrite rewrites: only the parts of the node that differ from its seed (ruling R53). */
@@ -96,9 +98,10 @@ interface ISeedDiff
  * set, and a relationship whose stored out-edges differ from the seed's links (ordered: the same
  * sequence of targets and edge properties; unordered: the same targets with the same edge properties)
  * has its out-edges removed and the seed links re-added in seed order; a node that already matches its
- * seed (the data a connector write-through just put in the engine) gets only its marker. Its owner must
- * match (owner is create-time: InvalidValue otherwise, checked first); a node whose concept differs is
- * deleted and created again. Previously seeded ids missing from the seed are deleted. Creates come
+ * seed (the data a connector write-through just put in the engine) gets only its marker. A node whose
+ * owner differs is re-owned in place (SetOwner, ruling R90: identity, matching properties and edges, and
+ * runtime incoming edges kept); a node whose concept differs is deleted and created again (with the
+ * seed's owner). Previously seeded ids missing from the seed are deleted. Creates come
  * before property sets and links, so links may point at seed nodes later in the array.
  *
  * A node left alone is promoted to overwritten (ruling R55) when one of its seed links points at a node
@@ -110,7 +113,6 @@ interface ISeedDiff
 export class SeedSynchronizer
 {
     private static readonly ErrDuplicate = 'Seed lists the public id twice: ';
-    private static readonly ErrOwner = 'Seed owner differs from the stored node owner (owner is fixed at creation): ';
     private static readonly ErrRequired = 'Seed lacks a value for a required property: ';
     private static readonly Dot = '.';
 
@@ -182,6 +184,10 @@ export class SeedSynchronizer
                 batch.CreateNode(node.PublicId, node.Concept, node.Owner.length > 0 ? { Owner: node.Owner } : undefined);
             }
         }
+        for (const step of steps.filter(s => s.Reown === true))
+        {
+            batch.SetOwner(step.Node.PublicId, step.Node.Owner);
+        }
         for (const step of steps.filter(s => s.Action !== SeedAction.Keep))
         {
             const diff = diffs.get(step);
@@ -217,11 +223,14 @@ export class SeedSynchronizer
         {
             return { Node: node, Action: SeedAction.Keep, Hash: hash };
         }
-        if (present.Owner !== node.Owner)
+        if (present.Concept !== node.Concept)
         {
-            throw new CommitError(CommitErrorCode.InvalidValue, SeedSynchronizer.ErrOwner + node.PublicId);
+            // The recreate's CreateNode carries the seed's owner, whatever the stored one was.
+            return { Node: node, Action: SeedAction.Recreate, Hash: hash };
         }
-        return { Node: node, Action: present.Concept !== node.Concept ? SeedAction.Recreate : SeedAction.Overwrite, Hash: hash };
+        return present.Owner !== node.Owner
+            ? { Node: node, Action: SeedAction.Overwrite, Hash: hash, Reown: true }
+            : { Node: node, Action: SeedAction.Overwrite, Hash: hash };
     }
 
     /** Ruling R55: Keep becomes Overwrite when leaving the node alone would lose or skip part of its seed. */

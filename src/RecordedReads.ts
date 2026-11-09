@@ -87,7 +87,7 @@ export class RecordedReads
         return this.context.Columns.ReadCell(this.snapshot.Txn, node.Location, def);
     }
 
-    /** The model holding the node ('' for none); records the node's binding (owner is create-time only, R36). */
+    /** The model holding the node ('' for none); records the node's binding (owner changes only with the Node key: create, delete or a seed re-own, R36, R90). */
     public async Owner(node: IReadNode): Promise<string>
     {
         this.Reads?.AddKey(ConflictKeys.NodeSpace, ConflictKeys.Node(node.PublicId));

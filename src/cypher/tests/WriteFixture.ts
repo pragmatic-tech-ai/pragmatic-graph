@@ -135,6 +135,8 @@ export class WriteFixture
                 return `Link${o}${op.From}${s}${op.Relationship}${s}${op.To}${c}`;
             case WriteOp.Unlink:
                 return `Unlink${o}${op.From}${s}${op.Relationship}${s}${op.To}${c}`;
+            case WriteOp.SetOwner:
+                return `SetOwner${o}${op.PublicId}${s}${op.Owner}${c}`;
         }
     }
 

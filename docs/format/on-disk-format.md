@@ -90,7 +90,7 @@ Both directions and the node owner live in the `ids` keyspace, distinguished by 
 
 Values: `PublicToInternal` holds the internal id as a tuple-encoded single integer `(id)`; `InternalToPublic` holds the public id as raw UTF-8 bytes. A public id is non-empty, at most 400 UTF-8 bytes and contains no U+0000 (rejected on read and write, so the `(1, publicId)` key always fits the key limit). The two directions are always written and deleted together; a public id is bound to at most one internal id and vice versa.
 
-Owner: key `(3, id)` holds the name of the model that holds the node, as raw UTF-8 bytes. It is written when the node is created with a non-empty owner and deleted with the node (together with the two id directions); an absent entry means "no owner" (reads as the empty string). The owner is fixed at creation; changing it is not supported. It is covered by the node's logical `Node(publicId)` conflict key, so it adds no conflict key of its own.
+Owner: key `(3, id)` holds the name of the model that holds the node, as raw UTF-8 bytes. It is written when the node is created with a non-empty owner and deleted with the node (together with the two id directions); an absent entry means "no owner" (reads as the empty string). The owner is set at creation; only seed synchronization changes it later, through a `SetOwner` op (batch op kind 7, ruling R90), which puts the new owner (or deletes the entry for no owner) and leaves the id directions untouched. It is covered by the node's logical `Node(publicId)` conflict key, so it adds no conflict key of its own.
 
 ### Rows (row index)
 
@@ -268,6 +268,8 @@ op      : kind u8, then the fields of that kind
   6 DeleteNode (strict) : publicId str   a DeleteNode with Strict: the commit fails (CommitError NodeHasEdges)
                   while the node has any edge after the batch's earlier ops; a plain DeleteNode keeps kind 3,
                   so every batch without a strict delete serializes exactly as before (version stays 1)
+  7 SetOwner    : publicId str, owner str   re-owns a live node in place ('' = no owner); recorded only by seed
+                  synchronization (ruling R90); batches without it serialize exactly as before (version stays 1)
 str        : byteLength u32, UTF-8 bytes (well-formed Unicode)
 value      : tag u8; 0 = null (no bytes follow), else the ValueType (1 Boolean .. 7 Duration)
              followed by that type's single value bytes (see Columns, Single value bytes)

@@ -14,6 +14,11 @@ export enum WriteOp
      * Op DeleteNode with Strict); listed here so no future op can take the value.
      */
     StrictDeleteNode = 6,
+    /**
+     * Re-owns a live node (ruling R90): recorded by seed synchronization only, when a seed node's Owner
+     * changed; a transaction cannot record it (owner is otherwise create-time).
+     */
+    SetOwner = 7,
 }
 
 /**
@@ -26,7 +31,7 @@ export interface LinkOptions
     readonly Properties?: ReadonlyMap<string, CellValue>;
 }
 
-/** Optional placement and ownership of a new node. Owner (the holding model's name) is fixed at creation. */
+/** Optional placement and ownership of a new node. Owner (the holding model's name) is set at creation; only seed synchronization re-owns a node (SetOwner, ruling R90). */
 export interface ICreateNodeOptions
 {
     readonly ClusterHint?: string;
@@ -85,7 +90,15 @@ export interface IUnlinkOp
     readonly To: string;
 }
 
-export type BatchOp = ICreateNodeOp | ISetPropertyOp | IDeleteNodeOp | ILinkOp | IUnlinkOp;
+/** The node's owner becomes `Owner` ('' for none); identity, properties and edges are unchanged (ruling R90). */
+export interface ISetOwnerOp
+{
+    readonly Op: WriteOp.SetOwner;
+    readonly PublicId: string;
+    readonly Owner: string;
+}
+
+export type BatchOp = ICreateNodeOp | ISetPropertyOp | IDeleteNodeOp | ILinkOp | IUnlinkOp | ISetOwnerOp;
 
 /** A Map that rejects every mutation once constructed; edge properties of recorded ops are held in one. */
 class FrozenMap<K, V> extends Map<K, V>
@@ -355,6 +368,13 @@ export class WriteBatch
         this.Push({ Op: WriteOp.Unlink, From: from, Relationship: relationship, To: to });
     }
 
+    /** Re-owns the node ('' = no owner). Seed synchronization only (ruling R90); GraphTransaction has no such write. */
+    public SetOwner(publicId: string, owner: string): void
+    {
+        WriteBatch.RequireText(publicId, owner);
+        this.Push({ Op: WriteOp.SetOwner, PublicId: publicId, Owner: owner });
+    }
+
     public Serialize(): Uint8Array
     {
         const w = new ByteWriter();
@@ -396,6 +416,10 @@ export class WriteBatch
                     w.Text(op.From);
                     w.Text(op.Relationship);
                     w.Text(op.To);
+                    break;
+                case WriteOp.SetOwner:
+                    w.Text(op.PublicId);
+                    w.Text(op.Owner);
                     break;
             }
         }
@@ -491,6 +515,12 @@ export class WriteBatch
                 const from = r.Text();
                 const relationship = r.Text();
                 batch.Unlink(from, relationship, r.Text());
+                return;
+            }
+            case WriteOp.SetOwner:
+            {
+                const publicId = r.Text();
+                batch.SetOwner(publicId, r.Text());
                 return;
             }
             default:

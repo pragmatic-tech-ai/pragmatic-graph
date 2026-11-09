@@ -157,6 +157,7 @@ export class WriteGate
     private static readonly ErrInvisible = 'the node is not visible under the scope';
     private static readonly ErrInvisibleTarget = 'the target is not visible under the scope: ';
     private static readonly ErrInvisibleSibling = 'the sibling is not visible under the scope: ';
+    private static readonly ErrSeedOnly = 'an owner change is recorded by seed synchronization only';
     private static readonly NoOwner = '';
     private static readonly AccessDenied = 'Access denied: op ';
     private static readonly Open = ' (';
@@ -221,6 +222,9 @@ export class WriteGate
                 case WriteOp.Unlink:
                     this.targets.push(new OpTargets(live.get(op.From), live.get(op.To)));
                     break;
+                case WriteOp.SetOwner:
+                    this.targets.push(new OpTargets(live.get(op.PublicId)));
+                    break;
             }
         }
     }
@@ -259,6 +263,9 @@ export class WriteGate
             case WriteOp.DeleteNode:
                 await this.CheckDelete(index, op.PublicId, targets.Source);
                 break;
+            case WriteOp.SetOwner:
+                // Unreachable through GraphTransaction (ruling R90); a gated batch never re-owns.
+                throw this.Denied(AccessErrorCode.UpdateDenied, index, op.Op, op.PublicId, targets.Source?.Concept, WriteGate.ErrSeedOnly);
         }
     }
 
