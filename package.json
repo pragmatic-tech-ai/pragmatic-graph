@@ -1,6 +1,6 @@
 {
   "name": "@pragmatic-tech-ai/graph",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Graph database storage engine: KV layer and graph layout",
   "license": "Apache-2.0",
   "engines": {

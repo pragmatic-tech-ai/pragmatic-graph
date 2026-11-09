@@ -38,6 +38,13 @@ class DeleteFx
     public static readonly Ext = 'ext';
     public static readonly A = 'A';
     public static readonly B = 'B';
+    /** Node ids: x, y (crm), h, k (hr), e (ext); n is created by a test. */
+    public static readonly X = 'x';
+    public static readonly Y = 'y';
+    public static readonly H = 'h';
+    public static readonly K = 'k';
+    public static readonly E = 'e';
+    public static readonly N = 'n';
 
     public static Define(m: CatalogModel): void
     {
@@ -70,11 +77,11 @@ class DeleteFx
         await g.DefineSchema(m => DeleteFx.Define(m));
         await DeleteFx.Commit(g, t =>
         {
-            t.CreateNode('x', DeleteFx.Item, { Owner: DeleteFx.Crm });
-            t.CreateNode('y', DeleteFx.Item, { Owner: DeleteFx.Crm });
-            t.CreateNode('h', DeleteFx.Item, { Owner: DeleteFx.Hr });
-            t.CreateNode('k', DeleteFx.Item, { Owner: DeleteFx.Hr });
-            t.CreateNode('e', DeleteFx.Item, { Owner: DeleteFx.Ext });
+            t.CreateNode(DeleteFx.X, DeleteFx.Item, { Owner: DeleteFx.Crm });
+            t.CreateNode(DeleteFx.Y, DeleteFx.Item, { Owner: DeleteFx.Crm });
+            t.CreateNode(DeleteFx.H, DeleteFx.Item, { Owner: DeleteFx.Hr });
+            t.CreateNode(DeleteFx.K, DeleteFx.Item, { Owner: DeleteFx.Hr });
+            t.CreateNode(DeleteFx.E, DeleteFx.Item, { Owner: DeleteFx.Ext });
             for (const [from, rel, to] of links)
             {
                 t.Link(from, rel, to);
@@ -122,91 +129,91 @@ class DeleteFx
         {
             it('incoming edges from a node bound to another connector reach that connector with the source owner', async () =>
             {
-                const fx = await F.Ready(open, [['h', F.Ref, 'x'], ['h', F.Next, 'x'], ['k', F.Next, 'x']]);
-                await F.Commit(fx.G, t => t.DeleteNode('x'));
-                assert.deepEqual(F.Changes(fx.A), [F.Delete('x', F.Crm)]);
+                const fx = await F.Ready(open, [[F.H, F.Ref, F.X], [F.H, F.Next, F.X], [F.K, F.Next, F.X]]);
+                await F.Commit(fx.G, t => t.DeleteNode(F.X));
+                assert.deepEqual(F.Changes(fx.A), [F.Delete(F.X, F.Crm)]);
                 // Relationship declaration order (next before ref), then edge order.
-                assert.deepEqual(F.Changes(fx.B), [F.Unlink('h', F.Next, 'x', F.Hr), F.Unlink('k', F.Next, 'x', F.Hr), F.Unlink('h', F.Ref, 'x', F.Hr)]);
+                assert.deepEqual(F.Changes(fx.B), [F.Unlink(F.H, F.Next, F.X, F.Hr), F.Unlink(F.K, F.Next, F.X, F.Hr), F.Unlink(F.H, F.Ref, F.X, F.Hr)]);
                 await fx.G.dispose();
             });
 
             it('outgoing edges route by the deleted node, before its DeleteNode; an engine-only source routes nowhere', async () =>
             {
-                const fx = await F.Ready(open, [['x', F.Ref, 'y'], ['x', F.Next, 'h'], ['e', F.Next, 'x']]);
-                await F.Commit(fx.G, t => t.DeleteNode('x'));
-                assert.deepEqual(F.Changes(fx.A), [F.Unlink('x', F.Next, 'h', F.Crm), F.Unlink('x', F.Ref, 'y', F.Crm), F.Delete('x', F.Crm)]);
+                const fx = await F.Ready(open, [[F.X, F.Ref, F.Y], [F.X, F.Next, F.H], [F.E, F.Next, F.X]]);
+                await F.Commit(fx.G, t => t.DeleteNode(F.X));
+                assert.deepEqual(F.Changes(fx.A), [F.Unlink(F.X, F.Next, F.H, F.Crm), F.Unlink(F.X, F.Ref, F.Y, F.Crm), F.Delete(F.X, F.Crm)]);
                 assert.deepEqual(F.Changes(fx.B), []);
                 await fx.G.dispose();
             });
 
             it('a self-loop is unlinked once', async () =>
             {
-                const fx = await F.Ready(open, [['x', F.Next, 'x']]);
-                await F.Commit(fx.G, t => t.DeleteNode('x'));
-                assert.deepEqual(F.Changes(fx.A), [F.Unlink('x', F.Next, 'x', F.Crm), F.Delete('x', F.Crm)]);
+                const fx = await F.Ready(open, [[F.X, F.Next, F.X]]);
+                await F.Commit(fx.G, t => t.DeleteNode(F.X));
+                assert.deepEqual(F.Changes(fx.A), [F.Unlink(F.X, F.Next, F.X, F.Crm), F.Delete(F.X, F.Crm)]);
                 await fx.G.dispose();
             });
 
             it('an explicit Unlink earlier in the batch is not repeated', async () =>
             {
-                const fx = await F.Ready(open, [['h', F.Next, 'x'], ['k', F.Next, 'x']]);
+                const fx = await F.Ready(open, [[F.H, F.Next, F.X], [F.K, F.Next, F.X]]);
                 await F.Commit(fx.G, t =>
                 {
-                    t.Unlink('h', F.Next, 'x');
-                    t.DeleteNode('x');
+                    t.Unlink(F.H, F.Next, F.X);
+                    t.DeleteNode(F.X);
                 });
-                assert.deepEqual(F.Changes(fx.B), [F.Unlink('h', F.Next, 'x', F.Hr), F.Unlink('k', F.Next, 'x', F.Hr)]);
-                assert.deepEqual(F.Changes(fx.A), [F.Delete('x', F.Crm)]);
+                assert.deepEqual(F.Changes(fx.B), [F.Unlink(F.H, F.Next, F.X, F.Hr), F.Unlink(F.K, F.Next, F.X, F.Hr)]);
+                assert.deepEqual(F.Changes(fx.A), [F.Delete(F.X, F.Crm)]);
                 await fx.G.dispose();
             });
 
             it('edges follow the batch: links added earlier are unlinked, edges an earlier delete removed are not repeated', async () =>
             {
-                const fx = await F.Ready(open, [['h', F.Next, 'x'], ['x', F.Next, 'h']]);
+                const fx = await F.Ready(open, [[F.H, F.Next, F.X], [F.X, F.Next, F.H]]);
                 await F.Commit(fx.G, t =>
                 {
-                    t.CreateNode('n', F.Item, { Owner: F.Hr });
-                    t.Link('n', F.Ref, 'x');
-                    t.Link('x', F.Next, 'y');
-                    t.DeleteNode('h');
-                    t.DeleteNode('x');
+                    t.CreateNode(F.N, F.Item, { Owner: F.Hr });
+                    t.Link(F.N, F.Ref, F.X);
+                    t.Link(F.X, F.Next, F.Y);
+                    t.DeleteNode(F.H);
+                    t.DeleteNode(F.X);
                 });
                 assert.deepEqual(F.Changes(fx.B), [
-                    { Op: WriteOp.CreateNode, PublicId: 'n', Concept: F.Item, Owner: F.Hr },
-                    { Op: WriteOp.Link, From: 'n', Relationship: F.Ref, To: 'x', Owner: F.Hr, Concept: F.Item },
-                    F.Unlink('h', F.Next, 'x', F.Hr),
-                    F.Delete('h', F.Hr),
-                    F.Unlink('n', F.Ref, 'x', F.Hr),
+                    { Op: WriteOp.CreateNode, PublicId: F.N, Concept: F.Item, Owner: F.Hr },
+                    { Op: WriteOp.Link, From: F.N, Relationship: F.Ref, To: F.X, Owner: F.Hr, Concept: F.Item },
+                    F.Unlink(F.H, F.Next, F.X, F.Hr),
+                    F.Delete(F.H, F.Hr),
+                    F.Unlink(F.N, F.Ref, F.X, F.Hr),
                 ]);
                 assert.deepEqual(F.Changes(fx.A), [
-                    { Op: WriteOp.Link, From: 'x', Relationship: F.Next, To: 'y', Owner: F.Crm, Concept: F.Item },
-                    F.Unlink('x', F.Next, 'h', F.Crm),
-                    F.Unlink('x', F.Next, 'y', F.Crm),
-                    F.Delete('x', F.Crm),
+                    { Op: WriteOp.Link, From: F.X, Relationship: F.Next, To: F.Y, Owner: F.Crm, Concept: F.Item },
+                    F.Unlink(F.X, F.Next, F.H, F.Crm),
+                    F.Unlink(F.X, F.Next, F.Y, F.Crm),
+                    F.Delete(F.X, F.Crm),
                 ]);
                 await fx.G.dispose();
             });
 
             it('a node deleted and re-created in the batch has only the batch\'s edges', async () =>
             {
-                const fx = await F.Ready(open, [['h', F.Next, 'x']]);
+                const fx = await F.Ready(open, [[F.H, F.Next, F.X]]);
                 await F.Commit(fx.G, t =>
                 {
-                    t.DeleteNode('x');
-                    t.CreateNode('x', F.Item, { Owner: F.Crm });
-                    t.Link('k', F.Next, 'x');
-                    t.DeleteNode('x');
+                    t.DeleteNode(F.X);
+                    t.CreateNode(F.X, F.Item, { Owner: F.Crm });
+                    t.Link(F.K, F.Next, F.X);
+                    t.DeleteNode(F.X);
                 });
-                assert.deepEqual(F.Changes(fx.B), [F.Unlink('h', F.Next, 'x', F.Hr), { Op: WriteOp.Link, From: 'k', Relationship: F.Next, To: 'x', Owner: F.Hr, Concept: F.Item }, F.Unlink('k', F.Next, 'x', F.Hr)]);
+                assert.deepEqual(F.Changes(fx.B), [F.Unlink(F.H, F.Next, F.X, F.Hr), { Op: WriteOp.Link, From: F.K, Relationship: F.Next, To: F.X, Owner: F.Hr, Concept: F.Item }, F.Unlink(F.K, F.Next, F.X, F.Hr)]);
                 await fx.G.dispose();
             });
 
             it('a strict delete gets no synthetic Unlinks', async () =>
             {
-                const fx = await F.Ready(open, [['h', F.Next, 'x']]);
-                await F.Commit(fx.G, t => t.DeleteNode('y', { Strict: true }));
-                assert.deepEqual(F.Changes(fx.A), [{ ...F.Delete('y', F.Crm), Strict: true }]);
-                await assert.rejects(F.Commit(fx.G, t => t.DeleteNode('x', { Strict: true })), (e: unknown) => e instanceof CommitError && e.Code === CommitErrorCode.NodeHasEdges);
+                const fx = await F.Ready(open, [[F.H, F.Next, F.X]]);
+                await F.Commit(fx.G, t => t.DeleteNode(F.Y, { Strict: true }));
+                assert.deepEqual(F.Changes(fx.A), [{ ...F.Delete(F.Y, F.Crm), Strict: true }]);
+                await assert.rejects(F.Commit(fx.G, t => t.DeleteNode(F.X, { Strict: true })), (e: unknown) => e instanceof CommitError && e.Code === CommitErrorCode.NodeHasEdges);
                 assert.equal(fx.B.Applied.length, 0, 'the strict delete failed at Prepare: no connector began');
                 await fx.G.dispose();
             });
@@ -217,8 +224,8 @@ class DeleteFx
                 const t = await fx.G.Begin(AccessScope.System);
                 try
                 {
-                    t.DeleteNode('x');
-                    await F.Commit(fx.G, w => w.Link('k', F.Next, 'x'));
+                    t.DeleteNode(F.X);
+                    await F.Commit(fx.G, w => w.Link(F.K, F.Next, F.X));
                     await assert.rejects(t.Commit(), ConflictError);
                 }
                 finally
@@ -235,8 +242,8 @@ class DeleteFx
                 const t = await fx.G.Begin(AccessScope.System);
                 try
                 {
-                    t.DeleteNode('e');
-                    await F.Commit(fx.G, w => w.Link('k', F.Next, 'e'));
+                    t.DeleteNode(F.E);
+                    await F.Commit(fx.G, w => w.Link(F.K, F.Next, F.E));
                     await assert.rejects(t.Commit(), ConflictError);
                 }
                 finally
@@ -260,7 +267,11 @@ class DetachFx
     public static readonly A = 'A';
     public static readonly B = 'B';
     public static readonly Name = 'name';
-    public static readonly DetachB = "MATCH (n:Server {name: 'b'}) DETACH DELETE n";
+    public static readonly NodeA = 'a';
+    public static readonly NodeB = 'b';
+    public static readonly NodeC = 'c';
+    /** Deletes node b by its name (each node's name is its id). */
+    public static readonly DetachB = `MATCH (n:${DetachFx.Server} {${DetachFx.Name}: '${DetachFx.NodeB}'}) DETACH DELETE n`;
 }
 
 describe('Cypher DETACH DELETE routes hidden edges', () =>
@@ -273,9 +284,9 @@ describe('Cypher DETACH DELETE routes hidden edges', () =>
         const fx = await F.Open(
             [F.Concept(DetachFx.Server, [F.Text(DetachFx.Name), F.Rel(DetachFx.Peer, [DetachFx.Server]), F.Rel(DetachFx.Ref, [DetachFx.Server])])],
             [
-                F.Node('a', DetachFx.Server, { [DetachFx.Name]: 'a' }, [[DetachFx.Peer, 'b']], DetachFx.Crm),
-                F.Node('b', DetachFx.Server, { [DetachFx.Name]: 'b' }, [], DetachFx.Hr),
-                F.Node('c', DetachFx.Server, { [DetachFx.Name]: 'c' }, [[DetachFx.Ref, 'b']], DetachFx.Hr),
+                F.Node(DetachFx.NodeA, DetachFx.Server, { [DetachFx.Name]: DetachFx.NodeA }, [[DetachFx.Peer, DetachFx.NodeB]], DetachFx.Crm),
+                F.Node(DetachFx.NodeB, DetachFx.Server, { [DetachFx.Name]: DetachFx.NodeB }, [], DetachFx.Hr),
+                F.Node(DetachFx.NodeC, DetachFx.Server, { [DetachFx.Name]: DetachFx.NodeC }, [[DetachFx.Ref, DetachFx.NodeB]], DetachFx.Hr),
             ],
             [],
             [{ Model: DetachFx.Crm, Connector: DetachFx.A }, { Model: DetachFx.Hr, Connector: DetachFx.B }],
@@ -286,10 +297,10 @@ describe('Cypher DETACH DELETE routes hidden edges', () =>
             const scope = AccessScope.Build({ Default: AccessDefault.Allow, Hidden: new Map([[DetachFx.Server, new Set([DetachFx.Peer])]]) });
             await WriteFixture.Write(fx, DetachFx.DetachB, { Scope: scope });
             const changes = (c: FakeConnector): object[] => c.Applied.flatMap(set => set.Changes.map(ch => ({ ...ch })));
-            assert.deepEqual(changes(a), [{ Op: WriteOp.Unlink, From: 'a', Relationship: DetachFx.Peer, To: 'b', Owner: DetachFx.Crm, Concept: DetachFx.Server }]);
+            assert.deepEqual(changes(a), [{ Op: WriteOp.Unlink, From: DetachFx.NodeA, Relationship: DetachFx.Peer, To: DetachFx.NodeB, Owner: DetachFx.Crm, Concept: DetachFx.Server }]);
             assert.deepEqual(changes(b), [
-                { Op: WriteOp.Unlink, From: 'c', Relationship: DetachFx.Ref, To: 'b', Owner: DetachFx.Hr, Concept: DetachFx.Server },
-                { Op: WriteOp.DeleteNode, PublicId: 'b', Owner: DetachFx.Hr, Concept: DetachFx.Server },
+                { Op: WriteOp.Unlink, From: DetachFx.NodeC, Relationship: DetachFx.Ref, To: DetachFx.NodeB, Owner: DetachFx.Hr, Concept: DetachFx.Server },
+                { Op: WriteOp.DeleteNode, PublicId: DetachFx.NodeB, Owner: DetachFx.Hr, Concept: DetachFx.Server },
             ]);
         }
         finally
@@ -306,7 +317,7 @@ describe('WriteCoordinator.Route', () =>
         const m = new CatalogModel();
         DeleteFx.Define(m);
         const batch = new WriteBatch();
-        batch.SetOwner('x', DeleteFx.Crm);
+        batch.SetOwner(DeleteFx.X, DeleteFx.Crm);
         const origins: INodeOrigins = { Origin: async () => ({ Owner: DeleteFx.Crm, Concept: DeleteFx.Item }), Edges: async () => [] };
         const table = new BindingTable([{ Model: DeleteFx.Crm, Connector: DeleteFx.A }]);
         await assert.rejects(WriteCoordinator.Route(batch, table, new CatalogIndex(m.Seal()), origins), (e: unknown) => e instanceof GraphError && e.GraphCode === GraphErrorCode.Internal);
