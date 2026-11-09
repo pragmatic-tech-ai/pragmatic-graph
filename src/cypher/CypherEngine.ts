@@ -33,7 +33,7 @@ export interface ICypherRunOptions
 /**
  * Runs Cypher on a GraphEngine under an access scope. A read-only query runs on one GraphReader
  * (BeginRead(scope)); a query with write clauses on one GraphTransaction (Begin(scope)) that commits once at the
- * end (one CommitApplied). The reader or transaction is disposed in every outcome. Before the result is returned
+ * end: at most one CommitApplied (none when it changed nothing), its number in CypherResult.Commit. The reader or transaction is disposed in every outcome. Before the result is returned
  * every node reachable in a row (inside lists, maps and paths too) gets its outgoing links filled, once per
  * distinct node, through the same scoped reader (for a write, the query's own view of the graph), so ToDto is
  * synchronous and sees exactly what the scope may see.
@@ -76,13 +76,20 @@ export class CypherEngine
     }
 
     /**
-     * The operator tree the query would run, one line per operator (children indented), planned over the engine's
-     * current catalog without a scope. A write query is planned too, but nothing is read, written or begun.
+     * The operator tree Execute(scope, source, options) would run, one line per operator (children indented), planned
+     * over the engine's current catalog. The scope is used only for plan-time metadata (its hidden members rule out
+     * indexes, as at Execute); without one nothing is hidden. Options supply the parameters (SKIP / LIMIT may use
+     * them) and the limits: with paging (Skip) the implicit total-order Sort shows, and paging limits are validated as
+     * Execute does. A write query is planned too, but nothing is read, written or begun.
      */
-    public Explain(source: string | CypherQuery): string
+    public Explain(source: string | CypherQuery, scope?: AccessScope, options: ICypherRunOptions = {}): string
     {
         const model = typeof source === 'string' ? new CypherParser(source).Parse() : source.ToModel();
-        return LogicalPlanner.Explain(new PlanSource(this.engine.Catalog), model, new Map(), this.options);
+        const parameters = ParameterBinder.FromInputMap(options.Parameters ?? CypherEngine.EmptyParams);
+        const limits = options.Limits;
+        const paging = !model.HasWrites() && limits?.Skip !== undefined;
+        if (paging) CypherEngine.ValidatePaging(limits!);
+        return LogicalPlanner.Explain(new PlanSource(this.engine.Catalog, scope?.Hidden), model, parameters, this.options, paging);
     }
 
     public static ToDto(result: CypherResult): CypherResultDto
@@ -96,6 +103,10 @@ export class CypherEngine
         if (result.Stats !== undefined)
         {
             dto.Stats = result.Stats.ToDto();
+        }
+        if (result.Commit !== undefined)
+        {
+            dto.Commit = result.Commit.toString();
         }
         return dto;
     }
@@ -112,8 +123,9 @@ export class CypherEngine
             const runner = new WriteQueryRunner(transaction, runOptions);
             const outcome = await runner.Run(model, parameters, options.Limits?.Cancel);
             await CypherEngine.FillLinks(outcome.Rows, runner.Source, options.Limits?.Cancel);
-            await runner.Commit();
-            return new CypherResult(outcome.Columns, outcome.Rows, false, false, runner.Stats);
+            const commit = await runner.Commit();
+            // A query that recorded no writes commits nothing (no commit number, no CommitApplied).
+            return new CypherResult(outcome.Columns, outcome.Rows, false, false, runner.Stats, runner.Steps().length > 0 ? commit : undefined);
         }
         finally
         {

@@ -5,6 +5,7 @@ import { ReaderSource } from '../ReaderSource.js';
 import { CypherSemanticError } from '../CypherError.js';
 import { RelDirection } from '../CypherEnums.js';
 import { CypherFixture } from './CypherFixture.js';
+import { EngineHarness } from './EngineHarness.js';
 
 /**
  * aspect Asset { tag, peers -> Server }; Server carries Asset { name, secret, hosts -> Server };
@@ -280,6 +281,47 @@ describe('ReaderSource read recording', () =>
         finally
         {
             await fx.dispose();
+        }
+    });
+});
+
+// A relationship name declared by several concepts: A.r -> P and B.r -> [T, P], with T : P. Incoming edges of t come
+// from both declarations; every In-shaped expand must find each source exactly once.
+describe('a relationship declared by several concepts', () =>
+{
+    let h: EngineHarness;
+    before(async () =>
+    {
+        const F = CypherFixture;
+        h = await EngineHarness.Open(
+            [F.Concept('P', []), F.Concept('T', [], 'P'), F.Concept('A', [F.Rel('r', ['P'])]), F.Concept('B', [F.Rel('r', ['T', 'P'])])],
+            [F.Node('t', 'T'), F.Node('p', 'P'), F.Node('a', 'A', {}, [['r', 't']]), F.Node('b', 'B', {}, [['r', 't'], ['r', 'p']])]);
+    });
+    after(() => h.dispose());
+
+    test('In, undirected and var-length In expands from t return exactly a and b', async () =>
+    {
+        const queries = [
+            'MATCH (t:T)<-[:r]-(x) RETURN x',
+            'MATCH (t:T)-[:r]-(x) RETURN x',
+            'MATCH (t:T)<-[:r*1..2]-(x) RETURN x',
+            'MATCH (t:T)<-[:r*1]-(x) RETURN x',
+        ];
+        for (const q of queries)
+        {
+            assert.deepEqual(EngineHarness.Col(await h.Execute(q)).sort(), ['a', 'b'], q);
+        }
+        assert.equal((await h.Execute('MATCH (p:P)<-[:r]-(x) RETURN p, x')).Rows.length, 3);
+        assert.deepEqual(EngineHarness.Col(await h.Execute('MATCH (x)-[:r]->(t:T) RETURN x')).sort(), ['a', 'b']);
+    });
+
+    test('the write overlay agrees: the In expand sees both declarations plus the edge the query adds', async () =>
+    {
+        const q = 'MATCH (t:T) CREATE (:A)-[:r]->(t) WITH t MATCH (t)<-[:r]-(x) RETURN count(x) AS c, count(DISTINCT x) AS d';
+        assert.deepEqual(EngineHarness.Pairs(await h.Execute(q)), [[3n, 3n]]);
+        for (const shape of ['MATCH (t:T)<-[:r]-(x) RETURN x', 'MATCH (t:T)-[:r]-(x) RETURN x', 'MATCH (t:T)<-[:r*1..2]-(x) RETURN x'])
+        {
+            assert.equal((await h.Execute(shape)).Rows.length, 3, shape);
         }
     });
 });

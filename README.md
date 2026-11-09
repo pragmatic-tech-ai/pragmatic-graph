@@ -29,7 +29,7 @@ Graph database storage engine for TypeScript: an ordered KV layer (LMDB) with a 
     });
     const dto = Cypher.CypherEngine.ToDto(result);
 
-A query without write clauses runs on one `BeginRead(scope)` reader. A query with write clauses runs on one `Begin(scope)` transaction and commits once at the end, so it produces one `CommitApplied`. Inside the query later clauses see the earlier writes (read-your-writes), and a failed query commits nothing. The scope applies to every read; the write gate and connectors act at commit, so a write query may return its own creates and changes even where the scope's row predicates would hide them from later reads. A write query is never paged or truncated (`Cancel` still applies); for a read, `RowCap` truncates (`Truncated`) and, together with `Skip`, pages (`HasMore`).
+A query without write clauses runs on one `BeginRead(scope)` reader. A query with write clauses runs on one `Begin(scope)` transaction and commits once at the end, so it produces at most one `CommitApplied` (none when it changed nothing); `result.Commit` is that commit's number (absent for a read and for a write that changed nothing; a decimal string in the DTO). Inside the query later clauses see the earlier writes (read-your-writes), and a failed query commits nothing. The scope applies to every read; the write gate and connectors act at commit, so a write query may return its own creates and changes even where the scope's row predicates would hide them from later reads. A write query is never paged or truncated (`Cancel` still applies; the deadline is checked as nodes and edges are read, not only per result row); for a read, `RowCap` truncates (`Truncated`) and, together with `Skip`, pages (`HasMore`).
 
 `Placement` (an `INodePlacement`) chooses the public id and owner of every node a `CREATE` or `MERGE` makes, from its concept and initial properties. The default, `GuidPlacement`, uses a random UUID and no owner.
 
@@ -37,6 +37,6 @@ A query without write clauses runs on one `BeginRead(scope)` reader. A query wit
 
 `ORDER BY` follows openCypher orderability: NaN sorts above every other number (last ascending, first descending) and equals itself for ordering, while `=` and `<` still treat NaN as comparable to nothing.
 
-`Explain(text)` returns the operator tree the query would run, without a scope and without reading or writing anything; write queries are explained too.
+`Explain(text, scope?, options?)` returns the operator tree `Execute(scope, text, options)` would run, without reading or writing anything; write queries are explained too. The scope is used only for plan-time metadata (members it hides rule out indexes, as at `Execute`; without a scope nothing is hidden), and the options supply the parameters and the limits (with `Skip`, the implicit paging sort shows).
 
 Licensed under Apache-2.0. See NOTICE for attribution.

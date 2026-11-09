@@ -8,6 +8,7 @@ import { TemporalText } from './TemporalText.js';
 
 // Converts caller-supplied plain-JS (JSON-shaped) parameter trees into the engine's internal CypherValue currency.
 // Numbers: a safe integer binds as an Int64 (bigint), any other number as a Float64; bigints must fit Int64.
+// Strings (and map keys) are made well-formed: a lone surrogate binds as U+FFFD (ScalarSemantics.WellFormed).
 // Temporals: { $date: 'YYYY-MM-DD' }, { $datetime: '<ISO-8601 instant>', zone?: '<IANA>' } (an absent zone is UTC; a present zone must be a string)
 // and { $duration: '<ISO-8601 duration>' }, or engine DateValue/DateTimeValue/DurationValue instances.
 // Non-finite floats (which JSON cannot carry): { $float: 'NaN' | 'Infinity' | '-Infinity' }, the result-cell tag.
@@ -39,10 +40,10 @@ export class ParameterBinder
             const tagged = ParameterBinder.Float(record) ?? ParameterBinder.Temporal(record);
             if (tagged !== undefined) return tagged;
             const entries = new Map<string, CypherValue>();
-            for (const [k, v] of Object.entries(record)) entries.set(k, ParameterBinder.FromInput(v));
+            for (const [k, v] of Object.entries(record)) entries.set(ScalarSemantics.WellFormed(k), ParameterBinder.FromInput(v));
             return new MapValue(entries);
         }
-        return new ScalarValue(value as string | boolean);
+        return new ScalarValue(typeof value === 'string' ? ScalarSemantics.WellFormed(value) : value as boolean);
     }
 
     public static FromInputMap(parameters: ReadonlyMap<string, ParameterValue>): ReadonlyMap<string, CypherValue>

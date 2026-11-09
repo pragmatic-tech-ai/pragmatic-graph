@@ -8,7 +8,9 @@ import type { GraphReader } from '../../GraphReader.js';
 import { ReaderSource } from '../ReaderSource.js';
 import { ScalarValue, type CypherValue } from '../CypherValue.js';
 import { LogicalPlanner } from '../LogicalPlanner.js';
+import { CypherQuery, Expr, Pattern, Return } from '../CypherQuery.js';
 import { CypherFixture } from './CypherFixture.js';
+import { EngineHarness } from './EngineHarness.js';
 
 /** Service { name, tier, ratio(Float64), count(Int64) } with and without indexes over the same data. */
 class SeekHarness
@@ -321,5 +323,49 @@ describe('cypher index seek shapes', () =>
         const declined = await ShapeHarness.Run(fx, text, r => new NoSeekSource(r));
         assert.deepEqual(declined, seeking);
         assert.deepEqual(declined, ['c1']);
+    });
+});
+
+// R87 (d): every string entering a query (parameters, literals, fluent values) is made well-formed (toWellFormed), so
+// a lone surrogate is U+FFFD everywhere: the seek, the scan and grouping keys agree.
+describe('lone surrogates are normalised on entry', () =>
+{
+    const Lone = String.fromCharCode(0xD800);
+    const Replacement = '�';
+    let indexed: EngineHarness;
+    let plain: EngineHarness;
+    before(async () =>
+    {
+        const seed = [CypherFixture.Node('w', SeekHarness.Service, { name: Replacement }), ...SeekHarness.Seed()];
+        indexed = await EngineHarness.Open(SeekHarness.Definitions(), seed, undefined, SeekHarness.Indexes());
+        plain = await EngineHarness.Open(SeekHarness.Definitions(), seed);
+    });
+    after(async () =>
+    {
+        await indexed.dispose();
+        await plain.dispose();
+    });
+
+    test('seek and scan agree for a lone-surrogate parameter, literal and fluent value', async () =>
+    {
+        const byParam = 'MATCH (n:Service) WHERE n.name = $x RETURN n';
+        const byLiteral = `MATCH (n:Service {name: '${Lone}'}) RETURN n`;
+        const fluent = CypherQuery.Match(Pattern.Node('n').Label(SeekHarness.Service)).Where(Expr.Prop('n', 'name').Eq(Lone)).Return(Return.Node('n'));
+        assert.ok(indexed.Cypher.Explain(byParam).includes(SeekHarness.SeekMark));
+        assert.ok(indexed.Cypher.Explain(byLiteral).includes(SeekHarness.SeekMark));
+        for (const h of [indexed, plain])
+        {
+            assert.deepEqual(EngineHarness.Col(await h.Execute(byParam, new Map([['x', Lone]]))), ['w']);
+            assert.deepEqual(EngineHarness.Col(await h.Execute(byLiteral)), ['w']);
+            assert.deepEqual(EngineHarness.Col(await h.Execute(fluent)), ['w']);
+        }
+    });
+
+    test('count(DISTINCT) folds a lone surrogate with U+FFFD', async () =>
+    {
+        assert.deepEqual(EngineHarness.Col(await plain.Execute('UNWIND $xs AS x RETURN count(DISTINCT x) AS c', new Map([['xs', [Lone, Replacement]]]))), [1n]);
+        assert.deepEqual(EngineHarness.Col(await plain.Execute(`UNWIND ['${Lone}', '${Replacement}'] AS x RETURN count(DISTINCT x) AS c`)), [1n]);
+        assert.deepEqual(EngineHarness.Col(await plain.Execute('MATCH (n:Service) WHERE n.name = $x RETURN count(DISTINCT n.name) AS c', new Map([['x', Lone]]))), [1n]);
+        assert.deepEqual(EngineHarness.Col(await plain.Execute('RETURN $x AS x', new Map([['x', `a${Lone}b`]]))), [`a${Replacement}b`]);
     });
 });

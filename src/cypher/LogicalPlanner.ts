@@ -111,14 +111,15 @@ export class LogicalPlanner
      * The operator tree for a query over the source, one line per operator, children indented. Planning only:
      * nothing is read. A write query is planned with an ExplainSink (its writes compile against an empty overlay
      * and would refuse to run), and its final projection is shown over the mutation pipeline. Parameters are
-     * needed only when SKIP/LIMIT use them. CypherEngine.Explain delegates here.
+     * needed only when SKIP/LIMIT use them; `paging` adds the implicit total-order Sort a paged read gets (ignored
+     * for a write, which is never paged). CypherEngine.Explain delegates here.
      */
-    public static Explain(source: ICypherSource, query: string | CypherQueryModel, parameters: ReadonlyMap<string, CypherValue> = new Map(), options?: PlannerOptions): string
+    public static Explain(source: ICypherSource, query: string | CypherQueryModel, parameters: ReadonlyMap<string, CypherValue> = new Map(), options?: PlannerOptions, paging: boolean = false): string
     {
         const model = typeof query === 'string' ? new CypherParser(query).Parse() : query;
         if (!model.HasWrites())
         {
-            return OperatorPrinter.Print(new LogicalPlanner(source, parameters, options).Plan(model));
+            return OperatorPrinter.Print(new LogicalPlanner(source, parameters, options, undefined, paging).Plan(model));
         }
         const sink = new ExplainSink(source);
         const planner = new LogicalPlanner(sink.View, parameters, options, undefined, false, sink);

@@ -6,8 +6,8 @@ import type { CypherNode } from './CypherNode.js';
 import type { IExpandRow } from './CypherSource.js';
 
 /**
- * The source CypherEngine.Explain plans over: the engine's current catalog with nothing hidden (Explain shows the
- * unscoped plan). Planning only resolves labels, relationships and indexes; every read refuses, so an explained
+ * The source CypherEngine.Explain plans over: the engine's current catalog and the explained scope's hidden members
+ * (none when Explain has no scope), so index choice matches a scoped Execute. Planning only resolves labels, relationships and indexes; every read refuses, so an explained
  * plan can never be run by mistake.
  */
 export class PlanSource extends CatalogSource
@@ -15,9 +15,9 @@ export class PlanSource extends CatalogSource
     private static readonly NoReads = 'an explained plan reads nothing';
     private static readonly NoHidden: ReadonlyMap<string, ReadonlySet<string>> = new Map();
 
-    constructor(catalog: CatalogSnapshot)
+    constructor(catalog: CatalogSnapshot, hidden: ReadonlyMap<string, ReadonlySet<string>> = PlanSource.NoHidden)
     {
-        super(catalog, PlanSource.NoHidden);
+        super(catalog, hidden);
     }
 
     public ScanLabel(): AsyncIterable<CypherNode>

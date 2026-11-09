@@ -5,6 +5,12 @@ import { CypherError, CypherErrorCode } from './CypherError.js';
 import type { CypherScalar } from './CypherValue.js';
 import { TemporalText } from './TemporalText.js';
 
+/** String.prototype.toWellFormed (ES2024; the build's lib is ES2022, the runtime has it). */
+interface IWellFormedText
+{
+    toWellFormed(): string;
+}
+
 /** Scalar type groups in the cross-type total order (ORDER BY); numbers (Int64 and Float64) share one group. */
 export enum ScalarRank
 {
@@ -46,12 +52,25 @@ export class ScalarSemantics
         return Number.isSafeInteger(n) ? BigInt(n) : n;
     }
 
-    /** A host-supplied scalar with JS numbers normalised by FromNumber and bigints checked against the Int64 range. */
+    /**
+     * A host-supplied scalar with JS numbers normalised by FromNumber, bigints checked against the Int64 range and
+     * strings made well-formed (WellFormed).
+     */
     public static FromHost(value: CypherScalar): CypherScalar
     {
         if (typeof value === 'number') return ScalarSemantics.FromNumber(value);
         if (typeof value === 'bigint') return ScalarSemantics.CheckInt64(value);
+        if (typeof value === 'string') return ScalarSemantics.WellFormed(value);
         return value;
+    }
+
+    /**
+     * The string with every lone surrogate replaced by U+FFFD, as storage (UTF-8) would hold it. Applied to every
+     * string entering a query (parameters, literals, fluent values), so seeks, scans and grouping keys agree.
+     */
+    public static WellFormed(text: string): string
+    {
+        return (text as unknown as IWellFormedText).toWellFormed();
     }
 
     /** The text of a NaN or infinite Float64: 'NaN', 'Infinity' or '-Infinity' (the `$float` tag's payload). */

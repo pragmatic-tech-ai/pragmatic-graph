@@ -635,7 +635,7 @@ export class CypherParser
         if (t.Kind === TokenKind.String)
         {
             this.advance();
-            return t.Text;
+            return ScalarSemantics.WellFormed(t.Text);
         }
         if (t.Kind === TokenKind.Number)
         {

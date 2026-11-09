@@ -322,6 +322,35 @@ describe('CypherEngine transactions', () =>
         }
     });
 
+    test('Explain under a scope and paging limits shows the plan the scoped, paged Execute runs', async () =>
+    {
+        const F = CypherFixture;
+        const h = await EngineHarness.Open(
+            [F.Concept('Service', [F.Text('name'), F.Text('note')])],
+            [F.Node('a', 'Service', { name: 'checkout', note: 'n' })],
+            undefined,
+            [{ Name: 'by_name', On: 'Service', Members: ['name'] }]);
+        try
+        {
+            const q = "MATCH (a:Service) WHERE a.name = 'checkout' RETURN a.note AS n";
+            const hiding = AccessScope.Build({ Default: AccessDefault.Allow, Hidden: new Map([['Service', new Set(['name'])]]) });
+            assert.match(h.Cypher.Explain(q), /IndexSeek\(by_name\)/);
+            assert.match(h.Cypher.Explain(q, AccessScope.System), /IndexSeek\(by_name\)/);
+            const scoped = h.Cypher.Explain(q, hiding);
+            assert.doesNotMatch(scoped, /IndexSeek/);
+            assert.match(scoped, /LabelScan/);
+            assert.doesNotMatch(h.Cypher.Explain(q), /Sort/);
+            assert.match(h.Cypher.Explain(q, undefined, { Limits: { Skip: 0, RowCap: 5 } }), /Sort/);
+            assert.doesNotMatch(h.Cypher.Explain(q, undefined, { Limits: { RowCap: 5 } }), /Sort/);
+            assert.match(h.Cypher.Explain('MATCH (a:Service) RETURN a.note SKIP $s', undefined, { Parameters: new Map([['s', 1]]) }), /Skip/);
+            assert.throws(() => h.Cypher.Explain(q, undefined, { Limits: { Skip: -1, RowCap: 5 } }), CypherSemanticError);
+        }
+        finally
+        {
+            await h.dispose();
+        }
+    });
+
     test('Explain renders read and write plans without reading, writing or beginning anything', async () =>
     {
         const h = await EngineFixture.Open();
@@ -524,6 +553,35 @@ describe('CypherEngine under an access scope', () =>
             assert.equal(commits.length, 0);
             await assert.rejects(spy.Transactions[2]!.ReadNode('a'), /disposed/);
             assert.equal((await h.Execute("MATCH (n:Service {name: 'late'}) RETURN n")).Rows.length, 0);
+        }
+        finally
+        {
+            await h.dispose();
+        }
+    });
+});
+
+describe('CypherResult commit number', () =>
+{
+    test('a write that changed something carries its commit (DTO: decimal string); a no-op write and a read carry none', async () =>
+    {
+        const h = await EngineFixture.Open();
+        try
+        {
+            const commits = EngineFixture.Commits(h);
+            const write = await h.Execute("CREATE (n:Service {name: 'new'}) RETURN n.name");
+            await EngineFixture.Settle();
+            assert.equal(commits.length, 1);
+            assert.equal(write.Commit, commits[0]!.Commit);
+            assert.equal(CypherEngine.ToDto(write).Commit, commits[0]!.Commit.toString());
+            const noop = await h.Execute("MATCH (a:Service {name: 'nobody'}) SET a.note = 'x'");
+            await EngineFixture.Settle();
+            assert.equal(commits.length, 1);
+            assert.equal(noop.Commit, undefined);
+            assert.equal('Commit' in CypherEngine.ToDto(noop), false);
+            const read = await h.Execute('MATCH (a:Service) RETURN a.name');
+            assert.equal(read.Commit, undefined);
+            assert.equal('Commit' in CypherEngine.ToDto(read), false);
         }
         finally
         {

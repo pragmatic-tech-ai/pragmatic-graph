@@ -26,9 +26,14 @@ class Surface
 // Compile-time: the type-only exports exist under the namespace.
 type TypeExports = [
     Cypher.ICypherRunOptions, Cypher.PlannerOptions, Cypher.CypherResultDto, Cypher.ExprArg, Cypher.ParameterValue, Cypher.CypherValueDto,
-    Cypher.NodeCellDto, Cypher.RelDto, Cypher.ICypherSource, Cypher.ExecutionLimits, Cypher.ICancellation, Cypher.CypherWriteStatsDto,
-    Cypher.INodePlacement, Cypher.IExpandRow,
+    Cypher.NodeCellDto, Cypher.RelDto, Cypher.ExecutionLimits, Cypher.ICancellation, Cypher.CypherWriteStatsDto, Cypher.INodePlacement,
 ];
+
+// Compile-time: the source contracts the operators read through stay internal (R87 g).
+// @ts-expect-error ICypherSource is not part of the public surface
+type NoSource = Cypher.ICypherSource;
+// @ts-expect-error IExpandRow is not part of the public surface
+type NoExpandRow = Cypher.IExpandRow;
 
 describe('cypher public surface', () =>
 {
@@ -40,7 +45,7 @@ describe('cypher public surface', () =>
             assert.equal(name in Cypher, false, name);
             assert.equal(name in Root, false, name);
         }
-        const types: TypeExports | undefined = undefined;
+        const types: [TypeExports, NoSource, NoExpandRow] | undefined = undefined;
         assert.equal(types, undefined);
     });
 
