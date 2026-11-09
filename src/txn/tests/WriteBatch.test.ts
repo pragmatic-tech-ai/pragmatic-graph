@@ -69,7 +69,9 @@ describe('WriteBatch', () =>
         b.DeleteNode('y', { Strict: false });
         assert.deepEqual(b.Ops(), [{ Op: WriteOp.DeleteNode, PublicId: 'x', Strict: true }, { Op: WriteOp.DeleteNode, PublicId: 'y' }]);
         const bytes = b.Serialize();
-        assert.deepEqual([...bytes], [1, 2, 0, 0, 0, 6, 1, 0, 0, 0, 0x78, WriteOp.DeleteNode, 1, 0, 0, 0, 0x79]);
+        assert.equal(WriteOp.StrictDeleteNode, 6, 'kind 6 is reserved for the strict delete');
+        assert.deepEqual([...bytes], [1, 2, 0, 0, 0, WriteOp.StrictDeleteNode, 1, 0, 0, 0, 0x78, WriteOp.DeleteNode, 1, 0, 0, 0, 0x79]);
+        assert.ok(b.Ops().every(o => (o.Op as WriteOp) !== WriteOp.StrictDeleteNode), 'never a recorded Op');
         assert.deepEqual(WriteBatch.Deserialize(bytes).Ops(), b.Ops());
     });
 

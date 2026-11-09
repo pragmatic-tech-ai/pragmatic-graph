@@ -8,6 +8,7 @@ import { AccessError } from '../../access/AccessError.js';
 import { CatalogModel } from '../../catalog/CatalogModel.js';
 import { MemberKind, ValueType } from '../../catalog/ValueType.js';
 import { GraphError, GraphErrorCode } from '../../errors/GraphError.js';
+import { EdgeDirection } from '../../format/FormatKeys.js';
 import type { GraphContext } from '../../GraphContext.js';
 import { EngineInternals } from '../../tests/EngineInternals.js';
 import { GraphStore } from '../../GraphStore.js';
@@ -484,6 +485,47 @@ class ThroughFx
                 assert.ok(e.cause instanceof ConflictError);
                 assert.deepEqual(fx.Log, ['A.Begin', 'B.Begin', 'A.Apply', 'B.Apply', 'A.Commit', 'B.Commit', 'B.Revert', 'A.Revert']);
                 assert.equal(await ThroughFx.Value(g, 'x'), null);
+                await g.dispose();
+            });
+
+            it('a strict delete whose edge check a concurrent link invalidated fails with ConflictError, not NodeHasEdges', async () =>
+            {
+                const g = await ThroughFx.Ready(open);
+                await ThroughFx.Commit(g, t => t.CreateNode('z', ThroughFx.Item, { Owner: ThroughFx.Crm }));
+                const fx = ThroughFx.Install(g, ThroughFx.TwoModels);
+                const t = await g.Begin(AccessScope.System);
+                try
+                {
+                    // The deleter saw z edge-free (as Cypher's in-query check does), then e (engine-only) links into z.
+                    assert.deepEqual(await t.Links('z', EdgeDirection.In), []);
+                    await ThroughFx.Commit(g, w => w.Link('e', ThroughFx.Next, 'z'));
+                    t.DeleteNode('z', { Strict: true });
+                    const e = await ThroughFx.Rejection(t.Commit());
+                    assert.ok(e instanceof ConflictError, String(e));
+                    assert.ok(!fx.Log.includes('A.Commit'), fx.Log.join());
+                    assert.ok(!fx.Log.includes('A.Begin') || fx.Log.includes('A.Revert'), fx.Log.join());
+                    assert.equal(await ThroughFx.Exists(g, 'z'), true);
+                }
+                finally
+                {
+                    t.dispose();
+                }
+                await g.dispose();
+            });
+
+            it('a link racing a prepared strict delete is rejected by its reservation (R71): the delete commits through A', async () =>
+            {
+                const g = await ThroughFx.Ready(open);
+                await ThroughFx.Commit(g, t => t.CreateNode('z', ThroughFx.Item, { Owner: ThroughFx.Crm }));
+                const fx = ThroughFx.Install(g, ThroughFx.TwoModels);
+                let concurrent: unknown;
+                // While A commits the prepared delete, e (engine-only) tries to link into z: the adjacency the strict check read is reserved.
+                fx.A.OnCommit = async () => { concurrent = await ThroughFx.Commit(g, w => w.Link('e', ThroughFx.Next, 'z')).catch((error: unknown) => error); };
+                await ThroughFx.Commit(g, t => t.DeleteNode('z', { Strict: true }));
+                assert.ok(concurrent instanceof ConflictError, String(concurrent));
+                assert.deepEqual(fx.Log, ['A.Begin', 'A.Apply', 'A.Commit']);
+                assert.deepEqual(ThroughFx.Changes(fx.A), [{ Op: WriteOp.DeleteNode, PublicId: 'z', Strict: true, Owner: ThroughFx.Crm, Concept: ThroughFx.Item }], 'Strict reaches the connector');
+                assert.equal(await ThroughFx.Exists(g, 'z'), false);
                 await g.dispose();
             });
 

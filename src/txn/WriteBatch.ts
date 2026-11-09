@@ -9,6 +9,11 @@ export enum WriteOp
     DeleteNode = 3,
     Link = 4,
     Unlink = 5,
+    /**
+     * Reserved: the serialized kind of a strict DeleteNode. Never the Op of a recorded op (a strict delete is
+     * Op DeleteNode with Strict); listed here so no future op can take the value.
+     */
+    StrictDeleteNode = 6,
 }
 
 /** Placement and properties of a new edge. Siblings are public ids of existing targets of the same (from, relationship). */
@@ -255,8 +260,6 @@ export class WriteBatch
     private static readonly FlagHint = 1;
     private static readonly FlagOwner = 2;
     private static readonly KnownCreateFlags = 3;
-    /** Serialized kind of a strict DeleteNode (a plain one keeps kind WriteOp.DeleteNode, so v1 bytes are unchanged). */
-    private static readonly StrictDeleteKind = 6;
     private static readonly LoneSurrogate = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
     private static readonly ErrValueType = 'Unsupported cell value: ';
     private static readonly ErrValue = 'Invalid cell value: ';
@@ -357,7 +360,7 @@ export class WriteBatch
         w.U32(this.ops.length);
         for (const op of this.ops)
         {
-            w.U8(op.Op === WriteOp.DeleteNode && op.Strict === true ? WriteBatch.StrictDeleteKind : op.Op);
+            w.U8(op.Op === WriteOp.DeleteNode && op.Strict === true ? WriteOp.StrictDeleteNode : op.Op);
             switch (op.Op)
             {
                 case WriteOp.CreateNode:
@@ -459,7 +462,7 @@ export class WriteBatch
             case WriteOp.DeleteNode:
                 batch.DeleteNode(r.Text());
                 return;
-            case WriteBatch.StrictDeleteKind:
+            case WriteOp.StrictDeleteNode:
                 batch.DeleteNode(r.Text(), { Strict: true });
                 return;
             case WriteOp.Link:

@@ -265,26 +265,12 @@ export class BatchApplier
         const members = this.index.Catalog.EffectiveMembers(node.Concept);
         if (op.Strict === true)
         {
+            // One scan: it records the adjacency dependencies and proves there is nothing to unlink.
             await this.RequireNoEdges(txn, node, members);
         }
-        // Each edge is unlinked at the position its scan already found: no per-edge lookup (F9).
-        for (const rel of members.filter(m => m.Kind === MemberKind.Relationship))
+        else
         {
-            this.DependOn(rel, node.Id, EdgeDirection.Out);
-            for (const edge of await this.Adjacent(txn, rel, node.Id, EdgeDirection.Out))
-            {
-                await this.edges.UnlinkAt(txn, rel, node.Id, edge.Node, edge.Position);
-                BatchApplier.AddEdgeKeys(keys, rel, node.Id, edge.Node);
-            }
-        }
-        for (const rel of this.index.IncomingRelationships(node.Concept))
-        {
-            this.DependOn(rel, node.Id, EdgeDirection.In);
-            for (const edge of await this.Adjacent(txn, rel, node.Id, EdgeDirection.In))
-            {
-                await this.edges.UnlinkAt(txn, rel, edge.Node, node.Id, edge.Position);
-                BatchApplier.AddEdgeKeys(keys, rel, edge.Node, node.Id);
-            }
+            await this.UnlinkAll(txn, node, members, keys);
         }
         // Every property cell of the slot is nulled, not just the node id (F9); slots are not reused in v1.
         for (const m of members.filter(x => x.Kind === MemberKind.Property))
@@ -368,6 +354,30 @@ export class BatchApplier
         }
         const label = BatchApplier.Label(from, rel, target);
         throw new CommitError(CommitErrorCode.InvalidEdge, BatchApplier.ErrSibling + label, new EdgeError(EdgeErrorCode.UnknownSibling, BatchApplier.ErrSibling + label));
+    }
+
+    /** Unlinks every edge of the node being deleted, in both directions (a plain DeleteNode). */
+    private async UnlinkAll(txn: IWriteTransaction, node: INode, members: readonly MemberDef[], keys: WriteKeySet): Promise<void>
+    {
+        // Each edge is unlinked at the position its scan already found: no per-edge lookup (F9).
+        for (const rel of members.filter(m => m.Kind === MemberKind.Relationship))
+        {
+            this.DependOn(rel, node.Id, EdgeDirection.Out);
+            for (const edge of await this.Adjacent(txn, rel, node.Id, EdgeDirection.Out))
+            {
+                await this.edges.UnlinkAt(txn, rel, node.Id, edge.Node, edge.Position);
+                BatchApplier.AddEdgeKeys(keys, rel, node.Id, edge.Node);
+            }
+        }
+        for (const rel of this.index.IncomingRelationships(node.Concept))
+        {
+            this.DependOn(rel, node.Id, EdgeDirection.In);
+            for (const edge of await this.Adjacent(txn, rel, node.Id, EdgeDirection.In))
+            {
+                await this.edges.UnlinkAt(txn, rel, edge.Node, node.Id, edge.Position);
+                BatchApplier.AddEdgeKeys(keys, rel, edge.Node, node.Id);
+            }
+        }
     }
 
     /**
