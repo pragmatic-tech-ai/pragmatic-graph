@@ -6,6 +6,9 @@ import type { IOperator } from './IOperator.js';
 /** Binds every visible node that is the label (subtypes and aspect carriers included) to the variable. */
 export class LabelScan implements IOperator
 {
+    private static readonly Name = 'LabelScan';
+    private static readonly Colon = ':';
+
     constructor(private readonly source: ICypherSource, private readonly variable: string, private readonly label: string)
     {
     }
@@ -20,6 +23,6 @@ export class LabelScan implements IOperator
 
     public Describe(): string
     {
-        return `LabelScan(${this.variable}:${this.label})`;
+        return `${LabelScan.Name}(${this.variable}${LabelScan.Colon}${this.label})`;
     }
 }

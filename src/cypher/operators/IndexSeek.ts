@@ -1,5 +1,6 @@
 import { Binding, EvalContext } from '../Binding.js';
 import { ComparisonOp } from '../CypherEnums.js';
+import { CypherUnparser } from '../CypherUnparser.js';
 import type { ICypherSource } from '../CypherSource.js';
 import { NodeValue, ScalarValue, type CypherValue } from '../CypherValue.js';
 import { BooleanExpression, Comparison, PropertyAccess, type Expression } from '../Expression.js';
@@ -60,6 +61,6 @@ export class IndexSeek implements IOperator
 
     public Describe(): string
     {
-        return `IndexSeek${IndexSeek.Open}${this.indexName}${IndexSeek.Close}${IndexSeek.Space}${this.variable}${IndexSeek.Dot}${this.member}${IndexSeek.Equals}${this.value.StructuralKey()}`;
+        return `IndexSeek${IndexSeek.Open}${this.indexName}${IndexSeek.Close}${IndexSeek.Space}${this.variable}${IndexSeek.Dot}${this.member}${IndexSeek.Equals}${new CypherUnparser().ExpressionText(this.value)}`;
     }
 }

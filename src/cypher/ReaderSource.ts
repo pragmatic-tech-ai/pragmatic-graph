@@ -1,4 +1,5 @@
-import type { IndexDef } from '../catalog/CatalogTypes.js';
+import type { IndexDef, MemberDef } from '../catalog/CatalogTypes.js';
+import { ValueCodec } from '../columns/ValueCodec.js';
 import { ValueType } from '../catalog/ValueType.js';
 import { DateTimeValue, DateValue, type CellValue } from '../columns/CellValue.js';
 import { EdgeDirection } from '../format/FormatKeys.js';
@@ -21,6 +22,8 @@ export class ReaderSource implements ICypherSource
 
     private static readonly Int64Min = -(2n ** 63n);
     private static readonly Int64Limit = 2n ** 63n;
+    private static readonly Int64MinNumber = Number(ReaderSource.Int64Min);
+    private static readonly Int64LimitNumber = Number(ReaderSource.Int64Limit);
 
     private readonly labels: LabelResolver;
     private readonly relationships: ReadonlySet<string>;
@@ -115,8 +118,9 @@ export class ReaderSource implements ICypherSource
         {
             return undefined;
         }
-        const key = ReaderSource.SeekKey(this.reader.Catalog.IndexMembers(index)[0]!.Type, value);
-        return key === undefined ? ReaderSource.NoNodes() : this.Seek(index.Name, name, key);
+        const type = this.reader.Catalog.IndexMembers(index)[0]!.Type;
+        const key = ReaderSource.SeekKey(type, value);
+        return key === undefined || !ReaderSource.Encodable(type!, key) ? ReaderSource.NoNodes() : this.Seek(index.Name, name, key);
     }
 
     private FindIndex(label: string, member: string): IndexDef | undefined
@@ -126,9 +130,20 @@ export class ReaderSource implements ICypherSource
         {
             const catalog = this.reader.Catalog;
             const candidates = catalog.IsAspect(label) ? catalog.Indexes().filter(i => i.On === label) : catalog.IndexesOn(label);
-            this.indexCache.set(cacheKey, candidates.find(i => i.Where === undefined && catalog.IndexMembers(i)[0]?.Name === member));
+            this.indexCache.set(cacheKey, candidates.find(i => i.Where === undefined && catalog.IndexMembers(i)[0]?.Name === member && !this.HidesAny(catalog.IndexMembers(i))));
         }
         return this.indexCache.get(cacheKey);
+    }
+
+    // SeekIndex skips a node when the scope hides ANY member of the index, so such an index would drop rows the scan
+    // returns. Conservative: a member name hidden on any type disqualifies the index.
+    private HidesAny(members: readonly MemberDef[]): boolean
+    {
+        for (const hidden of this.reader.Scope.Hidden.values())
+        {
+            if (members.some(m => hidden.has(m.Name))) return true;
+        }
+        return false;
     }
 
     private async *Seek(index: string, label: string, key: CellValue): AsyncIterable<CypherNode>
@@ -140,6 +155,20 @@ export class ReaderSource implements ICypherSource
             {
                 yield node;
             }
+        }
+    }
+
+    /** True when the codec accepts the value (a lone-surrogate string, say, cannot be stored, so it equals nothing). */
+    private static Encodable(type: ValueType, key: CellValue): boolean
+    {
+        try
+        {
+            ValueCodec.Check(type, key);
+            return true;
+        }
+        catch
+        {
+            return false;
         }
     }
 
@@ -162,7 +191,7 @@ export class ReaderSource implements ICypherSource
                 {
                     return value;
                 }
-                return typeof value === 'number' && Number.isInteger(value) && value >= Number(ReaderSource.Int64Min) && value < Number(ReaderSource.Int64Limit) ? BigInt(value) : undefined;
+                return typeof value === 'number' && Number.isInteger(value) && value >= ReaderSource.Int64MinNumber && value < ReaderSource.Int64LimitNumber ? BigInt(value) : undefined;
             case ValueType.Float64:
                 if (typeof value === 'number')
                 {

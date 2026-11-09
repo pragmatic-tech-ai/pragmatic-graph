@@ -97,6 +97,12 @@ export class CypherUnparser
         [ArithmeticOp.Div, '/'], [ArithmeticOp.Mod, '%'],
     ]);
 
+    /** One expression as Cypher text. */
+    public ExpressionText(e: Expression): string
+    {
+        return this.Expr(e, Prec.Or);
+    }
+
     public Text(model: CypherQueryModel): string
     {
         return model.Parts.map((p) => this.Part(p)).join(CypherUnparser.Space);

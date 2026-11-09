@@ -1,6 +1,11 @@
 import { after, before, describe, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { AccessDefault, AccessScope, Compare, CompareOp, IdIn, type IDefinitionDescription, type IIndexDescription, type ISeedNode } from '../../index.js';
+import { AccessDefault, AccessScope, Compare, CompareOp, DateTimeValue, IdIn, MemberKind, ValueType, type CellValue, type IDefinitionDescription, type IIndexDescription, type ISeedNode } from '../../index.js';
+import { CypherParser } from '../CypherParser.js';
+import type { CypherNode } from '../CypherNode.js';
+import type { Binding } from '../Binding.js';
+import type { GraphReader } from '../../GraphReader.js';
+import { ReaderSource } from '../ReaderSource.js';
 import { ScalarValue, type CypherValue } from '../CypherValue.js';
 import { LogicalPlanner } from '../LogicalPlanner.js';
 import { CypherFixture } from './CypherFixture.js';
@@ -13,8 +18,9 @@ class SeekHarness
     public static readonly PartialTier = 'partial_tier';
     public static readonly ByRatio = 'by_ratio';
     public static readonly ByCount = 'by_count';
-    private static readonly SeekMark = 'IndexSeek(';
-    private static readonly ScanMark = 'LabelScan(';
+    public static readonly SeekMark = 'IndexSeek(';
+    public static readonly ScanMark = 'LabelScan(';
+    public static readonly FilterMark = 'Filter';
 
     public static Definitions(): IDefinitionDescription[]
     {
@@ -89,7 +95,7 @@ describe('cypher index seek', () =>
         const text = "MATCH (n:Service {name: 'checkout'}) RETURN n";
         const plan = await SeekHarness.Explain(indexed, text);
         assert.ok(SeekHarness.IsSeek(plan), plan);
-        assert.ok(plan.includes(`IndexSeek(${SeekHarness.ByName})`), plan);
+        assert.ok(plan.includes(`${SeekHarness.SeekMark}${SeekHarness.ByName})`), plan);
         assert.deepEqual(await SeekHarness.Ids(indexed, text), ['a', 'c']);
     });
 
@@ -97,8 +103,8 @@ describe('cypher index seek', () =>
     {
         const text = "MATCH (n:Service) WHERE n.name = 'checkout' AND n.tier = 'gold' RETURN n";
         const plan = await SeekHarness.Explain(indexed, text);
-        assert.ok(plan.includes('IndexSeek('), plan);
-        assert.ok(plan.includes('Filter'), plan);
+        assert.ok(plan.includes(SeekHarness.SeekMark), plan);
+        assert.ok(plan.includes(SeekHarness.FilterMark), plan);
         assert.deepEqual(await SeekHarness.Ids(indexed, text), ['a']);
         assert.deepEqual(await SeekHarness.Ids(indexed, "MATCH (n:Service) WHERE 'ledger' = n.name RETURN n"), ['b']);
     });
@@ -106,13 +112,13 @@ describe('cypher index seek', () =>
     test('a lone where equality leaves no filter', async () =>
     {
         const plan = await SeekHarness.Explain(indexed, "MATCH (n:Service) WHERE n.name = 'ledger' RETURN n");
-        assert.ok(plan.includes('IndexSeek(') && !plan.includes('Filter'), plan);
+        assert.ok(plan.includes(SeekHarness.SeekMark) && !plan.includes(SeekHarness.FilterMark), plan);
     });
 
     test('parameter equality seeks with the run-time value', async () =>
     {
         const text = 'MATCH (n:Service) WHERE n.name = $x RETURN n';
-        assert.ok((await SeekHarness.Explain(indexed, text)).includes('IndexSeek('));
+        assert.ok((await SeekHarness.Explain(indexed, text)).includes(SeekHarness.SeekMark));
         assert.deepEqual(await SeekHarness.Ids(indexed, text, new Map([['x', new ScalarValue('ledger')]])), ['b']);
         assert.deepEqual(await SeekHarness.Ids(indexed, text, new Map([['x', new ScalarValue('nobody')]])), []);
     });
@@ -135,7 +141,7 @@ describe('cypher index seek', () =>
     {
         assert.ok(SeekHarness.IsScan(await SeekHarness.Explain(indexed, "MATCH (n:Service) WHERE n.name <> 'x' RETURN n")));
         assert.ok(SeekHarness.IsScan(await SeekHarness.Explain(indexed, "MATCH (n:Service) WHERE n.name = 'x' OR n.name = 'y' RETURN n")));
-        assert.ok(!(await SeekHarness.Explain(indexed, "MATCH (n) WHERE n.name = 'x' RETURN n")).includes('IndexSeek('));
+        assert.ok(!(await SeekHarness.Explain(indexed, "MATCH (n) WHERE n.name = 'x' RETURN n")).includes(SeekHarness.SeekMark));
     });
 
     test('seek and scan agree', async () =>
@@ -165,7 +171,7 @@ describe('cypher index seek', () =>
 
     test('mixed numeric types seek exactly', async () =>
     {
-        assert.ok((await SeekHarness.Explain(indexed, 'MATCH (n:Service {ratio: 2}) RETURN n')).includes('IndexSeek('));
+        assert.ok((await SeekHarness.Explain(indexed, 'MATCH (n:Service {ratio: 2}) RETURN n')).includes(SeekHarness.SeekMark));
         assert.deepEqual(await SeekHarness.Ids(indexed, 'MATCH (n:Service {ratio: 2}) RETURN n'), ['a']);
         assert.deepEqual(await SeekHarness.Ids(indexed, 'MATCH (n:Service) WHERE n.count = 2.0 RETURN n'), ['a', 'c']);
         assert.deepEqual(await SeekHarness.Ids(indexed, 'MATCH (n:Service) WHERE n.count = 2.5 RETURN n'), []);
@@ -177,5 +183,143 @@ describe('cypher index seek', () =>
         const scope = AccessScope.Build({ Default: AccessDefault.Allow, Rows: new Map([[SeekHarness.Service, new IdIn(new Set(['a', 'b']))]]) });
         const rows = await indexed.Rows("MATCH (n:Service {name: 'checkout'}) RETURN n", scope);
         assert.deepEqual(rows.map(r => r.get('n')), ['a']);
+    });
+});
+
+/** A source whose index answers are withdrawn at run time: IndexFor still names an index, SeekEqual returns undefined. */
+class NoSeekSource extends ReaderSource
+{
+    public override SeekEqual(_label: string, _member: string, _value: CellValue): undefined
+    {
+        return undefined;
+    }
+}
+
+/** Shapes beyond the flat Service: composite and hidden members, parent/child, aspects, DateTime. */
+class ShapeHarness
+{
+    public static readonly Secret = 'secret';
+    public static readonly LoneSurrogate = String.fromCharCode(0xD800);
+    private static readonly Base = 'Base';
+    private static readonly Child = 'Child';
+    private static readonly Tagged = 'Tagged';
+    private static readonly Event = 'Event';
+    private static readonly Wire = 'Wire';
+
+    private static Prop(name: string, type: ValueType): { Name: string; Kind: MemberKind.Property; Type: ValueType; Nullable: boolean }
+    {
+        return { Name: name, Kind: MemberKind.Property, Type: type, Nullable: true };
+    }
+
+    public static Open(): Promise<CypherFixture>
+    {
+        const F = CypherFixture;
+        const P = ShapeHarness.Prop;
+        const defs: IDefinitionDescription[] = [
+            F.Aspect(ShapeHarness.Tagged, [P('tag', ValueType.String)]),
+            F.Concept(ShapeHarness.Base, [P('name', ValueType.String), P(ShapeHarness.Secret, ValueType.String)], null, [ShapeHarness.Tagged]),
+            F.Concept(ShapeHarness.Child, [], ShapeHarness.Base),
+            F.Concept(ShapeHarness.Event, [P('at', ValueType.DateTime)]),
+        ];
+        const seed: ISeedNode[] = [
+            F.Node('p1', ShapeHarness.Base, { name: 'x', secret: 's', tag: 't' }),
+            F.Node('c1', ShapeHarness.Child, { name: 'x', secret: 's', tag: 't' }),
+            F.Node('c2', ShapeHarness.Child, { name: 'y', secret: 's', tag: 'u' }),
+            F.Node('e1', ShapeHarness.Event, { at: new DateTimeValue(1_000_000n, 'UTC') }),
+        ];
+        const indexes: IIndexDescription[] = [
+            { Name: 'base_composite', On: ShapeHarness.Base, Members: ['name', ShapeHarness.Secret] },
+            { Name: 'tagged_tag', On: ShapeHarness.Tagged, Members: ['tag'] },
+            { Name: 'event_at', On: ShapeHarness.Event, Members: ['at'] },
+        ];
+        return F.Open(defs, seed, indexes);
+    }
+
+    public static Hiding(): AccessScope
+    {
+        return AccessScope.Build({ Default: AccessDefault.Allow, Hidden: new Map([[ShapeHarness.Base, new Set([ShapeHarness.Secret])]]) });
+    }
+
+    public static async Run(fx: CypherFixture, text: string, make: (reader: GraphReader) => ReaderSource): Promise<string[]>
+    {
+        const model = new CypherParser(text).Parse();
+        const reader = await fx.Engine.BeginRead(AccessScope.System);
+        try
+        {
+            const rows: Binding[] = await CypherFixture.Collect(new LogicalPlanner(make(reader), new Map()).Plan(model));
+            return rows.map(r => CypherFixture.Plain(r.Get('n')) as string).sort();
+        }
+        finally
+        {
+            reader.dispose();
+        }
+    }
+}
+
+describe('cypher index seek shapes', () =>
+{
+    let fx: CypherFixture;
+    before(async () => { fx = await ShapeHarness.Open(); });
+    after(async () => { await fx.dispose(); });
+
+    test('composite index leading member seeks', async () =>
+    {
+        const text = "MATCH (n:Base {name: 'x'}) RETURN n";
+        assert.ok((await fx.Read(async s => LogicalPlanner.Explain(s, text))).includes(SeekHarness.SeekMark));
+        assert.deepEqual((await fx.Rows(text)).map(r => r.get('n')).sort(), ['c1', 'p1']);
+    });
+
+    test('a scope hiding a composite index member disables the index', async () =>
+    {
+        const text = "MATCH (n:Base {name: 'x'}) RETURN n";
+        const scope = ShapeHarness.Hiding();
+        const plan = await fx.Read(async s => LogicalPlanner.Explain(s, text), scope);
+        assert.ok(plan.includes(SeekHarness.ScanMark) && !plan.includes(SeekHarness.SeekMark), plan);
+        assert.deepEqual((await fx.Rows(text, scope)).map(r => r.get('n')).sort(), ['c1', 'p1']);
+    });
+
+    test('an index on the parent queried through the child excludes the parent instances', async () =>
+    {
+        const text = "MATCH (n:Child {name: 'x'}) RETURN n";
+        assert.ok((await fx.Read(async s => LogicalPlanner.Explain(s, text))).includes(SeekHarness.SeekMark));
+        assert.deepEqual((await fx.Rows(text)).map(r => r.get('n')), ['c1']);
+    });
+
+    test('aspect label seeks through the aspect index', async () =>
+    {
+        const text = "MATCH (n:Tagged {tag: 't'}) RETURN n";
+        assert.ok((await fx.Read(async s => LogicalPlanner.Explain(s, text))).includes(SeekHarness.SeekMark));
+        assert.deepEqual((await fx.Rows(text)).map(r => r.get('n')).sort(), ['c1', 'p1']);
+    });
+
+    test('lone surrogate parameter matches nothing, as the scan does', async () =>
+    {
+        const params = new Map([['x', new ScalarValue(ShapeHarness.LoneSurrogate)]]);
+        const text = 'MATCH (n:Base) WHERE n.name = $x RETURN n';
+        assert.deepEqual(await fx.Rows(text, AccessScope.System, params), []);
+    });
+
+    test('DateTime equality ignores the zone, as the scan does', async () =>
+    {
+        const zoned = new DateTimeValue(1_000_000n, 'Europe/Paris');
+        const text = 'MATCH (n:Event) WHERE n.at = $t RETURN n';
+        assert.ok((await fx.Read(async s => LogicalPlanner.Explain(s, text, new Map([['t', new ScalarValue(zoned)]])))).includes(SeekHarness.SeekMark));
+        assert.deepEqual((await fx.Rows(text, AccessScope.System, new Map([['t', new ScalarValue(zoned)]]))).map(r => r.get('n')), ['e1']);
+    });
+
+    test('Explain renders the value as Cypher', async () =>
+    {
+        const plan = await fx.Read(async s => LogicalPlanner.Explain(s, "MATCH (n:Base {name: 'x'}) RETURN n"));
+        assert.ok(plan.includes("n.name = 'x'"), plan);
+        assert.ok((await fx.Read(async s => LogicalPlanner.Explain(s, 'MATCH (n:Base) WHERE n.name = $x RETURN n'))).includes('n.name = $x'));
+    });
+
+    test('IndexSeek falls back to a filtered scan when the source declines the seek', async () =>
+    {
+        const text = "MATCH (n:Child {name: 'x'}) RETURN n";
+        const seeking = await ShapeHarness.Run(fx, text, r => new ReaderSource(r));
+        const declined = await ShapeHarness.Run(fx, text, r => new NoSeekSource(r));
+        assert.deepEqual(declined, seeking);
+        assert.deepEqual(declined, ['c1']);
     });
 });

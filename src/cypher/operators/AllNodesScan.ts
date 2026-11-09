@@ -6,6 +6,8 @@ import type { IOperator } from './IOperator.js';
 /** Binds every visible node to the variable, per concept then slot order. */
 export class AllNodesScan implements IOperator
 {
+    private static readonly Name = 'AllNodesScan';
+
     constructor(private readonly source: ICypherSource, private readonly variable: string)
     {
     }
@@ -20,6 +22,6 @@ export class AllNodesScan implements IOperator
 
     public Describe(): string
     {
-        return `AllNodesScan(${this.variable})`;
+        return `${AllNodesScan.Name}(${this.variable})`;
     }
 }
