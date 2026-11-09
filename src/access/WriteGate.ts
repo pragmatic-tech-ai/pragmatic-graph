@@ -160,8 +160,9 @@ enum RuleKind
  *   predicate using Related or Reachable is not node-local and denies the create.
  * - SetProperty, Link, Unlink (the node is the edge's source): the node must be visible and every
  *   applicable Update predicate hold on its snapshot values (R30); a node the batch created is exempt.
- *   The member written must not be hidden on the node's concept, nor read-only (ruling R92): the entries'
- *   ReadOnly.Create sets on a node the batch created, their ReadOnly.Update sets on an existing node. A host-placed
+ *   The member written must not be hidden on the node's concept (Hidden or its own concept's HiddenExact), nor read-only
+ *   (ruling R92): the entries' ReadOnly.Create sets on a node the batch created, their ReadOnly.Update sets on an existing
+ *   node, plus the same stage of the own concept's entry's ReadOnlyExact (R94). A host-placed
  *   default on a node the batch created (GraphTransaction.SetDefault, R91) is exempt from both; an unlink a
  *   DETACH DELETE implies (GraphTransaction.DetachUnlink) is exempt from ReadOnly when the batch later deletes
  *   one of its ends (the Delete rule governs it). A Link/Unlink target and a Link's

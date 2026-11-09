@@ -5,7 +5,7 @@ import { GraphError, GraphErrorCode } from '../errors/GraphError.js';
 import { NodeEvaluator, Truth } from '../predicate/NodeEvaluator.js';
 import { type And, type ConceptIs, type Not, type Or, type OwnerIs, Predicate, PredicateKind, type Reachable, type Related } from '../predicate/Predicate.js';
 import type { IReadNode, RecordedReads } from '../RecordedReads.js';
-import { AccessDefault, type AccessScope, type IWriteRules } from './AccessScope.js';
+import { AccessDefault, type AccessScope, type IReadOnlyMembers, type IWriteRules } from './AccessScope.js';
 import { WriteStage } from './WriteStage.js';
 
 /** One node under evaluation, with the property values read so far (absent = not a property of the node). */
@@ -135,13 +135,16 @@ export class ScopeEvaluator
         return out;
     }
 
-    /** Members hidden on instances of `concept`: the union of every applicable Hidden entry. */
+    /**
+     * Members hidden on nodes whose own concept is `concept`: the union of every applicable Hidden entry and the
+     * HiddenExact entry keyed by `concept` itself (ruling R94). The single source every Hidden consumer reads.
+     */
     public HiddenMembers(concept: string): ReadonlySet<string>
     {
         let out = this.hidden.get(concept);
         if (out === undefined)
         {
-            const union = new Set<string>();
+            const union = new Set<string>(this.scope.HiddenExact.get(concept) ?? ScopeEvaluator.NoHidden);
             for (const [name, members] of this.scope.Hidden)
             {
                 if (this.Applies(concept, name))
@@ -160,7 +163,8 @@ export class ScopeEvaluator
 
     /**
      * Members the writer may not write on instances of `concept` at `stage` (a node the batch creates, or an
-     * existing one): the union of every applicable Writes entry's ReadOnly set for that stage (R92).
+     * existing one) whose own concept is `concept`: the union of every applicable Writes entry's ReadOnly set for that
+     * stage (R92) and the ReadOnlyExact set of the entry keyed by `concept` itself (R94).
      */
     public ReadOnlyMembers(concept: string, stage: WriteStage): ReadonlySet<string>
     {
@@ -168,11 +172,10 @@ export class ScopeEvaluator
         let out = cache.get(concept);
         if (out === undefined)
         {
-            const union = new Set<string>();
+            const union = new Set<string>(ScopeEvaluator.Stage(this.scope.Writes.get(concept)?.ReadOnlyExact, stage));
             for (const rules of this.ApplicableWrites(concept))
             {
-                const members = stage === WriteStage.Create ? rules.ReadOnly?.Create : rules.ReadOnly?.Update;
-                for (const m of members ?? ScopeEvaluator.NoReadOnly)
+                for (const m of ScopeEvaluator.Stage(rules.ReadOnly, stage))
                 {
                     union.add(m);
                 }
@@ -181,6 +184,12 @@ export class ScopeEvaluator
             cache.set(concept, out);
         }
         return out;
+    }
+
+    /** The members of `readOnly` for `stage` (none when absent). */
+    private static Stage(readOnly: IReadOnlyMembers | undefined, stage: WriteStage): ReadonlySet<string>
+    {
+        return (stage === WriteStage.Create ? readOnly?.Create : readOnly?.Update) ?? ScopeEvaluator.NoReadOnly;
     }
 
     private ApplicableRows(concept: string): readonly Predicate[]

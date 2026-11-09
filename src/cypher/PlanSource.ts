@@ -13,9 +13,10 @@ import type { IExpandRow } from './CypherSource.js';
 export class PlanSource extends CatalogSource
 {
     private static readonly NoReads = 'an explained plan reads nothing';
-    private static readonly NoHidden: ReadonlyMap<string, ReadonlySet<string>> = new Map();
+    private static readonly NoHidden: ReadonlySet<string> = new Set();
 
-    constructor(catalog: CatalogSnapshot, hidden: ReadonlyMap<string, ReadonlySet<string>> = PlanSource.NoHidden)
+    /** `hidden`: the explained scope's AccessScope.HiddenNames (none without a scope). */
+    constructor(catalog: CatalogSnapshot, hidden: ReadonlySet<string> = PlanSource.NoHidden)
     {
         super(catalog, hidden);
     }

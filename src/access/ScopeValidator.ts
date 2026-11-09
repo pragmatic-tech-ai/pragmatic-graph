@@ -23,7 +23,8 @@ class Place
 /**
  * Internal: checks an AccessScope's names against a catalog (ruling R63). Every Rows, Hidden and Writes
  * key must be a concept or aspect; every Hidden member and every Writes ReadOnly member (Create and Update) a member of its key;
- * every ConceptIs name a concept (R93); every property a Rows or
+ * every HiddenExact key and the key of every Writes entry with ReadOnlyExact a concept, never an aspect, and their
+ * members members of that key (R94); every ConceptIs name a concept (R93); every property a Rows or
  * Writes predicate reads an effective property of its key (Related Targets: of a concept the step
  * reaches), and every relationship a Related or Reachable step follows an effective relationship
  * (parity with index Where, R61). Violations are GraphError InvalidArgument naming the key and name.
@@ -35,6 +36,8 @@ export class ScopeValidator
     private static readonly ErrUnknownReadOnly = 'AccessScope marks read-only a member that is not effective on its key: ';
     private static readonly ErrProperty = 'AccessScope predicate reads a name that is not an effective property: ';
     private static readonly ErrRelationship = 'AccessScope predicate follows a name that is not an effective relationship: ';
+    private static readonly ErrHiddenExactKey = 'AccessScope HiddenExact key is not a concept: ';
+    private static readonly ErrReadOnlyExactKey = 'AccessScope Writes ReadOnlyExact key is not a concept: ';
     private static readonly ErrConceptIs = 'AccessScope predicate tests for a name that is not a concept: ';
     private static readonly ErrNoConcept = 'AccessScope predicate follows a relationship that reaches no concept: ';
     private static readonly Dot = '.';
@@ -57,6 +60,11 @@ export class ScopeValidator
         {
             ScopeValidator.RequireMembers(index, key, members, ScopeValidator.ErrUnknownMember);
         }
+        for (const [key, members] of scope.HiddenExact)
+        {
+            ScopeValidator.RequireConcept(index, key, ScopeValidator.ErrHiddenExactKey);
+            ScopeValidator.RequireMembers(index, key, members, ScopeValidator.ErrUnknownMember);
+        }
         for (const [key, predicate] of scope.Rows)
         {
             ScopeValidator.Walk(index, predicate, new Place(key, key, []));
@@ -65,6 +73,12 @@ export class ScopeValidator
         {
             ScopeValidator.RequireMembers(index, key, rules.ReadOnly?.Create ?? [], ScopeValidator.ErrUnknownReadOnly);
             ScopeValidator.RequireMembers(index, key, rules.ReadOnly?.Update ?? [], ScopeValidator.ErrUnknownReadOnly);
+            if (rules.ReadOnlyExact !== undefined)
+            {
+                ScopeValidator.RequireConcept(index, key, ScopeValidator.ErrReadOnlyExactKey);
+                ScopeValidator.RequireMembers(index, key, rules.ReadOnlyExact.Create ?? [], ScopeValidator.ErrUnknownReadOnly);
+                ScopeValidator.RequireMembers(index, key, rules.ReadOnlyExact.Update ?? [], ScopeValidator.ErrUnknownReadOnly);
+            }
             for (const predicate of [rules.Create, rules.Update, rules.Delete])
             {
                 if (predicate !== undefined)
@@ -72,6 +86,18 @@ export class ScopeValidator
                     ScopeValidator.Walk(index, predicate, new Place(key, key, []));
                 }
             }
+        }
+    }
+
+    /**
+     * An exact-concept set's key must be a concept of the catalog, never an aspect: a node's own concept is never an
+     * aspect, so such a set could never apply (R94, as ConceptIs in R93).
+     */
+    private static RequireConcept(index: CatalogIndex, key: string, error: string): void
+    {
+        if (!index.Catalog.Has(key) || index.Catalog.IsAspect(key))
+        {
+            throw new GraphError(GraphErrorCode.InvalidArgument, error + key);
         }
     }
 

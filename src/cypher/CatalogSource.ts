@@ -8,7 +8,7 @@ import type { ICypherSource, IExpandRow } from './CypherSource.js';
 import { LabelResolver } from './LabelResolver.js';
 
 /**
- * The plan-time half of an ICypherSource, answered from one catalog snapshot and the scope's hidden members alone:
+ * The plan-time half of an ICypherSource, answered from one catalog snapshot and the scope's hidden member names alone:
  * label resolution, relationship names, IsA and index choice. Nothing here reads a node. ReaderSource adds the
  * reads over a scoped reader; PlanSource (Explain) refuses them.
  */
@@ -20,7 +20,8 @@ export abstract class CatalogSource implements ICypherSource
     private readonly relationships: ReadonlySet<string>;
     private readonly indexCache = new Map<string, IndexDef | undefined>();
 
-    protected constructor(protected readonly catalog: CatalogSnapshot, private readonly hidden: ReadonlyMap<string, ReadonlySet<string>>)
+    /** `hidden`: every member name the scope hides on any concept (AccessScope.HiddenNames: Hidden and HiddenExact). */
+    protected constructor(protected readonly catalog: CatalogSnapshot, private readonly hidden: ReadonlySet<string>)
     {
         this.labels = new LabelResolver(catalog);
         this.relationships = new Set(catalog.Relationships());
@@ -66,13 +67,9 @@ export abstract class CatalogSource implements ICypherSource
     }
 
     // SeekIndex skips a node when the scope hides ANY member of the index, so such an index would drop rows the scan
-    // returns. Conservative: a member name hidden on any type disqualifies the index.
+    // returns. Conservative: a member name hidden on any type (by Hidden or HiddenExact) disqualifies the index.
     private HidesAny(members: readonly MemberDef[]): boolean
     {
-        for (const hidden of this.hidden.values())
-        {
-            if (members.some(m => hidden.has(m.Name))) return true;
-        }
-        return false;
+        return members.some(m => this.hidden.has(m.Name));
     }
 }

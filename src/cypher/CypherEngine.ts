@@ -90,7 +90,7 @@ export class CypherEngine
         const limits = options.Limits;
         const paging = !model.HasWrites() && limits?.Skip !== undefined;
         if (paging) CypherEngine.ValidatePaging(limits!);
-        return LogicalPlanner.Explain(new PlanSource(this.engine.Catalog, scope?.Hidden), model, parameters, this.options, paging);
+        return LogicalPlanner.Explain(new PlanSource(this.engine.Catalog, scope?.HiddenNames), model, parameters, this.options, paging);
     }
 
     public static ToDto(result: CypherResult): CypherResultDto

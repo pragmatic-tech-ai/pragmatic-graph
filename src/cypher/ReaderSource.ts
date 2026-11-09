@@ -26,7 +26,7 @@ export class ReaderSource extends CatalogSource
 
     constructor(private readonly reader: GraphReader)
     {
-        super(reader.Catalog, reader.Scope.Hidden);
+        super(reader.Catalog, reader.Scope.HiddenNames);
     }
 
     public async *ScanLabel(label: string, probe?: IReadProbe): AsyncIterable<CypherNode>

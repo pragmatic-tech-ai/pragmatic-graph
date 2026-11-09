@@ -54,7 +54,7 @@ export interface IReadProbe
  * disposes readers still open when it is disposed). Values returned are copies, never live storage.
  *
  * Every reader carries an AccessScope (spec section 7). A node the scope does not let it see behaves
- * exactly as a missing node in every read; a member the scope hides reads as null in GetProperty and
+ * exactly as a missing node in every read; a member the scope hides (Hidden or HiddenExact) reads as null in GetProperty and
  * yields no rows in ScanConcept (and an index over a hidden member skips the node in SeekIndex). The
  * visibility reads are recorded like any other read. EstimateCount stays an unscoped upper bound.
  */
@@ -102,8 +102,8 @@ export class GraphReader implements IGraphDisposable
     }
 
     /**
-     * The members the scope hides on instances of the concept (the union of every Hidden entry naming it, an
-     * ancestor or a carried aspect); empty when nothing is hidden. Scope metadata only: nothing is read or recorded.
+     * The members the scope hides on nodes whose own concept is `concept` (the union of every Hidden entry naming it, an
+     * ancestor or a carried aspect, and the HiddenExact entry naming it); empty when nothing is hidden. Scope metadata only: nothing is read or recorded.
      */
     public HiddenMembers(concept: string): ReadonlySet<string>
     {
