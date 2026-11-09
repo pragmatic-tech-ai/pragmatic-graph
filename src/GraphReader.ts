@@ -22,6 +22,22 @@ export interface IScanRow
     readonly Value: CellValue;
 }
 
+/** A whole node as the query layer reads it: every effective, non-hidden property (null when unset). */
+export interface INodeView
+{
+    readonly PublicId: string;
+    readonly Concept: string;
+    readonly Owner: string;
+    readonly Properties: ReadonlyMap<string, CellValue>;
+}
+
+/** One edge of a node as the query layer reads it: the relationship name and the far node's public id. */
+export interface ILinkView
+{
+    readonly Relationship: string;
+    readonly PublicId: string;
+}
+
 /**
  * A consistent, read-only view of the graph at one commit (snapshot isolation): commits made after
  * the reader opened are not visible. Created by GraphStore.BeginRead; end it with dispose() (the store
@@ -93,6 +109,80 @@ export class GraphReader implements IGraphDisposable
             return null;
         }
         return this.recorded.Cell(node, def);
+    }
+
+    /**
+     * The whole node: concept, owner and every effective property the scope does not hide (null for an
+     * unset one), in effective member order. Undefined when no visible node has the public id. Records
+     * the node's binding and one Cell key per returned property, as GetProperty does.
+     */
+    public async ReadNode(publicId: string): Promise<INodeView | undefined>
+    {
+        this.RequireOpen();
+        const node = await this.Locate(publicId);
+        if (node === undefined)
+        {
+            return undefined;
+        }
+        const hidden = this.evaluator?.HiddenMembers(node.Concept);
+        const properties = new Map<string, CellValue>();
+        for (const def of this.snapshot.Index.Catalog.EffectiveMembers(node.Concept))
+        {
+            if (def.Kind === MemberKind.Property && hidden?.has(def.Name) !== true)
+            {
+                properties.set(def.Name, await this.recorded.Cell(node, def));
+            }
+        }
+        return { PublicId: node.PublicId, Concept: node.Concept, Owner: await this.recorded.Owner(node), Properties: properties };
+    }
+
+    /**
+     * Every edge of the node in `direction` whose far node is visible: Out follows each relationship
+     * effective on the node's concept in effective member order (parent's, then aspects', then own),
+     * In each relationship targeting the concept (catalog order); within one relationship in edge order.
+     * A relationship the scope hides on its source concept is omitted. A missing or invisible node has
+     * none. Records the node's binding and the adjacency ranges, as Neighbors does.
+     */
+    public async Links(publicId: string, direction: EdgeDirection): Promise<readonly ILinkView[]>
+    {
+        this.RequireOpen();
+        if (direction !== EdgeDirection.Out && direction !== EdgeDirection.In)
+        {
+            throw new GraphError(GraphErrorCode.InvalidArgument, GraphReader.ErrDirection + String(direction));
+        }
+        const node = await this.Locate(publicId);
+        const out: ILinkView[] = [];
+        if (node === undefined)
+        {
+            return out;
+        }
+        const evaluator = this.evaluator;
+        const rels = direction === EdgeDirection.Out
+            ? this.snapshot.Index.Catalog.EffectiveMembers(node.Concept).filter(m => m.Kind === MemberKind.Relationship)
+            : this.snapshot.Index.IncomingRelationships(node.Concept);
+        const hidden = direction === EdgeDirection.Out ? evaluator?.HiddenMembers(node.Concept) : undefined;
+        for (const rel of rels)
+        {
+            if (hidden?.has(rel.Name) === true)
+            {
+                continue;
+            }
+            for await (const id of this.recorded.Adjacent(rel, node.Id, direction))
+            {
+                this.RequireOpen();
+                if (evaluator === undefined)
+                {
+                    out.push({ Relationship: rel.Name, PublicId: await this.recorded.PublicIdOf(id) });
+                    continue;
+                }
+                const neighbor = await evaluator.VisibleById(id);
+                if (neighbor !== undefined && (direction === EdgeDirection.Out || !evaluator.HiddenMembers(neighbor.Concept).has(rel.Name)))
+                {
+                    out.push({ Relationship: rel.Name, PublicId: neighbor.PublicId });
+                }
+            }
+        }
+        return out;
     }
 
     /**

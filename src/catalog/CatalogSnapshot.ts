@@ -379,6 +379,29 @@ export class CatalogSnapshot
         return this.isaSets.get(concept)!.has(conceptOrAspect);
     }
 
+    /** Distinct relationship names declared by any concept or aspect, in definition order. */
+    public Relationships(): readonly string[]
+    {
+        const names = new Set<string>();
+        for (const d of this.defs)
+        {
+            for (const m of d.Members)
+            {
+                if (m.Kind === MemberKind.Relationship)
+                {
+                    names.add(m.Name);
+                }
+            }
+        }
+        return [...names];
+    }
+
+    /** Every concept and aspect name, in definition order. */
+    public Names(): readonly string[]
+    {
+        return this.defs.map(d => d.Name);
+    }
+
     public ConceptsMatching(conceptOrAspect: string): readonly number[]
     {
         this.Require(conceptOrAspect);
