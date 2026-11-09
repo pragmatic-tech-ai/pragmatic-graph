@@ -54,6 +54,9 @@ export type { IBindingDescription, IDefinitionDescription, IIndexDescription, IS
 export { CatalogPlanner, type ICatalogPlan } from './schema/CatalogPlanner.js';
 export { CatalogDiff, type IRemovedMember } from './schema/CatalogDiff.js';
 
+// Cypher over the engine (plan 2): parse, plan and run queries under an access scope.
+export * as Cypher from './cypher/index.js';
+
 export class EngineInfo
 {
     public static readonly FormatVersion = 1;

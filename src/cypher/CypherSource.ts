@@ -1,4 +1,5 @@
 import type { CellValue } from '../columns/CellValue.js';
+import type { ILinkView } from '../GraphReader.js';
 import type { RelDirection } from './CypherEnums.js';
 import type { CypherNode } from './CypherNode.js';
 
@@ -30,6 +31,12 @@ export interface ICypherSource
     Node(publicId: string): Promise<CypherNode | undefined>;
     /** The node's edges in `direction`, of `relationship` or of every relationship when undefined. */
     Expand(publicId: string, relationship: string | undefined, direction: RelDirection): AsyncIterable<IExpandRow>;
+    /**
+     * The node's outgoing links (relationship, far node's public id), in relationship declaration then edge order
+     * as GraphReader.Links Out: relationships the scope hides and invisible far nodes are omitted. The result
+     * encoder fills each result node's links from it.
+     */
+    OutLinks(publicId: string): Promise<readonly ILinkView[]>;
     /**
      * The name of an index SeekEqual would use for the label and member: a non-partial index whose leading member
      * is the property and whose scope is the label itself, an ancestor or a carried aspect; undefined when none.

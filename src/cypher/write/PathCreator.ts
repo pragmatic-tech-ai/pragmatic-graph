@@ -5,7 +5,7 @@ import type { ICypherSource } from '../CypherSource.js';
 import { NodeValue, NullValue } from '../CypherValue.js';
 import type { NodePattern, PatternPath } from '../PatternPath.js';
 import { RelOrientation } from '../operators/RelOrientation.js';
-import type { TransactionSink } from './TransactionSink.js';
+import type { ICypherSink } from './CypherSink.js';
 import { WriteSupport } from './WriteSupport.js';
 
 /**
@@ -15,7 +15,7 @@ import { WriteSupport } from './WriteSupport.js';
  */
 export class PathCreator
 {
-    constructor(private readonly source: ICypherSource, private readonly sink: TransactionSink)
+    constructor(private readonly source: ICypherSource, private readonly sink: ICypherSink)
     {
     }
 

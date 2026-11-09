@@ -2,7 +2,7 @@ import type { Binding } from '../Binding.js';
 import type { DeleteClause } from '../CypherQueryModel.js';
 import type { CypherValue } from '../CypherValue.js';
 import type { IOperator } from '../operators/IOperator.js';
-import type { TransactionSink } from './TransactionSink.js';
+import type { ICypherSink } from './CypherSink.js';
 import { WriteSupport } from './WriteSupport.js';
 
 /** [DETACH] DELETE: deletes every target node of each input row (null targets are skipped). */
@@ -11,7 +11,7 @@ export class DeleteOperator implements IOperator
     constructor(
         private readonly child: IOperator,
         private readonly clause: DeleteClause,
-        private readonly sink: TransactionSink,
+        private readonly sink: ICypherSink,
         private readonly parameters: ReadonlyMap<string, CypherValue>,
     )
     {

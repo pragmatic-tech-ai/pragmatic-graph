@@ -4,7 +4,7 @@ import { CypherSemanticError } from '../CypherError.js';
 import type { SetItem } from '../CypherQueryModel.js';
 import { NodeValue, NullValue, ScalarValue, type CypherValue } from '../CypherValue.js';
 import { MapValue } from '../StructuredValues.js';
-import type { TransactionSink } from './TransactionSink.js';
+import type { ICypherSink } from './CypherSink.js';
 import { WriteSupport } from './WriteSupport.js';
 
 /**
@@ -14,7 +14,7 @@ import { WriteSupport } from './WriteSupport.js';
  */
 export class SetApplier
 {
-    constructor(private readonly sink: TransactionSink, private readonly parameters: ReadonlyMap<string, CypherValue>)
+    constructor(private readonly sink: ICypherSink, private readonly parameters: ReadonlyMap<string, CypherValue>)
     {
     }
 

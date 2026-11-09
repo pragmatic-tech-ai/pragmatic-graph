@@ -1,13 +1,13 @@
 import type { Binding } from '../Binding.js';
 import type { RemoveClause } from '../CypherQueryModel.js';
 import type { IOperator } from '../operators/IOperator.js';
-import type { TransactionSink } from './TransactionSink.js';
+import type { ICypherSink } from './CypherSink.js';
 import { WriteSupport } from './WriteSupport.js';
 
 /** REMOVE n.p: sets the property to null (a relationship member loses its edges) for each input row. */
 export class RemoveOperator implements IOperator
 {
-    constructor(private readonly child: IOperator, private readonly clause: RemoveClause, private readonly sink: TransactionSink)
+    constructor(private readonly child: IOperator, private readonly clause: RemoveClause, private readonly sink: ICypherSink)
     {
     }
 

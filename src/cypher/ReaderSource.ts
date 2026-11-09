@@ -1,21 +1,20 @@
-import type { IndexDef, MemberDef } from '../catalog/CatalogTypes.js';
 import { ValueCodec } from '../columns/ValueCodec.js';
 import { ValueType } from '../catalog/ValueType.js';
 import { DateTimeValue, DateValue, type CellValue } from '../columns/CellValue.js';
 import { EdgeDirection } from '../format/FormatKeys.js';
-import type { GraphReader } from '../GraphReader.js';
+import type { GraphReader, ILinkView } from '../GraphReader.js';
+import { CatalogSource } from './CatalogSource.js';
 import { RelDirection } from './CypherEnums.js';
 import { CypherSemanticError } from './CypherError.js';
 import { CypherNode } from './CypherNode.js';
-import type { ICypherSource, IExpandRow } from './CypherSource.js';
-import { LabelResolver } from './LabelResolver.js';
+import type { IExpandRow } from './CypherSource.js';
 
 /**
  * ICypherSource over one scoped GraphReader (or a GraphTransaction, which reads its snapshot). Every read goes
  * through the reader, so invisible nodes never surface, hidden members are absent and every read is recorded.
  * Nodes are loaded whole (ReadNode) when yielded. The reader stays owned by the caller.
  */
-export class ReaderSource implements ICypherSource
+export class ReaderSource extends CatalogSource
 {
     private static readonly UnknownDirection = 'unknown relationship direction';
     private static readonly StepSeparator = '\u0000';
@@ -25,29 +24,9 @@ export class ReaderSource implements ICypherSource
     private static readonly Int64MinNumber = Number(ReaderSource.Int64Min);
     private static readonly Int64LimitNumber = Number(ReaderSource.Int64Limit);
 
-    private readonly labels: LabelResolver;
-    private readonly relationships: ReadonlySet<string>;
-    private readonly indexCache = new Map<string, IndexDef | undefined>();
-
     constructor(private readonly reader: GraphReader)
     {
-        this.labels = new LabelResolver(reader.Catalog);
-        this.relationships = new Set(reader.Catalog.Relationships());
-    }
-
-    public ResolveLabel(label: string): string
-    {
-        return this.labels.Resolve(label);
-    }
-
-    public HasRelationship(name: string): boolean
-    {
-        return this.relationships.has(name);
-    }
-
-    public IsA(node: CypherNode, label: string): boolean
-    {
-        return this.reader.Catalog.IsA(node.Concept, this.labels.Resolve(label));
+        super(reader.Catalog, reader.Scope.Hidden);
     }
 
     public async *ScanLabel(label: string): AsyncIterable<CypherNode>
@@ -58,7 +37,7 @@ export class ReaderSource implements ICypherSource
     /** Root concepts in definition order, each with its subtypes (ScanNodes order): every concept exactly once. */
     public async *ScanAll(): AsyncIterable<CypherNode>
     {
-        for (const def of this.reader.Catalog.Definitions())
+        for (const def of this.catalog.Definitions())
         {
             if (!def.IsAspect && def.Parent === null)
             {
@@ -100,9 +79,10 @@ export class ReaderSource implements ICypherSource
         throw new CypherSemanticError(`${ReaderSource.UnknownDirection} "${String(direction)}"`);
     }
 
-    public IndexFor(label: string, member: string): string | undefined
+    /** The node's outgoing links as the reader sees them (Links Out: hidden relationships and invisible targets omitted). */
+    public OutLinks(publicId: string): Promise<readonly ILinkView[]>
     {
-        return this.FindIndex(this.labels.Resolve(label), member)?.Name;
+        return this.reader.Links(publicId, EdgeDirection.Out);
     }
 
     /**
@@ -118,32 +98,9 @@ export class ReaderSource implements ICypherSource
         {
             return undefined;
         }
-        const type = this.reader.Catalog.IndexMembers(index)[0]!.Type;
+        const type = this.catalog.IndexMembers(index)[0]!.Type;
         const key = ReaderSource.SeekKey(type, value);
         return key === undefined || !ReaderSource.Encodable(type!, key) ? ReaderSource.NoNodes() : this.Seek(index.Name, name, key);
-    }
-
-    private FindIndex(label: string, member: string): IndexDef | undefined
-    {
-        const cacheKey = label + ReaderSource.StepSeparator + member;
-        if (!this.indexCache.has(cacheKey))
-        {
-            const catalog = this.reader.Catalog;
-            const candidates = catalog.IsAspect(label) ? catalog.Indexes().filter(i => i.On === label) : catalog.IndexesOn(label);
-            this.indexCache.set(cacheKey, candidates.find(i => i.Where === undefined && catalog.IndexMembers(i)[0]?.Name === member && !this.HidesAny(catalog.IndexMembers(i))));
-        }
-        return this.indexCache.get(cacheKey);
-    }
-
-    // SeekIndex skips a node when the scope hides ANY member of the index, so such an index would drop rows the scan
-    // returns. Conservative: a member name hidden on any type disqualifies the index.
-    private HidesAny(members: readonly MemberDef[]): boolean
-    {
-        for (const hidden of this.reader.Scope.Hidden.values())
-        {
-            if (members.some(m => hidden.has(m.Name))) return true;
-        }
-        return false;
     }
 
     private async *Seek(index: string, label: string, key: CellValue): AsyncIterable<CypherNode>
@@ -151,7 +108,7 @@ export class ReaderSource implements ICypherSource
         for await (const publicId of this.reader.SeekIndex(index, { Prefix: [key] }))
         {
             const node = await this.Node(publicId);
-            if (node !== undefined && this.reader.Catalog.IsA(node.Concept, label))
+            if (node !== undefined && this.catalog.IsA(node.Concept, label))
             {
                 yield node;
             }

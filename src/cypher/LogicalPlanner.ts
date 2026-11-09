@@ -41,7 +41,8 @@ import { MergeOperator } from './write/MergeOperator.js';
 import { RemoveOperator } from './write/RemoveOperator.js';
 import { SetApplier } from './write/SetApplier.js';
 import { SetOperator } from './write/SetOperator.js';
-import type { TransactionSink } from './write/TransactionSink.js';
+import type { ICypherSink } from './write/CypherSink.js';
+import { ExplainSink } from './write/ExplainSink.js';
 
 interface ISeekChoice
 {
@@ -67,7 +68,7 @@ export interface PlannerOptions
 /**
  * Compiles a CypherQueryModel into an async operator tree over an ICypherSource. Planning is synchronous and
  * raises every semantic error (scope, labels, relationship types, SKIP/LIMIT) before any row is read: labels are
- * resolved here (exact name, else unique simple name). Write clauses compile only with a TransactionSink (whose
+ * resolved here (exact name, else unique simple name). Write clauses compile only with an ICypherSink (whose
  * View must be the planner's source): each is fenced by EagerBarriers (clause-at-a-time, rows refreshed through
  * the overlay); without a sink they fail planning.
  */
@@ -99,7 +100,7 @@ export class LogicalPlanner
         // Paging needs a stable order: when set, an unordered final RETURN is sorted by all its columns (ascending).
         private readonly ensureOrder: boolean = false,
         // Only write-capable plans (PlanForWrite) supply one; read planning omits it.
-        private readonly sink?: TransactionSink,
+        private readonly sink?: ICypherSink,
     )
     {
         this.maxVarLength = options?.MaxVarLength ?? LogicalPlanner.DefaultMaxVarLength;
@@ -107,12 +108,22 @@ export class LogicalPlanner
     }
 
     /**
-     * The operator tree for a read query over the source, one line per operator, children indented. Planning only:
-     * nothing is read. Parameters are needed only when SKIP/LIMIT use them. CypherEngine.Explain delegates here.
+     * The operator tree for a query over the source, one line per operator, children indented. Planning only:
+     * nothing is read. A write query is planned with an ExplainSink (its writes compile against an empty overlay
+     * and would refuse to run), and its final projection is shown over the mutation pipeline. Parameters are
+     * needed only when SKIP/LIMIT use them. CypherEngine.Explain delegates here.
      */
-    public static Explain(source: ICypherSource, text: string, parameters: ReadonlyMap<string, CypherValue> = new Map(), options?: PlannerOptions): string
+    public static Explain(source: ICypherSource, query: string | CypherQueryModel, parameters: ReadonlyMap<string, CypherValue> = new Map(), options?: PlannerOptions): string
     {
-        return OperatorPrinter.Print(new LogicalPlanner(source, parameters, options).Plan(new CypherParser(text).Parse()));
+        const model = typeof query === 'string' ? new CypherParser(query).Parse() : query;
+        if (!model.HasWrites())
+        {
+            return OperatorPrinter.Print(new LogicalPlanner(source, parameters, options).Plan(model));
+        }
+        const sink = new ExplainSink(source);
+        const planner = new LogicalPlanner(sink.View, parameters, options, undefined, false, sink);
+        const plan = planner.PlanForWrite(model);
+        return OperatorPrinter.Print(plan.Projection === undefined ? plan.Mutations : planner.ProjectOver(plan.Mutations, plan.Projection));
     }
 
     public Plan(model: CypherQueryModel): IOperator

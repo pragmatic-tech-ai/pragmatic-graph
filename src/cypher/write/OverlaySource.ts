@@ -1,4 +1,5 @@
 import type { CellValue } from '../../columns/CellValue.js';
+import type { ILinkView } from '../../GraphReader.js';
 import { Binding, EvalContext } from '../Binding.js';
 import { ComparisonOp, RelDirection } from '../CypherEnums.js';
 import type { CypherNode } from '../CypherNode.js';
@@ -92,6 +93,29 @@ export class OverlaySource implements ICypherSource
                 yield row;
             }
         }
+    }
+
+    /**
+     * The snapshot's outgoing links minus the edges this query removed and the far nodes it deleted, then the
+     * edges it added (each in recording order); none for a deleted node. Within one relationship that is the
+     * order the commit will store them in.
+     */
+    public async OutLinks(publicId: string): Promise<readonly ILinkView[]>
+    {
+        if (this.overlay.IsDeleted(publicId)) return [];
+        const links: ILinkView[] = [];
+        if (!this.overlay.IsCreated(publicId))
+        {
+            for (const link of await this.base.OutLinks(publicId))
+            {
+                if (!this.overlay.IsRemoved(publicId, link.Relationship, link.PublicId) && !this.overlay.IsDeleted(link.PublicId)) links.push(link);
+            }
+        }
+        for (const edge of this.overlay.AddedEdges())
+        {
+            if (edge.From === publicId && !this.overlay.IsDeleted(edge.To)) links.push({ Relationship: edge.Relationship, PublicId: edge.To });
+        }
+        return links;
     }
 
     public IndexFor(label: string, member: string): string | undefined

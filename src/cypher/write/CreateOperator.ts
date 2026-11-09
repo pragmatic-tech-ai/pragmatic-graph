@@ -3,14 +3,14 @@ import type { CreateClause } from '../CypherQueryModel.js';
 import type { ICypherSource } from '../CypherSource.js';
 import type { IOperator } from '../operators/IOperator.js';
 import { PathCreator } from './PathCreator.js';
-import type { TransactionSink } from './TransactionSink.js';
+import type { ICypherSink } from './CypherSink.js';
 
 /** CREATE: writes every pattern of the clause for each input row. */
 export class CreateOperator implements IOperator
 {
     private readonly creator: PathCreator;
 
-    constructor(private readonly child: IOperator, private readonly clause: CreateClause, source: ICypherSource, sink: TransactionSink, bound: ReadonlySet<string>)
+    constructor(private readonly child: IOperator, private readonly clause: CreateClause, source: ICypherSource, sink: ICypherSink, bound: ReadonlySet<string>)
     {
         for (const path of clause.Paths)
         {

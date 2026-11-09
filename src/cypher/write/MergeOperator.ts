@@ -8,7 +8,7 @@ import type { IOperator } from '../operators/IOperator.js';
 import type { IOptionalPlan } from '../operators/OptionalApply.js';
 import { PathCreator } from './PathCreator.js';
 import type { SetApplier } from './SetApplier.js';
-import type { TransactionSink } from './TransactionSink.js';
+import type { ICypherSink } from './CypherSink.js';
 import { WriteSupport } from './WriteSupport.js';
 
 /**
@@ -25,7 +25,7 @@ export class MergeOperator implements IOperator
         private readonly child: IOperator,
         private readonly clause: MergeClause,
         source: ICypherSource,
-        private readonly sink: TransactionSink,
+        private readonly sink: ICypherSink,
         private readonly applier: SetApplier,
         // The MERGE pattern compiled as a match over one input row (its bound variables fixed).
         private readonly matcher: IOptionalPlan,

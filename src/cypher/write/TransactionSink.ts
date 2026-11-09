@@ -17,6 +17,7 @@ import { CypherNode } from '../CypherNode.js';
 import type { ICypherSource } from '../CypherSource.js';
 import type { CypherScalar } from '../CypherValue.js';
 import { CypherWriteStats } from './CypherWriteStats.js';
+import type { ICypherSink } from './CypherSink.js';
 import type { INodePlacement } from './NodePlacement.js';
 import { OverlaySource } from './OverlaySource.js';
 import { OverlayEdge, PendingOverlay } from './PendingOverlay.js';
@@ -30,7 +31,7 @@ import { OverlayEdge, PendingOverlay } from './PendingOverlay.js';
  * CypherWriteError with the GraphError as cause (ConflictError → Conflict, AccessError → Denied, CommitError →
  * Invalid, ConnectorError → ConnectorFailed).
  */
-export class TransactionSink
+export class TransactionSink implements ICypherSink
 {
     private static readonly Dot = '.';
     private static readonly NoOwner = '';
