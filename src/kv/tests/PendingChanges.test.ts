@@ -27,6 +27,12 @@ class Rng
 
 class PendingFx
 {
+    /** Keys per structure in the small linearity run; the large run builds 10x (ruling R84). */
+    public static readonly LinearSmall = 2000;
+    /** Independent structures built per timed run, so the small run is well above timer noise (R84). */
+    public static readonly LinearBatches = 10;
+    public static readonly LinearRepeats = 5;
+
     public static Key(n: number): Uint8Array
     {
         return TupleCodec.Encode([n]);
@@ -141,21 +147,24 @@ describe('PendingChanges', () =>
 
     it('stays linear for many keys in random order and for alternating Set and bounded scans', async () =>
     {
-        await Linearity.Check('PendingChanges random Set + alternating Set/InRange', 20000, n =>
+        await Linearity.Check('PendingChanges random Set + alternating Set/InRange', PendingFx.LinearSmall, n =>
         {
-            const pending = new PendingChanges();
-            const rng = new Rng(5);
-            for (let i = 0; i < n; i++)
+            for (let batch = 0; batch < PendingFx.LinearBatches; batch++)
             {
-                pending.Set(PendingFx.Key(rng.Int(1_000_000_000)), Uint8Array.of(1));
+                const pending = new PendingChanges();
+                const rng = new Rng(5 + batch);
+                for (let i = 0; i < n; i++)
+                {
+                    pending.Set(PendingFx.Key(rng.Int(1_000_000_000)), Uint8Array.of(1));
+                }
+                for (let i = 0; i < n / 10; i++)
+                {
+                    const k = rng.Int(1_000_000_000);
+                    pending.Set(PendingFx.Key(k), Uint8Array.of(2));
+                    const first = pending.InRange({ Start: PendingFx.Key(k), End: PendingFx.Key(k + 1_000_000) })[Symbol.iterator]().next();
+                    assert.equal(first.done, false);
+                }
             }
-            for (let i = 0; i < n / 10; i++)
-            {
-                const k = rng.Int(1_000_000_000);
-                pending.Set(PendingFx.Key(k), Uint8Array.of(2));
-                const first = pending.InRange({ Start: PendingFx.Key(k), End: PendingFx.Key(k + 1_000_000) })[Symbol.iterator]().next();
-                assert.equal(first.done, false);
-            }
-        }, 3);
+        }, PendingFx.LinearRepeats);
     });
 });
