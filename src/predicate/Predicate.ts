@@ -27,6 +27,7 @@ export enum PredicateKind
     Reachable,
     Seeded,
     OwnerIs,
+    ConceptIs,
 }
 
 /** One hop of a Reachable predicate: follow `Relationship` in `Direction`. */
@@ -44,7 +45,7 @@ export abstract class Predicate
 {
     public abstract readonly Kind: PredicateKind;
 
-    /** True iff the tree contains no Related, Reachable, Seeded or OwnerIs. Computed once at construction. */
+    /** True iff the tree contains no Related, Reachable, Seeded, OwnerIs or ConceptIs. Computed once at construction. */
     public abstract readonly IsNodeLocal: boolean;
 
     public static get True(): Predicate
@@ -207,6 +208,25 @@ export class OwnerIs extends Predicate
         super();
         this.IsNodeLocal = false;
         this.Owners = new Set(owners);
+        Object.freeze(this);
+    }
+}
+
+/**
+ * The node's own concept is exactly `Concept`: no ancestors, no carried aspects (ruling R93). Lets an access-scope
+ * entry, which applies to subconcepts and aspect carriers too, be guarded to its own concept:
+ * `Or(Not(ConceptIs K), rule)`. Not node-local (the concept is not one of the node's values), so an index Where
+ * may not use it; scope evaluators decide it from the node itself.
+ */
+export class ConceptIs extends Predicate
+{
+    public readonly Kind = PredicateKind.ConceptIs;
+    public readonly IsNodeLocal: boolean;
+
+    public constructor(public readonly Concept: string)
+    {
+        super();
+        this.IsNodeLocal = false;
         Object.freeze(this);
     }
 }

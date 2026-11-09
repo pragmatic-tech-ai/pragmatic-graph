@@ -1,13 +1,14 @@
 import type { CatalogSnapshot } from '../catalog/CatalogSnapshot.js';
 import type { CellValue } from '../columns/CellValue.js';
 import { NodeEvaluator, Truth } from '../predicate/NodeEvaluator.js';
-import { type And, type Not, type Or, type OwnerIs, type Predicate, PredicateKind } from '../predicate/Predicate.js';
+import { type And, type ConceptIs, type Not, type Or, type OwnerIs, type Predicate, PredicateKind } from '../predicate/Predicate.js';
 import type { IReadNode } from '../RecordedReads.js';
 import { type BatchOp, type WriteBatch, WriteOp } from '../txn/WriteBatch.js';
 import { AccessError, AccessErrorCode } from './AccessError.js';
 import { AccessDefault, type IWriteRules } from './AccessScope.js';
 import type { ScopeEvaluator } from './ScopeEvaluator.js';
 import { WriteExemptions } from './WriteExemptions.js';
+import { WriteStage } from './WriteStage.js';
 
 /** A node the batch creates: its concept, owner ('' for none) and the values the batch sets on it (last wins). */
 class CreatedNode
@@ -41,7 +42,8 @@ class OpTargets
 
 /**
  * Evaluates a Create rule on a node that exists only in the batch (ruling R69): node-local subtrees by
- * NodeEvaluator on the end-of-batch values, OwnerIs against the CreateNode op's owner, Seeded as false
+ * NodeEvaluator on the end-of-batch values, OwnerIs against the CreateNode op's owner, ConceptIs against its
+ * concept, Seeded as false
  * (a transaction never seeds); Kleene logic across the tree, collapsed at the top. Related and Reachable
  * would need the graph, which a batch is not (R30): such a rule is refused before evaluation.
  */
@@ -82,6 +84,8 @@ class CreateEvaluator
                 return Truth.False;
             case PredicateKind.OwnerIs:
                 return (p as OwnerIs).Owners.has(node.Owner) ? Truth.True : Truth.False;
+            case PredicateKind.ConceptIs:
+                return node.Concept === (p as ConceptIs).Concept ? Truth.True : Truth.False;
             case PredicateKind.Not:
             {
                 const inner = CreateEvaluator.Eval((p as Not).Term, node);
@@ -137,7 +141,8 @@ enum RuleKind
  *   predicate using Related or Reachable is not node-local and denies the create.
  * - SetProperty, Link, Unlink (the node is the edge's source): the node must be visible and every
  *   applicable Update predicate hold on its snapshot values (R30); a node the batch created is exempt.
- *   The member written must not be hidden on the node's concept, nor read-only (ruling R92). A host-placed
+ *   The member written must not be hidden on the node's concept, nor read-only (ruling R92): the entries'
+ *   ReadOnly.Create sets on a node the batch created, their ReadOnly.Update sets on an existing node. A host-placed
  *   default on a node the batch created (GraphTransaction.SetDefault, R91) is exempt from both; an unlink a
  *   DETACH DELETE implies (GraphTransaction.DetachUnlink) is exempt from ReadOnly when the batch later deletes
  *   one of its ends (the Delete rule governs it). A Link/Unlink target and a Link's
@@ -342,7 +347,7 @@ export class WriteGate
                 this.CheckHidden(index, op, publicId, created.Concept, member);
                 if (!detach)
                 {
-                    this.CheckReadOnly(index, op, publicId, created.Concept, member);
+                    this.CheckReadOnly(index, op, publicId, created.Concept, member, WriteStage.Create);
                 }
             }
             return created.Concept;
@@ -351,7 +356,7 @@ export class WriteGate
         this.CheckHidden(index, op, publicId, node.Concept, member);
         if (!detach)
         {
-            this.CheckReadOnly(index, op, publicId, node.Concept, member);
+            this.CheckReadOnly(index, op, publicId, node.Concept, member, WriteStage.Update);
         }
         let allowed = this.updates.get(node.Id);
         if (allowed === undefined)
@@ -388,9 +393,9 @@ export class WriteGate
         }
     }
 
-    private CheckReadOnly(index: number, op: WriteOp, publicId: string, concept: string, member: string): void
+    private CheckReadOnly(index: number, op: WriteOp, publicId: string, concept: string, member: string, stage: WriteStage): void
     {
-        if (this.evaluator.ReadOnlyMembers(concept).has(member))
+        if (this.evaluator.ReadOnlyMembers(concept, stage).has(member))
         {
             throw this.Denied(AccessErrorCode.MemberReadOnly, index, op, publicId, concept, WriteGate.ErrReadOnly + member);
         }

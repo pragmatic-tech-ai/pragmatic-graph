@@ -3,9 +3,10 @@ import { MemberKind } from '../catalog/ValueType.js';
 import type { CellValue } from '../columns/CellValue.js';
 import { GraphError, GraphErrorCode } from '../errors/GraphError.js';
 import { NodeEvaluator, Truth } from '../predicate/NodeEvaluator.js';
-import { type And, type Not, type Or, type OwnerIs, Predicate, PredicateKind, type Reachable, type Related } from '../predicate/Predicate.js';
+import { type And, type ConceptIs, type Not, type Or, type OwnerIs, Predicate, PredicateKind, type Reachable, type Related } from '../predicate/Predicate.js';
 import type { IReadNode, RecordedReads } from '../RecordedReads.js';
 import { AccessDefault, type AccessScope, type IWriteRules } from './AccessScope.js';
+import { WriteStage } from './WriteStage.js';
 
 /** One node under evaluation, with the property values read so far (absent = not a property of the node). */
 class NodeFacts
@@ -61,7 +62,8 @@ export class ScopeEvaluator
     private readonly rows = new Map<string, readonly Predicate[]>();
     private readonly writes = new Map<string, readonly IWriteRules[]>();
     private readonly hidden = new Map<string, ReadonlySet<string>>();
-    private readonly readOnly = new Map<string, ReadonlySet<string>>();
+    private readonly readOnlyCreate = new Map<string, ReadonlySet<string>>();
+    private readonly readOnlyUpdate = new Map<string, ReadonlySet<string>>();
     private readonly properties = new Map<string, ReadonlyMap<string, MemberDef>>();
     private readonly memberNames = new Map<Predicate, ReadonlySet<string>>();
     private readonly reachable = new Map<Reachable, Promise<ReadonlySet<bigint>>>();
@@ -156,22 +158,27 @@ export class ScopeEvaluator
         return out;
     }
 
-    /** Members the writer may not write on instances of `concept`: the union of every applicable Writes entry's ReadOnly (R92). */
-    public ReadOnlyMembers(concept: string): ReadonlySet<string>
+    /**
+     * Members the writer may not write on instances of `concept` at `stage` (a node the batch creates, or an
+     * existing one): the union of every applicable Writes entry's ReadOnly set for that stage (R92).
+     */
+    public ReadOnlyMembers(concept: string, stage: WriteStage): ReadonlySet<string>
     {
-        let out = this.readOnly.get(concept);
+        const cache = stage === WriteStage.Create ? this.readOnlyCreate : this.readOnlyUpdate;
+        let out = cache.get(concept);
         if (out === undefined)
         {
             const union = new Set<string>();
             for (const rules of this.ApplicableWrites(concept))
             {
-                for (const m of rules.ReadOnly ?? ScopeEvaluator.NoReadOnly)
+                const members = stage === WriteStage.Create ? rules.ReadOnly?.Create : rules.ReadOnly?.Update;
+                for (const m of members ?? ScopeEvaluator.NoReadOnly)
                 {
                     union.add(m);
                 }
             }
             out = union.size === 0 ? ScopeEvaluator.NoReadOnly : union;
-            this.readOnly.set(concept, out);
+            cache.set(concept, out);
         }
         return out;
     }
@@ -289,6 +296,8 @@ export class ScopeEvaluator
                 return (await this.reads.Seeded(facts.Node)) ? Truth.True : Truth.False;
             case PredicateKind.OwnerIs:
                 return (p as OwnerIs).Owners.has(await this.reads.Owner(facts.Node)) ? Truth.True : Truth.False;
+            case PredicateKind.ConceptIs:
+                return facts.Node.Concept === (p as ConceptIs).Concept ? Truth.True : Truth.False;
             default:
                 throw new GraphError(GraphErrorCode.Internal, ScopeEvaluator.ErrKind + String(p.Kind));
         }

@@ -1,7 +1,7 @@
 import { test, describe, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { AccessError, AccessErrorCode } from '../AccessError.js';
-import { AccessDefault, AccessScope } from '../AccessScope.js';
+import { AccessDefault, AccessScope, type IReadOnlyMembers } from '../AccessScope.js';
 import { FalsePredicate } from '../../predicate/Predicate.js';
 import type { CellValue } from '../../columns/CellValue.js';
 import { GraphError, GraphErrorCode } from '../../errors/GraphError.js';
@@ -53,6 +53,7 @@ class RoFx
     public static readonly Tag = 'tag';
     public static readonly FirstPlaced = 'c0';
     public static readonly Created = 'n';
+    public static readonly FirstSequenced = 'n0';
     public static readonly Unknown = 'nope';
 
     public static Open(): Promise<F>
@@ -73,13 +74,25 @@ class RoFx
 
     public static Scope(readOnly: readonly string[] = [RoFx.Owner, RoFx.Assignee]): AccessScope
     {
-        return AccessScope.Build({ Default: AccessDefault.Allow, Writes: new Map([[RoFx.Item, { ReadOnly: new Set(readOnly) }]]) });
+        return AccessScope.Build({ Default: AccessDefault.Allow, Writes: new Map([[RoFx.Item, { ReadOnly: RoFx.Both(readOnly) }]]) });
+    }
+
+    /** The same members read-only at create and at update. */
+    public static Both(members: readonly string[]): IReadOnlyMembers
+    {
+        return { Create: new Set(members), Update: new Set(members) };
+    }
+
+    /** Item's read-only members: `create` checked on nodes the batch creates, `update` on existing nodes. */
+    public static StageScope(create: readonly string[], update: readonly string[]): AccessScope
+    {
+        return AccessScope.Build({ Default: AccessDefault.Allow, Writes: new Map([[RoFx.Item, { ReadOnly: { Create: new Set(create), Update: new Set(update) } }]]) });
     }
 
     /** Item's owner and assignee read-only, and Item nodes may not be deleted. */
     public static NoDeleteScope(): AccessScope
     {
-        return AccessScope.Build({ Default: AccessDefault.Allow, Writes: new Map([[RoFx.Item, { ReadOnly: new Set([RoFx.Owner, RoFx.Assignee]), Delete: FalsePredicate.Instance }]]) });
+        return AccessScope.Build({ Default: AccessDefault.Allow, Writes: new Map([[RoFx.Item, { ReadOnly: RoFx.Both([RoFx.Owner, RoFx.Assignee]), Delete: FalsePredicate.Instance }]]) });
     }
 
     public static async Exists(fx: F, publicId: string): Promise<boolean>
@@ -181,7 +194,7 @@ describe('read-only write members (R92)', () =>
 
     test('read-only keyed on an aspect applies to the concepts carrying it', async () =>
     {
-        const scope = AccessScope.Build({ Default: AccessDefault.Allow, Writes: new Map([[RoFx.Tagged, { ReadOnly: new Set([RoFx.Tag]) }]]) });
+        const scope = AccessScope.Build({ Default: AccessDefault.Allow, Writes: new Map([[RoFx.Tagged, { ReadOnly: RoFx.Both([RoFx.Tag]) }]]) });
         await RoFx.DeniedQuery(fx, "MATCH (p:Person) SET p.tag = 't'", RoFx.Tag, { Scope: scope });
         await W.Write(fx, "MATCH (p:Person) SET p.name = 'n'", { Scope: scope });
     });
@@ -224,15 +237,71 @@ describe('read-only write members (R92)', () =>
         await assert.rejects(fx.Engine.Begin(RoFx.Scope([RoFx.Unknown])),
             (e: unknown) => e instanceof GraphError && e.GraphCode === GraphErrorCode.InvalidArgument && e.message.includes(`${RoFx.Item}.${RoFx.Unknown}`));
         // A subconcept's member is not a member of the parent key.
-        await assert.rejects(fx.Engine.Begin(AccessScope.Build({ Default: AccessDefault.Allow, Writes: new Map([[RoFx.Person, { ReadOnly: new Set([RoFx.Owner]) }]]) })),
+        await assert.rejects(fx.Engine.Begin(AccessScope.Build({ Default: AccessDefault.Allow, Writes: new Map([[RoFx.Person, { ReadOnly: RoFx.Both([RoFx.Owner]) }]]) })),
             (e: unknown) => e instanceof GraphError && e.GraphCode === GraphErrorCode.InvalidArgument);
     });
 
-    test('Build copies the read-only set', async () =>
+    test('Build copies the read-only sets', async () =>
     {
-        const names = new Set([RoFx.Owner]);
-        const scope = AccessScope.Build({ Default: AccessDefault.Allow, Writes: new Map([[RoFx.Item, { ReadOnly: names }]]) });
-        names.clear();
-        assert.deepEqual([...(scope.Writes.get(RoFx.Item)?.ReadOnly ?? [])], [RoFx.Owner]);
+        const create = new Set([RoFx.Owner]);
+        const update = new Set([RoFx.Title]);
+        const scope = AccessScope.Build({ Default: AccessDefault.Allow, Writes: new Map([[RoFx.Item, { ReadOnly: { Create: create, Update: update } }]]) });
+        create.clear();
+        update.clear();
+        const readOnly = scope.Writes.get(RoFx.Item)?.ReadOnly;
+        assert.deepEqual([...(readOnly?.Create ?? [])], [RoFx.Owner]);
+        assert.deepEqual([...(readOnly?.Update ?? [])], [RoFx.Title]);
+        assert.ok(Object.isFrozen(readOnly));
+    });
+
+    test('read-only names on either stage must be members of their key', async () =>
+    {
+        for (const scope of [RoFx.StageScope([RoFx.Unknown], []), RoFx.StageScope([], [RoFx.Unknown])])
+        {
+            await assert.rejects(fx.Engine.Begin(scope),
+                (e: unknown) => e instanceof GraphError && e.GraphCode === GraphErrorCode.InvalidArgument && e.message.includes(`${RoFx.Item}.${RoFx.Unknown}`));
+        }
+    });
+
+    test('create-only member is settable on create', async () =>
+    {
+        const scope = RoFx.StageScope([], [RoFx.Owner, RoFx.Assignee]);
+        await W.Write(fx, "CREATE (n:Ticket {title: 'a', owner: 'u2'})-[:assignee]->(m:Person)", { Scope: scope });
+        assert.equal(await RoFx.Read(fx, AccessScope.System, RoFx.FirstSequenced, RoFx.Owner), RoFx.U2);
+        const t = await fx.Engine.Begin(scope);
+        try
+        {
+            t.CreateNode(RoFx.Created, RoFx.Ticket);
+            t.SetProperty(RoFx.Created, RoFx.Owner, RoFx.U1);
+            t.Link(RoFx.Created, RoFx.Assignee, RoFx.Q);
+            await t.Commit();
+        }
+        finally
+        {
+            t.dispose();
+        }
+        assert.equal(await RoFx.Read(fx, AccessScope.System, RoFx.Created, RoFx.Owner), RoFx.U1);
+    });
+
+    test('create-only member is refused on update', async () =>
+    {
+        const scope = RoFx.StageScope([], [RoFx.Owner, RoFx.Assignee]);
+        await RoFx.DeniedQuery(fx, "MATCH (k:Ticket {title: 'x'}) SET k.owner = 'u2'", RoFx.Owner, { Scope: scope });
+        await RoFx.DeniedQuery(fx, "MATCH (k:Ticket {title: 'x'}) REMOVE k.assignee", RoFx.Assignee, { Scope: scope });
+        await RoFx.DeniedQuery(fx, "MATCH (k:Ticket {title: 'x'}), (q:Person) CREATE (k)-[:assignee]->(q)", RoFx.Assignee, { Scope: scope });
+        // Other members of an existing node stay writable.
+        await W.Write(fx, "MATCH (k:Ticket {title: 'x'}) SET k.title = 'y'", { Scope: scope });
+        assert.equal(await RoFx.Read(fx, AccessScope.System, RoFx.K, RoFx.Owner), RoFx.U1);
+    });
+
+    test('update-only read-only member is refused on create but default still allowed', async () =>
+    {
+        const scope = RoFx.StageScope([RoFx.Owner], []);
+        await RoFx.DeniedQuery(fx, "CREATE (n:Ticket {title: 'a', owner: 'u2'})", RoFx.Owner, { Scope: scope });
+        await W.Write(fx, "CREATE (n:Ticket {title: 'a'})", { Scope: scope, Placement: new OwnerPlacement(RoFx.U2) });
+        assert.equal(await RoFx.Read(fx, AccessScope.System, RoFx.FirstPlaced, RoFx.Owner), RoFx.U2);
+        // Not read-only on update: an existing node's owner may change.
+        await W.Write(fx, "MATCH (k:Ticket {title: 'x'}) SET k.owner = 'u2'", { Scope: scope });
+        assert.equal(await RoFx.Read(fx, AccessScope.System, RoFx.K, RoFx.Owner), RoFx.U2);
     });
 });

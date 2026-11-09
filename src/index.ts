@@ -10,7 +10,7 @@ export type { ILmdbOptions } from './kv/lmdb/LmdbStore.js';
 export { GraphReader, type ILinkView, type INodeView, type IReadProbe, type IScanRow } from './GraphReader.js';
 export type { IIndexBound, IIndexRange } from './indexes/IndexKey.js';
 export { GraphTransaction } from './GraphTransaction.js';
-export { AccessDefault, AccessScope, type IAccessScopeOptions, type IWriteRules } from './access/AccessScope.js';
+export { AccessDefault, AccessScope, type IAccessScopeOptions, type IReadOnlyMembers, type IWriteRules } from './access/AccessScope.js';
 
 // Schema definition.
 export { CatalogModel, type IConceptOptions, type IndexDef, type MemberDef, type MemberInput, type TypeDefinition } from './catalog/CatalogModel.js';
@@ -44,7 +44,7 @@ export { BindingTable } from './connectors/BindingTable.js';
 export { ConnectorError, ConnectorPhase } from './connectors/ConnectorError.js';
 
 // Predicate language and node-local evaluation.
-export { And, Compare, CompareOp, FalsePredicate, IdIn, In, IsNull, Not, Or, OwnerIs, Predicate, PredicateKind, Reachable, Related, Seeded, TruePredicate, type IPathStep } from './predicate/Predicate.js';
+export { And, Compare, CompareOp, ConceptIs, FalsePredicate, IdIn, In, IsNull, Not, Or, OwnerIs, Predicate, PredicateKind, Reachable, Related, Seeded, TruePredicate, type IPathStep } from './predicate/Predicate.js';
 export { PredicateCodec } from './predicate/PredicateCodec.js';
 export { PredicateError, PredicateErrorCode } from './predicate/PredicateError.js';
 export { NodeEvaluator } from './predicate/NodeEvaluator.js';

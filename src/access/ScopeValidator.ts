@@ -3,7 +3,7 @@ import type { MemberDef } from '../catalog/CatalogTypes.js';
 import { MemberKind } from '../catalog/ValueType.js';
 import { GraphError, GraphErrorCode } from '../errors/GraphError.js';
 import { EdgeDirection } from '../format/FormatKeys.js';
-import type { And, Compare, In, IsNull, Not, Or, Predicate, Reachable, Related } from '../predicate/Predicate.js';
+import type { And, Compare, ConceptIs, In, IsNull, Not, Or, Predicate, Reachable, Related } from '../predicate/Predicate.js';
 import { PredicateKind } from '../predicate/Predicate.js';
 import type { CatalogIndex } from '../txn/CatalogIndex.js';
 import type { AccessScope } from './AccessScope.js';
@@ -22,7 +22,8 @@ class Place
 
 /**
  * Internal: checks an AccessScope's names against a catalog (ruling R63). Every Rows, Hidden and Writes
- * key must be a concept or aspect; every Hidden member and every Writes ReadOnly member a member of its key; every property a Rows or
+ * key must be a concept or aspect; every Hidden member and every Writes ReadOnly member (Create and Update) a member of its key;
+ * every ConceptIs name a concept (R93); every property a Rows or
  * Writes predicate reads an effective property of its key (Related Targets: of a concept the step
  * reaches), and every relationship a Related or Reachable step follows an effective relationship
  * (parity with index Where, R61). Violations are GraphError InvalidArgument naming the key and name.
@@ -34,8 +35,10 @@ export class ScopeValidator
     private static readonly ErrUnknownReadOnly = 'AccessScope marks read-only a member that is not effective on its key: ';
     private static readonly ErrProperty = 'AccessScope predicate reads a name that is not an effective property: ';
     private static readonly ErrRelationship = 'AccessScope predicate follows a name that is not an effective relationship: ';
+    private static readonly ErrConceptIs = 'AccessScope predicate tests for a name that is not a concept: ';
     private static readonly ErrNoConcept = 'AccessScope predicate follows a relationship that reaches no concept: ';
     private static readonly Dot = '.';
+    private static readonly Colon = ': ';
 
     public static Validate(scope: AccessScope, index: CatalogIndex): void
     {
@@ -60,7 +63,8 @@ export class ScopeValidator
         }
         for (const [key, rules] of scope.Writes)
         {
-            ScopeValidator.RequireMembers(index, key, rules.ReadOnly ?? [], ScopeValidator.ErrUnknownReadOnly);
+            ScopeValidator.RequireMembers(index, key, rules.ReadOnly?.Create ?? [], ScopeValidator.ErrUnknownReadOnly);
+            ScopeValidator.RequireMembers(index, key, rules.ReadOnly?.Update ?? [], ScopeValidator.ErrUnknownReadOnly);
             for (const predicate of [rules.Create, rules.Update, rules.Delete])
             {
                 if (predicate !== undefined)
@@ -96,6 +100,16 @@ export class ScopeValidator
             case PredicateKind.IsNull:
                 ScopeValidator.RequireProperty(index, place, (p as IsNull).Member);
                 break;
+            case PredicateKind.ConceptIs:
+            {
+                // A node's own concept is never an aspect: naming one could only ever be false (R93).
+                const concept = (p as ConceptIs).Concept;
+                if (!index.Catalog.Has(concept) || index.Catalog.IsAspect(concept))
+                {
+                    throw new GraphError(GraphErrorCode.InvalidArgument, ScopeValidator.ErrConceptIs + place.Label + ScopeValidator.Colon + concept);
+                }
+                break;
+            }
             case PredicateKind.And:
             case PredicateKind.Or:
                 for (const term of (p as And | Or).Terms)

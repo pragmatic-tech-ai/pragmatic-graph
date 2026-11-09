@@ -1,6 +1,6 @@
 import { DateTimeValue, DateValue, DurationValue, type CellValue } from '../columns/CellValue.js';
 import { EdgeDirection } from '../format/FormatKeys.js';
-import { And, Compare, CompareOp, IdIn, In, IsNull, Not, Or, OwnerIs, Predicate, PredicateKind, Reachable, Related, Seeded, type IPathStep } from './Predicate.js';
+import { And, Compare, CompareOp, ConceptIs, IdIn, In, IsNull, Not, Or, OwnerIs, Predicate, PredicateKind, Reachable, Related, Seeded, type IPathStep } from './Predicate.js';
 import { PredicateError, PredicateErrorCode } from './PredicateError.js';
 
 type Json = Record<string, unknown>;
@@ -12,6 +12,7 @@ type Json = Record<string, unknown>;
  *   In: Member, Values (cell value array).      IsNull: Member.
  *   And, Or: Terms (predicate array).            Not: Term.
  *   IdIn: Ids (sorted string array).             OwnerIs: Owners (sorted string array).
+ *   ConceptIs: Concept (string).
  *   Related: Relationship, Direction (EdgeDirection number), Target (predicate).
  *   Reachable: From (sorted string array), Steps ([{ Relationship, Direction }]), MaxHops (integer >= 1).
  * Cell values: null, boolean and string are plain JSON; every other type is a single-key tagged
@@ -32,6 +33,7 @@ export class PredicateCodec
     private static readonly TermField = 'Term';
     private static readonly IdsField = 'Ids';
     private static readonly OwnersField = 'Owners';
+    private static readonly ConceptField = 'Concept';
     private static readonly RelationshipField = 'Relationship';
     private static readonly DirectionField = 'Direction';
     private static readonly TargetField = 'Target';
@@ -95,6 +97,8 @@ export class PredicateCodec
                 return { [PredicateCodec.KindField]: kind, [PredicateCodec.IdsField]: PredicateCodec.Sorted((p as IdIn).Ids) };
             case PredicateKind.OwnerIs:
                 return { [PredicateCodec.KindField]: kind, [PredicateCodec.OwnersField]: PredicateCodec.Sorted((p as OwnerIs).Owners) };
+            case PredicateKind.ConceptIs:
+                return { [PredicateCodec.KindField]: kind, [PredicateCodec.ConceptField]: (p as ConceptIs).Concept };
             case PredicateKind.Related:
             {
                 const r = p as Related;
@@ -158,6 +162,8 @@ export class PredicateCodec
                 return new IdIn(PredicateCodec.StrSet(o, PredicateCodec.IdsField));
             case PredicateKind.OwnerIs:
                 return new OwnerIs(PredicateCodec.StrSet(o, PredicateCodec.OwnersField));
+            case PredicateKind.ConceptIs:
+                return new ConceptIs(PredicateCodec.Str(o, PredicateCodec.ConceptField));
             case PredicateKind.Related:
                 return new Related(
                     PredicateCodec.Str(o, PredicateCodec.RelationshipField),

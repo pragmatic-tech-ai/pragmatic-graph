@@ -16,10 +16,19 @@ export interface IWriteRules
     readonly Delete?: Predicate;
     /**
      * Members (properties and relationships) the writer may not set, remove, link or unlink on the instances,
-     * at create and update alike (AccessError MemberReadOnly, ruling R92). They stay readable. Values a host
-     * places as defaults on a node the batch creates (GraphTransaction.SetDefault) are exempt.
+     * per operation (AccessError MemberReadOnly, ruling R92). They stay readable. Values a host places as
+     * defaults on a node the batch creates (GraphTransaction.SetDefault) are exempt.
      */
-    readonly ReadOnly?: ReadonlySet<string>;
+    readonly ReadOnly?: IReadOnlyMembers;
+}
+
+/** Read-only members of one Writes entry, per operation (ruling R92). */
+export interface IReadOnlyMembers
+{
+    /** Checked on a node the batch creates (its writes up to and including the batch's end). */
+    readonly Create?: ReadonlySet<string>;
+    /** Checked on a node that exists in the snapshot. */
+    readonly Update?: ReadonlySet<string>;
 }
 
 export interface IAccessScopeOptions
@@ -80,10 +89,25 @@ export class AccessScope
         const writes = new Map<string, IWriteRules>();
         for (const [name, rules] of options.Writes ?? AccessScope.NoWrites)
         {
-            const copy: IWriteRules = rules.ReadOnly === undefined ? { ...rules } : { ...rules, ReadOnly: new Set(rules.ReadOnly) };
+            const copy: IWriteRules = rules.ReadOnly === undefined ? { ...rules } : { ...rules, ReadOnly: AccessScope.CopyReadOnly(rules.ReadOnly) };
             writes.set(name, Object.freeze(copy));
         }
         return new AccessScope(options.Default, new Map(options.Rows ?? AccessScope.NoRows), hidden, writes);
+    }
+
+    /** A frozen copy of `readOnly`, each present set copied. */
+    private static CopyReadOnly(readOnly: IReadOnlyMembers): IReadOnlyMembers
+    {
+        const copy: { Create?: ReadonlySet<string>; Update?: ReadonlySet<string> } = {};
+        if (readOnly.Create !== undefined)
+        {
+            copy.Create = new Set(readOnly.Create);
+        }
+        if (readOnly.Update !== undefined)
+        {
+            copy.Update = new Set(readOnly.Update);
+        }
+        return Object.freeze(copy);
     }
 
     /**
