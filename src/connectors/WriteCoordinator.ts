@@ -47,7 +47,8 @@ class BatchEdges
 
     private readonly detached = new Set<string>();
     private readonly removed = new Set<string>();
-    private added: IIncidentEdge[] = [];
+    /** The batch's links still standing, by edge key, in batch order (Map keeps insertion order). */
+    private readonly added = new Map<string, IIncidentEdge>();
 
     public constructor(private readonly index: CatalogIndex, private readonly origins: INodeOrigins)
     {
@@ -60,18 +61,16 @@ class BatchEdges
 
     public Linked(edge: IIncidentEdge): void
     {
-        this.added.push({ From: edge.From, Relationship: edge.Relationship, To: edge.To });
+        const key = BatchEdges.Key(edge);
+        // A link re-added after an unlink moves to the end, as the batch order of its latest Link.
+        this.added.delete(key);
+        this.added.set(key, { From: edge.From, Relationship: edge.Relationship, To: edge.To });
     }
 
     public Unlinked(edge: IIncidentEdge): void
     {
         const key = BatchEdges.Key(edge);
-        const at = this.added.findIndex(e => BatchEdges.Key(e) === key);
-        if (at >= 0)
-        {
-            this.added.splice(at, 1);
-        }
-        else
+        if (!this.added.delete(key))
         {
             this.removed.add(key);
         }
@@ -86,7 +85,13 @@ class BatchEdges
     public async Deleted(publicId: string, concept: string | undefined): Promise<IIncidentEdge[]>
     {
         const edges = concept === undefined ? [] : await this.Incident(publicId, concept);
-        this.added = this.added.filter(e => e.From !== publicId && e.To !== publicId);
+        for (const [key, e] of this.added)
+        {
+            if (e.From === publicId || e.To === publicId)
+            {
+                this.added.delete(key);
+            }
+        }
         this.detached.add(publicId);
         return edges;
     }
@@ -110,7 +115,13 @@ class BatchEdges
                 }
             }
         }
-        candidates.push(...this.added.filter(e => e.From === publicId || e.To === publicId));
+        for (const e of this.added.values())
+        {
+            if (e.From === publicId || e.To === publicId)
+            {
+                candidates.push(e);
+            }
+        }
         const outgoing = this.index.Catalog.EffectiveMembers(concept).filter(m => m.Kind === MemberKind.Relationship).map(m => m.Name);
         const incoming = this.index.IncomingRelationships(concept).map(m => m.Name);
         const seen = new Set<string>();
@@ -296,6 +307,8 @@ export class WriteCoordinator
     private static readonly TimedOut: unique symbol = Symbol('TimedOut');
     /** The owner of a node created without one (as GraphReader.OwnerOf reports it). */
     private static readonly NoOwner = '';
+    private static readonly ErrSeedOnly = 'A seed-only SetOwner op cannot be routed to connectors: ';
+    private static readonly ErrUnhandled = 'Unhandled batch op kind: ';
 
     private began: { readonly Connector: IGraphConnector; readonly Txn: IConnectorTransaction }[] = [];
     private expired = false;
@@ -361,9 +374,20 @@ export class WriteCoordinator
                 case WriteOp.SetProperty:
                     router.Emit(op, await router.Origin(op.PublicId));
                     break;
+                case WriteOp.SetOwner:
+                    // Seed synchronization only (ruling R90), and seed sync is never routed.
+                    throw new GraphError(GraphErrorCode.Internal, WriteCoordinator.ErrSeedOnly + op.PublicId);
+                default:
+                    return WriteCoordinator.Unhandled(op);
             }
         }
         return router.Sets();
+    }
+
+    /** Compile-time exhaustiveness: every BatchOp kind has a case in Route. */
+    private static Unhandled(op: never): never
+    {
+        throw new GraphError(GraphErrorCode.Internal, WriteCoordinator.ErrUnhandled + String((op as BatchOp).Op));
     }
 
     /** Runs the write-through of `sets` (from Route, non-empty); resolves with the engine's commit number. */

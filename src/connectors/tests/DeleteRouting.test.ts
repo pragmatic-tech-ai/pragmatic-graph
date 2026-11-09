@@ -12,8 +12,11 @@ import { GraphStore } from '../../GraphStore.js';
 import type { GraphTransaction } from '../../GraphTransaction.js';
 import { CommitError, CommitErrorCode } from '../../txn/CommitError.js';
 import { ConflictError } from '../../txn/ConflictError.js';
-import { WriteOp } from '../../txn/WriteBatch.js';
+import { CatalogIndex } from '../../txn/CatalogIndex.js';
+import { WriteBatch, WriteOp } from '../../txn/WriteBatch.js';
+import { GraphError, GraphErrorCode } from '../../errors/GraphError.js';
 import { BindingTable } from '../BindingTable.js';
+import { type INodeOrigins, WriteCoordinator } from '../WriteCoordinator.js';
 import { FakeConnector } from './FakeConnector.js';
 
 /**
@@ -225,6 +228,23 @@ class DeleteFx
                 assert.equal(fx.A.Applied.length, 0);
                 await fx.G.dispose();
             });
+
+            it('with connectors installed, a concurrent link into an engine-only node also makes its plain delete conflict', async () =>
+            {
+                const fx = await F.Ready(open, []);
+                const t = await fx.G.Begin(AccessScope.System);
+                try
+                {
+                    t.DeleteNode('e');
+                    await F.Commit(fx.G, w => w.Link('k', F.Next, 'e'));
+                    await assert.rejects(t.Commit(), ConflictError);
+                }
+                finally
+                {
+                    t.dispose();
+                }
+                await fx.G.dispose();
+            });
         });
     }
 }
@@ -239,6 +259,8 @@ class DetachFx
     public static readonly Hr = 'hr';
     public static readonly A = 'A';
     public static readonly B = 'B';
+    public static readonly Name = 'name';
+    public static readonly DetachB = "MATCH (n:Server {name: 'b'}) DETACH DELETE n";
 }
 
 describe('Cypher DETACH DELETE routes hidden edges', () =>
@@ -249,11 +271,11 @@ describe('Cypher DETACH DELETE routes hidden edges', () =>
         const a = new FakeConnector(DetachFx.A, []);
         const b = new FakeConnector(DetachFx.B, []);
         const fx = await F.Open(
-            [F.Concept(DetachFx.Server, [F.Text('name'), F.Rel(DetachFx.Peer, [DetachFx.Server]), F.Rel(DetachFx.Ref, [DetachFx.Server])])],
+            [F.Concept(DetachFx.Server, [F.Text(DetachFx.Name), F.Rel(DetachFx.Peer, [DetachFx.Server]), F.Rel(DetachFx.Ref, [DetachFx.Server])])],
             [
-                F.Node('a', DetachFx.Server, { name: 'a' }, [[DetachFx.Peer, 'b']], DetachFx.Crm),
-                F.Node('b', DetachFx.Server, { name: 'b' }, [], DetachFx.Hr),
-                F.Node('c', DetachFx.Server, { name: 'c' }, [[DetachFx.Ref, 'b']], DetachFx.Hr),
+                F.Node('a', DetachFx.Server, { [DetachFx.Name]: 'a' }, [[DetachFx.Peer, 'b']], DetachFx.Crm),
+                F.Node('b', DetachFx.Server, { [DetachFx.Name]: 'b' }, [], DetachFx.Hr),
+                F.Node('c', DetachFx.Server, { [DetachFx.Name]: 'c' }, [[DetachFx.Ref, 'b']], DetachFx.Hr),
             ],
             [],
             [{ Model: DetachFx.Crm, Connector: DetachFx.A }, { Model: DetachFx.Hr, Connector: DetachFx.B }],
@@ -262,7 +284,7 @@ describe('Cypher DETACH DELETE routes hidden edges', () =>
         try
         {
             const scope = AccessScope.Build({ Default: AccessDefault.Allow, Hidden: new Map([[DetachFx.Server, new Set([DetachFx.Peer])]]) });
-            await WriteFixture.Write(fx, "MATCH (n:Server {name: 'b'}) DETACH DELETE n", { Scope: scope });
+            await WriteFixture.Write(fx, DetachFx.DetachB, { Scope: scope });
             const changes = (c: FakeConnector): object[] => c.Applied.flatMap(set => set.Changes.map(ch => ({ ...ch })));
             assert.deepEqual(changes(a), [{ Op: WriteOp.Unlink, From: 'a', Relationship: DetachFx.Peer, To: 'b', Owner: DetachFx.Crm, Concept: DetachFx.Server }]);
             assert.deepEqual(changes(b), [
@@ -274,6 +296,20 @@ describe('Cypher DETACH DELETE routes hidden edges', () =>
         {
             await fx.dispose();
         }
+    });
+});
+
+describe('WriteCoordinator.Route', () =>
+{
+    it('refuses a seed-only SetOwner op (ruling R90): it is never routed', async () =>
+    {
+        const m = new CatalogModel();
+        DeleteFx.Define(m);
+        const batch = new WriteBatch();
+        batch.SetOwner('x', DeleteFx.Crm);
+        const origins: INodeOrigins = { Origin: async () => ({ Owner: DeleteFx.Crm, Concept: DeleteFx.Item }), Edges: async () => [] };
+        const table = new BindingTable([{ Model: DeleteFx.Crm, Connector: DeleteFx.A }]);
+        await assert.rejects(WriteCoordinator.Route(batch, table, new CatalogIndex(m.Seal()), origins), (e: unknown) => e instanceof GraphError && e.GraphCode === GraphErrorCode.Internal);
     });
 });
 
