@@ -20,6 +20,8 @@ export enum CommitErrorCode
     MissingRequired,
     /** A unique index would hold two entries with the same value tuple (one without a null). */
     UniqueViolation,
+    /** A strict DeleteNode found the node still has an edge after the batch's earlier ops. */
+    NodeHasEdges,
 }
 
 import { GraphError, GraphErrorCode } from '../errors/GraphError.js';
@@ -55,6 +57,7 @@ export class CommitError extends GraphError
             case CommitErrorCode.InvalidEdge:
             case CommitErrorCode.MissingRequired:
             case CommitErrorCode.UniqueViolation:
+            case CommitErrorCode.NodeHasEdges:
                 return GraphErrorCode.ConstraintViolation;
             default:
                 return GraphErrorCode.SchemaViolation;

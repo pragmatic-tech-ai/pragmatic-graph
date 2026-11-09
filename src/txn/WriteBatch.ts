@@ -43,10 +43,22 @@ export interface ISetPropertyOp
     readonly Value: CellValue;
 }
 
+/** Options of DeleteNode. */
+export interface IDeleteNodeOptions
+{
+    /**
+     * Fail the commit (CommitError NodeHasEdges) when the node still has any edge, in either direction and
+     * whatever the scope shows, once the batch's earlier ops are applied. Without it DeleteNode removes them.
+     */
+    readonly Strict?: boolean;
+}
+
 export interface IDeleteNodeOp
 {
     readonly Op: WriteOp.DeleteNode;
     readonly PublicId: string;
+    /** Present (true) only for a strict delete. */
+    readonly Strict?: true;
 }
 
 export interface ILinkOp
@@ -243,6 +255,8 @@ export class WriteBatch
     private static readonly FlagHint = 1;
     private static readonly FlagOwner = 2;
     private static readonly KnownCreateFlags = 3;
+    /** Serialized kind of a strict DeleteNode (a plain one keeps kind WriteOp.DeleteNode, so v1 bytes are unchanged). */
+    private static readonly StrictDeleteKind = 6;
     private static readonly LoneSurrogate = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
     private static readonly ErrValueType = 'Unsupported cell value: ';
     private static readonly ErrValue = 'Invalid cell value: ';
@@ -313,10 +327,10 @@ export class WriteBatch
         this.Push({ Op: WriteOp.SetProperty, PublicId: publicId, Member: member, Value: value });
     }
 
-    public DeleteNode(publicId: string): void
+    public DeleteNode(publicId: string, options?: IDeleteNodeOptions): void
     {
         WriteBatch.RequireText(publicId);
-        this.Push({ Op: WriteOp.DeleteNode, PublicId: publicId });
+        this.Push(options?.Strict === true ? { Op: WriteOp.DeleteNode, PublicId: publicId, Strict: true } : { Op: WriteOp.DeleteNode, PublicId: publicId });
     }
 
     public Link(from: string, relationship: string, to: string, options?: LinkOptions): void
@@ -343,7 +357,7 @@ export class WriteBatch
         w.U32(this.ops.length);
         for (const op of this.ops)
         {
-            w.U8(op.Op);
+            w.U8(op.Op === WriteOp.DeleteNode && op.Strict === true ? WriteBatch.StrictDeleteKind : op.Op);
             switch (op.Op)
             {
                 case WriteOp.CreateNode:
@@ -444,6 +458,9 @@ export class WriteBatch
             }
             case WriteOp.DeleteNode:
                 batch.DeleteNode(r.Text());
+                return;
+            case WriteBatch.StrictDeleteKind:
+                batch.DeleteNode(r.Text(), { Strict: true });
                 return;
             case WriteOp.Link:
             {

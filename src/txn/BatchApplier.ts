@@ -80,6 +80,7 @@ export class BatchApplier
     private static readonly ErrValue = 'Invalid value for ';
     private static readonly ErrNull = 'Null is not allowed for ';
     private static readonly ErrRequired = 'Created node is missing a required property: ';
+    private static readonly ErrHasEdges = 'Node still has relationships: ';
     private static readonly ErrEdge = 'Edge rejected: ';
     private static readonly ErrSibling = 'Sibling is not a target of this relationship from the source: ';
     private static readonly ErrPublicId = 'Public id must be 1..400 UTF-8 bytes without U+0000: ';
@@ -262,6 +263,10 @@ export class BatchApplier
             (touched.get(node.Id) as ITouchedNode).Live = false;
         }
         const members = this.index.Catalog.EffectiveMembers(node.Concept);
+        if (op.Strict === true)
+        {
+            await this.RequireNoEdges(txn, node, members);
+        }
         // Each edge is unlinked at the position its scan already found: no per-edge lookup (F9).
         for (const rel of members.filter(m => m.Kind === MemberKind.Relationship))
         {
@@ -363,6 +368,24 @@ export class BatchApplier
         }
         const label = BatchApplier.Label(from, rel, target);
         throw new CommitError(CommitErrorCode.InvalidEdge, BatchApplier.ErrSibling + label, new EdgeError(EdgeErrorCode.UnknownSibling, BatchApplier.ErrSibling + label));
+    }
+
+    /**
+     * Strict delete: CommitError NodeHasEdges when any edge of the node remains (after the batch's earlier ops),
+     * hidden or not. The message names the node only, no relationship, far node or count.
+     */
+    private async RequireNoEdges(txn: IWriteTransaction, node: INode, members: readonly MemberDef[]): Promise<void>
+    {
+        const outgoing = members.filter(m => m.Kind === MemberKind.Relationship).map(rel => [rel, EdgeDirection.Out] as const);
+        const incoming = this.index.IncomingRelationships(node.Concept).map(rel => [rel, EdgeDirection.In] as const);
+        for (const [rel, direction] of [...outgoing, ...incoming])
+        {
+            this.DependOn(rel, node.Id, direction);
+            for await (const _ of this.edges.Adjacent(txn, rel, node.Id, direction))
+            {
+                throw new CommitError(CommitErrorCode.NodeHasEdges, BatchApplier.ErrHasEdges + node.PublicId);
+            }
+        }
     }
 
     /** Collected first: the edges are deleted afterwards (no writes while a scan of the keyspace is open). */

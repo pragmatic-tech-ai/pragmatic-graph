@@ -265,6 +265,9 @@ op      : kind u8, then the fields of that kind
   3 DeleteNode  : publicId str
   4 Link        : from str, relationship str, to str, flags u8, [afterSibling str], [beforeSibling str], [properties]
   5 Unlink      : from str, relationship str, to str
+  6 DeleteNode (strict) : publicId str   a DeleteNode with Strict: the commit fails (CommitError NodeHasEdges)
+                  while the node has any edge after the batch's earlier ops; a plain DeleteNode keeps kind 3,
+                  so every batch without a strict delete serializes exactly as before (version stays 1)
 str        : byteLength u32, UTF-8 bytes (well-formed Unicode)
 value      : tag u8; 0 = null (no bytes follow), else the ValueType (1 Boolean .. 7 Duration)
              followed by that type's single value bytes (see Columns, Single value bytes)

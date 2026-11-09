@@ -62,6 +62,17 @@ describe('WriteBatch', () =>
         assert.deepEqual(WriteBatch.Deserialize(b.Serialize()), b);
     });
 
+    it('a strict DeleteNode records Strict and serializes as kind 6; a plain one keeps kind 3 bytes', () =>
+    {
+        const b = new WriteBatch();
+        b.DeleteNode('x', { Strict: true });
+        b.DeleteNode('y', { Strict: false });
+        assert.deepEqual(b.Ops(), [{ Op: WriteOp.DeleteNode, PublicId: 'x', Strict: true }, { Op: WriteOp.DeleteNode, PublicId: 'y' }]);
+        const bytes = b.Serialize();
+        assert.deepEqual([...bytes], [1, 2, 0, 0, 0, 6, 1, 0, 0, 0, 0x78, WriteOp.DeleteNode, 1, 0, 0, 0, 0x79]);
+        assert.deepEqual(WriteBatch.Deserialize(bytes).Ops(), b.Ops());
+    });
+
     it('starts with format version 1 and a u32 LE op count', () =>
     {
         const b = new WriteBatch();

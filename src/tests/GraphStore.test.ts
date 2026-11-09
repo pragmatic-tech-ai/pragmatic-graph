@@ -206,6 +206,38 @@ class GraphFx
                 await g.dispose();
             });
 
+            it('a strict DeleteNode fails while any edge remains, in either direction, and succeeds once the batch unlinked them', async () =>
+            {
+                const g = await GraphFx.Defined(open);
+                await GraphFx.Seed(g);
+                for (const id of ['c1', 'loc'])
+                {
+                    const t = await g.Begin(AccessScope.System);
+                    t.DeleteNode(id, { Strict: true });
+                    const e = await GraphFx.Settle(t.Commit());
+                    assert.ok(e instanceof CommitError && e.Code === CommitErrorCode.NodeHasEdges && e.GraphCode === GraphErrorCode.ConstraintViolation, id);
+                    assert.equal(e.message, 'Node still has relationships: ' + id, 'the message names the node only');
+                }
+                await GraphFx.Read(g, async r => { assert.deepEqual((await r.Neighbors('loc', 'in', EdgeDirection.In)).sort(), ['c1', 'c2']); });
+                await GraphFx.Commit(g, t =>
+                {
+                    t.Unlink('c1', 'in', 'loc');
+                    t.DeleteNode('c1', { Strict: true });
+                    t.DeleteNode('f1', { Strict: true });
+                });
+                await GraphFx.Read(g, async r =>
+                {
+                    assert.equal(await r.ConceptOf('c1'), undefined);
+                    assert.equal(await r.ConceptOf('f1'), undefined);
+                    assert.deepEqual(await r.Neighbors('loc', 'in', EdgeDirection.In), ['c2']);
+                });
+                const changes: Api.ICommitApplied[] = [];
+                for await (const c of g.ReadChanges(0n)) changes.push(c);
+                const strict = changes[changes.length - 1]!.Batch.Ops().filter(o => o.Op === WriteOp.DeleteNode);
+                assert.deepEqual(strict.map(o => o.Op === WriteOp.DeleteNode && o.Strict), [true, true], 'the log keeps the strict flag');
+                await g.dispose();
+            });
+
             it('a new reader sees committed values, edges in both directions and nothing for unknown nodes', async () =>
             {
                 const g = await GraphFx.Defined(open);

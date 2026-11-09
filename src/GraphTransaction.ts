@@ -9,7 +9,7 @@ import { GraphReader } from './GraphReader.js';
 import { ConflictError } from './txn/ConflictError.js';
 import type { ISnapshotHandle } from './txn/ConflictHistory.js';
 import { ReadSet } from './txn/ReadSet.js';
-import { type ICreateNodeOptions, type LinkOptions, WriteBatch } from './txn/WriteBatch.js';
+import { type ICreateNodeOptions, type IDeleteNodeOptions, type LinkOptions, WriteBatch } from './txn/WriteBatch.js';
 
 /**
  * An optimistic, serializable read-write transaction. Reads are snapshot reads at Begin and are
@@ -56,10 +56,11 @@ export class GraphTransaction extends GraphReader
         this.batch.SetProperty(publicId, member, value);
     }
 
-    public DeleteNode(publicId: string): void
+    /** Deletes the node and every edge it has; with Strict the commit instead fails while any edge remains (CommitError NodeHasEdges). */
+    public DeleteNode(publicId: string, options?: IDeleteNodeOptions): void
     {
         this.RequireActive();
-        this.batch.DeleteNode(publicId);
+        this.batch.DeleteNode(publicId, options);
     }
 
     public Link(from: string, relationship: string, to: string, options?: LinkOptions): void
