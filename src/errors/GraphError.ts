@@ -31,6 +31,8 @@ export enum GraphErrorCode
     AccessDenied = 12,
     /** A connector taking part in a write-through failed, timed out, or the engine could not finalize after it (ConnectorError). */
     ConnectorFailed = 13,
+    /** A Cypher query failed to parse, plan or run (CypherError; its Code gives the Cypher category). */
+    QueryFailed = 14,
 }
 
 /** Base class of every error the engine raises on purpose. `cause` carries an underlying error when there is one. */

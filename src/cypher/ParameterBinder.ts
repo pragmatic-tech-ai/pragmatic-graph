@@ -7,7 +7,7 @@ import { TemporalText } from './TemporalText.js';
 
 // Converts caller-supplied plain-JS (JSON-shaped) parameter trees into the engine's internal CypherValue currency.
 // Numbers: a safe integer binds as an Int64 (bigint), any other number as a Float64; bigints must fit Int64.
-// Temporals: { $date: 'YYYY-MM-DD' }, { $datetime: '<ISO-8601 instant>', zone?: '<IANA>' } (zone defaults to UTC)
+// Temporals: { $date: 'YYYY-MM-DD' }, { $datetime: '<ISO-8601 instant>', zone?: '<IANA>' } (an absent zone is UTC; a present zone must be a string)
 // and { $duration: '<ISO-8601 duration>' }, or engine DateValue/DateTimeValue/DurationValue instances.
 // Lives apart from CypherValue because ListValue/MapValue import CypherValue.ts; a static on the abstract root would
 // create an import cycle.
@@ -60,7 +60,8 @@ export class ParameterBinder
         if (keys.includes(ParameterBinder.DateTimeKey))
         {
             const text = ParameterBinder.Text(record, ParameterBinder.DateTimeKey, keys, [ParameterBinder.ZoneKey]);
-            const zone = record[ParameterBinder.ZoneKey] ?? ParameterBinder.DefaultZone;
+            // An absent zone defaults to UTC; a present one (null included) must be a string.
+            const zone = Object.hasOwn(record, ParameterBinder.ZoneKey) ? record[ParameterBinder.ZoneKey] : ParameterBinder.DefaultZone;
             if (typeof zone !== 'string') throw new CypherSemanticError(ParameterBinder.MalformedTemporal + ParameterBinder.ZoneKey);
             return new ScalarValue(TemporalText.ParseDateTime(text, zone));
         }

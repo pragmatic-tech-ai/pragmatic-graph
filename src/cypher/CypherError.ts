@@ -1,7 +1,9 @@
+import { GraphError, GraphErrorCode } from '../errors/GraphError.js';
+
 /** What kind of failure a CypherError reports. Subclasses fix their own code; IntegerOverflow is raised as a plain CypherError. */
 export enum CypherErrorCode
 {
-    Error,
+    Error = 1,
     Syntax,
     Semantic,
     Timeout,
@@ -9,11 +11,25 @@ export enum CypherErrorCode
     IntegerOverflow,
 }
 
-export class CypherError extends Error
+/** Why a write query failed (CypherWriteError.WriteCode). */
+export enum CypherWriteErrorCode
+{
+    /** The transaction conflicted with a concurrent commit; a retry may succeed. */
+    Conflict = 1,
+    /** The access scope does not allow the write. */
+    Denied,
+    /** The write does not fit the schema or a graph rule, or the query asked for an impossible write. */
+    Invalid,
+    /** A connector taking part in the write-through failed. */
+    ConnectorFailed,
+}
+
+/** Every Cypher failure is a GraphError with GraphCode QueryFailed; Code gives the Cypher category. */
+export class CypherError extends GraphError
 {
     constructor(message: string, public readonly Code: CypherErrorCode = CypherErrorCode.Error, cause?: unknown)
     {
-        super(message, cause === undefined ? undefined : { cause });
+        super(GraphErrorCode.QueryFailed, message, cause);
         this.name = new.target.name;
     }
 }
@@ -44,11 +60,11 @@ export class CypherSemanticError extends CypherError
     }
 }
 
-// Write-time semantic failure (distinct from CypherSemanticError so callers can classify it). cause carries the
-// engine error (a GraphError) when the failure came from the storage engine.
+// Write-time failure (distinct from CypherSemanticError so callers can classify it). WriteCode says why; cause
+// carries the engine error (a GraphError) when the failure came from the storage engine.
 export class CypherWriteError extends CypherError
 {
-    constructor(message: string, cause?: Error)
+    constructor(message: string, public readonly WriteCode: CypherWriteErrorCode = CypherWriteErrorCode.Invalid, cause?: Error)
     {
         super(message, CypherErrorCode.Write, cause);
     }

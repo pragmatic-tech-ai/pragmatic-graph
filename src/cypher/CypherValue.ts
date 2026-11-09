@@ -25,7 +25,14 @@ export enum ValueRank
 
 export abstract class CypherValue
 {
+    // Equivalence key (DISTINCT, grouping, joins): 2 and 2.0 share a key.
     public abstract GroupKey(): string;
+
+    // Type-exact identity key (expression structural keys): 2 and 2.0 differ. Same as GroupKey unless numbers are inside.
+    public TypedKey(): string
+    {
+        return this.GroupKey();
+    }
 
     // Total order; nulls sort last for ascending. Cross-type by TypeRank, then within-type.
     public static Compare(a: CypherValue, b: CypherValue): number
@@ -50,6 +57,11 @@ export class ScalarValue extends CypherValue
     public GroupKey(): string
     {
         return ScalarSemantics.GroupKey(this.Value);
+    }
+
+    public override TypedKey(): string
+    {
+        return ScalarSemantics.TypedKey(this.Value);
     }
 
     protected TypeRank(): number

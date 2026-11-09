@@ -32,6 +32,10 @@ export class ScalarSemantics
     private static readonly DateTimeTag = 'datetime';
     private static readonly DurationTag = 'duration';
     private static readonly KeySeparator = ':';
+    private static readonly NumberTag = 'num';
+    private static readonly DecimalPoint = '.';
+    private static readonly FloatSuffix = '.0';
+    private static readonly ExponentMarker = 'e';
 
     /** A JS number as a Cypher scalar: a safe integer is an Int64 (bigint), anything else a Float64. */
     public static FromNumber(n: number): bigint | number
@@ -39,10 +43,12 @@ export class ScalarSemantics
         return Number.isSafeInteger(n) ? BigInt(n) : n;
     }
 
-    /** A host-supplied scalar with JS numbers normalised by FromNumber. */
+    /** A host-supplied scalar with JS numbers normalised by FromNumber and bigints checked against the Int64 range. */
     public static FromHost(value: CypherScalar): CypherScalar
     {
-        return typeof value === 'number' ? ScalarSemantics.FromNumber(value) : value;
+        if (typeof value === 'number') return ScalarSemantics.FromNumber(value);
+        if (typeof value === 'bigint') return ScalarSemantics.CheckInt64(value);
+        return value;
     }
 
     /** Returns the value, or raises IntegerOverflow when it is outside the Int64 range. */
@@ -135,8 +141,24 @@ export class ScalarSemantics
         return order;
     }
 
-    /** Grouping key (DISTINCT, aggregation groups, join equality): typed, so an Int64 and a Float64 never share a group. */
+    /**
+     * Grouping key (DISTINCT, aggregation groups, join equality) under openCypher equivalence: an Int64 and an
+     * integral Float64 of the same value share one numeric key (2 and 2.0), and NaN is a single key.
+     */
     public static GroupKey(value: CypherScalar): string
+    {
+        const s = ScalarSemantics.KeySeparator;
+        if (typeof value === 'bigint') return ScalarSemantics.NumberTag + s + value.toString();
+        if (typeof value === 'number')
+        {
+            const text = Number.isInteger(value) ? BigInt(value).toString() : String(value);
+            return ScalarSemantics.NumberTag + s + text;
+        }
+        return ScalarSemantics.TypedKey(value);
+    }
+
+    /** Type-exact identity key (literal structural keys): an Int64 2 and a Float64 2.0 differ. */
+    public static TypedKey(value: CypherScalar): string
     {
         const s = ScalarSemantics.KeySeparator;
         if (value instanceof DateValue) return ScalarSemantics.DateTag + s + value.Days;
@@ -145,13 +167,22 @@ export class ScalarSemantics
         return `${typeof value}${s}${String(value)}`;
     }
 
-    /** Display text (toString, default column names): String() for primitives, ISO-8601 for temporals. */
+    /**
+     * Display text (toString, default column names): String() for primitives except that an integral Float64 keeps
+     * a decimal point (toString(2.0) = '2.0'); ISO-8601 for temporals.
+     */
     public static Text(value: CypherScalar): string
     {
         if (value instanceof DateValue) return TemporalText.FormatDate(value);
         if (value instanceof DateTimeValue) return TemporalText.FormatDateTime(value);
         if (value instanceof DurationValue) return TemporalText.FormatDuration(value);
-        return String(value);
+        const text = String(value);
+        if (typeof value === 'number' && Number.isInteger(value)
+            && !text.includes(ScalarSemantics.DecimalPoint) && !text.includes(ScalarSemantics.ExponentMarker))
+        {
+            return text + ScalarSemantics.FloatSuffix;
+        }
+        return text;
     }
 
     /** a op b, or undefined (Cypher null) for unsupported operand types and division/modulo by zero. */

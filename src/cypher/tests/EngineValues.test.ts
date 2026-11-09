@@ -1,15 +1,16 @@
 import { describe, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { DateTimeValue, DateValue, DurationValue } from '../../columns/CellValue.js';
+import { GraphError, GraphErrorCode } from '../../errors/GraphError.js';
 import { Binding, EvalContext } from '../Binding.js';
 import { ArithmeticOp, ComparisonOp } from '../CypherEnums.js';
-import { CypherError, CypherErrorCode, CypherSemanticError, CypherSyntaxError, CypherWriteError } from '../CypherError.js';
+import { CypherError, CypherErrorCode, CypherSemanticError, CypherSyntaxError, CypherWriteError, CypherWriteErrorCode } from '../CypherError.js';
 import { CypherNode } from '../CypherNode.js';
 import { CypherParser } from '../CypherParser.js';
 import { CypherQuery, Expr, Pattern, Return } from '../CypherQuery.js';
 import { CypherUnparser } from '../CypherUnparser.js';
 import { CypherValue, NodeValue, NullValue, ScalarValue, type CypherScalar, type ParameterValue } from '../CypherValue.js';
-import { ArithmeticExpression, Comparison, FunctionCall, InExpression, Literal, PropertyAccess, UnaryMinus } from '../Expression.js';
+import { ArithmeticExpression, Comparison, FunctionCall, InExpression, Literal, PropertyAccess, UnaryMinus, ValueLiteral } from '../Expression.js';
 import { ParameterBinder } from '../ParameterBinder.js';
 import { AggregatorFactory } from '../AggregatorFactory.js';
 import { ListValue, MapValue } from '../StructuredValues.js';
@@ -41,6 +42,11 @@ class V
     public static Bind(value: ParameterValue): unknown
     {
         return (ParameterBinder.FromInput(value) as ScalarValue).Value;
+    }
+
+    public static Structural(query: string): string
+    {
+        return new CypherParser(query).Parse().Parts[0]!.Projection!.Items[0]!.Expr.StructuralKey();
     }
 
     public static IsOverflow(e: unknown): boolean
@@ -116,9 +122,24 @@ describe('cypher engine values: numbers', () =>
         assert.ok(CypherValue.Compare(new ScalarValue(1n), new ScalarValue(1.5)) < 0);
         assert.ok(CypherValue.Compare(new ScalarValue(2n), new ScalarValue(1.5)) > 0);
         assert.equal(CypherValue.Compare(new ScalarValue(2n), new ScalarValue(2.0)), 0);
-        assert.notEqual(new ScalarValue(2n).GroupKey(), new ScalarValue(2.0).GroupKey());
+        // openCypher equivalence: 2 and 2.0 group together (as 2 = 2.0); expression identity stays typed.
+        assert.equal(new ScalarValue(2n).GroupKey(), new ScalarValue(2.0).GroupKey());
+        assert.equal(new ScalarValue(-0).GroupKey(), new ScalarValue(0n).GroupKey());
+        assert.notEqual(new ScalarValue(2n).GroupKey(), new ScalarValue(2.5).GroupKey());
+        assert.notEqual(new ScalarValue(2n).GroupKey(), new ScalarValue('2').GroupKey());
+        assert.equal(new ScalarValue(Number.NaN).GroupKey(), new ScalarValue(Number.NaN).GroupKey());
+        assert.equal(new ScalarValue(2n ** 60n).GroupKey(), new ScalarValue(2 ** 60).GroupKey());
+        const list = (v: CypherScalar) => new ListValue([new ScalarValue(v)]);
+        const map = (v: CypherScalar) => new MapValue(new Map([['k', new ScalarValue(v)]]));
+        assert.equal(list(2n).GroupKey(), list(2.0).GroupKey());
+        assert.equal(map(2n).GroupKey(), map(2.0).GroupKey());
+        assert.notEqual(list(2n).TypedKey(), list(2.0).TypedKey());
+        assert.notEqual(map(2n).TypedKey(), map(2.0).TypedKey());
         assert.notEqual(new Literal(2n).StructuralKey(), new Literal(2.0).StructuralKey());
+        assert.notEqual(new ValueLiteral(list(2n)).StructuralKey(), new ValueLiteral(list(2.0)).StructuralKey());
+        assert.notEqual(V.Structural('RETURN 7 / 2'), V.Structural('RETURN 7 / 2.0'));
         assert.equal(new Literal(2n).DefaultName(), '2');
+        assert.equal(new Literal(2.0).DefaultName(), '2.0');
     });
 
     test('integer-valued functions return Int64', () =>
@@ -129,11 +150,35 @@ describe('cypher engine values: numbers', () =>
         assert.ok(new FunctionCall('toInteger', [new Literal('99999999999999999999')], false, false).Evaluate(V.Ctx()) instanceof NullValue);
         assert.equal(call('toFloat', 3n), 3);
         assert.equal(call('toString', 3n), '3');
+        assert.equal(call('toString', 2.0), '2.0');
+        assert.equal(call('toString', 2.5), '2.5');
+        assert.equal(call('toString', 1e21), '1e+21');
         assert.equal(call('substring', 'hello', 1n, 3n), 'ell');
         const range = new FunctionCall('range', [new Literal(1n), new Literal(3n)], false, false).Evaluate(V.Ctx()) as ListValue;
         assert.deepEqual(range.Items.map((i) => (i as ScalarValue).Value), [1n, 2n, 3n]);
-        assert.ok(new FunctionCall('range', [new Literal(0), new Literal(1), new Literal(0.5)], false, false).Evaluate(V.Ctx()) instanceof NullValue);
+        const rangeOf = (...args: CypherScalar[]) => new FunctionCall('range', args.map((a) => new Literal(a)), false, false).Evaluate(V.Ctx());
+        assert.ok(rangeOf(0, 1, 0.5) instanceof NullValue);
+        // TODL's check order: a zero step (or non-numeric argument) is null before a non-finite bound throws.
+        assert.ok(rangeOf(0, Number.POSITIVE_INFINITY, 0) instanceof NullValue);
+        assert.ok(rangeOf('a', Number.POSITIVE_INFINITY) instanceof NullValue);
+        assert.throws(() => rangeOf(0.5, Number.POSITIVE_INFINITY), CypherSemanticError);
+        assert.ok(new FunctionCall('substring', [new Literal('hello'), new Literal(0.5)], false, false).Evaluate(V.Ctx()) instanceof NullValue);
         assert.equal((AggregatorFactory.Create('count', true).Result() as ScalarValue).Value, 0n);
+    });
+
+    test('Int64 minimum round-trips through the unparser', () =>
+    {
+        const min = -(2n ** 63n);
+        assert.equal(V.Eval('RETURN -9223372036854775808'), min);
+        const parsed = new CypherParser('RETURN -9223372036854775808 AS m, -5 AS n').Parse();
+        const text = new CypherUnparser().Text(parsed);
+        assert.equal(text, 'RETURN -9223372036854775808 AS m, -5 AS n');
+        assert.deepStrictEqual(new CypherParser(text).Parse(), parsed);
+        assert.ok(parsed.Parts[0]!.Projection!.Items[1]!.Expr instanceof UnaryMinus);
+        const q = CypherQuery.Unwind(Expr.List(), 'x').Return(Return.Item(Expr.Lit(min), 'm'), Return.Item(Expr.Lit(1n).Sub(Expr.Lit(min)), 'd'));
+        assert.equal(q.ToCypherText(), 'UNWIND [] AS x RETURN -9223372036854775808 AS m, 1 - -9223372036854775808 AS d');
+        assert.deepStrictEqual(new CypherParser(q.ToCypherText()).Parse(), q.ToModel());
+        assert.throws(() => V.Eval('RETURN - 9223372036854775809'), CypherSyntaxError);
     });
 
     test('unparser keeps Int64 and Float64 apart', () =>
@@ -145,6 +190,12 @@ describe('cypher engine values: numbers', () =>
         const big = CypherQuery.Unwind(Expr.List(), 'x').Return(Return.Item(Expr.Lit(1e21), 'b')).ToCypherText();
         assert.equal(big, 'UNWIND [] AS x RETURN 1000000000000000000000.0 AS b');
         assert.equal(V.Eval('RETURN 1000000000000000000000.0'), 1e21);
+        // Expr.Float keeps an integral value a Float64.
+        const flt = CypherQuery.Unwind(Expr.List(), 'x').Return(Return.Item(Expr.Float(2), 'f'), Return.Item(Expr.Lit(2), 'i'));
+        assert.equal(flt.ToCypherText(), 'UNWIND [] AS x RETURN 2.0 AS f, 2 AS i');
+        assert.deepStrictEqual(new CypherParser(flt.ToCypherText()).Parse(), flt.ToModel());
+        assert.throws(() => Expr.Lit(2n ** 63n), (e: unknown) => V.IsOverflow(e));
+        assert.throws(() => Pattern.Node('n').Prop('a', -(2n ** 63n) - 1n), (e: unknown) => V.IsOverflow(e));
     });
 });
 
@@ -164,12 +215,15 @@ describe('cypher engine values: temporals', () =>
         assert.ok(dur instanceof DurationValue);
         assert.deepEqual([dur.Months, dur.Days, dur.Micros], [14, 25, 5n * 3_600_000_000n + 6n * 60_000_000n + 7_500_000n]);
         assert.deepEqual([(V.Bind({ $duration: '-P1D' }) as DurationValue).Days], [-1]);
+        assert.equal((V.Bind({ $datetime: '2026-11-09T10:00:00-18:00' }) as DateTimeValue).Micros, BigInt(Date.UTC(2026, 10, 10, 4, 0, 0)) * 1000n);
         assert.equal(V.Bind(2.5), 2.5);
         assert.equal(V.Bind(2 ** 53), 2 ** 53);
         assert.equal(V.Bind(7), 7n);
         assert.ok(ParameterBinder.FromInput({ date: '2026-11-09' }) instanceof MapValue);
         for (const bad of [{ $date: '2026-02-30' }, { $date: 5 }, { $date: '2026-11-09', x: 1 }, { $datetime: '2026-11-09T10:00:00' },
-            { $datetime: '2026-11-09T10:00:00Z', zone: 'Nowhere/Land' }, { $duration: 'P' }, { $duration: 'PT' }, { $duration: '1D' }])
+            { $datetime: '2026-11-09T10:00:00Z', zone: 'Nowhere/Land' }, { $datetime: '2026-11-09T10:00:00Z', zone: null },
+            { $datetime: '2026-11-09T10:00:00Z', zone: 5 }, { $datetime: '2026-11-09T10:00:00+19:00' }, { $datetime: '2026-11-09T10:00:00+01:60' },
+            { $duration: 'P' }, { $duration: 'PT' }, { $duration: '1D' }])
         {
             assert.throws(() => ParameterBinder.FromInput(bad), CypherSemanticError, JSON.stringify(bad));
         }
@@ -227,7 +281,10 @@ describe('cypher engine values: nodes and errors', () =>
 
     test('CypherNode links fill exactly once', () =>
     {
-        const node = CypherNode.FromView({ PublicId: 'n1', Concept: 'C', Owner: 'o', Properties: new Map() });
+        const viewProps = new Map<string, CypherScalar | null>([['a', 1n]]);
+        const node = CypherNode.FromView({ PublicId: 'n1', Concept: 'C', Owner: 'o', Properties: viewProps });
+        viewProps.set('a', 2n);
+        assert.equal(node.Properties.get('a'), 1n);
         assert.equal(node.Links, undefined);
         node.FillLinks([{ Relationship: 'r', PublicId: 'n2' }]);
         assert.deepEqual(node.Links, [{ Relationship: 'r', PublicId: 'n2' }]);
@@ -239,8 +296,13 @@ describe('cypher engine values: nodes and errors', () =>
         assert.equal(new CypherSemanticError('x').Code, CypherErrorCode.Semantic);
         assert.equal(new CypherSyntaxError('x', 1, 1).Code, CypherErrorCode.Syntax);
         const cause = new Error('engine');
-        const e = new CypherWriteError('w', cause);
+        const e = new CypherWriteError('w', CypherWriteErrorCode.Conflict, cause);
         assert.equal(e.Code, CypherErrorCode.Write);
+        assert.equal(e.WriteCode, CypherWriteErrorCode.Conflict);
+        assert.equal(new CypherWriteError('w').WriteCode, CypherWriteErrorCode.Invalid);
+        assert.ok(e instanceof GraphError);
+        assert.equal(e.GraphCode, GraphErrorCode.QueryFailed);
+        assert.equal(new CypherSemanticError('x').GraphCode, GraphErrorCode.QueryFailed);
         assert.equal(e.cause, cause);
         assert.equal(e.name, 'CypherWriteError');
         assert.ok(new ListValue([]) instanceof CypherValue);

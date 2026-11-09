@@ -233,6 +233,12 @@ export class Expr
         return new ExprBuilder(new Literal(ScalarSemantics.FromHost(value)));
     }
 
+    // A Float64 literal even when the value is integral (Lit(2) is the Int64 2; Float(2) is 2.0).
+    public static Float(value: number): ExprBuilder
+    {
+        return new ExprBuilder(new Literal(value));
+    }
+
     public static List(...items: ExprArg[]): ExprBuilder
     {
         return new ExprBuilder(new ListLiteral(items.map((i) => ExprBuilder.Unwrap(i))));

@@ -499,8 +499,23 @@ export class CypherParser
 
     private parseUnary(): Expression
     {
+        if (this.isInt64MinLiteral())
+        {
+            // -9223372036854775808: its magnitude alone is outside Int64, so the minus folds into the literal. Every
+            // other negated number stays UnaryMinus.
+            this.advance();
+            this.advance();
+            return new Literal(ScalarSemantics.Int64Min);
+        }
         if (this.accept(TokenKind.Dash)) return new UnaryMinus(this.parseUnary());
         return this.parsePostfix();
+    }
+
+    private isInt64MinLiteral(): boolean
+    {
+        const next = this.tokens[this.index + 1];
+        return this.peek().Kind === TokenKind.Dash && next !== undefined && next.Kind === TokenKind.Number
+            && !next.Text.includes(CypherParser.DecimalPoint) && BigInt(next.Text) === -ScalarSemantics.Int64Min;
     }
 
     private parsePostfix(): Expression

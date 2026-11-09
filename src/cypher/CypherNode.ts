@@ -23,7 +23,8 @@ export class CypherNode
 
     public static FromView(view: INodeView): CypherNode
     {
-        return new CypherNode(view.PublicId, view.Concept, view.Owner, view.Properties);
+        // Copied, so the node never shares a map with the reader's view.
+        return new CypherNode(view.PublicId, view.Concept, view.Owner, new Map(view.Properties));
     }
 
     public get Links(): readonly ILinkView[] | undefined

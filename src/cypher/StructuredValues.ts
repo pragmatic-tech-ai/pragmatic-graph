@@ -14,6 +14,11 @@ export class ListValue extends CypherValue
         return ListValue.GroupKeyPrefix + JSON.stringify(this.Items.map(i => i.GroupKey()));
     }
 
+    public override TypedKey(): string
+    {
+        return ListValue.GroupKeyPrefix + JSON.stringify(this.Items.map(i => i.TypedKey()));
+    }
+
     protected TypeRank(): number
     {
         return ValueRank.List;
@@ -52,6 +57,12 @@ export class MapValue extends CypherValue
     public GroupKey(): string
     {
         const entries = this.SortedKeys().map(k => [k, this.Entries.get(k)?.GroupKey() ?? '']);
+        return MapValue.GroupKeyPrefix + JSON.stringify(entries);
+    }
+
+    public override TypedKey(): string
+    {
+        const entries = this.SortedKeys().map(k => [k, this.Entries.get(k)?.TypedKey() ?? '']);
         return MapValue.GroupKeyPrefix + JSON.stringify(entries);
     }
 

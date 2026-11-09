@@ -22,7 +22,13 @@ abstract class FunctionBase implements IScalarFunction
         return v instanceof ScalarValue && typeof v.Value === 'string' ? v.Value : undefined;
     }
 
-    // An integer-valued argument (Int64, or an integral Float64) as a bigint.
+    // A numeric argument (Int64 or Float64) as is.
+    protected static Numeric(v: CypherValue | undefined): bigint | number | undefined
+    {
+        return v instanceof ScalarValue && ScalarSemantics.IsNumeric(v.Value) ? v.Value : undefined;
+    }
+
+    // An integer-valued argument (Int64, or an integral Float64) as a bigint; a fractional Float64 is undefined.
     protected static Int(v: CypherValue | undefined): bigint | undefined
     {
         return v instanceof ScalarValue ? ScalarSemantics.AsInteger(v.Value) : undefined;
@@ -142,18 +148,22 @@ class RangeFunction extends FunctionBase
     private static readonly TooLarge = 'range() would produce too many elements';
     private static readonly MaxElements = 10_000_000n;
 
-    // Integer bounds and step (Int64, or integral Float64); the elements are Int64.
+    // Checks in TODL's order: a non-numeric argument or a zero step yields null, a non-finite one throws; then (engine
+    // rule) a fractional bound or step yields null, since the elements are Int64.
     public Invoke(args: readonly CypherValue[]): CypherValue
     {
-        const bounds = args.slice(0, 3);
-        if (bounds.some((v) => v instanceof ScalarValue && typeof v.Value === 'number' && !Number.isFinite(v.Value)))
+        const ra = FunctionBase.Numeric(args[0]);
+        const rb = FunctionBase.Numeric(args[1]);
+        const rstep = args.length > 2 ? FunctionBase.Numeric(args[2]) : 1n;
+        if (ra === undefined || rb === undefined || rstep === undefined || Number(rstep) === 0) return NullValue.Instance;
+        if ([ra, rb, rstep].some((v) => typeof v === 'number' && !Number.isFinite(v)))
         {
             throw new CypherSemanticError(RangeFunction.NonFiniteBound);
         }
-        const a = FunctionBase.Int(args[0]);
-        const b = FunctionBase.Int(args[1]);
-        const step = args.length > 2 ? FunctionBase.Int(args[2]) : 1n;
-        if (a === undefined || b === undefined || step === undefined || step === 0n) return NullValue.Instance;
+        const a = ScalarSemantics.AsInteger(ra);
+        const b = ScalarSemantics.AsInteger(rb);
+        const step = ScalarSemantics.AsInteger(rstep);
+        if (a === undefined || b === undefined || step === undefined) return NullValue.Instance;
         if ((b - a) / step >= RangeFunction.MaxElements)
         {
             throw new CypherSemanticError(RangeFunction.TooLarge);

@@ -123,10 +123,10 @@ export class Literal extends Expression
     {
         // JSON.stringify renders NaN/+-Infinity as null, which would collide with the null literal.
         if (typeof this.value === 'number' && !Number.isFinite(this.value)) return `lit:num:${String(this.value)}`;
-        // Int64 and temporal literals are tagged by their typed group key (an Int64 2 differs from the Float64 2.0).
+        // Int64 and temporal literals are tagged by their typed key (an Int64 2 differs from the Float64 2.0).
         if (this.value !== null && typeof this.value !== 'number' && typeof this.value !== 'string' && typeof this.value !== 'boolean')
         {
-            return `lit:${ScalarSemantics.GroupKey(this.value)}`;
+            return `lit:${ScalarSemantics.TypedKey(this.value)}`;
         }
         return `lit:${JSON.stringify(this.value)}`;
     }
@@ -158,7 +158,7 @@ export class ValueLiteral extends Expression
 
     public StructuralKey(): string
     {
-        return `val:${this.value.GroupKey()}`;
+        return `val:${this.value.TypedKey()}`;
     }
 
     public Rewrite(replacer: (e: Expression) => Expression | undefined): Expression
