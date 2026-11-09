@@ -1,4 +1,5 @@
 import type { AccessScope } from './access/AccessScope.js';
+import { HypotheticalNode } from './access/HypotheticalNode.js';
 import { ScopeEvaluator } from './access/ScopeEvaluator.js';
 import { CatalogError, CatalogErrorCode } from './catalog/CatalogError.js';
 import type { MemberDef } from './catalog/CatalogTypes.js';
@@ -117,17 +118,19 @@ export class GraphReader implements IGraphDisposable
      * (ancestors, carried aspects) and ConceptIs names exactly `concept`; a missing property is null. Predicates that need
      * stored identity or edges (IdIn, OwnerIs, Seeded, Related, Reachable) cannot hold, also under Not (fail closed).
      * False for an unknown concept or an aspect name; true otherwise under a scope that restricts no read (System).
+     * An undefined or null entry reads as unset; any other value must fit its member as a write would (an Int64 widens to a
+     * Float64 member when exact), else GraphError SchemaViolation naming `Concept.member`, under every scope.
      * Synchronous: reads nothing from the store and records nothing.
      */
     public Admits(concept: string, properties: ReadonlyMap<string, CellValue>): boolean
     {
         this.RequireOpen();
-        if (this.evaluator !== undefined)
+        const node = HypotheticalNode.Build(this.Catalog, concept, properties);
+        if (node === undefined)
         {
-            return this.evaluator.Admits(concept, properties);
+            return false;
         }
-        const catalog = this.Catalog;
-        return catalog.Has(concept) && !catalog.IsAspect(concept);
+        return this.evaluator === undefined || this.evaluator.Admits(node);
     }
 
     /**

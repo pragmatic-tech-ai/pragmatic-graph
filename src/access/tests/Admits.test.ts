@@ -3,11 +3,13 @@ import assert from 'node:assert/strict';
 import { AccessDefault, AccessScope } from '../AccessScope.js';
 import type { CellValue } from '../../columns/CellValue.js';
 import { EdgeDirection } from '../../format/FormatKeys.js';
-import { And, Compare, CompareOp, ConceptIs, IdIn, IsNull, Not, Or, OwnerIs, type Predicate, Reachable, Related, Seeded, TruePredicate } from '../../predicate/Predicate.js';
+import { And, Compare, CompareOp, ConceptIs, IdIn, In, IsNull, Not, Or, OwnerIs, type Predicate, Reachable, Related, Seeded, TruePredicate } from '../../predicate/Predicate.js';
 import { CypherFixture as F } from '../../cypher/tests/CypherFixture.js';
+import { GraphError, GraphErrorCode } from '../../errors/GraphError.js';
+import { ConflictError } from '../../txn/ConflictError.js';
 
 /**
- * Aspect Tagged { tag? }; P { owner?, title?, ref -> Q }; C extends P; Q carries Tagged { name? }.
+ * Aspect Tagged { tag? }; P { owner?, title?, level? Int64, score? Float64, ref -> Q }; C extends P; Q carries Tagged { name? }.
  * Seed: p1 (P, owner u1) -ref-> q1 (Q), so stored nodes and edges exist that a hypothetical node must never borrow.
  */
 class AdmitsFx
@@ -20,6 +22,10 @@ class AdmitsFx
     public static readonly Owner = 'owner';
     public static readonly Title = 'title';
     public static readonly Name = 'name';
+    public static readonly Level = 'level';
+    public static readonly Score = 'score';
+    public static readonly Five = '5';
+    public static readonly MismatchMessage = /P\.level/;
     public static readonly Ref = 'ref';
     public static readonly P1 = 'p1';
     public static readonly Q1 = 'q1';
@@ -33,7 +39,7 @@ class AdmitsFx
         return F.Open(
             [
                 F.Aspect(AdmitsFx.Tagged, [F.Text(AdmitsFx.Tag)]),
-                F.Concept(AdmitsFx.P, [F.Text(AdmitsFx.Owner), F.Text(AdmitsFx.Title), F.Rel(AdmitsFx.Ref, [AdmitsFx.Q])]),
+                F.Concept(AdmitsFx.P, [F.Text(AdmitsFx.Owner), F.Text(AdmitsFx.Title), F.Int(AdmitsFx.Level), F.Float(AdmitsFx.Score), F.Rel(AdmitsFx.Ref, [AdmitsFx.Q])]),
                 F.Concept(AdmitsFx.C, [], AdmitsFx.P),
                 F.Concept(AdmitsFx.Q, [F.Text(AdmitsFx.Name)], null, [AdmitsFx.Tagged]),
             ],
@@ -56,6 +62,20 @@ class AdmitsFx
     public static OwnerU1(): Predicate
     {
         return new Compare(AdmitsFx.Owner, CompareOp.Eq, AdmitsFx.U1);
+    }
+
+    /** True iff `error` is the GraphError SchemaViolation Admits raises for a mistyped P.level. */
+    public static Mismatch(error: unknown): boolean
+    {
+        return error instanceof GraphError && error.GraphCode === GraphErrorCode.SchemaViolation && AdmitsFx.MismatchMessage.test(error.message);
+    }
+
+    /** Commits `p1.owner = u2` under System, concurrently with whatever transaction the caller holds open. */
+    public static async ChangeOwner(fx: F): Promise<void>
+    {
+        const t = await fx.Engine.Begin(AccessScope.System);
+        t.SetProperty(AdmitsFx.P1, AdmitsFx.Owner, AdmitsFx.U2);
+        await t.Commit();
     }
 
     /** Admits on a reader opened under `scope`, for each `[concept, properties]` case. */
@@ -143,6 +163,8 @@ describe('GraphReader.Admits (R95)', () =>
         // IdIn needs a stored public id too.
         assert.equal(await AdmitsFx.OnP(fx, new IdIn(new Set([AdmitsFx.P1]))), false);
         assert.equal(await AdmitsFx.OnP(fx, new Not(new IdIn(new Set([AdmitsFx.P1])))), false);
+        assert.equal(await AdmitsFx.OnP(fx, new Not(new Not(new IdIn(new Set([AdmitsFx.P1]))))), false);
+        assert.equal(await AdmitsFx.OnP(fx, new Not(new Not(new OwnerIs(owners)))), false);
         assert.equal(await AdmitsFx.OnP(fx, new Not(new And([AdmitsFx.OwnerU1(), new IdIn(new Set([AdmitsFx.P1]))]))), false);
         // A term that cannot be decided does not block what the node's own values decide (Kleene: sound for every owner).
         assert.equal(await AdmitsFx.OnP(fx, new Or([new Seeded(), AdmitsFx.OwnerU1()])), true);
@@ -203,7 +225,63 @@ describe('GraphReader.Admits (R95)', () =>
         assert.deepEqual(await AdmitsFx.Admits(fx, scope, [[AdmitsFx.P, AdmitsFx.Props()], [AdmitsFx.Q, AdmitsFx.Props()]]), [true, false]);
     });
 
-    test('admits is synchronous (no store access) and throws once disposed', async () =>
+    test('explicit null and undefined entries read as unset', async () =>
+    {
+        const unset = AdmitsFx.Props({ owner: null }) as Map<string, CellValue>;
+        unset.set(AdmitsFx.Title, undefined as unknown as CellValue);
+        assert.deepEqual(await AdmitsFx.Admits(fx, AdmitsFx.Rows(AccessDefault.Allow, [[AdmitsFx.P, new And([new IsNull(AdmitsFx.Owner), new IsNull(AdmitsFx.Title)])]]),
+            [[AdmitsFx.P, unset]]), [true]);
+        assert.deepEqual(await AdmitsFx.Admits(fx, AdmitsFx.Rows(AccessDefault.Allow, [[AdmitsFx.P, new Not(new Compare(AdmitsFx.Owner, CompareOp.Eq, AdmitsFx.U1))]]),
+            [[AdmitsFx.P, unset]]), [false]);
+    });
+
+    test('a mistyped value is refused, never compared as False under Not', async () =>
+    {
+        const mistyped = AdmitsFx.Props({ level: AdmitsFx.Five });
+        for (const scope of [
+            AdmitsFx.Rows(AccessDefault.Allow, [[AdmitsFx.P, new Not(new Compare(AdmitsFx.Level, CompareOp.Eq, 5n))]]),
+            AdmitsFx.Rows(AccessDefault.Allow, [[AdmitsFx.P, new Not(new In(AdmitsFx.Level, [5n]))]]),
+            AccessScope.System,
+        ])
+        {
+            const reader = await fx.Engine.BeginRead(scope);
+            try
+            {
+                assert.throws(() => reader.Admits(AdmitsFx.P, mistyped), (e: unknown) => AdmitsFx.Mismatch(e));
+                // The same entry on a correctly typed value decides normally.
+                assert.equal(reader.Admits(AdmitsFx.P, AdmitsFx.Props({ level: 6n })), true);
+            }
+            finally
+            {
+                reader.dispose();
+            }
+        }
+        // An Int64 widens into a Float64 member when exact, as a write does; an inexact one is refused.
+        const scope = AdmitsFx.Rows(AccessDefault.Deny, [[AdmitsFx.P, new Compare(AdmitsFx.Score, CompareOp.Eq, 5)]]);
+        assert.deepEqual(await AdmitsFx.Admits(fx, scope, [[AdmitsFx.P, AdmitsFx.Props({ score: 5n })], [AdmitsFx.P, AdmitsFx.Props({ score: 5 })]]), [true, true]);
+        await assert.rejects(AdmitsFx.Admits(fx, scope, [[AdmitsFx.P, AdmitsFx.Props({ score: 2n ** 60n + 1n })]]),
+            (e: unknown) => e instanceof GraphError && e.GraphCode === GraphErrorCode.SchemaViolation);
+    });
+
+    test('admits on a transaction records nothing in its ReadSet', async () =>
+    {
+        const scope = AdmitsFx.Rows(AccessDefault.Allow, [[AdmitsFx.P, AdmitsFx.OwnerU1()]]);
+        const t = await fx.Engine.Begin(scope);
+        assert.equal(t.Admits(AdmitsFx.P, AdmitsFx.Props({ owner: AdmitsFx.U1 })), true);
+        await AdmitsFx.ChangeOwner(fx);
+        t.CreateNode(AdmitsFx.Unknown, AdmitsFx.Q);
+        assert.equal(typeof (await t.Commit()), 'bigint');
+        // Control: a stored read of the same node under the same scope does conflict with that change.
+        const control = await fx.Engine.Begin(scope);
+        assert.equal(await control.ReadNode(AdmitsFx.P1), undefined);
+        const reset = await fx.Engine.Begin(AccessScope.System);
+        reset.SetProperty(AdmitsFx.P1, AdmitsFx.Owner, AdmitsFx.U1);
+        await reset.Commit();
+        control.CreateNode(AdmitsFx.Q1 + AdmitsFx.Five, AdmitsFx.Q);
+        await assert.rejects(control.Commit(), ConflictError);
+    });
+
+    test('admits returns synchronously and throws once disposed', async () =>
     {
         const reader = await fx.Engine.BeginRead(AdmitsFx.Rows(AccessDefault.Deny, [[AdmitsFx.P, AdmitsFx.OwnerU1()]]));
         assert.equal(reader.Admits(AdmitsFx.P, AdmitsFx.Props({ owner: AdmitsFx.U1 })), true);

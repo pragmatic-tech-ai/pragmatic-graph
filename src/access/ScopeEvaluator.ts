@@ -6,6 +6,7 @@ import { NodeEvaluator, Truth } from '../predicate/NodeEvaluator.js';
 import { type And, type ConceptIs, type Not, type Or, type OwnerIs, Predicate, PredicateKind, type Reachable, type Related } from '../predicate/Predicate.js';
 import type { IReadNode, RecordedReads } from '../RecordedReads.js';
 import { AccessDefault, type AccessScope, type IReadOnlyMembers, type IWriteRules } from './AccessScope.js';
+import type { HypotheticalNode } from './HypotheticalNode.js';
 import { WriteStage } from './WriteStage.js';
 
 /** One node under evaluation, with the property values read so far (absent = not a property of the node). */
@@ -15,80 +16,6 @@ class NodeFacts
 
     public constructor(public readonly Node: IReadNode)
     {
-    }
-}
-
-/**
- * A node that is not stored (ruling R95): a concept and the values of its own properties (absent = null), with no
- * public id, owner, seed provenance or relationships. Evaluates a Rows predicate on it in Kleene logic: property
- * predicates as NodeEvaluator does, ConceptIs by exact name, and every predicate that needs stored identity or edges
- * (IdIn, OwnerIs, Seeded, Related, Reachable) as Unknown. Not of Unknown is Unknown and only True admits, so no
- * placement of Not can turn such a predicate into an admit: a True result holds whatever those predicates would be
- * on any real node with these values (Kleene logic is monotone in Unknown).
- */
-class HypotheticalNode
-{
-    private static readonly ErrKind = 'Unknown predicate kind in an access scope: ';
-    /** Never consulted: IdIn, the one leaf that reads it, is decided here as Unknown before NodeEvaluator sees it. */
-    private static readonly NoPublicId = '';
-
-    public constructor(public readonly Concept: string, public readonly Values: ReadonlyMap<string, CellValue>)
-    {
-    }
-
-    public Eval(p: Predicate): Truth
-    {
-        const kind = p.Kind;
-        switch (kind)
-        {
-            case PredicateKind.True:
-            case PredicateKind.False:
-            case PredicateKind.Compare:
-            case PredicateKind.In:
-            case PredicateKind.IsNull:
-                return NodeEvaluator.Evaluate(p, this.Values, HypotheticalNode.NoPublicId);
-            case PredicateKind.ConceptIs:
-                return this.Concept === (p as ConceptIs).Concept ? Truth.True : Truth.False;
-            case PredicateKind.IdIn:
-            case PredicateKind.OwnerIs:
-            case PredicateKind.Seeded:
-            case PredicateKind.Related:
-            case PredicateKind.Reachable:
-                return Truth.Unknown;
-            case PredicateKind.Not:
-            {
-                const inner = this.Eval((p as Not).Term);
-                return inner === Truth.Unknown ? Truth.Unknown : inner === Truth.True ? Truth.False : Truth.True;
-            }
-            case PredicateKind.And:
-                return this.Combine((p as And).Terms, Truth.False, Truth.True);
-            case PredicateKind.Or:
-                return this.Combine((p as Or).Terms, Truth.True, Truth.False);
-            default:
-            {
-                const unknown: never = kind;
-                throw new GraphError(GraphErrorCode.Internal, HypotheticalNode.ErrKind + String(unknown));
-            }
-        }
-    }
-
-    /** Kleene And (dominant False) or Or (dominant True): the dominant value wins, else Unknown if any, else `identity`. */
-    private Combine(terms: readonly Predicate[], dominant: Truth, identity: Truth): Truth
-    {
-        let result = identity;
-        for (const term of terms)
-        {
-            const t = this.Eval(term);
-            if (t === dominant)
-            {
-                return dominant;
-            }
-            if (t === Truth.Unknown)
-            {
-                result = Truth.Unknown;
-            }
-        }
-        return result;
     }
 }
 
@@ -190,34 +117,17 @@ export class ScopeEvaluator
     }
 
     /**
-     * True iff a node of `concept` that has exactly `properties` as its property values (absent = null; names that are
-     * not properties of `concept` are ignored), no owner, no seed provenance and no relationships would pass every
-     * applicable Rows predicate (ruling R95); the scope's Default when none applies. False for an unknown concept or an
-     * aspect name. Predicates needing stored identity or edges are Unknown (HypotheticalNode), so they never admit,
-     * also under Not. Reads nothing and records nothing.
+     * True iff the hypothetical node (built and checked by HypotheticalNode.Build) passes every applicable Rows
+     * predicate (ruling R95); the scope's Default when none applies. Predicates needing stored identity or edges are
+     * Unknown on it, so they never admit, also under Not. Reads nothing and records nothing.
      */
-    public Admits(concept: string, properties: ReadonlyMap<string, CellValue>): boolean
+    public Admits(node: HypotheticalNode): boolean
     {
-        const catalog = this.reads.Catalog;
-        if (!catalog.Has(concept) || catalog.IsAspect(concept))
-        {
-            return false;
-        }
-        const rows = this.ApplicableRows(concept);
+        const rows = this.ApplicableRows(node.Concept);
         if (rows.length === 0)
         {
             return this.scope.Default === AccessDefault.Allow;
         }
-        const values = new Map<string, CellValue>();
-        for (const name of this.Properties(concept).keys())
-        {
-            const value = properties.get(name);
-            if (value !== undefined)
-            {
-                values.set(name, value);
-            }
-        }
-        const node = new HypotheticalNode(concept, values);
         return rows.every(row => node.Eval(row) === Truth.True);
     }
 
