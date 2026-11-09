@@ -22,7 +22,7 @@ class Place
 
 /**
  * Internal: checks an AccessScope's names against a catalog (ruling R63). Every Rows, Hidden and Writes
- * key must be a concept or aspect; every Hidden member a member of its key; every property a Rows or
+ * key must be a concept or aspect; every Hidden member and every Writes ReadOnly member a member of its key; every property a Rows or
  * Writes predicate reads an effective property of its key (Related Targets: of a concept the step
  * reaches), and every relationship a Related or Reachable step follows an effective relationship
  * (parity with index Where, R61). Violations are GraphError InvalidArgument naming the key and name.
@@ -31,6 +31,7 @@ export class ScopeValidator
 {
     private static readonly ErrUnknownName = 'AccessScope names an unknown concept or aspect: ';
     private static readonly ErrUnknownMember = 'AccessScope hides a member that is not effective on its key: ';
+    private static readonly ErrUnknownReadOnly = 'AccessScope marks read-only a member that is not effective on its key: ';
     private static readonly ErrProperty = 'AccessScope predicate reads a name that is not an effective property: ';
     private static readonly ErrRelationship = 'AccessScope predicate follows a name that is not an effective relationship: ';
     private static readonly ErrNoConcept = 'AccessScope predicate follows a relationship that reaches no concept: ';
@@ -51,13 +52,11 @@ export class ScopeValidator
         }
         for (const [key, members] of scope.Hidden)
         {
-            for (const member of members)
-            {
-                if (ScopeValidator.MemberOf(index, key, member) === undefined)
-                {
-                    throw new GraphError(GraphErrorCode.InvalidArgument, ScopeValidator.ErrUnknownMember + key + ScopeValidator.Dot + member);
-                }
-            }
+            ScopeValidator.RequireMembers(index, key, members, ScopeValidator.ErrUnknownMember);
+        }
+        for (const [key, rules] of scope.Writes)
+        {
+            ScopeValidator.RequireMembers(index, key, rules.ReadOnly ?? [], ScopeValidator.ErrUnknownReadOnly);
         }
         for (const [key, predicate] of scope.Rows)
         {
@@ -71,6 +70,18 @@ export class ScopeValidator
                 {
                     ScopeValidator.Walk(index, predicate, new Place(key, key, []));
                 }
+            }
+        }
+    }
+
+    /** Every name in `members` must be a member of `key` (CatalogSnapshot.MemberOf: effective on it). */
+    private static RequireMembers(index: CatalogIndex, key: string, members: Iterable<string>, error: string): void
+    {
+        for (const member of members)
+        {
+            if (ScopeValidator.MemberOf(index, key, member) === undefined)
+            {
+                throw new GraphError(GraphErrorCode.InvalidArgument, error + key + ScopeValidator.Dot + member);
             }
         }
     }

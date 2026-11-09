@@ -23,4 +23,4 @@ export { ReferencedLabels } from './ReferencedLabels.js';
 export { CypherWriteStats } from './write/CypherWriteStats.js';
 export type { CypherWriteStatsDto } from './write/CypherWriteStats.js';
 export { GuidPlacement } from './write/NodePlacement.js';
-export type { INodePlacement } from './write/NodePlacement.js';
+export type { INodePlace, INodePlacement } from './write/NodePlacement.js';

@@ -56,10 +56,12 @@ export class ScopeEvaluator
     /** Node decisions one top-level decision may make; beyond it the rest is Unknown (fail closed, R66). */
     private static readonly MaxDecisions = 10_000;
     private static readonly NoHidden: ReadonlySet<string> = new Set();
+    private static readonly NoReadOnly: ReadonlySet<string> = new Set();
 
     private readonly rows = new Map<string, readonly Predicate[]>();
     private readonly writes = new Map<string, readonly IWriteRules[]>();
     private readonly hidden = new Map<string, ReadonlySet<string>>();
+    private readonly readOnly = new Map<string, ReadonlySet<string>>();
     private readonly properties = new Map<string, ReadonlyMap<string, MemberDef>>();
     private readonly memberNames = new Map<Predicate, ReadonlySet<string>>();
     private readonly reachable = new Map<Reachable, Promise<ReadonlySet<bigint>>>();
@@ -150,6 +152,26 @@ export class ScopeEvaluator
             }
             out = union.size === 0 ? ScopeEvaluator.NoHidden : union;
             this.hidden.set(concept, out);
+        }
+        return out;
+    }
+
+    /** Members the writer may not write on instances of `concept`: the union of every applicable Writes entry's ReadOnly (R92). */
+    public ReadOnlyMembers(concept: string): ReadonlySet<string>
+    {
+        let out = this.readOnly.get(concept);
+        if (out === undefined)
+        {
+            const union = new Set<string>();
+            for (const rules of this.ApplicableWrites(concept))
+            {
+                for (const m of rules.ReadOnly ?? ScopeEvaluator.NoReadOnly)
+                {
+                    union.add(m);
+                }
+            }
+            out = union.size === 0 ? ScopeEvaluator.NoReadOnly : union;
+            this.readOnly.set(concept, out);
         }
         return out;
     }

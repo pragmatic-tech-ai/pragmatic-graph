@@ -1,11 +1,16 @@
 import { randomUUID } from 'node:crypto';
 import type { CellValue } from '../../columns/CellValue.js';
 
-/** Where a node created by a Cypher write goes: its public id and its owner ('' for none). */
+/**
+ * Where a node created by a Cypher write goes: its public id, its owner ('' for none) and the property values
+ * a CREATE / MERGE sets when the query did not set them (ruling R91). Defaults are written before the scope's
+ * Create rules are judged, so they count for them, and are exempt from the scope's ReadOnly members.
+ */
 export interface INodePlace
 {
     readonly PublicId: string;
     readonly Owner: string;
+    readonly Defaults?: ReadonlyMap<string, CellValue>;
 }
 
 /**

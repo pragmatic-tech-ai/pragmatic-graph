@@ -36,6 +36,8 @@ export class GraphTransaction extends GraphReader
     private static readonly ErrSchemaNow = ', now ';
 
     private readonly batch = new WriteBatch();
+    /** Indexes in `batch` of the SetProperty ops SetDefault recorded. */
+    private readonly defaults = new Set<number>();
     private committing = false;
 
     /** @internal Created by GraphStore.Begin. */
@@ -54,6 +56,19 @@ export class GraphTransaction extends GraphReader
     {
         this.RequireActive();
         this.batch.SetProperty(publicId, member, value);
+    }
+
+    /**
+     * Records a value the host places on a node this transaction created earlier (a placement default, ruling
+     * R91): exactly SetProperty, except that the scope's ReadOnly members do not refuse it (R92). On a node the
+     * transaction did not create it is checked as an ordinary SetProperty.
+     */
+    public SetDefault(publicId: string, member: string, value: CellValue): void
+    {
+        this.RequireActive();
+        const index = this.batch.Count;
+        this.batch.SetProperty(publicId, member, value);
+        this.defaults.add(index);
     }
 
     /**
@@ -149,7 +164,7 @@ export class GraphTransaction extends GraphReader
         }
         try
         {
-            await WriteGate.Check(this.WriteEvaluator(), this.batch, this.snapshot.Index.Catalog);
+            await WriteGate.Check(this.WriteEvaluator(), this.batch, this.snapshot.Index.Catalog, this.defaults);
         }
         catch (error)
         {

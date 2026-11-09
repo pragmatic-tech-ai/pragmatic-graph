@@ -14,6 +14,12 @@ export interface IWriteRules
     readonly Create?: Predicate;
     readonly Update?: Predicate;
     readonly Delete?: Predicate;
+    /**
+     * Members (properties and relationships) the writer may not set, remove, link or unlink on the instances,
+     * at create and update alike (AccessError MemberReadOnly, ruling R92). They stay readable. Values a host
+     * places as defaults on a node the batch creates (GraphTransaction.SetDefault) are exempt.
+     */
+    readonly ReadOnly?: ReadonlySet<string>;
 }
 
 export interface IAccessScopeOptions
@@ -74,7 +80,7 @@ export class AccessScope
         const writes = new Map<string, IWriteRules>();
         for (const [name, rules] of options.Writes ?? AccessScope.NoWrites)
         {
-            writes.set(name, Object.freeze({ ...rules }));
+            writes.set(name, Object.freeze(rules.ReadOnly === undefined ? { ...rules } : { ...rules, ReadOnly: new Set(rules.ReadOnly) }));
         }
         return new AccessScope(options.Default, new Map(options.Rows ?? AccessScope.NoRows), hidden, writes);
     }

@@ -13,6 +13,8 @@ export enum AccessErrorCode
     HiddenMember = 4,
     /** The written node (or a Link/Unlink target) is not visible under the scope, or does not exist. */
     InvisibleNode = 5,
+    /** The write sets, removes, links or unlinks a member the scope marks read-only on the node's concept (ruling R92). */
+    MemberReadOnly = 6,
 }
 
 /**

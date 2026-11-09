@@ -136,7 +136,8 @@ enum RuleKind
  *   predicate using Related or Reachable is not node-local and denies the create.
  * - SetProperty, Link, Unlink (the node is the edge's source): the node must be visible and every
  *   applicable Update predicate hold on its snapshot values (R30); a node the batch created is exempt.
- *   The member written must not be hidden on the node's concept. A Link/Unlink target and a Link's
+ *   The member written must not be hidden on the node's concept, nor read-only (ruling R92) unless the op is
+ *   a host-placed default on a node the batch created (GraphTransaction.SetDefault). A Link/Unlink target and a Link's
  *   AfterSibling/BeforeSibling must be visible (or created by the batch and live at that op).
  * - DeleteNode: the node must be visible and every applicable Delete predicate hold on its snapshot
  *   values; deleting a node the batch created is exempt.
@@ -154,6 +155,7 @@ export class WriteGate
     private static readonly ErrDelete = 'a Delete rule does not hold on the node';
     private static readonly ErrDefault = 'the scope has no rule for it and denies by default';
     private static readonly ErrHidden = 'the scope hides member ';
+    private static readonly ErrReadOnly = 'the scope makes member read-only: ';
     private static readonly ErrInvisible = 'the node is not visible under the scope';
     private static readonly ErrInvisibleTarget = 'the target is not visible under the scope: ';
     private static readonly ErrInvisibleSibling = 'the sibling is not visible under the scope: ';
@@ -166,18 +168,22 @@ export class WriteGate
     private static readonly Quote = '\'';
     private static readonly Colon = ': ';
     private static readonly NotVisible = 'concept not visible';
+    private static readonly NoDefaults: ReadonlySet<number> = new Set();
 
     private readonly targets: OpTargets[] = [];
     private readonly updates = new Map<bigint, boolean>();
 
-    private constructor(private readonly evaluator: ScopeEvaluator, private readonly catalog: CatalogSnapshot)
+    private constructor(private readonly evaluator: ScopeEvaluator, private readonly catalog: CatalogSnapshot, private readonly defaults: ReadonlySet<number>)
     {
     }
 
-    /** Throws AccessError for the first op of `batch` the evaluator's scope does not allow. */
-    public static async Check(evaluator: ScopeEvaluator, batch: WriteBatch, catalog: CatalogSnapshot): Promise<void>
+    /**
+     * Throws AccessError for the first op of `batch` the evaluator's scope does not allow. `defaults`: indexes of
+     * SetProperty ops that are host-placed defaults (exempt from ReadOnly on a node the batch created, R92).
+     */
+    public static async Check(evaluator: ScopeEvaluator, batch: WriteBatch, catalog: CatalogSnapshot, defaults: ReadonlySet<number> = WriteGate.NoDefaults): Promise<void>
     {
-        const gate = new WriteGate(evaluator, catalog);
+        const gate = new WriteGate(evaluator, catalog, defaults);
         const ops = batch.Ops();
         gate.Resolve(ops);
         for (let i = 0; i < ops.length; i++)
@@ -238,12 +244,12 @@ export class WriteGate
                 this.CheckCreate(index, op.PublicId, targets.Source as CreatedNode);
                 break;
             case WriteOp.SetProperty:
-                await this.CheckWrite(index, op.Op, op.PublicId, op.Member, targets.Source);
+                await this.CheckWrite(index, op.Op, op.PublicId, op.Member, targets.Source, targets.Source !== undefined && this.defaults.has(index));
                 break;
             case WriteOp.Link:
             case WriteOp.Unlink:
             {
-                const concept = await this.CheckWrite(index, op.Op, op.From, op.Relationship, targets.Source);
+                const concept = await this.CheckWrite(index, op.Op, op.From, op.Relationship, targets.Source, false);
                 await this.CheckReferenced(index, op.Op, op.From, concept, op.To, targets.Target, WriteGate.ErrInvisibleTarget);
                 if (op.Op === WriteOp.Link)
                 {
@@ -308,19 +314,27 @@ export class WriteGate
         }
     }
 
-    /** SetProperty, Link or Unlink of `member` on the node `publicId` (an edge's source); resolves with its concept. */
-    private async CheckWrite(index: number, op: WriteOp, publicId: string, member: string, created: CreatedNode | undefined): Promise<string>
+    /**
+     * SetProperty, Link or Unlink of `member` on the node `publicId` (an edge's source); resolves with its concept.
+     * `placed`: a default the host placed on a node the batch created, exempt from ReadOnly.
+     */
+    private async CheckWrite(index: number, op: WriteOp, publicId: string, member: string, created: CreatedNode | undefined, placed: boolean): Promise<string>
     {
         if (created !== undefined)
         {
             if (created.Known)
             {
                 this.CheckHidden(index, op, publicId, created.Concept, member);
+                if (!placed)
+                {
+                    this.CheckReadOnly(index, op, publicId, created.Concept, member);
+                }
             }
             return created.Concept;
         }
         const node = await this.RequireVisible(index, op, publicId);
         this.CheckHidden(index, op, publicId, node.Concept, member);
+        this.CheckReadOnly(index, op, publicId, node.Concept, member);
         let allowed = this.updates.get(node.Id);
         if (allowed === undefined)
         {
@@ -353,6 +367,14 @@ export class WriteGate
         if (this.evaluator.HiddenMembers(concept).has(member))
         {
             throw this.Denied(AccessErrorCode.HiddenMember, index, op, publicId, concept, WriteGate.ErrHidden + member);
+        }
+    }
+
+    private CheckReadOnly(index: number, op: WriteOp, publicId: string, concept: string, member: string): void
+    {
+        if (this.evaluator.ReadOnlyMembers(concept).has(member))
+        {
+            throw this.Denied(AccessErrorCode.MemberReadOnly, index, op, publicId, concept, WriteGate.ErrReadOnly + member);
         }
     }
 

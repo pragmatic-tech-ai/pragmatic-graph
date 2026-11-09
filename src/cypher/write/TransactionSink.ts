@@ -50,12 +50,15 @@ export class TransactionSink implements ICypherSink
     private static readonly Invalid = 'the write was rejected by the graph';
     private static readonly ConnectorFailed = 'a connector taking part in the write failed';
     private static readonly AlreadyCommitted = 'the write query has already committed';
+    private static readonly NoDefaults: ReadonlyMap<string, CellValue> = new Map();
 
     public readonly View: OverlaySource;
     public readonly Stats = new CypherWriteStats();
 
     private readonly overlay = new PendingOverlay();
     private readonly pending = new WriteBatch();
+    /** Indexes in `pending` of the SetProperty ops that are placement defaults (replayed with SetDefault). */
+    private readonly defaults = new Set<number>();
     private readonly catalog: CatalogSnapshot;
     private committed = false;
 
@@ -71,7 +74,10 @@ export class TransactionSink implements ICypherSink
         return this.pending.Ops();
     }
 
-    /** Creates a node of the (resolved) concept with the given properties; returns it as the query now sees it. */
+    /**
+     * Creates a node of the (resolved) concept with the given properties; returns it as the query now sees it. The
+     * placement's Defaults fill the properties the query did not set (ruling R91), checked like query values.
+     */
     public CreateNode(concept: string, properties: ReadonlyMap<string, CypherScalar>): CypherNode
     {
         try
@@ -88,10 +94,24 @@ export class TransactionSink implements ICypherSink
             cells.set(name, this.Cell(this.Property(concept, name), concept, value));
         }
         const place = this.placement.Place(concept, cells);
+        const placed = new Map<string, CellValue>();
+        for (const [name, value] of place.Defaults ?? TransactionSink.NoDefaults)
+        {
+            if (!cells.has(name))
+            {
+                placed.set(name, this.Cell(this.Property(concept, name), concept, value));
+            }
+        }
         this.pending.CreateNode(place.PublicId, concept, place.Owner === TransactionSink.NoOwner ? undefined : { Owner: place.Owner });
         for (const [name, value] of cells)
         {
             this.pending.SetProperty(place.PublicId, name, value);
+        }
+        for (const [name, value] of placed)
+        {
+            this.defaults.add(this.pending.Count);
+            this.pending.SetProperty(place.PublicId, name, value);
+            cells.set(name, value);
         }
         const node = new CypherNode(place.PublicId, concept, place.Owner, this.Visible(concept, cells));
         this.overlay.RecordCreate(node);
@@ -197,15 +217,24 @@ export class TransactionSink implements ICypherSink
         if (this.committed) throw new CypherWriteError(TransactionSink.AlreadyCommitted);
         this.committed = true;
         const t = this.transaction;
-        for (const op of this.pending.Ops())
+        const ops = this.pending.Ops();
+        for (let i = 0; i < ops.length; i++)
         {
+            const op = ops[i] as BatchOp;
             switch (op.Op)
             {
                 case WriteOp.CreateNode:
                     t.CreateNode(op.PublicId, op.Concept, op.Owner === undefined ? undefined : { Owner: op.Owner });
                     break;
                 case WriteOp.SetProperty:
-                    t.SetProperty(op.PublicId, op.Member, op.Value);
+                    if (this.defaults.has(i))
+                    {
+                        t.SetDefault(op.PublicId, op.Member, op.Value);
+                    }
+                    else
+                    {
+                        t.SetProperty(op.PublicId, op.Member, op.Value);
+                    }
                     break;
                 case WriteOp.DeleteNode:
                     t.DeleteNode(op.PublicId, op.Strict === true ? { Strict: true } : undefined);
