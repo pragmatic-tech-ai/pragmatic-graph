@@ -1,13 +1,13 @@
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { CypherSemanticError, CypherWriteError } from '../CypherError.js';
-import { NodeRefValue, NodeValue } from '../CypherValue.js';
+import { CypherSemanticError } from '../CypherError.js';
 import { CypherWriteStats } from '../write/CypherWriteStats.js';
 import { CypherFixture as F } from './CypherFixture.js';
 
 /**
  * Port of TODL write-stats.test.ts. The two CypherResult DTO tests move to Task 6 (CypherResult and the codec
- * are ported there); NodeRefValue's ToDto refusal is now NodeRefValue.Unresolved() (R81 i); TODL's
+ * are ported there); the NodeRefValue test is dropped with the type (never produced: created nodes are whole
+ * NodeValues through the overlay, R85); TODL's
  * GraphQueryAdapter.ResolveConcept cases run against the engine's label resolution (ReaderSource.ResolveLabel).
  */
 class StatsFx
@@ -38,19 +38,6 @@ describe('CypherWriteStats', () =>
         s.PropertiesSet = 5;
         assert.equal(s.ToDto().NodesCreated, 2);
         assert.equal(s.ToDto().PropertiesSet, 5);
-    });
-});
-
-describe('NodeRefValue', () =>
-{
-    test('exposes id, groups like a node, and reports itself unresolved', () =>
-    {
-        const ref = new NodeRefValue('n1');
-        assert.equal(ref.Id, 'n1');
-        assert.equal(ref.GroupKey(), `${NodeValue.GroupKeyPrefix}n1`);
-        assert.equal(new NodeRefValue('x').GroupKey(), 'node:x');
-        const e = ref.Unresolved();
-        assert.ok(e instanceof CypherWriteError && /unresolved node reference/.test(e.message));
     });
 });
 

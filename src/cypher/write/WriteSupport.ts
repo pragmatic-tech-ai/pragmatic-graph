@@ -1,6 +1,6 @@
 import { Binding, EvalContext } from '../Binding.js';
 import { CypherSemanticError } from '../CypherError.js';
-import { NodeRefValue, NodeValue, NullValue, type CypherValue } from '../CypherValue.js';
+import { NodeValue, NullValue, type CypherValue } from '../CypherValue.js';
 import type { Expression } from '../Expression.js';
 
 /** Shared helpers and messages of the write operators. */
@@ -26,7 +26,7 @@ export class WriteSupport
     public static NodeId(value: CypherValue | undefined): string | undefined
     {
         if (value === undefined || value instanceof NullValue) return undefined;
-        if (value instanceof NodeValue || value instanceof NodeRefValue) return value.Id;
+        if (value instanceof NodeValue) return value.Id;
         throw new CypherSemanticError(WriteSupport.NotANode);
     }
 

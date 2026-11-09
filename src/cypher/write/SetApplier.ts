@@ -2,7 +2,7 @@ import type { Binding } from '../Binding.js';
 import { SetMode } from '../CypherEnums.js';
 import { CypherSemanticError } from '../CypherError.js';
 import type { SetItem } from '../CypherQueryModel.js';
-import { NodeRefValue, NodeValue, NullValue, ScalarValue, type CypherValue } from '../CypherValue.js';
+import { NodeValue, NullValue, ScalarValue, type CypherValue } from '../CypherValue.js';
 import { MapValue } from '../StructuredValues.js';
 import type { TransactionSink } from './TransactionSink.js';
 import { WriteSupport } from './WriteSupport.js';
@@ -58,7 +58,7 @@ export class SetApplier
         {
             await this.sink.RemoveProperty(id, name);
         }
-        else if (value instanceof NodeValue || value instanceof NodeRefValue)
+        else if (value instanceof NodeValue)
         {
             await this.sink.ReplaceRelationship(id, name, value.Id);
         }

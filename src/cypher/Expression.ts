@@ -1,6 +1,6 @@
 import { ComparisonOp, BooleanOp, ArithmeticOp } from './CypherEnums.js';
 import { EvalContext } from './Binding.js';
-import { CypherValue, ScalarValue, NullValue, NodeValue, NodeRefValue, type CypherScalar } from './CypherValue.js';
+import { CypherValue, ScalarValue, NullValue, NodeValue, type CypherScalar } from './CypherValue.js';
 import { CypherSemanticError } from './CypherError.js';
 import { ScalarSemantics } from './ScalarSemantics.js';
 import { ListValue, MapValue } from './StructuredValues.js';
@@ -64,7 +64,6 @@ export class VariableRef extends Expression
 export class PropertyAccess extends Expression
 {
     private static readonly Separator = '.';
-    private static readonly NoReadYourWrites = 'cannot read a property of a node created in the same query before RETURN; intra-query read-your-writes is not supported';
 
     constructor(public readonly Variable: string, public readonly Property: string)
     {
@@ -75,7 +74,6 @@ export class PropertyAccess extends Expression
     {
         const target = ctx.Binding.Get(this.Variable);
         if (target instanceof MapValue) return target.Get(this.Property) ?? NullValue.Instance;
-        if (target instanceof NodeRefValue) throw new CypherSemanticError(PropertyAccess.NoReadYourWrites);
         if (!(target instanceof NodeValue)) return NullValue.Instance;
         const value = target.Field(this.Property);
         return value === undefined || value === null ? NullValue.Instance : new ScalarValue(value);

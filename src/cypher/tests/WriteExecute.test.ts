@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { AccessScope } from '../../index.js';
 import { CypherParser } from '../CypherParser.js';
 import { CypherSemanticError } from '../CypherError.js';
-import { NodeRefValue, NodeValue, NullValue } from '../CypherValue.js';
+import { NodeValue, NullValue } from '../CypherValue.js';
 import { LogicalPlanner } from '../LogicalPlanner.js';
 import { ListValue, MapValue } from '../StructuredValues.js';
 import { WriteQueryRunner } from '../write/WriteQueryRunner.js';
@@ -61,7 +61,6 @@ describe('cypher two-phase write execution', () =>
         assert.equal(r.Values.length, 1);
         const cell = r.Values[0]![0]!;
         assert.ok(cell instanceof NodeValue);
-        assert.ok(!(cell instanceof NodeRefValue));
         assert.equal(cell.Id, 'n0');
         assert.equal(cell.Field('name'), 'Ada');
     });

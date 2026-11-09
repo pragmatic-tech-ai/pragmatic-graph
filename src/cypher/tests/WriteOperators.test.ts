@@ -106,7 +106,7 @@ describe('cypher write operators', () =>
     {
         assert.deepEqual((await W.Steps(fx, "MATCH (n:shop.Order {ref: 'new'}) DELETE n")).Steps, ['DeleteNode(o2)']);
         assert.deepEqual((await W.Steps(fx, 'MATCH (n:shop.Customer) DETACH DELETE n')).Steps, ['Unlink(c1,orders,o1)', 'DeleteNode(c1)']);
-        await assert.rejects(W.Steps(fx, 'MATCH (n:shop.Customer) DELETE n'), (e: unknown) => e instanceof CypherWriteError && e.WriteCode === CypherWriteErrorCode.Invalid && /relationships/.test(e.message));
+        await assert.rejects(W.Steps(fx, 'MATCH (n:shop.Customer) DELETE n'), (e: unknown) => e instanceof CypherWriteError && e.WriteCode === CypherWriteErrorCode.NodeHasRelationships && /relationships/.test(e.message));
     });
 
     test('REMOVE n.p sets the property to null', async () =>

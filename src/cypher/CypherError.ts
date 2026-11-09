@@ -22,6 +22,8 @@ export enum CypherWriteErrorCode
     Invalid,
     /** A connector taking part in the write-through failed. */
     ConnectorFailed,
+    /** A DELETE without DETACH hit a node that still has relationships (visible ones in the query, any at commit). */
+    NodeHasRelationships,
 }
 
 /** Every Cypher failure is a GraphError with GraphCode QueryFailed; Code gives the Cypher category. */

@@ -1,6 +1,6 @@
 import { test, describe, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { AccessDefault, AccessError, AccessScope, CommitError, ConflictError, ConnectorError, EdgeDirection, FalsePredicate } from '../../index.js';
+import { AccessDefault, AccessError, AccessScope, CommitError, CommitErrorCode, ConflictError, ConnectorError, EdgeDirection, FalsePredicate, WriteOp } from '../../index.js';
 import { FakeConnector, FakeStep } from '../../connectors/tests/FakeConnector.js';
 import { RelDirection } from '../CypherEnums.js';
 import { CypherParser } from '../CypherParser.js';
@@ -137,6 +137,15 @@ describe('write overlay: read-your-writes within one query', () =>
         assert.ok(o.Log.includes('A.Begin'));
     });
 
+    test('a CREATE placed with a bound owner routes the created node to its connector', async () =>
+    {
+        await W.Write(fx, "CREATE (n:Server {name: 'routed', code: 'c'})", { Placement: { Place: () => ({ PublicId: 'r1', Owner: OverlayFx.Crm }) } });
+        assert.ok(o.Log.includes('A.Begin'), o.Log.join());
+        const applied = o.Connector.Applied.flatMap(set => set.Changes);
+        assert.ok(applied.some(c => c.Op === WriteOp.CreateNode && c.PublicId === 'r1' && c.Owner === OverlayFx.Crm && c.Concept === OverlayFx.Server));
+        assert.ok(applied.some(c => c.Op === WriteOp.SetProperty && c.PublicId === 'r1' && c.Member === 'code'));
+    });
+
     test('placement supplies id and owner', async () =>
     {
         const placement = { Place: () => ({ PublicId: 'srv-1', Owner: 'ops' }) };
@@ -271,5 +280,34 @@ describe('write overlay: read-your-writes within one query', () =>
     {
         const r = await W.Write(fx, "UNWIND [1, 2] AS i MATCH (n:Server {name: 'b'}) DETACH DELETE n");
         assert.equal(r.Stats.NodesDeleted, 1);
+    });
+});
+
+describe('non-detach DELETE and hidden edges', () =>
+{
+    test('a hidden edge still blocks a plain DELETE (strict delete at commit); data intact', async () =>
+    {
+        const fx = await F.Open(
+            [F.Concept('S', [F.Text('name'), F.Rel('secret', ['S'])])],
+            [F.Node('a', 'S', { name: 'a' }, [['secret', 'b']]), F.Node('b', 'S', { name: 'b' })],
+        );
+        try
+        {
+            const scope = AccessScope.Build({ Default: AccessDefault.Allow, Hidden: new Map([['S', new Set(['secret'])]]) });
+            const head = await W.Head(fx);
+            await assert.rejects(W.Write(fx, "MATCH (n:S {name: 'b'}) DELETE n", { Scope: scope }), (e: unknown) =>
+                e instanceof CypherWriteError && e.WriteCode === CypherWriteErrorCode.NodeHasRelationships
+                && e.cause instanceof CommitError && e.cause.Code === CommitErrorCode.NodeHasEdges
+                && !e.message.includes('secret') && !e.cause.message.includes('secret'));
+            assert.equal(await W.CommitsAfter(fx, head), 0);
+            assert.deepEqual(await fx.Column("MATCH (x:S)-[:secret]->(y) RETURN y.name", 'y.name'), ['b']);
+            // DETACH cascades the hidden edge (R68/R69 policy; restrict through the gate's Delete rule).
+            await W.Write(fx, "MATCH (n:S {name: 'b'}) DETACH DELETE n", { Scope: scope });
+            assert.deepEqual(await fx.Column('MATCH (x:S) RETURN x.name', 'x.name'), ['a']);
+        }
+        finally
+        {
+            await fx.dispose();
+        }
     });
 });

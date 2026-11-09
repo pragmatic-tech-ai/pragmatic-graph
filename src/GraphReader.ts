@@ -56,6 +56,7 @@ export class GraphReader implements IGraphDisposable
     private static readonly ErrUnknownIndex = 'Unknown index: ';
     private static readonly Dot = '.';
     private static readonly Partition = 0;
+    private static readonly NoHidden: ReadonlySet<string> = new Set();
 
     private readonly recorded: RecordedReads;
     /** Undefined when the scope restricts no read (System): the hot path then does no evaluator work. */
@@ -88,6 +89,15 @@ export class GraphReader implements IGraphDisposable
     public get Scope(): AccessScope
     {
         return this.scope;
+    }
+
+    /**
+     * The members the scope hides on instances of the concept (the union of every Hidden entry naming it, an
+     * ancestor or a carried aspect); empty when nothing is hidden. Scope metadata only: nothing is read or recorded.
+     */
+    public HiddenMembers(concept: string): ReadonlySet<string>
+    {
+        return this.evaluator?.HiddenMembers(concept) ?? GraphReader.NoHidden;
     }
 
     /**

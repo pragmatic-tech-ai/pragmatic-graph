@@ -1,5 +1,4 @@
 import type { CellValue } from '../columns/CellValue.js';
-import { CypherWriteError } from './CypherError.js';
 import type { CypherNode } from './CypherNode.js';
 import { ScalarSemantics } from './ScalarSemantics.js';
 
@@ -148,49 +147,9 @@ export class NodeValue extends CypherValue
 
     protected CompareSameType(other: CypherValue): number
     {
-        const o = (other as NodeValue | NodeRefValue).Id;
+        const o = (other as NodeValue).Id;
         if (this.Id < o) return -1;
         if (this.Id > o) return 1;
-        return 0;
-    }
-}
-
-// Id-only placeholder for a just-created node; re-resolved to a NodeValue after commit.
-export class NodeRefValue extends CypherValue
-{
-    private static readonly Unresolved = 'unresolved node reference';
-
-    constructor(private readonly id: string)
-    {
-        super();
-    }
-
-    public get Id(): string
-    {
-        return this.id;
-    }
-
-    /** Raised where a result needs the node's content (the result codec) but only its id is known. */
-    public Unresolved(): CypherWriteError
-    {
-        return new CypherWriteError(`${NodeRefValue.Unresolved} "${this.id}"`);
-    }
-
-    public GroupKey(): string
-    {
-        return `${NodeValue.GroupKeyPrefix}${this.id}`;
-    }
-
-    protected TypeRank(): number
-    {
-        return ValueRank.Node;
-    }
-
-    protected CompareSameType(other: CypherValue): number
-    {
-        const o = (other as NodeValue | NodeRefValue).Id;
-        if (this.id < o) return -1;
-        if (this.id > o) return 1;
         return 0;
     }
 }

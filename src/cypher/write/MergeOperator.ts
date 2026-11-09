@@ -2,7 +2,7 @@ import type { Binding } from '../Binding.js';
 import { CypherSemanticError } from '../CypherError.js';
 import type { MergeClause, SetItem } from '../CypherQueryModel.js';
 import type { ICypherSource } from '../CypherSource.js';
-import { NodeRefValue, NodeValue, NullValue } from '../CypherValue.js';
+import { NodeValue, NullValue } from '../CypherValue.js';
 import type { PatternPath } from '../PatternPath.js';
 import type { IOperator } from '../operators/IOperator.js';
 import type { IOptionalPlan } from '../operators/OptionalApply.js';
@@ -88,7 +88,7 @@ export class MergeOperator implements IOperator
             const value = node.Variable === undefined ? undefined : row.Get(node.Variable);
             if (value === undefined) continue;
             if (value instanceof NullValue) throw new CypherSemanticError(`${WriteSupport.MergeBoundNull}: "${node.Variable}"`);
-            if (!(value instanceof NodeValue || value instanceof NodeRefValue))
+            if (!(value instanceof NodeValue))
             {
                 throw new CypherSemanticError(`${WriteSupport.MergeBoundNotNode}: "${node.Variable}"`);
             }

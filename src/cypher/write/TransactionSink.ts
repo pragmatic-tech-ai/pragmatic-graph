@@ -8,7 +8,7 @@ import { ValueCodec } from '../../columns/ValueCodec.js';
 import { ConnectorError } from '../../connectors/ConnectorError.js';
 import { GraphError } from '../../errors/GraphError.js';
 import type { GraphTransaction } from '../../GraphTransaction.js';
-import { CommitError } from '../../txn/CommitError.js';
+import { CommitError, CommitErrorCode } from '../../txn/CommitError.js';
 import { ConflictError } from '../../txn/ConflictError.js';
 import { WriteBatch, WriteOp, type BatchOp } from '../../txn/WriteBatch.js';
 import { RelDirection } from '../CypherEnums.js';
@@ -43,7 +43,7 @@ export class TransactionSink
     private static readonly NullNotAllowed = 'null is not allowed for the required property ';
     private static readonly Inexact = 'integer is not exactly representable as a Float64 for ';
     private static readonly BadValue = 'value does not fit the property ';
-    private static readonly NodeHasRelationships = 'cannot delete a node that still has relationships; use DETACH DELETE: ';
+    private static readonly NodeHasRelationships = 'cannot delete a node that still has relationships; use DETACH DELETE';
     private static readonly Conflict = 'the write conflicted with a concurrent commit; retry the query';
     private static readonly Denied = 'the access scope does not allow the write';
     private static readonly Invalid = 'the write was rejected by the graph';
@@ -180,10 +180,11 @@ export class TransactionSink
         }
         if (edges.length > 0 && !detach)
         {
-            throw new CypherWriteError(TransactionSink.NodeHasRelationships + publicId);
+            throw new CypherWriteError(TransactionSink.NodeHasRelationships, CypherWriteErrorCode.NodeHasRelationships);
         }
         for (const [from, relationship, to] of edges) await this.DeleteRelationship(from, relationship, to);
-        this.pending.DeleteNode(publicId);
+        // Strict: hidden edges the query cannot see still fail the commit (NodeHasEdges).
+        this.pending.DeleteNode(publicId, detach ? undefined : { Strict: true });
         this.overlay.RecordDelete(publicId);
         this.Stats.NodesDeleted++;
     }
@@ -205,7 +206,7 @@ export class TransactionSink
                     t.SetProperty(op.PublicId, op.Member, op.Value);
                     break;
                 case WriteOp.DeleteNode:
-                    t.DeleteNode(op.PublicId);
+                    t.DeleteNode(op.PublicId, op.Strict === true ? { Strict: true } : undefined);
                     break;
                 case WriteOp.Link:
                     t.Link(op.From, op.Relationship, op.To);
@@ -230,6 +231,10 @@ export class TransactionSink
     {
         if (error instanceof ConflictError) return new CypherWriteError(TransactionSink.Conflict, CypherWriteErrorCode.Conflict, error);
         if (error instanceof AccessError) return new CypherWriteError(TransactionSink.Denied, CypherWriteErrorCode.Denied, error);
+        if (error instanceof CommitError && error.Code === CommitErrorCode.NodeHasEdges)
+        {
+            return new CypherWriteError(TransactionSink.NodeHasRelationships, CypherWriteErrorCode.NodeHasRelationships, error);
+        }
         if (error instanceof CommitError) return new CypherWriteError(`${TransactionSink.Invalid}: ${error.message}`, CypherWriteErrorCode.Invalid, error);
         if (error instanceof ConnectorError) return new CypherWriteError(TransactionSink.ConnectorFailed, CypherWriteErrorCode.ConnectorFailed, error);
         return error;
@@ -303,11 +308,7 @@ export class TransactionSink
     /** A created node's properties as a reader under the transaction's scope would show them (null for unset). */
     private Visible(concept: string, cells: ReadonlyMap<string, CellValue>): Map<string, CellValue>
     {
-        const hidden = new Set<string>();
-        for (const [name, members] of this.transaction.Scope.Hidden)
-        {
-            if (this.catalog.Has(name) && this.catalog.IsA(concept, name)) for (const m of members) hidden.add(m);
-        }
+        const hidden = this.transaction.HiddenMembers(concept);
         const out = new Map<string, CellValue>();
         for (const def of this.catalog.EffectiveMembers(concept))
         {
