@@ -34,6 +34,8 @@ class DefaultsFx
     public static readonly U1 = 'u1';
     public static readonly U2 = 'u2';
     public static readonly First = 't0';
+    public static readonly A = 'a';
+    public static readonly Unknown = 'nope';
 
     public static Open(): Promise<F>
     {
@@ -76,7 +78,7 @@ describe('placement defaults (R91)', () =>
         const r = await W.Write(fx, "CREATE (n:Ticket {title: 'a'}) RETURN n.owner AS o", { Placement: DefaultsFx.OwnerDefault() });
         assert.deepEqual(r.Rows.map(row => row.get('o')), [DefaultsFx.U1]);
         assert.equal(await DefaultsFx.Property(fx, DefaultsFx.First, DefaultsFx.Owner), DefaultsFx.U1);
-        assert.equal(await DefaultsFx.Property(fx, DefaultsFx.First, DefaultsFx.Title), 'a');
+        assert.equal(await DefaultsFx.Property(fx, DefaultsFx.First, DefaultsFx.Title), DefaultsFx.A);
     });
 
     test('query value wins over default', async () =>
@@ -99,8 +101,8 @@ describe('placement defaults (R91)', () =>
 
     test('a default must name a property of the concept and fit its type', async () =>
     {
-        await assert.rejects(W.Write(fx, "CREATE (n:Ticket {title: 'a'})", { Placement: new DefaultsPlacement(new Map([['nope', 'x']])) }),
-            (e: unknown) => e instanceof CypherWriteError && /unknown member Ticket\.nope/.test(e.message));
+        await assert.rejects(W.Write(fx, "CREATE (n:Ticket {title: 'a'})", { Placement: new DefaultsPlacement(new Map([[DefaultsFx.Unknown, 'x']])) }),
+            (e: unknown) => e instanceof CypherWriteError && e.message.includes(`unknown member ${DefaultsFx.Ticket}.${DefaultsFx.Unknown}`));
         await assert.rejects(W.Write(fx, "CREATE (n:Ticket {title: 'a'})", { Placement: new DefaultsPlacement(new Map([[DefaultsFx.Rank, 'x']])) }),
             (e: unknown) => e instanceof CypherWriteError && /Ticket\.rank/.test(e.message));
     });

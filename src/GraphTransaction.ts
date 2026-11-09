@@ -1,5 +1,6 @@
 import type { AccessScope } from './access/AccessScope.js';
 import { AccessError } from './access/AccessError.js';
+import { WriteExemptions } from './access/WriteExemptions.js';
 import { WriteGate } from './access/WriteGate.js';
 import type { CellValue } from './columns/CellValue.js';
 import { type INodeOrigins, WriteCoordinator } from './connectors/WriteCoordinator.js';
@@ -36,8 +37,8 @@ export class GraphTransaction extends GraphReader
     private static readonly ErrSchemaNow = ', now ';
 
     private readonly batch = new WriteBatch();
-    /** Indexes in `batch` of the SetProperty ops SetDefault recorded. */
-    private readonly defaults = new Set<number>();
+    /** The batch ops SetDefault and DetachUnlink recorded. */
+    private readonly exempt = new WriteExemptions();
     private committing = false;
 
     /** @internal Created by GraphStore.Begin. */
@@ -60,15 +61,16 @@ export class GraphTransaction extends GraphReader
 
     /**
      * Records a value the host places on a node this transaction created earlier (a placement default, ruling
-     * R91): exactly SetProperty, except that the scope's ReadOnly members do not refuse it (R92). On a node the
-     * transaction did not create it is checked as an ordinary SetProperty.
+     * R91). It BYPASSES the scope's Hidden and ReadOnly member rules for that write. The bypass holds only for a
+     * node created earlier in this same transaction; on any other node SetDefault is checked exactly as
+     * SetProperty. Otherwise it is SetProperty (same op, same commit).
      */
     public SetDefault(publicId: string, member: string, value: CellValue): void
     {
         this.RequireActive();
         const index = this.batch.Count;
         this.batch.SetProperty(publicId, member, value);
-        this.defaults.add(index);
+        this.exempt.Defaults.add(index);
     }
 
     /**
@@ -91,6 +93,20 @@ export class GraphTransaction extends GraphReader
     {
         this.RequireActive();
         this.batch.Unlink(from, relationship, to);
+    }
+
+    /**
+     * Records an Unlink implied by deleting `from` or `to` later in this transaction (a Cypher DETACH DELETE,
+     * ruling R92). It BYPASSES the scope's ReadOnly members, as the engine's own DeleteNode does for the edges it
+     * removes: the Delete rule governs it. The bypass holds only when the transaction deletes one of the edge's
+     * ends after it; otherwise it is checked exactly as Unlink. Otherwise it is Unlink (same op, same commit).
+     */
+    public DetachUnlink(from: string, relationship: string, to: string): void
+    {
+        this.RequireActive();
+        const index = this.batch.Count;
+        this.batch.Unlink(from, relationship, to);
+        this.exempt.Detaches.add(index);
     }
 
     /**
@@ -164,7 +180,7 @@ export class GraphTransaction extends GraphReader
         }
         try
         {
-            await WriteGate.Check(this.WriteEvaluator(), this.batch, this.snapshot.Index.Catalog, this.defaults);
+            await WriteGate.Check(this.WriteEvaluator(), this.batch, this.snapshot.Index.Catalog, this.exempt);
         }
         catch (error)
         {

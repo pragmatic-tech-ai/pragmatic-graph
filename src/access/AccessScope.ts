@@ -80,7 +80,8 @@ export class AccessScope
         const writes = new Map<string, IWriteRules>();
         for (const [name, rules] of options.Writes ?? AccessScope.NoWrites)
         {
-            writes.set(name, Object.freeze(rules.ReadOnly === undefined ? { ...rules } : { ...rules, ReadOnly: new Set(rules.ReadOnly) }));
+            const copy: IWriteRules = rules.ReadOnly === undefined ? { ...rules } : { ...rules, ReadOnly: new Set(rules.ReadOnly) };
+            writes.set(name, Object.freeze(copy));
         }
         return new AccessScope(options.Default, new Map(options.Rows ?? AccessScope.NoRows), hidden, writes);
     }

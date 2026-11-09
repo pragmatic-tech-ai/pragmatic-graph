@@ -54,16 +54,13 @@ export class ScopeValidator
         {
             ScopeValidator.RequireMembers(index, key, members, ScopeValidator.ErrUnknownMember);
         }
-        for (const [key, rules] of scope.Writes)
-        {
-            ScopeValidator.RequireMembers(index, key, rules.ReadOnly ?? [], ScopeValidator.ErrUnknownReadOnly);
-        }
         for (const [key, predicate] of scope.Rows)
         {
             ScopeValidator.Walk(index, predicate, new Place(key, key, []));
         }
         for (const [key, rules] of scope.Writes)
         {
+            ScopeValidator.RequireMembers(index, key, rules.ReadOnly ?? [], ScopeValidator.ErrUnknownReadOnly);
             for (const predicate of [rules.Create, rules.Update, rules.Delete])
             {
                 if (predicate !== undefined)

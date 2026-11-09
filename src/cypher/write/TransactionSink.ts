@@ -59,6 +59,8 @@ export class TransactionSink implements ICypherSink
     private readonly pending = new WriteBatch();
     /** Indexes in `pending` of the SetProperty ops that are placement defaults (replayed with SetDefault). */
     private readonly defaults = new Set<number>();
+    /** Indexes in `pending` of the Unlink ops a DETACH DELETE implies (replayed with DetachUnlink). */
+    private readonly detaches = new Set<number>();
     private readonly catalog: CatalogSnapshot;
     private committed = false;
 
@@ -169,9 +171,16 @@ export class TransactionSink implements ICypherSink
     }
 
     /** False, writing nothing, when the edge does not exist in the query's view. */
-    public async DeleteRelationship(from: string, relationship: string, to: string): Promise<boolean>
+    public DeleteRelationship(from: string, relationship: string, to: string): Promise<boolean>
+    {
+        return this.Unlink(from, relationship, to, false);
+    }
+
+    /** DeleteRelationship; `detach`: implied by the DETACH DELETE that follows (ruling R92). */
+    private async Unlink(from: string, relationship: string, to: string, detach: boolean): Promise<boolean>
     {
         if (!(await this.Targets(from, relationship)).includes(to)) return false;
+        if (detach) this.detaches.add(this.pending.Count);
         this.pending.Unlink(from, relationship, to);
         this.overlay.RecordUnlink(from, relationship, to);
         this.Stats.RelationshipsDeleted++;
@@ -203,7 +212,7 @@ export class TransactionSink implements ICypherSink
         {
             throw new CypherWriteError(TransactionSink.NodeHasRelationships, CypherWriteErrorCode.NodeHasRelationships);
         }
-        for (const [from, relationship, to] of edges) await this.DeleteRelationship(from, relationship, to);
+        for (const [from, relationship, to] of edges) await this.Unlink(from, relationship, to, true);
         // Strict: hidden edges the query cannot see still fail the commit (NodeHasEdges). DETACH: the engine
         // removes the hidden ones too, and routes their Unlinks to connectors itself (ruling R89).
         this.pending.DeleteNode(publicId, detach ? undefined : { Strict: true });
@@ -243,7 +252,14 @@ export class TransactionSink implements ICypherSink
                     t.Link(op.From, op.Relationship, op.To);
                     break;
                 case WriteOp.Unlink:
-                    t.Unlink(op.From, op.Relationship, op.To);
+                    if (this.detaches.has(i))
+                    {
+                        t.DetachUnlink(op.From, op.Relationship, op.To);
+                    }
+                    else
+                    {
+                        t.Unlink(op.From, op.Relationship, op.To);
+                    }
                     break;
             }
         }
