@@ -6,7 +6,8 @@ import { CypherSemanticError } from './CypherError.js';
  * formatting for toString() and the result cell codec. Dates are YYYY-MM-DD; instants are
  * YYYY-MM-DDThh:mm[:ss[.fraction]] with Z or a +hh:mm offset (fraction truncated to microseconds; formatted in
  * UTC, toString() followed by the [zone]); durations are [-]P[nY][nM][nW][nD][T[nH][nM][n[.fraction]S]] with
- * each component optionally signed (a duration whose parts differ in sign formats that way). Years may be
+ * each component optionally signed when there is no outer sign, one sign per group (Y/M, W/D, H/M/S): a duration
+ * whose months, days and time differ in sign formats that way. Years may be
  * negative or longer than four digits (ISO-8601 expanded form), so every engine Date and DateTime formats and
  * parses back exactly: calendar arithmetic is proleptic Gregorian on plain integers, not on the JS Date range.
  */
@@ -40,6 +41,7 @@ export class TemporalText
     private static readonly MicroDigits = 6;
     private static readonly Utc = 'Z';
     private static readonly Minus = '-';
+    private static readonly SignChars = '+-';
     private static readonly Zero = '0';
     private static readonly Dot = '.';
     private static readonly ZeroDuration = 'PT0S';
@@ -124,7 +126,8 @@ export class TemporalText
     {
         const m = TemporalText.DurationPattern.exec(text);
         // At least one component, and a T must be followed by a time component.
-        if (m === null || [m[2], m[3], m[4], m[5], m[6], m[7], m[9]].every((g) => g === undefined) || TemporalText.TrailingTimeMarker.test(text))
+        if (m === null || [m[2], m[3], m[4], m[5], m[6], m[7], m[9]].every((g) => g === undefined) || TemporalText.TrailingTimeMarker.test(text)
+            || !TemporalText.SignsConsistent(m))
         {
             throw new CypherSemanticError(TemporalText.BadDuration + text);
         }
@@ -132,7 +135,8 @@ export class TemporalText
         // `+ 0` folds a -0 (e.g. -P0D) into 0.
         const months = (Number(m[2] ?? 0) * TemporalText.MonthsPerYear + Number(m[3] ?? 0)) * sign + 0;
         const days = (Number(m[4] ?? 0) * TemporalText.DaysPerWeek + Number(m[5] ?? 0)) * sign + 0;
-        if (!Number.isSafeInteger(months) || !Number.isSafeInteger(days) || Math.abs(months) > TemporalText.Int32Max || Math.abs(days) > TemporalText.Int32Max)
+        if (!Number.isSafeInteger(months) || !Number.isSafeInteger(days) || months < TemporalText.Int32Min || months > TemporalText.Int32Max
+            || days < TemporalText.Int32Min || days > TemporalText.Int32Max)
         {
             throw new CypherSemanticError(TemporalText.BadDuration + text);
         }
@@ -218,6 +222,22 @@ export class TemporalText
         {
             throw new CypherSemanticError(TemporalText.BadZone + zone);
         }
+    }
+
+    /**
+     * Component signs are only what FormatDuration emits: none with an outer sign, and within each group that one
+     * engine field feeds (years and months; weeks and days; hours, minutes and seconds) one sign for every component.
+     */
+    private static SignsConsistent(m: RegExpExecArray): boolean
+    {
+        const groups = [[m[2], m[3]], [m[4], m[5]], [m[6], m[7], m[9] === undefined ? undefined : m[8]! + m[9]]];
+        const signed = (c: string | undefined): boolean => c !== undefined && TemporalText.SignChars.includes(c[0]!);
+        if (m[1] !== undefined && groups.some((g) => g.some(signed))) return false;
+        return groups.every((g) =>
+        {
+            const present = g.filter((c): c is string => c !== undefined);
+            return present.every((c) => c.startsWith(TemporalText.Minus) === present[0]!.startsWith(TemporalText.Minus));
+        });
     }
 
     // Up to nine fraction digits, truncated to microseconds.

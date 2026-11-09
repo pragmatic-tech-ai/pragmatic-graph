@@ -11,7 +11,7 @@ import type { CypherQueryModel } from './CypherQueryModel.js';
 import { CypherResult, type CypherResultDto } from './CypherResult.js';
 import type { ICypherSource } from './CypherSource.js';
 import { NodeValue, NullValue, type CypherValue, type ParameterValue } from './CypherValue.js';
-import { CancelProbe, type ExecutionLimits } from './ExecutionLimits.js';
+import { CancelProbe, type ExecutionLimits, type ICancellation } from './ExecutionLimits.js';
 import { LogicalPlanner, type PlannerOptions } from './LogicalPlanner.js';
 import type { IOperator } from './operators/IOperator.js';
 import { ParameterBinder } from './ParameterBinder.js';
@@ -66,7 +66,7 @@ export class CypherEngine
             const plan = new LogicalPlanner(view, parameters, this.options, limits?.Cancel, paging).Plan(model);
             const columns = model.FinalColumns();
             const result = paging ? await CypherEngine.Page(plan, columns, limits!) : await CypherEngine.Collect(plan, columns, limits);
-            await CypherEngine.FillLinks(result.Rows, view);
+            await CypherEngine.FillLinks(result.Rows, view, limits?.Cancel);
             return result;
         }
         finally
@@ -111,7 +111,7 @@ export class CypherEngine
             if (this.options !== undefined) runOptions.Planner = this.options;
             const runner = new WriteQueryRunner(transaction, runOptions);
             const outcome = await runner.Run(model, parameters, options.Limits?.Cancel);
-            await CypherEngine.FillLinks(outcome.Rows, runner.Source);
+            await CypherEngine.FillLinks(outcome.Rows, runner.Source, options.Limits?.Cancel);
             await runner.Commit();
             return new CypherResult(outcome.Columns, outcome.Rows, false, false, runner.Stats);
         }
@@ -179,20 +179,27 @@ export class CypherEngine
     }
 
     // Each distinct node (by public id) is read once; every CypherNode instance of it is filled with that read.
-    private static async FillLinks(rows: readonly (readonly CypherValue[])[], source: ICypherSource): Promise<void>
+    // When there is anything to read, the deadline is checked before the first read and then per read (CancelProbe).
+    private static async FillLinks(rows: readonly (readonly CypherValue[])[], source: ICypherSource, cancel: ICancellation | undefined): Promise<void>
     {
+        const probe = new CancelProbe(cancel);
         const nodes: CypherNode[] = [];
         for (const row of rows)
         {
             for (const value of row) CypherEngine.CollectNodes(value, nodes);
         }
         const read = new Map<string, readonly ILinkView[]>();
+        if (nodes.length > 0)
+        {
+            probe.Begin();
+        }
         for (const node of nodes)
         {
             if (node.Links !== undefined) continue;
             let links = read.get(node.PublicId);
             if (links === undefined)
             {
+                probe.Tick();
                 links = await source.OutLinks(node.PublicId);
                 read.set(node.PublicId, links);
             }

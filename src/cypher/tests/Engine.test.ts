@@ -1,9 +1,9 @@
 import { after, before, describe, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { AccessDefault, AccessScope, type GraphReader, type GraphTransaction, type ICommitApplied } from '../../index.js';
+import { AccessDefault, AccessScope, FalsePredicate, IdIn, type GraphReader, type GraphTransaction, type ICommitApplied } from '../../index.js';
 import { CypherCellCodec } from '../CypherCellCodec.js';
 import { CypherEngine } from '../CypherEngine.js';
-import { CypherSemanticError, CypherTimeout, CypherWriteError } from '../CypherError.js';
+import { CypherSemanticError, CypherTimeout, CypherWriteError, CypherWriteErrorCode } from '../CypherError.js';
 import { CypherNode } from '../CypherNode.js';
 import { CypherQuery, Expr, Pattern, Return } from '../CypherQuery.js';
 import { CypherResult } from '../CypherResult.js';
@@ -325,6 +325,142 @@ describe('CypherEngine transactions', () =>
             await EngineFixture.Settle();
             assert.equal(spy.Readers.length + spy.Transactions.length, 0);
             assert.equal(commits.length, 0);
+        }
+        finally
+        {
+            await h.dispose();
+        }
+    });
+});
+
+describe('CypherEngine under an access scope', () =>
+{
+    const OnlyA = (): AccessScope => AccessScope.Build({ Default: AccessDefault.Allow, Rows: new Map([['Service', new IdIn(new Set(['a']))]]) });
+    const NoNote = (): AccessScope => AccessScope.Build({ Default: AccessDefault.Allow, Hidden: new Map([['Service', new Set(['note'])]]) });
+
+    // R85 (i) / R86 (b): a write query returns what it wrote even where the scope's Rows will hide it on later reads.
+    test('a write result includes the nodes and links it created; later reads under the scope hide them', async () =>
+    {
+        const h = await EngineFixture.Open();
+        try
+        {
+            const scope = OnlyA();
+            const result = await h.Cypher.Execute(scope,
+                "MATCH (a:Service {name: 'checkout'}) CREATE (a)-[:calls]->(n:Service {name: 'y'}) RETURN a, n", { Placement: new SequencePlacement() });
+            const row = CypherEngine.ToDto(result).Rows[0]!;
+            // b exists and a still calls it, but b is invisible: only the query-created n0 is in a's links.
+            assert.deepEqual(CypherCellCodec.AsNode(row[0])!.links, { calls: ['n0'] });
+            assert.equal(CypherCellCodec.AsNode(row[1])!.id, 'n0');
+            const later = CypherEngine.ToDto(await h.Execute('MATCH (x:Service) RETURN x', undefined, undefined, scope));
+            assert.deepEqual(later.Rows.map((r) => CypherCellCodec.AsNode(r[0])!.id), ['a']);
+            assert.deepEqual(CypherCellCodec.AsNode(later.Rows[0]![0])!.links, {});
+            assert.equal((await h.Execute("MATCH (x:Service {name: 'y'}) RETURN x", undefined, undefined, scope)).Rows.length, 0);
+            const system = await h.Execute("MATCH (a:Service {name: 'checkout'})-[:calls]->(x) RETURN x.name AS n ORDER BY n");
+            assert.deepEqual(EngineHarness.Col(system), ['ledger', 'y']);
+        }
+        finally
+        {
+            await h.dispose();
+        }
+    });
+
+    test('a pre-existing invisible node never appears in a write result', async () =>
+    {
+        const h = await EngineFixture.Open();
+        try
+        {
+            const scope = OnlyA();
+            const matched = await h.Execute("MATCH (a:Service {name: 'checkout'}), (b:Service {name: 'ledger'}) CREATE (a)-[:calls]->(b) RETURN a, b", undefined, undefined, scope);
+            assert.equal(matched.Rows.length, 0);
+            assert.equal(matched.Stats?.RelationshipsCreated, 0);
+            const set = CypherEngine.ToDto(await h.Execute("MATCH (a:Service {name: 'checkout'}) SET a.note = 'z' RETURN a, [a] AS l", undefined, undefined, scope));
+            assert.deepEqual(CypherCellCodec.AsNode(set.Rows[0]![0])!.links, {});
+            const merged = await h.Cypher.Execute(scope,
+                "MATCH (a:Service {name: 'checkout'}) MERGE (a)-[:calls]->(x:Service {name: 'ledger'}) RETURN a, x", { Placement: new SequencePlacement() });
+            const row = CypherEngine.ToDto(merged).Rows[0]!;
+            assert.equal(CypherCellCodec.AsNode(row[1])!.id, 'n0');
+            assert.deepEqual(CypherCellCodec.AsNode(row[0])!.links, { calls: ['n0'] });
+        }
+        finally
+        {
+            await h.dispose();
+        }
+    });
+
+    test('a hidden property member is absent from node cells, on reads and writes', async () =>
+    {
+        const h = await EngineFixture.Open();
+        try
+        {
+            const read = CypherEngine.ToDto(await h.Execute("MATCH (a:Service {name: 'checkout'}) RETURN a", undefined, undefined, NoNote()));
+            assert.deepEqual(CypherCellCodec.AsNode(read.Rows[0]![0])!.properties, { name: 'checkout' });
+            const write = await h.Cypher.Execute(NoNote(), "CREATE (n:Service {name: 'w'}) RETURN n", { Placement: new SequencePlacement() });
+            assert.deepEqual(CypherCellCodec.AsNode(CypherEngine.ToDto(write).Rows[0]![0])!.properties, { name: 'w' });
+        }
+        finally
+        {
+            await h.dispose();
+        }
+    });
+
+    test('a write the scope denies fails as Denied, commits nothing and disposes the transaction', async () =>
+    {
+        const h = await EngineFixture.Open();
+        try
+        {
+            const spy = EngineFixture.Spy(h);
+            const commits = EngineFixture.Commits(h);
+            const scope = AccessScope.Build({ Default: AccessDefault.Allow, Writes: new Map([['Service', { Create: FalsePredicate.Instance }]]) });
+            await assert.rejects(h.Execute("CREATE (n:Service {name: 'no'})", undefined, undefined, scope),
+                (e: unknown) => e instanceof CypherWriteError && e.WriteCode === CypherWriteErrorCode.Denied);
+            await EngineFixture.Settle();
+            assert.equal(commits.length, 0);
+            await assert.rejects(spy.Transactions[0]!.ReadNode('a'), /disposed/);
+            assert.equal((await h.Execute("MATCH (n:Service {name: 'no'}) RETURN n")).Rows.length, 0);
+        }
+        finally
+        {
+            await h.dispose();
+        }
+    });
+
+    test('reader disposed after RowCap truncation', async () =>
+    {
+        const h = await EngineFixture.Open();
+        try
+        {
+            const spy = EngineFixture.Spy(h);
+            const r = await h.Execute('MATCH (a:Service) RETURN a', undefined, { RowCap: 1 });
+            assert.equal(r.Truncated, true);
+            assert.equal(CypherEngine.ToDto(r).Rows.length, 1);
+            await assert.rejects(spy.Readers[0]!.ReadNode('a'), /disposed/);
+        }
+        finally
+        {
+            await h.dispose();
+        }
+    });
+
+    test('the deadline applies to the link fill; the reader is disposed', async () =>
+    {
+        const h = await EngineFixture.Open();
+        try
+        {
+            const spy = EngineFixture.Spy(h);
+            const expired = { Expired: () => true };
+            // No buffering operator and no nodes: nothing checks the deadline, the query completes.
+            assert.equal((await h.Execute('MATCH (a:Service) RETURN a.name AS n', undefined, { Cancel: expired })).Rows.length, 2);
+            // The same rows as nodes need their links read: the fill checks the deadline first.
+            await assert.rejects(h.Execute('MATCH (a:Service) RETURN a', undefined, { Cancel: expired }), CypherTimeout);
+            for (const reader of spy.Readers)
+            {
+                await assert.rejects(reader.ReadNode('a'), /disposed/);
+            }
+            const commits = EngineFixture.Commits(h);
+            await assert.rejects(h.Execute("CREATE (n:Service {name: 'late'}) RETURN n", undefined, { Cancel: expired }), CypherTimeout);
+            await EngineFixture.Settle();
+            assert.equal(commits.length, 0);
+            await assert.rejects(spy.Transactions[0]!.ReadNode('a'), /disposed/);
         }
         finally
         {

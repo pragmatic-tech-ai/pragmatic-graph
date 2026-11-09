@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import { DateTimeValue, DateValue, DurationValue } from '../../index.js';
 import { CypherCellCodec, type CypherValueDto } from '../CypherCellCodec.js';
 import { CypherEngine } from '../CypherEngine.js';
-import { CypherError } from '../CypherError.js';
+import { CypherError, CypherSemanticError } from '../CypherError.js';
+import { ParameterBinder } from '../ParameterBinder.js';
 import { CypherNode } from '../CypherNode.js';
 import { CypherValue, NodeValue, NullValue, ScalarValue, type CypherScalar, type ParameterValue } from '../CypherValue.js';
 import { ListValue, MapValue, PathValue, RelValue } from '../StructuredValues.js';
@@ -171,6 +172,7 @@ describe('value cells', () =>
             new DateTimeValue(2n ** 63n - 1n, 'UTC'), new DateTimeValue(-(2n ** 63n), 'Not/AZone'),
             new DurationValue(0, 0, 0n), new DurationValue(-13, 0, 0n), new DurationValue(1, -1, 0n), new DurationValue(0, 0, -500_000n),
             new DurationValue(0, 2, -3_600_000_001n), new DurationValue(2 ** 31 - 1, -(2 ** 31 - 1), 2n ** 63n - 1n), new DurationValue(0, 0, -(2n ** 63n) + 1n),
+            new DurationValue(-(2 ** 31), -(2 ** 31), 0n), new DurationValue(2 ** 31 - 1, 2 ** 31 - 1, 0n), new DurationValue(-(2 ** 31), 2 ** 31 - 1, -1n),
         ];
         for (const v of values)
         {
@@ -178,6 +180,33 @@ describe('value cells', () =>
             assert.equal(back.constructor, v.constructor, JSON.stringify(CypherCellCodec.EncodeScalar(v)));
             assert.ok((back as { Equals(o: unknown): boolean }).Equals(v), JSON.stringify(CypherCellCodec.EncodeScalar(v)));
         }
+    });
+
+    test('Int32 duration limits bind as $duration parameters and leave the range rejected', () =>
+    {
+        for (const v of [new DurationValue(-(2 ** 31), -(2 ** 31), 0n), new DurationValue(2 ** 31 - 1, 2 ** 31 - 1, 0n)])
+        {
+            const text = (CypherCellCodec.EncodeScalar(v) as { $duration: string }).$duration;
+            const bound = ParameterBinder.FromInput({ $duration: text }) as ScalarValue;
+            assert.ok((bound.Value as DurationValue).Equals(v), text);
+        }
+        for (const text of ['-P2147483649M', 'P2147483648M', '-P2147483649D', 'P2147483648D'])
+        {
+            assert.throws(() => ParameterBinder.FromInput({ $duration: text }), CypherSemanticError, text);
+        }
+    });
+
+    test('duration component signs: only the forms FormatDuration emits', () =>
+    {
+        for (const text of ['P1M-1D', 'P-1Y-2M', 'PT-1H-2M-3.5S', 'P-3DT4H', 'PT-0.5S', '-P1Y2M', '+PT1S'])
+        {
+            assert.doesNotThrow(() => ParameterBinder.FromInput({ $duration: text }), text);
+        }
+        for (const text of ['-P-1Y', '+P+1D', '-PT-1S', 'PT1H-30M', 'P1Y-2M', 'P1W-1D', 'PT-1H30S', '-P1YT+1H'])
+        {
+            assert.throws(() => ParameterBinder.FromInput({ $duration: text }), CypherSemanticError, text);
+        }
+        assert.ok(((ParameterBinder.FromInput({ $duration: 'PT-0.5S' }) as ScalarValue).Value as DurationValue).Equals(new DurationValue(0, 0, -500_000n)));
     });
 
     test('node cells decode with their properties and links', () =>

@@ -15,7 +15,7 @@ export { CypherCellCodec } from './CypherCellCodec.js';
 export type { CypherValueDto, NodeCellDto, RelDto } from './CypherCellCodec.js';
 export { ListValue, MapValue, RelValue, PathValue } from './StructuredValues.js';
 export { CypherNode } from './CypherNode.js';
-export type { ICypherSource } from './CypherSource.js';
+export type { ICypherSource, IExpandRow } from './CypherSource.js';
 export { RelDirection, ComparisonOp, BooleanOp } from './CypherEnums.js';
 export { CypherError, CypherErrorCode, CypherSyntaxError, CypherSemanticError, CypherTimeout, CypherWriteError, CypherWriteErrorCode } from './CypherError.js';
 export { Deadline } from './ExecutionLimits.js';

@@ -27,7 +27,7 @@ class Surface
 type TypeExports = [
     Cypher.ICypherRunOptions, Cypher.PlannerOptions, Cypher.CypherResultDto, Cypher.ExprArg, Cypher.ParameterValue, Cypher.CypherValueDto,
     Cypher.NodeCellDto, Cypher.RelDto, Cypher.ICypherSource, Cypher.ExecutionLimits, Cypher.ICancellation, Cypher.CypherWriteStatsDto,
-    Cypher.INodePlacement,
+    Cypher.INodePlacement, Cypher.IExpandRow,
 ];
 
 describe('cypher public surface', () =>
