@@ -254,6 +254,47 @@ describe('read-only write members (R92)', () =>
         assert.ok(Object.isFrozen(readOnly));
     });
 
+    test('Build refuses a read-only value of the wrong shape', () =>
+    {
+        const invalid = (e: unknown) => e instanceof GraphError && e.GraphCode === GraphErrorCode.InvalidArgument && e.message.includes(RoFx.Item);
+        const build = (readOnly: unknown) => () => AccessScope.Build({ Default: AccessDefault.Allow, Writes: new Map([[RoFx.Item, { ReadOnly: readOnly as IReadOnlyMembers }]]) });
+        // The pre-amendment shape: a bare Set.
+        assert.throws(build(new Set([RoFx.Owner])), invalid);
+        assert.throws(build({ Create: [RoFx.Owner] }), invalid);
+        assert.throws(build({ Update: RoFx.Owner }), invalid);
+        assert.throws(build(null), invalid);
+        assert.doesNotThrow(build({}));
+    });
+
+    test('MERGE ON MATCH SET of an update-only read-only member is refused', async () =>
+    {
+        const scope = RoFx.StageScope([], [RoFx.Owner]);
+        await RoFx.DeniedQuery(fx, "MERGE (k:Ticket {title: 'x'}) ON MATCH SET k.owner = 'u2'", RoFx.Owner, { Scope: scope });
+        assert.equal(await RoFx.Read(fx, AccessScope.System, RoFx.K, RoFx.Owner), RoFx.U1);
+        // ON CREATE SET of the same member is a create: allowed.
+        await W.Write(fx, "MERGE (k:Ticket {title: 'new'}) ON CREATE SET k.owner = 'u2'", { Scope: scope });
+        assert.equal(await RoFx.Read(fx, AccessScope.System, RoFx.FirstSequenced, RoFx.Owner), RoFx.U2);
+    });
+
+    test('delete then recreate in one batch is judged as a create', async () =>
+    {
+        const t = await fx.Engine.Begin(RoFx.StageScope([], [RoFx.Owner, RoFx.Assignee]));
+        try
+        {
+            t.DeleteNode(RoFx.K);
+            t.CreateNode(RoFx.K, RoFx.Ticket);
+            t.SetProperty(RoFx.K, RoFx.Owner, RoFx.U2);
+            await t.Commit();
+        }
+        finally
+        {
+            t.dispose();
+        }
+        assert.equal(await RoFx.Read(fx, AccessScope.System, RoFx.K, RoFx.Owner), RoFx.U2);
+        // The same write without the recreate is an update, and refused.
+        await RoFx.DeniedCommit(fx, tx => tx.SetProperty(RoFx.K, RoFx.Owner, RoFx.U1), RoFx.Owner);
+    });
+
     test('read-only names on either stage must be members of their key', async () =>
     {
         for (const scope of [RoFx.StageScope([RoFx.Unknown], []), RoFx.StageScope([], [RoFx.Unknown])])

@@ -1,5 +1,6 @@
 import type { CatalogSnapshot } from '../catalog/CatalogSnapshot.js';
 import type { CellValue } from '../columns/CellValue.js';
+import { GraphError, GraphErrorCode } from '../errors/GraphError.js';
 import { NodeEvaluator, Truth } from '../predicate/NodeEvaluator.js';
 import { type And, type ConceptIs, type Not, type Or, type OwnerIs, type Predicate, PredicateKind } from '../predicate/Predicate.js';
 import type { IReadNode } from '../RecordedReads.js';
@@ -49,6 +50,9 @@ class OpTargets
  */
 class CreateEvaluator
 {
+    private static readonly ErrUndecidable = 'Create rule evaluated a predicate Decidable refuses: ';
+    private static readonly ErrKind = 'Unknown predicate kind in a Create rule: ';
+
     /** True iff `p` can be decided on a created node alone (no Related or Reachable anywhere). */
     public static Decidable(p: Predicate): boolean
     {
@@ -78,8 +82,17 @@ class CreateEvaluator
         {
             return NodeEvaluator.Evaluate(p, node.Values, node.PublicId);
         }
-        switch (p.Kind)
+        const kind = p.Kind;
+        switch (kind)
         {
+            case PredicateKind.True:
+            case PredicateKind.False:
+            case PredicateKind.Compare:
+            case PredicateKind.In:
+            case PredicateKind.IsNull:
+            case PredicateKind.IdIn:
+                // Always node-local, so handled above; kept for exhaustiveness.
+                return NodeEvaluator.Evaluate(p, node.Values, node.PublicId);
             case PredicateKind.Seeded:
                 return Truth.False;
             case PredicateKind.OwnerIs:
@@ -95,9 +108,15 @@ class CreateEvaluator
                 return CreateEvaluator.Combine((p as And).Terms, node, Truth.False, Truth.True);
             case PredicateKind.Or:
                 return CreateEvaluator.Combine((p as Or).Terms, node, Truth.True, Truth.False);
+            case PredicateKind.Related:
+            case PredicateKind.Reachable:
+                // Unreachable: Decidable refused them before evaluation. Never fail open (a False here would grant under Not).
+                throw new GraphError(GraphErrorCode.Internal, CreateEvaluator.ErrUndecidable + PredicateKind[kind]);
             default:
-                // Unreachable: Decidable refused Related and Reachable before evaluation.
-                return Truth.False;
+            {
+                const unknown: never = kind;
+                throw new GraphError(GraphErrorCode.Internal, CreateEvaluator.ErrKind + String(unknown));
+            }
         }
     }
 

@@ -2,16 +2,20 @@ import { test, describe, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { AccessError, AccessErrorCode } from '../AccessError.js';
 import { AccessDefault, AccessScope, type IWriteRules } from '../AccessScope.js';
-import { CatalogError } from '../../catalog/CatalogError.js';
+import { CatalogError, CatalogErrorCode } from '../../catalog/CatalogError.js';
 import { GraphError, GraphErrorCode } from '../../errors/GraphError.js';
 import type { GraphTransaction } from '../../GraphTransaction.js';
-import { Compare, CompareOp, ConceptIs, Not, Or, type Predicate, PredicateKind } from '../../predicate/Predicate.js';
+import { EdgeDirection } from '../../format/FormatKeys.js';
+import { Compare, CompareOp, ConceptIs, Not, Or, type Predicate, PredicateKind, Related } from '../../predicate/Predicate.js';
 import { PredicateCodec } from '../../predicate/PredicateCodec.js';
+import { CypherWriteError } from '../../cypher/CypherError.js';
 import { CypherFixture as F } from '../../cypher/tests/CypherFixture.js';
+import { WriteFixture as W } from '../../cypher/tests/WriteFixture.js';
+import { GuidPlacement } from '../../cypher/write/NodePlacement.js';
 
 /**
- * Aspect Tagged { tag? }; P { owner?, title? }; C extends P; Q and R carry Tagged { name? }. Index pByTitle on
- * P(title). Seed: p1 (P, owner u1), p2 (P, owner u2), c1 (C, owner u2), all titled t; q1 (Q), r1 (R).
+ * Aspect Tagged { tag? }; P { owner?, title?, ref -> Q, R }; C extends P; Q and R carry Tagged { name? }. Index
+ * pByTitle on P(title). Seed: p1 (P, owner u1), p2 (P, owner u2) -ref-> q1, c1 (C, owner u2), all titled t; q1 (Q), r1 (R).
  */
 class ConceptFx
 {
@@ -25,6 +29,15 @@ class ConceptFx
     public static readonly Title = 'title';
     public static readonly Name = 'name';
     public static readonly PByTitle = 'pByTitle';
+    public static readonly Ref = 'ref';
+    public static readonly AllP = 'MATCH (n:P) RETURN n';
+    public static readonly CreateP1 = "CREATE (n:P {owner: 'u1'})";
+    public static readonly CreateP2 = "CREATE (n:P {owner: 'u2'})";
+    public static readonly CreateC2 = "CREATE (n:C {owner: 'u2'})";
+    public static readonly DeleteU2 = "MATCH (n:P {owner: 'u2'}) DETACH DELETE n";
+    public static readonly DeleteU1 = "MATCH (n:P {owner: 'u1'}) DETACH DELETE n";
+    public static readonly DeleteC = 'MATCH (n:C) DETACH DELETE n';
+    public static readonly WhereMessage = 'Index Where must be node-local';
     public static readonly P1 = 'p1';
     public static readonly P2 = 'p2';
     public static readonly C1 = 'c1';
@@ -44,14 +57,14 @@ class ConceptFx
         return F.Open(
             [
                 F.Aspect(ConceptFx.Tagged, [F.Text(ConceptFx.Tag)]),
-                F.Concept(ConceptFx.P, [F.Text(ConceptFx.Owner), F.Text(ConceptFx.Title)]),
+                F.Concept(ConceptFx.P, [F.Text(ConceptFx.Owner), F.Text(ConceptFx.Title), F.Rel(ConceptFx.Ref, [ConceptFx.Q, ConceptFx.R])]),
                 F.Concept(ConceptFx.C, [], ConceptFx.P),
                 F.Concept(ConceptFx.Q, [F.Text(ConceptFx.Name)], null, [ConceptFx.Tagged]),
                 F.Concept(ConceptFx.R, [F.Text(ConceptFx.Name)], null, [ConceptFx.Tagged]),
             ],
             [
                 F.Node(ConceptFx.P1, ConceptFx.P, { owner: ConceptFx.U1, title: ConceptFx.T }),
-                F.Node(ConceptFx.P2, ConceptFx.P, { owner: ConceptFx.U2, title: ConceptFx.T }),
+                F.Node(ConceptFx.P2, ConceptFx.P, { owner: ConceptFx.U2, title: ConceptFx.T }, [[ConceptFx.Ref, ConceptFx.Q1]]),
                 F.Node(ConceptFx.C1, ConceptFx.C, { owner: ConceptFx.U2, title: ConceptFx.T }),
                 F.Node(ConceptFx.Q1, ConceptFx.Q),
                 F.Node(ConceptFx.R1, ConceptFx.R),
@@ -119,6 +132,30 @@ class ConceptFx
         {
             t.dispose();
         }
+    }
+
+    /** Runs the Cypher write under `scope`; resolves with the AccessError code it was denied with, or undefined. */
+    public static async Query(fx: F, scope: AccessScope, text: string): Promise<AccessErrorCode | undefined>
+    {
+        try
+        {
+            await W.Write(fx, text, { Scope: scope, Placement: new GuidPlacement() });
+            return undefined;
+        }
+        catch (error)
+        {
+            if (error instanceof CypherWriteError && error.cause instanceof AccessError)
+            {
+                return error.cause.Code;
+            }
+            throw error;
+        }
+    }
+
+    /** The guard on P's Create and Delete rules, as the server compiles them. */
+    public static GuardedWrites(): AccessScope
+    {
+        return ConceptFx.Writes(ConceptFx.P, { Create: ConceptFx.Guarded(), Delete: ConceptFx.Guarded() });
     }
 
     public static async Seek(fx: F, scope: AccessScope): Promise<string[]>
@@ -190,6 +227,46 @@ describe('ConceptIs predicate (R93)', () =>
         assert.equal(await ConceptFx.Commit(fx, scope, t => t.DeleteNode(ConceptFx.C1)), undefined);
     });
 
+    test('guarded Create and Delete rules through the engine', async () =>
+    {
+        const scope = ConceptFx.GuardedWrites();
+        const create = (concept: string, owner: string) => (t: GraphTransaction) =>
+        {
+            t.CreateNode(ConceptFx.Created, concept);
+            t.SetProperty(ConceptFx.Created, ConceptFx.Owner, owner);
+        };
+        assert.equal(await ConceptFx.Commit(fx, scope, create(ConceptFx.P, ConceptFx.U2)), AccessErrorCode.CreateDenied);
+        assert.equal(await ConceptFx.Commit(fx, scope, create(ConceptFx.P, ConceptFx.U1)), undefined);
+        assert.equal(await ConceptFx.Commit(fx, scope, t => t.DeleteNode(ConceptFx.Created)), undefined);
+        assert.equal(await ConceptFx.Commit(fx, scope, create(ConceptFx.C, ConceptFx.U2)), undefined);
+        assert.equal(await ConceptFx.Commit(fx, scope, t => t.DeleteNode(ConceptFx.P2)), AccessErrorCode.DeleteDenied);
+        assert.equal(await ConceptFx.Commit(fx, scope, t => t.DeleteNode(ConceptFx.P1)), undefined);
+        assert.equal(await ConceptFx.Commit(fx, scope, t => t.DeleteNode(ConceptFx.C1)), undefined);
+        assert.deepEqual(await ConceptFx.Visible(fx, AccessScope.System), [ConceptFx.P2, ConceptFx.Q1, ConceptFx.R1]);
+    });
+
+    test('guarded Create and Delete rules through Cypher', async () =>
+    {
+        const scope = ConceptFx.GuardedWrites();
+        assert.equal(await ConceptFx.Query(fx, scope, ConceptFx.CreateP2), AccessErrorCode.CreateDenied);
+        assert.equal(await ConceptFx.Query(fx, scope, ConceptFx.CreateP1), undefined);
+        assert.equal(await ConceptFx.Query(fx, scope, ConceptFx.CreateC2), undefined);
+        // Matches p2 (denied) and c1 and the created C: the whole write is refused.
+        assert.equal(await ConceptFx.Query(fx, scope, ConceptFx.DeleteU2), AccessErrorCode.DeleteDenied);
+        assert.equal(await ConceptFx.Query(fx, scope, ConceptFx.DeleteC), undefined);
+        assert.equal(await ConceptFx.Query(fx, scope, ConceptFx.DeleteU1), undefined);
+        assert.deepEqual(await fx.Column(ConceptFx.AllP, ConceptFx.SeekColumn), [ConceptFx.P2]);
+    });
+
+    test('concept is inside a Related target', async () =>
+    {
+        const toQ = ConceptFx.Rows(ConceptFx.P, new Related(ConceptFx.Ref, EdgeDirection.Out, new ConceptIs(ConceptFx.Q)));
+        assert.deepEqual(await fx.Column(ConceptFx.AllP, ConceptFx.SeekColumn, toQ), [ConceptFx.P2]);
+        const toR = ConceptFx.Rows(ConceptFx.P, new Related(ConceptFx.Ref, EdgeDirection.Out, new ConceptIs(ConceptFx.R)));
+        assert.deepEqual(await fx.Column(ConceptFx.AllP, ConceptFx.SeekColumn, toR), []);
+        await ConceptFx.Rejected(fx, ConceptFx.Rows(ConceptFx.P, new Related(ConceptFx.Ref, EdgeDirection.Out, new ConceptIs(ConceptFx.Unknown))), ConceptFx.Unknown);
+    });
+
     test('unknown concept name is rejected by the validator', async () =>
     {
         await ConceptFx.Rejected(fx, ConceptFx.Rows(ConceptFx.P, new ConceptIs(ConceptFx.Unknown)), ConceptFx.Unknown);
@@ -206,7 +283,8 @@ describe('ConceptIs predicate (R93)', () =>
 
     test('concept is in an index Where is refused, never dropped', async () =>
     {
-        await assert.rejects(ConceptFx.Open(new ConceptIs(ConceptFx.C)), (e: unknown) => e instanceof CatalogError);
+        await assert.rejects(ConceptFx.Open(new ConceptIs(ConceptFx.C)),
+            (e: unknown) => e instanceof CatalogError && e.Code === CatalogErrorCode.InvalidMember && e.message.includes(ConceptFx.WhereMessage) && e.message.includes(ConceptFx.PByTitle));
     });
 
     test('concept is round-trips through the codec', () =>

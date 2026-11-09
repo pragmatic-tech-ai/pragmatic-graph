@@ -25,9 +25,9 @@ export interface IWriteRules
 /** Read-only members of one Writes entry, per operation (ruling R92). */
 export interface IReadOnlyMembers
 {
-    /** Checked on a node the batch creates (its writes up to and including the batch's end). */
+    /** Checked on a write to a node the batch created and that is live at the op. */
     readonly Create?: ReadonlySet<string>;
-    /** Checked on a node that exists in the snapshot. */
+    /** Checked on a write to a node that exists in the snapshot (not created by the batch, or no longer live). */
     readonly Update?: ReadonlySet<string>;
 }
 
@@ -53,6 +53,11 @@ export interface IAccessScopeOptions
 export class AccessScope
 {
     private static readonly ErrDefault = 'AccessScope Default must be an AccessDefault: ';
+    private static readonly ErrReadOnlyShape = 'AccessScope Writes ReadOnly must be { Create?, Update? } of Sets: ';
+    private static readonly ErrReadOnlySet = 'AccessScope Writes ReadOnly stage must be a Set: ';
+    private static readonly CreateStage = 'Create';
+    private static readonly UpdateStage = 'Update';
+    private static readonly Dot = '.';
     private static readonly NoRows: ReadonlyMap<string, Predicate> = new Map();
     private static readonly NoHidden: ReadonlyMap<string, ReadonlySet<string>> = new Map();
     private static readonly NoWrites: ReadonlyMap<string, IWriteRules> = new Map();
@@ -74,7 +79,10 @@ export class AccessScope
         Object.freeze(this);
     }
 
-    /** A scope from `options` (maps and sets copied). GraphError InvalidArgument for an unknown Default. */
+    /**
+     * A scope from `options` (maps and sets copied). GraphError InvalidArgument for an unknown Default or a Writes
+     * ReadOnly that is not `{ Create?, Update? }` of Sets.
+     */
     public static Build(options: IAccessScopeOptions): AccessScope
     {
         if (options.Default !== AccessDefault.Allow && options.Default !== AccessDefault.Deny)
@@ -89,25 +97,41 @@ export class AccessScope
         const writes = new Map<string, IWriteRules>();
         for (const [name, rules] of options.Writes ?? AccessScope.NoWrites)
         {
-            const copy: IWriteRules = rules.ReadOnly === undefined ? { ...rules } : { ...rules, ReadOnly: AccessScope.CopyReadOnly(rules.ReadOnly) };
+            const copy: IWriteRules = rules.ReadOnly === undefined ? { ...rules } : { ...rules, ReadOnly: AccessScope.CopyReadOnly(name, rules.ReadOnly) };
             writes.set(name, Object.freeze(copy));
         }
         return new AccessScope(options.Default, new Map(options.Rows ?? AccessScope.NoRows), hidden, writes);
     }
 
-    /** A frozen copy of `readOnly`, each present set copied. */
-    private static CopyReadOnly(readOnly: IReadOnlyMembers): IReadOnlyMembers
+    /**
+     * A frozen copy of `name`'s `readOnly`, each present set copied. GraphError InvalidArgument when it is a Set
+     * (the pre-R92-amendment shape) or a present Create/Update is not a Set.
+     */
+    private static CopyReadOnly(name: string, readOnly: IReadOnlyMembers): IReadOnlyMembers
     {
+        if (readOnly instanceof Set || typeof readOnly !== 'object' || readOnly === null)
+        {
+            throw new GraphError(GraphErrorCode.InvalidArgument, AccessScope.ErrReadOnlyShape + name);
+        }
         const copy: { Create?: ReadonlySet<string>; Update?: ReadonlySet<string> } = {};
         if (readOnly.Create !== undefined)
         {
-            copy.Create = new Set(readOnly.Create);
+            copy.Create = AccessScope.CopySet(name, AccessScope.CreateStage, readOnly.Create);
         }
         if (readOnly.Update !== undefined)
         {
-            copy.Update = new Set(readOnly.Update);
+            copy.Update = AccessScope.CopySet(name, AccessScope.UpdateStage, readOnly.Update);
         }
         return Object.freeze(copy);
+    }
+
+    private static CopySet(name: string, stage: string, members: ReadonlySet<string>): ReadonlySet<string>
+    {
+        if (!(members instanceof Set))
+        {
+            throw new GraphError(GraphErrorCode.InvalidArgument, AccessScope.ErrReadOnlySet + name + AccessScope.Dot + stage);
+        }
+        return new Set(members);
     }
 
     /**
