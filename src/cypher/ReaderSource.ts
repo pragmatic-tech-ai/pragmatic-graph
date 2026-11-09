@@ -1,4 +1,6 @@
-import type { CellValue } from '../columns/CellValue.js';
+import type { IndexDef } from '../catalog/CatalogTypes.js';
+import { ValueType } from '../catalog/ValueType.js';
+import { DateTimeValue, DateValue, type CellValue } from '../columns/CellValue.js';
 import { EdgeDirection } from '../format/FormatKeys.js';
 import type { GraphReader } from '../GraphReader.js';
 import { RelDirection } from './CypherEnums.js';
@@ -17,8 +19,12 @@ export class ReaderSource implements ICypherSource
     private static readonly UnknownDirection = 'unknown relationship direction';
     private static readonly StepSeparator = '\u0000';
 
+    private static readonly Int64Min = -(2n ** 63n);
+    private static readonly Int64Limit = 2n ** 63n;
+
     private readonly labels: LabelResolver;
     private readonly relationships: ReadonlySet<string>;
+    private readonly indexCache = new Map<string, IndexDef | undefined>();
 
     constructor(private readonly reader: GraphReader)
     {
@@ -91,10 +97,89 @@ export class ReaderSource implements ICypherSource
         throw new CypherSemanticError(`${ReaderSource.UnknownDirection} "${String(direction)}"`);
     }
 
-    /** No index seeks yet (plan 2 Task 4): callers fall back to a label scan and a filter. */
-    public SeekEqual(_label: string, _member: string, _value: CellValue): AsyncIterable<CypherNode> | undefined
+    public IndexFor(label: string, member: string): string | undefined
     {
-        return undefined;
+        return this.FindIndex(this.labels.Resolve(label), member)?.Name;
+    }
+
+    /**
+     * Seeks the usable index for the label and member (see IndexFor) with the value converted to the member's
+     * index element type, then keeps the nodes that are the label (an index on an ancestor or an aspect covers
+     * more nodes than the label). Values that cannot equal any stored value seek nothing.
+     */
+    public SeekEqual(label: string, member: string, value: CellValue): AsyncIterable<CypherNode> | undefined
+    {
+        const name = this.labels.Resolve(label);
+        const index = this.FindIndex(name, member);
+        if (index === undefined)
+        {
+            return undefined;
+        }
+        const key = ReaderSource.SeekKey(this.reader.Catalog.IndexMembers(index)[0]!.Type, value);
+        return key === undefined ? ReaderSource.NoNodes() : this.Seek(index.Name, name, key);
+    }
+
+    private FindIndex(label: string, member: string): IndexDef | undefined
+    {
+        const cacheKey = label + ReaderSource.StepSeparator + member;
+        if (!this.indexCache.has(cacheKey))
+        {
+            const catalog = this.reader.Catalog;
+            const candidates = catalog.IsAspect(label) ? catalog.Indexes().filter(i => i.On === label) : catalog.IndexesOn(label);
+            this.indexCache.set(cacheKey, candidates.find(i => i.Where === undefined && catalog.IndexMembers(i)[0]?.Name === member));
+        }
+        return this.indexCache.get(cacheKey);
+    }
+
+    private async *Seek(index: string, label: string, key: CellValue): AsyncIterable<CypherNode>
+    {
+        for await (const publicId of this.reader.SeekIndex(index, { Prefix: [key] }))
+        {
+            const node = await this.Node(publicId);
+            if (node !== undefined && this.reader.Catalog.IsA(node.Concept, label))
+            {
+                yield node;
+            }
+        }
+    }
+
+    private static async *NoNodes(): AsyncIterable<CypherNode>
+    {
+        // An equality that no stored value can satisfy.
+    }
+
+    /**
+     * The index element that equals the value under the equality filter's numeric rules (exact mathematical
+     * comparison: an Int64 against a Float64 member seeks the float only when it is exact; a Float64 against an
+     * Int64 member seeks the integer only when integral and in range), or undefined when nothing can equal it.
+     */
+    private static SeekKey(type: ValueType | undefined, value: CellValue): CellValue | undefined
+    {
+        switch (type)
+        {
+            case ValueType.Int64:
+                if (typeof value === 'bigint')
+                {
+                    return value;
+                }
+                return typeof value === 'number' && Number.isInteger(value) && value >= Number(ReaderSource.Int64Min) && value < Number(ReaderSource.Int64Limit) ? BigInt(value) : undefined;
+            case ValueType.Float64:
+                if (typeof value === 'number')
+                {
+                    return Number.isNaN(value) ? undefined : value === 0 ? 0 : value;
+                }
+                return typeof value === 'bigint' && BigInt(Number(value)) === value ? Number(value) : undefined;
+            case ValueType.Boolean:
+                return typeof value === 'boolean' ? value : undefined;
+            case ValueType.String:
+                return typeof value === 'string' ? value : undefined;
+            case ValueType.Date:
+                return value instanceof DateValue ? value : undefined;
+            case ValueType.DateTime:
+                return value instanceof DateTimeValue ? value : undefined;
+            default:
+                return undefined;
+        }
     }
 
     private async *Scan(name: string): AsyncIterable<CypherNode>

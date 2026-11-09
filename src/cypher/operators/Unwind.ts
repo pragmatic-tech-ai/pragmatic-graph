@@ -38,4 +38,9 @@ export class Unwind implements IOperator
             }
         }
     }
+
+    public Inputs(): readonly IOperator[]
+    {
+        return [this.child];
+    }
 }

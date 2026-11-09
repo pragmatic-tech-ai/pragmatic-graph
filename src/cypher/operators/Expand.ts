@@ -36,4 +36,9 @@ export class Expand implements IOperator
             }
         }
     }
+
+    public Inputs(): readonly IOperator[]
+    {
+        return [this.child];
+    }
 }

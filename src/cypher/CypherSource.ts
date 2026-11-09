@@ -30,6 +30,15 @@ export interface ICypherSource
     Node(publicId: string): Promise<CypherNode | undefined>;
     /** The node's edges in `direction`, of `relationship` or of every relationship when undefined. */
     Expand(publicId: string, relationship: string | undefined, direction: RelDirection): AsyncIterable<IExpandRow>;
-    /** Nodes of the label whose member equals the value, through an index; undefined when no usable index exists. */
+    /**
+     * The name of an index SeekEqual would use for the label and member: a non-partial index whose leading member
+     * is the property and whose scope is the label itself, an ancestor or a carried aspect; undefined when none.
+     */
+    IndexFor(label: string, member: string): string | undefined;
+    /**
+     * Nodes of the label whose member equals the value, through an index; undefined when IndexFor finds none. A value
+     * that can equal no stored value of the member (null, another type, a non-integral float against an Int64
+     * member) yields an empty iterable, as the equality filter would.
+     */
     SeekEqual(label: string, member: string, value: CellValue): AsyncIterable<CypherNode> | undefined;
 }

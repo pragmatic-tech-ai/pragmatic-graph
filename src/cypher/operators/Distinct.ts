@@ -28,4 +28,9 @@ export class Distinct implements IOperator
             }
         }
     }
+
+    public Inputs(): readonly IOperator[]
+    {
+        return [this.child];
+    }
 }

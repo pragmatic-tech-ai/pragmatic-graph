@@ -47,4 +47,9 @@ export class Sort implements IOperator
         }
         return 0;
     }
+
+    public Inputs(): readonly IOperator[]
+    {
+        return [this.child];
+    }
 }

@@ -92,4 +92,9 @@ export class VarLengthExpand implements IOperator
     {
         return this.toLabel === undefined || this.source.IsA(node.Node, this.toLabel);
     }
+
+    public Inputs(): readonly IOperator[]
+    {
+        return [this.child];
+    }
 }

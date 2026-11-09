@@ -23,4 +23,9 @@ export class Project implements IOperator
             yield projected;
         }
     }
+
+    public Inputs(): readonly IOperator[]
+    {
+        return [this.child];
+    }
 }

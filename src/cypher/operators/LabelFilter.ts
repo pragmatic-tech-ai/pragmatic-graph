@@ -27,4 +27,9 @@ export class LabelFilter implements IOperator
             if (v instanceof NodeValue && this.source.IsA(v.Node, this.label)) yield row;
         }
     }
+
+    public Inputs(): readonly IOperator[]
+    {
+        return [this.child];
+    }
 }

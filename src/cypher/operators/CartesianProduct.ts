@@ -46,4 +46,9 @@ export class CartesianProduct implements IOperator
         }
         return rights;
     }
+
+    public Inputs(): readonly IOperator[]
+    {
+        return [this.left, this.right];
+    }
 }

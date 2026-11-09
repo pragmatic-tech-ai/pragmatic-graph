@@ -91,4 +91,9 @@ export class Aggregate implements IOperator
         }
         return out;
     }
+
+    public Inputs(): readonly IOperator[]
+    {
+        return [this.child];
+    }
 }

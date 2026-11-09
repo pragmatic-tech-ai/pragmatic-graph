@@ -18,4 +18,9 @@ export class Filter implements IOperator
             if (BooleanExpression.Truthy(this.predicate.Evaluate(ctx))) yield row;
         }
     }
+
+    public Inputs(): readonly IOperator[]
+    {
+        return [this.child];
+    }
 }

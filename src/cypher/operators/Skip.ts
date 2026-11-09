@@ -23,4 +23,9 @@ export class Skip implements IOperator
             }
         }
     }
+
+    public Inputs(): readonly IOperator[]
+    {
+        return [this.child];
+    }
 }

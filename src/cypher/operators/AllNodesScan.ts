@@ -17,4 +17,9 @@ export class AllNodesScan implements IOperator
             yield new Binding().With(this.variable, new NodeValue(node));
         }
     }
+
+    public Describe(): string
+    {
+        return `AllNodesScan(${this.variable})`;
+    }
 }

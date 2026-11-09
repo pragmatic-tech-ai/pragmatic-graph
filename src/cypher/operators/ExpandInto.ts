@@ -42,4 +42,9 @@ export class ExpandInto implements IOperator
             }
         }
     }
+
+    public Inputs(): readonly IOperator[]
+    {
+        return [this.child];
+    }
 }

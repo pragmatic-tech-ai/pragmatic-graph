@@ -9,7 +9,10 @@ import type { ICypherSource } from './CypherSource.js';
 import { ScalarValue, type CypherValue } from './CypherValue.js';
 import type { ICancellation } from './ExecutionLimits.js';
 import { Comparison, FunctionCall, Literal, PropertyAccess, VariableRef, type Expression } from './Expression.js';
+import { OperatorPrinter } from './OperatorPrinter.js';
 import { OptionalMatchPlan } from './OptionalMatchPlan.js';
+import { CypherParser } from './CypherParser.js';
+import { SeekEquality } from './SeekEquality.js';
 import type { NodePattern, PatternPath } from './PatternPath.js';
 import { Aggregate, type AggregateItem } from './operators/Aggregate.js';
 import { AllNodesScan } from './operators/AllNodesScan.js';
@@ -19,6 +22,7 @@ import { Distinct } from './operators/Distinct.js';
 import { Expand } from './operators/Expand.js';
 import { ExpandInto } from './operators/ExpandInto.js';
 import { Filter } from './operators/Filter.js';
+import { IndexSeek } from './operators/IndexSeek.js';
 import type { IOperator } from './operators/IOperator.js';
 import { LabelFilter } from './operators/LabelFilter.js';
 import { LabelScan } from './operators/LabelScan.js';
@@ -30,6 +34,13 @@ import { Skip } from './operators/Skip.js';
 import { Sort } from './operators/Sort.js';
 import { Unwind } from './operators/Unwind.js';
 import { VarLengthExpand } from './operators/VarLengthExpand.js';
+
+interface ISeekChoice
+{
+    readonly Op: IOperator;
+    readonly InlineKey: string | undefined;
+    readonly Source: Expression | undefined;
+}
 
 export interface PlannerOptions
 {
@@ -74,6 +85,15 @@ export class LogicalPlanner
     {
         this.maxVarLength = options?.MaxVarLength ?? LogicalPlanner.DefaultMaxVarLength;
         this.strictWithScope = options?.StrictWithScope ?? false;
+    }
+
+    /**
+     * The operator tree for a read query over the source, one line per operator, children indented. Planning only:
+     * nothing is read. Parameters are needed only when SKIP/LIMIT use them. CypherEngine.Explain delegates here.
+     */
+    public static Explain(source: ICypherSource, text: string, parameters: ReadonlyMap<string, CypherValue> = new Map(), options?: PlannerOptions): string
+    {
+        return OperatorPrinter.Print(new LogicalPlanner(source, parameters, options).Plan(new CypherParser(text).Parse()));
     }
 
     public Plan(model: CypherQueryModel): IOperator
@@ -211,13 +231,20 @@ export class LogicalPlanner
         {
             return this.compileOptionalMatch(input, match, bound);
         }
+        const conjuncts = match.Where === undefined ? [] : SeekEquality.Conjuncts(match.Where.Predicate);
+        const seeks = conjuncts.map(c => SeekEquality.TryParse(c)).filter((e): e is SeekEquality => e !== undefined);
+        const consumed = new Set<Expression>();
         let op = input;
         for (const path of match.Paths)
         {
-            op = this.compilePath(op, path, bound);
+            op = this.compilePath(op, path, bound, seeks, consumed);
         }
         if (op === undefined) op = new SingleRow();
-        if (match.Where !== undefined) op = new Filter(op, match.Where.Predicate, this.parameters);
+        if (match.Where !== undefined)
+        {
+            const predicate = consumed.size === 0 ? match.Where.Predicate : SeekEquality.Join(conjuncts.filter(c => !consumed.has(c)));
+            if (predicate !== undefined) op = new Filter(op, predicate, this.parameters);
+        }
         return op;
     }
 
@@ -234,7 +261,7 @@ export class LogicalPlanner
         return new OptionalApply(source, plan, optionalVars);
     }
 
-    private compilePath(input: IOperator | undefined, path: PatternPath, bound: Set<string>): IOperator
+    private compilePath(input: IOperator | undefined, path: PatternPath, bound: Set<string>, seeks: readonly SeekEquality[], consumed: Set<Expression>): IOperator
     {
         this.validateRels(path);
         const names = path.Nodes.map((n, i) => n.Variable ?? `${LogicalPlanner.AnonPrefix}${i}`);
@@ -248,9 +275,11 @@ export class LogicalPlanner
         }
         else
         {
-            const scan = this.anchor(anchor, names[0]!);
+            const seek = this.trySeek(anchor, names[0]!, seeks);
+            const scan = seek?.Op ?? this.anchor(anchor, names[0]!);
+            if (seek?.Source !== undefined) consumed.add(seek.Source);
             op = input === undefined ? scan : new CartesianProduct(input, scan, this.cancel);
-            op = this.foldNodeProperties(op, anchor, names[0]!);
+            op = this.foldNodeProperties(op, anchor, names[0]!, seek?.InlineKey);
             if (anchor.Variable !== undefined) bound.add(anchor.Variable);
         }
 
@@ -447,6 +476,32 @@ export class LogicalPlanner
         return label === undefined ? new AllNodesScan(this.source, name) : new LabelScan(this.source, name, label);
     }
 
+    // An index seek for a freshly bound labelled anchor: an inline property first, then a top-level WHERE equality on
+    // the anchor's variable, whichever has a usable index. The consumed inline key or WHERE conjunct is not filtered again.
+    private trySeek(node: NodePattern, name: string, seeks: readonly SeekEquality[]): ISeekChoice | undefined
+    {
+        const label = this.resolve(node.Label);
+        if (label === undefined) return undefined;
+        for (const [key, value] of node.Properties)
+        {
+            const index = this.source.IndexFor(label, key);
+            if (index !== undefined)
+            {
+                return { Op: new IndexSeek(this.source, name, label, key, index, new Literal(value), this.parameters), InlineKey: key, Source: undefined };
+            }
+        }
+        if (node.Variable === undefined) return undefined;
+        for (const seek of seeks)
+        {
+            const index = seek.Variable === node.Variable ? this.source.IndexFor(label, seek.Property) : undefined;
+            if (index !== undefined)
+            {
+                return { Op: new IndexSeek(this.source, name, label, seek.Property, index, seek.Value, this.parameters), InlineKey: undefined, Source: seek.Source };
+            }
+        }
+        return undefined;
+    }
+
     private foldReusedConstraints(op: IOperator, node: NodePattern, name: string): IOperator
     {
         let result = op;
@@ -455,11 +510,12 @@ export class LogicalPlanner
         return this.foldNodeProperties(result, node, name);
     }
 
-    private foldNodeProperties(op: IOperator, node: NodePattern, name: string): IOperator
+    private foldNodeProperties(op: IOperator, node: NodePattern, name: string, skipKey?: string): IOperator
     {
         let result = op;
         for (const [key, value] of node.Properties)
         {
+            if (key === skipKey) continue;
             result = new Filter(result, new Comparison(new PropertyAccess(name, key), ComparisonOp.Eq, new Literal(value)), this.parameters);
         }
         return result;

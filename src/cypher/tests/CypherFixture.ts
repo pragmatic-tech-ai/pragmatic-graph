@@ -1,6 +1,6 @@
 import {
     AccessScope, GraphEngine, MemberKind, StorageKind, ValueType,
-    type CellValue, type IDefinitionDescription, type MemberInput, type ISeedNode,
+    type CellValue, type IDefinitionDescription, type IIndexDescription, type MemberInput, type ISeedNode,
 } from '../../index.js';
 import type { Binding } from '../Binding.js';
 import { CypherParser } from '../CypherParser.js';
@@ -26,10 +26,10 @@ export class CypherFixture
     {
     }
 
-    public static async Open(definitions: readonly IDefinitionDescription[], seed: readonly ISeedNode[]): Promise<CypherFixture>
+    public static async Open(definitions: readonly IDefinitionDescription[], seed: readonly ISeedNode[], indexes: readonly IIndexDescription[] = []): Promise<CypherFixture>
     {
         const engine = await GraphEngine.Open({
-            Description: { Version: CypherFixture.Version, Definitions: definitions, Indexes: [], Seed: seed, Bindings: [] },
+            Description: { Version: CypherFixture.Version, Definitions: definitions, Indexes: indexes, Seed: seed, Bindings: [] },
             Storage: { Kind: StorageKind.Memory },
         });
         return new CypherFixture(engine);
@@ -53,6 +53,11 @@ export class CypherFixture
     public static Int(name: string): MemberInput
     {
         return { Name: name, Kind: MemberKind.Property, Type: ValueType.Int64, Nullable: true };
+    }
+
+    public static Float(name: string): MemberInput
+    {
+        return { Name: name, Kind: MemberKind.Property, Type: ValueType.Float64, Nullable: true };
     }
 
     public static Rel(name: string, targets: readonly string[]): MemberInput

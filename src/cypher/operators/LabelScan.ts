@@ -17,4 +17,9 @@ export class LabelScan implements IOperator
             yield new Binding().With(this.variable, new NodeValue(node));
         }
     }
+
+    public Describe(): string
+    {
+        return `LabelScan(${this.variable}:${this.label})`;
+    }
 }
