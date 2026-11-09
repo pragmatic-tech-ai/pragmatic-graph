@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { AccessError, AccessErrorCode } from '../AccessError.js';
 import { AccessDefault, AccessScope, type IReadOnlyMembers } from '../AccessScope.js';
 import { FalsePredicate } from '../../predicate/Predicate.js';
+import { EdgeDirection } from '../../format/FormatKeys.js';
 import type { CellValue } from '../../columns/CellValue.js';
 import { GraphError, GraphErrorCode } from '../../errors/GraphError.js';
 import type { GraphTransaction } from '../../GraphTransaction.js';
@@ -55,6 +56,9 @@ class RoFx
     public static readonly Created = 'n';
     public static readonly FirstSequenced = 'n0';
     public static readonly Unknown = 'nope';
+    public static readonly MergeOnMatchOwner = "MERGE (k:Ticket {title: 'x'}) ON MATCH SET k.owner = 'u2'";
+    public static readonly MergeOnCreateOwner = "MERGE (k:Ticket {title: 'new'}) ON CREATE SET k.owner = 'u2'";
+    public static readonly DetachPerson = "MATCH (:Ticket {title: 'x'})-[:assignee]->(p:Person) DETACH DELETE p";
 
     public static Open(): Promise<F>
     {
@@ -87,6 +91,12 @@ class RoFx
     public static StageScope(create: readonly string[], update: readonly string[]): AccessScope
     {
         return AccessScope.Build({ Default: AccessDefault.Allow, Writes: new Map([[RoFx.Item, { ReadOnly: { Create: new Set(create), Update: new Set(update) } }]]) });
+    }
+
+    /** Item nodes may not be updated (ruling F-a: a delete-implied unlink ignores the source's Update rule). */
+    public static NoUpdateScope(): AccessScope
+    {
+        return AccessScope.Build({ Default: AccessDefault.Allow, Writes: new Map([[RoFx.Item, { Update: FalsePredicate.Instance }]]) });
     }
 
     /** Item's owner and assignee read-only, and Item nodes may not be deleted. */
@@ -192,6 +202,34 @@ describe('read-only write members (R92)', () =>
         assert.equal(await RoFx.Exists(fx, RoFx.K), true);
     });
 
+    test('DETACH DELETE unlinks ignore the visible source Update rule (F-a)', async () =>
+    {
+        await W.Write(fx, RoFx.DetachPerson, { Scope: RoFx.NoUpdateScope() });
+        assert.equal(await RoFx.Exists(fx, RoFx.P), false);
+        assert.equal(await RoFx.Exists(fx, RoFx.K), true);
+        const reader = await fx.Engine.BeginRead(AccessScope.System);
+        try
+        {
+            assert.deepEqual(await reader.Neighbors(RoFx.K, RoFx.Assignee, EdgeDirection.Out), []);
+        }
+        finally
+        {
+            reader.dispose();
+        }
+        // An explicit unlink from the same source is still an update, and refused.
+        const t = await fx.Engine.Begin(RoFx.NoUpdateScope());
+        try
+        {
+            t.Unlink(RoFx.K, RoFx.Assignee, RoFx.Q);
+            t.DetachUnlink(RoFx.K, RoFx.Assignee, RoFx.Q);
+            await assert.rejects(t.Commit(), (e: unknown) => e instanceof AccessError && e.Code === AccessErrorCode.UpdateDenied);
+        }
+        finally
+        {
+            t.dispose();
+        }
+    });
+
     test('read-only keyed on an aspect applies to the concepts carrying it', async () =>
     {
         const scope = AccessScope.Build({ Default: AccessDefault.Allow, Writes: new Map([[RoFx.Tagged, { ReadOnly: RoFx.Both([RoFx.Tag]) }]]) });
@@ -269,10 +307,10 @@ describe('read-only write members (R92)', () =>
     test('MERGE ON MATCH SET of an update-only read-only member is refused', async () =>
     {
         const scope = RoFx.StageScope([], [RoFx.Owner]);
-        await RoFx.DeniedQuery(fx, "MERGE (k:Ticket {title: 'x'}) ON MATCH SET k.owner = 'u2'", RoFx.Owner, { Scope: scope });
+        await RoFx.DeniedQuery(fx, RoFx.MergeOnMatchOwner, RoFx.Owner, { Scope: scope });
         assert.equal(await RoFx.Read(fx, AccessScope.System, RoFx.K, RoFx.Owner), RoFx.U1);
         // ON CREATE SET of the same member is a create: allowed.
-        await W.Write(fx, "MERGE (k:Ticket {title: 'new'}) ON CREATE SET k.owner = 'u2'", { Scope: scope });
+        await W.Write(fx, RoFx.MergeOnCreateOwner, { Scope: scope });
         assert.equal(await RoFx.Read(fx, AccessScope.System, RoFx.FirstSequenced, RoFx.Owner), RoFx.U2);
     });
 

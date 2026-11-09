@@ -7,7 +7,10 @@ import { GraphError, GraphErrorCode } from '../../errors/GraphError.js';
 import { EdgeDirection } from '../../format/FormatKeys.js';
 import type { GraphReader } from '../../GraphReader.js';
 import type { GraphTransaction } from '../../GraphTransaction.js';
+import { CypherCellCodec } from '../../cypher/CypherCellCodec.js';
 import { CypherEngine } from '../../cypher/CypherEngine.js';
+import { ListValue } from '../../cypher/StructuredValues.js';
+import { ScalarValue } from '../../cypher/CypherValue.js';
 import { CypherWriteError } from '../../cypher/CypherError.js';
 import { CypherFixture as F } from '../../cypher/tests/CypherFixture.js';
 import { WriteFixture as W } from '../../cypher/tests/WriteFixture.js';
@@ -70,6 +73,12 @@ class ExactFx
     public static readonly CreateTitled = "CREATE (n:P {title: 'a'})";
     public static readonly CreateOwned = "CREATE (n:P {title: 'a', owner: 'u1'})";
     public static readonly DetachTitled = "MATCH (n:P {title: 't'}) DETACH DELETE n";
+    public static readonly ReturnKeys = 'MATCH (n:P) RETURN n, keys(n) AS x ORDER BY n';
+    public static readonly ReturnNodes = 'MATCH (n:P) RETURN n ORDER BY n.title, n.owner';
+    public static readonly OrderBySecret = 'MATCH (n:P) RETURN n, n.secret AS x ORDER BY x, n.owner';
+    public static readonly CountSecret = 'MATCH (n:P) RETURN count(n.secret) AS x';
+    public static readonly CollectSecret = 'MATCH (n:P) RETURN collect(n.secret) AS x';
+    public static readonly MergeSecretOwned = "MERGE (n:P {secret: 's', owner: 'u1'}) RETURN n";
     public static readonly IndexSeek = /IndexSeek\(pByTitle\)/;
     public static readonly LabelScan = /LabelScan/;
 
@@ -180,6 +189,28 @@ class ExactFx
             (e: unknown) => e instanceof GraphError && e.GraphCode === GraphErrorCode.InvalidArgument && e.message.includes(name));
         await assert.rejects(fx.Engine.Begin(scope),
             (e: unknown) => e instanceof GraphError && e.GraphCode === GraphErrorCode.InvalidArgument && e.message.includes(name));
+    }
+
+    /** Each row's `n` id with its keys(n) value (Plain). */
+    public static async Keys(fx: F, scope: AccessScope): Promise<[unknown, unknown][]>
+    {
+        return (await fx.Rows(ExactFx.ReturnKeys, scope)).map(r => [r.get(ExactFx.Column), r.get(ExactFx.ValueColumn)]);
+    }
+
+    public static Names(list: unknown): string[]
+    {
+        return (list as ListValue).Items.map(item => String((item as ScalarValue).Value)).sort();
+    }
+
+    /** Each returned node's id with its node-cell property names (the properties(n) a client sees), sorted. */
+    public static async CellProperties(fx: F, scope: AccessScope): Promise<[string, string[]][]>
+    {
+        const dto = CypherEngine.ToDto(await new CypherEngine(fx.Engine).Execute(scope, ExactFx.ReturnNodes));
+        return dto.Rows.map(row =>
+        {
+            const node = CypherCellCodec.AsNode(row[0])!;
+            return [node.id, Object.keys(node.properties).sort()];
+        });
     }
 
     public static CreateWith(concept: string, member: string, value: CellValue, publicId: string = ExactFx.Created): (t: GraphTransaction) => void
@@ -372,5 +403,49 @@ describe('exact-concept Hidden and ReadOnly member sets (R94)', () =>
         assert.equal(await ExactFx.Commit(fx, scope, t => t.Unlink(ExactFx.P1, ExactFx.Ref, ExactFx.Q1)), AccessErrorCode.MemberReadOnly);
         assert.equal(await ExactFx.Query(fx, scope, ExactFx.DetachTitled), undefined);
         await ExactFx.Reading(fx, AccessScope.System, async reader => { assert.equal(await reader.ReadNode(ExactFx.P1), undefined); });
+    });
+
+    test('exact hidden through keys(n) and node-cell properties', async () =>
+    {
+        const scope = ExactFx.HiddenExact(ExactFx.P, ExactFx.Secret);
+        // keys(n) / properties(n) are not node functions in this dialect (keys is map-only, properties absent): a node
+        // yields null under every scope, so neither can enumerate a hidden member; the node cell is what lists properties.
+        assert.deepEqual(await ExactFx.Keys(fx, scope), [[ExactFx.C1, null], [ExactFx.P1, null]]);
+        assert.deepEqual(await ExactFx.Keys(fx, AccessScope.System), [[ExactFx.C1, null], [ExactFx.P1, null]]);
+        assert.deepEqual(await ExactFx.CellProperties(fx, scope), [[ExactFx.P1, [ExactFx.Owner, ExactFx.Title]], [ExactFx.C1, [ExactFx.Owner, ExactFx.Secret, ExactFx.Title]]]);
+    });
+
+    test('exact hidden through ORDER BY and aggregation', async () =>
+    {
+        const scope = ExactFx.HiddenExact(ExactFx.P, ExactFx.Secret);
+        // The hidden value sorts as null (last ascending), never by its stored value.
+        assert.deepEqual(await ExactFx.Pairs(fx, ExactFx.OrderBySecret, scope), [[ExactFx.C1, ExactFx.S], [ExactFx.P1, null]]);
+        assert.deepEqual(await ExactFx.Pairs(fx, ExactFx.OrderBySecret, AccessScope.System), [[ExactFx.P1, ExactFx.S], [ExactFx.C1, ExactFx.S]]);
+        assert.deepEqual(await fx.Column(ExactFx.CountSecret, ExactFx.ValueColumn, scope), [1n]);
+        assert.deepEqual(await fx.Column(ExactFx.CountSecret, ExactFx.ValueColumn), [2n]);
+        assert.deepEqual(ExactFx.Names((await fx.Column(ExactFx.CollectSecret, ExactFx.ValueColumn, scope))[0]), [ExactFx.S]);
+    });
+
+    test('MERGE on an exact-hidden member never matches through it', async () =>
+    {
+        const scope = ExactFx.HiddenExact(ExactFx.P, ExactFx.Secret);
+        // p1 matches on its stored values, but its secret is hidden: MERGE sees no match and the create is refused.
+        assert.equal(await ExactFx.Query(fx, scope, ExactFx.MergeSecretOwned), AccessErrorCode.HiddenMember);
+        assert.deepEqual(await fx.Column(ExactFx.ReturnSecret, ExactFx.Column), [ExactFx.P1, ExactFx.C1]);
+        // Unscoped, the same MERGE matches p1 and creates nothing.
+        assert.equal(await ExactFx.Query(fx, AccessScope.System, ExactFx.MergeSecretOwned), undefined);
+        assert.deepEqual(await fx.Column(ExactFx.ReturnSecret, ExactFx.Column), [ExactFx.P1, ExactFx.C1]);
+    });
+
+    test('HiddenNames is a frozen view (deferred 8)', () =>
+    {
+        const scope = AccessScope.Build({ Default: AccessDefault.Allow, Hidden: new Map([[ExactFx.P, ExactFx.Set(ExactFx.Title)]]), HiddenExact: new Map([[ExactFx.P, ExactFx.Set(ExactFx.Secret)]]) });
+        assert.deepEqual([...scope.HiddenNames].sort(), [ExactFx.Secret, ExactFx.Title]);
+        const mutable = scope.HiddenNames as unknown as { add?: unknown; delete?: unknown; clear?: unknown };
+        assert.equal(mutable.add, undefined);
+        assert.equal(mutable.delete, undefined);
+        assert.equal(mutable.clear, undefined);
+        assert.ok(Object.isFrozen(scope.HiddenNames));
+        assert.equal(scope.HiddenNames.has(ExactFx.Secret), true);
     });
 });

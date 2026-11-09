@@ -1,4 +1,5 @@
 import { GraphError, GraphErrorCode } from '../errors/GraphError.js';
+import { FrozenNameSet } from './FrozenNameSet.js';
 import type { Predicate } from '../predicate/Predicate.js';
 
 /** What a scope grants a node none of whose concept, ancestors or carried aspects has a Rows entry. */
@@ -84,11 +85,8 @@ export class AccessScope
     public readonly Hidden: ReadonlyMap<string, ReadonlySet<string>>;
     public readonly HiddenExact: ReadonlyMap<string, ReadonlySet<string>>;
     public readonly Writes: ReadonlyMap<string, IWriteRules>;
-    /**
-     * @internal Every member name some Hidden or HiddenExact entry hides, on any concept: what plan-time index choice
-     * (CatalogSource) rules out, conservatively, without knowing which concepts a plan reaches.
-     */
-    public readonly HiddenNames: ReadonlySet<string>;
+    /** Every member name some Hidden or HiddenExact entry hides, on any concept (see HiddenNames). */
+    private readonly hiddenNames: FrozenNameSet;
 
     private constructor(fallback: AccessDefault, rows: ReadonlyMap<string, Predicate>, hidden: ReadonlyMap<string, ReadonlySet<string>>,
         hiddenExact: ReadonlyMap<string, ReadonlySet<string>>, writes: ReadonlyMap<string, IWriteRules>)
@@ -109,8 +107,18 @@ export class AccessScope
                 }
             }
         }
-        this.HiddenNames = names;
+        this.hiddenNames = new FrozenNameSet(names);
         Object.freeze(this);
+    }
+
+    /**
+     * @internal Every member name some Hidden or HiddenExact entry hides, on any concept: what plan-time index choice
+     * (CatalogSource) rules out, conservatively, without knowing which concepts a plan reaches. A frozen view: it
+     * cannot be mutated, not even by casting away ReadonlySet.
+     */
+    public get HiddenNames(): ReadonlySet<string>
+    {
+        return this.hiddenNames;
     }
 
     /**

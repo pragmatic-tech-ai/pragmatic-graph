@@ -164,8 +164,8 @@ enum RuleKind
  *   (ruling R92): the entries' ReadOnly.Create sets on a node the batch created, their ReadOnly.Update sets on an existing
  *   node, plus the same stage of the own concept's entry's ReadOnlyExact (R94). A host-placed
  *   default on a node the batch created (GraphTransaction.SetDefault, R91) is exempt from both; an unlink a
- *   DETACH DELETE implies (GraphTransaction.DetachUnlink) is exempt from ReadOnly when the batch later deletes
- *   one of its ends (the Delete rule governs it). A Link/Unlink target and a Link's
+ *   DETACH DELETE implies (GraphTransaction.DetachUnlink) is exempt from ReadOnly and from the source's Update
+ *   rule when the batch later deletes one of its ends (ruling F-a: only the Delete rule governs it). A Link/Unlink target and a Link's
  *   AfterSibling/BeforeSibling must be visible (or created by the batch and live at that op).
  * - DeleteNode: the node must be visible and every applicable Delete predicate hold on its snapshot
  *   values; deleting a node the batch created is exempt.
@@ -207,7 +207,7 @@ export class WriteGate
     }
 
     /** Throws AccessError for the first op of `batch` the evaluator's scope does not allow; `exempt` as WriteExemptions. */
-    public static async Check(evaluator: ScopeEvaluator, batch: WriteBatch, catalog: CatalogSnapshot, exempt: WriteExemptions = WriteExemptions.None): Promise<void>
+    public static async Check(evaluator: ScopeEvaluator, batch: WriteBatch, catalog: CatalogSnapshot, exempt: WriteExemptions = WriteExemptions.None()): Promise<void>
     {
         const gate = new WriteGate(evaluator, catalog, exempt);
         const ops = batch.Ops();
@@ -347,7 +347,7 @@ export class WriteGate
         return targets.Source !== undefined && this.exempt.Defaults.has(index);
     }
 
-    /** A DetachUnlink op one of whose ends the batch deletes later: exempt from ReadOnly (R92). */
+    /** A DetachUnlink op one of whose ends the batch deletes later: exempt from ReadOnly and Update (R92, F-a). */
     private IsDetach(index: number, from: string, to: string): boolean
     {
         return this.exempt.Detaches.has(index) && ((this.lastDelete.get(from) ?? -1) > index || (this.lastDelete.get(to) ?? -1) > index);
@@ -356,7 +356,7 @@ export class WriteGate
     /**
      * SetProperty, Link or Unlink of `member` on the node `publicId` (an edge's source); resolves with its concept.
      * `placed`: a default the host placed on a node the batch created, exempt from Hidden and ReadOnly.
-     * `detach`: an unlink a later delete in the batch implies, exempt from ReadOnly.
+     * `detach`: an unlink a later delete in the batch implies, exempt from ReadOnly and the Update rule (F-a).
      */
     private async CheckWrite(index: number, op: WriteOp, publicId: string, member: string, created: CreatedNode | undefined, placed: boolean, detach: boolean): Promise<string>
     {
@@ -374,10 +374,13 @@ export class WriteGate
         }
         const node = await this.RequireVisible(index, op, publicId);
         this.CheckHidden(index, op, publicId, node.Concept, member);
-        if (!detach)
+        if (detach)
         {
-            this.CheckReadOnly(index, op, publicId, node.Concept, member, WriteStage.Update);
+            // Ruling F-a (R92): a delete-implied unlink is governed only by the Delete rule of the node the batch
+            // deletes, never by the source's ReadOnly or Update rules, whether the source is visible or hidden.
+            return node.Concept;
         }
+        this.CheckReadOnly(index, op, publicId, node.Concept, member, WriteStage.Update);
         let allowed = this.updates.get(node.Id);
         if (allowed === undefined)
         {
