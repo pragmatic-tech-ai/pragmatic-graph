@@ -65,7 +65,8 @@ export class ReaderSource implements ICypherSource
     }
 
     /**
-     * Outgoing and Incoming map to the reader's Links (Out / In), filtered to `relationship` when given.
+     * Outgoing and Incoming map to the reader's Links (Out / In), narrowed to `relationship` when given (only
+     * that relationship's edges are read and recorded).
      * Undirected walks Out then In and reports each (relationship, far node) pair once, so a self-loop, seen
      * from both ends, appears once (TODL deduplicated by far node).
      */
@@ -110,12 +111,8 @@ export class ReaderSource implements ICypherSource
 
     private async *Walk(publicId: string, relationship: string | undefined, direction: EdgeDirection, seen: Set<string> | undefined): AsyncIterable<IExpandRow>
     {
-        for (const link of await this.reader.Links(publicId, direction))
+        for (const link of await this.reader.Links(publicId, direction, relationship))
         {
-            if (relationship !== undefined && link.Relationship !== relationship)
-            {
-                continue;
-            }
             if (seen !== undefined)
             {
                 const key = link.Relationship + ReaderSource.StepSeparator + link.PublicId;

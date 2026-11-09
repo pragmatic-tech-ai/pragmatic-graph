@@ -147,9 +147,11 @@ export class GraphReader implements IGraphDisposable
      * effective on the node's concept in effective member order (parent's, then aspects', then own),
      * In each relationship targeting the concept (catalog order); within one relationship in edge order.
      * A relationship the scope hides on its source concept is omitted. A missing or invisible node has
-     * none. Records the node's binding and the adjacency ranges, as Neighbors does.
+     * none. Records the node's binding and the adjacency ranges, as Neighbors does. With `relationship`
+     * only edges of that relationship are walked and only its adjacency ranges are recorded; a node whose
+     * concept has no such relationship (in that direction) has none, rather than an error as in Neighbors.
      */
-    public async Links(publicId: string, direction: EdgeDirection): Promise<readonly ILinkView[]>
+    public async Links(publicId: string, direction: EdgeDirection, relationship?: string): Promise<readonly ILinkView[]>
     {
         this.RequireOpen();
         if (direction !== EdgeDirection.Out && direction !== EdgeDirection.In)
@@ -163,9 +165,11 @@ export class GraphReader implements IGraphDisposable
             return out;
         }
         const evaluator = this.evaluator;
-        const rels = direction === EdgeDirection.Out
-            ? this.snapshot.Index.Catalog.EffectiveMembers(node.Concept).filter(m => m.Kind === MemberKind.Relationship)
-            : this.snapshot.Index.IncomingRelationships(node.Concept);
+        const rels = relationship !== undefined
+            ? this.recorded.RelationshipsOrNone(node.Concept, relationship, direction)
+            : direction === EdgeDirection.Out
+                ? this.snapshot.Index.Catalog.EffectiveMembers(node.Concept).filter(m => m.Kind === MemberKind.Relationship)
+                : this.snapshot.Index.IncomingRelationships(node.Concept);
         const hidden = direction === EdgeDirection.Out ? evaluator?.HiddenMembers(node.Concept) : undefined;
         for (const rel of rels)
         {

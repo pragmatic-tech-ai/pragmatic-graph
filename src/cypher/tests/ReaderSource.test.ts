@@ -1,6 +1,7 @@
 import { after, before, describe, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { AccessDefault, AccessScope, IdIn } from '../../index.js';
+import { AccessDefault, AccessScope, ConflictError, IdIn, type GraphTransaction } from '../../index.js';
+import { ReaderSource } from '../ReaderSource.js';
 import { CypherSemanticError } from '../CypherError.js';
 import { RelDirection } from '../CypherEnums.js';
 import { CypherFixture } from './CypherFixture.js';
@@ -56,6 +57,11 @@ class SourceFx
     public static WithoutS2(): AccessScope
     {
         return AccessScope.Build({ Default: AccessDefault.Allow, Rows: new Map([[SourceFx.Server, new IdIn(new Set(['s1', 'b1']))]]) });
+    }
+
+    public static HidingHosts(): AccessScope
+    {
+        return AccessScope.Build({ Default: AccessDefault.Allow, Hidden: new Map([[SourceFx.Server, new Set([SourceFx.Hosts])]]) });
     }
 
     public static HidingSecret(): AccessScope
@@ -191,6 +197,29 @@ describe('ReaderSource and read queries over the engine', () =>
             [new Map<string, unknown>([['n', 'beta'], ['c', 1n]]), new Map<string, unknown>([['n', 'alpha'], ['c', 1n]])]);
     });
 
+    test('a hidden relationship is absent from typed, untyped, incoming and variable-length expands', async () =>
+    {
+        const scope = SourceFx.HidingHosts();
+        assert.deepEqual(await fx.Column("MATCH (a:Server {name: 'alpha'})-[:hosts]->(b) RETURN b", 'b', scope), []);
+        assert.deepEqual(await fx.Column("MATCH (a:Server {name: 'alpha'})-[r]->(b) RETURN r", 'r', scope), ['s1-peers->s2']);
+        assert.deepEqual(await fx.Column('MATCH (b:Blade)<-[:hosts]-(x) RETURN x', 'x', scope), []);
+        assert.deepEqual(await fx.Column("MATCH (a:Server {name: 'alpha'})-[:hosts*1..3]->(x) RETURN x", 'x', scope), []);
+    });
+
+    test('variable-length expand does not pass through an invisible node', async () =>
+    {
+        // With s2 invisible, s1's peers and hosts edges to s2 are gone; only s1 -hosts-> b1 continues the walk.
+        assert.deepEqual(await fx.Column('MATCH (p:Person)-[*1..4]->(x:Server) RETURN x', 'x', SourceFx.WithoutS2()), ['s1', 'b1']);
+        assert.deepEqual(await fx.Column('MATCH (p:Person)-[*1..4]->(x) RETURN x', 'x', SourceFx.WithoutS2()), ['s1', 'b1', 'l1']);
+    });
+
+    test('optional match to an invisible target pads with null', async () =>
+    {
+        const q = "MATCH (a:Server {name: 'alpha'}) OPTIONAL MATCH (a)-[:peers]->(x) RETURN a, x";
+        assert.deepEqual(await fx.Rows(q), [new Map<string, unknown>([['a', 's1'], ['x', 's2']])]);
+        assert.deepEqual(await fx.Rows(q, SourceFx.WithoutS2()), [new Map<string, unknown>([['a', 's1'], ['x', null]])]);
+    });
+
     test('source surface: relationships, IsA, nodes and no index seek yet', async () =>
     {
         await fx.Read(async s =>
@@ -207,5 +236,50 @@ describe('ReaderSource and read queries over the engine', () =>
             assert.equal(await s.Node('nope'), undefined);
             assert.equal(s.SeekEqual(SourceFx.Server, SourceFx.Name, 'alpha'), undefined);
         });
+    });
+});
+
+describe('ReaderSource read recording', () =>
+{
+    test('a typed expand records only that relationship', async () =>
+    {
+        const fx = await SourceFx.Open();
+        try
+        {
+            const engine = fx.Engine;
+            const commit = async (work: (t: GraphTransaction) => void): Promise<void> =>
+            {
+                const t = await engine.Begin(AccessScope.System);
+                work(t);
+                await t.Commit();
+            };
+            const expandHosts = async (t: GraphTransaction): Promise<string[]> =>
+            {
+                const out: string[] = [];
+                for await (const row of new ReaderSource(t).Expand('s1', SourceFx.Hosts, RelDirection.Outgoing))
+                {
+                    out.push(row.Target.PublicId);
+                }
+                return out;
+            };
+
+            // A concurrent link on another relationship of the same node does not conflict...
+            const t1 = await engine.Begin(AccessScope.System);
+            assert.deepEqual(await expandHosts(t1), ['s2', 'b1']);
+            await commit(t => t.Link('s1', SourceFx.Peers, 'b1'));
+            t1.SetProperty('l1', SourceFx.Name, 'lap2');
+            await t1.Commit();
+
+            // ...one on the same relationship does.
+            const t2 = await engine.Begin(AccessScope.System);
+            assert.deepEqual(await expandHosts(t2), ['s2', 'b1']);
+            await commit(t => t.Link('s1', SourceFx.Hosts, 's1'));
+            t2.SetProperty('l1', SourceFx.Name, 'lap3');
+            await assert.rejects(t2.Commit(), ConflictError);
+        }
+        finally
+        {
+            await fx.dispose();
+        }
     });
 });

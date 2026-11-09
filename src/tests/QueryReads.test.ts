@@ -3,8 +3,9 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { EngineDescriptions } from './EngineDescriptions.js';
 import { EngineInternals } from './EngineInternals.js';
-import { AccessDefault, AccessScope, CatalogModel, ConflictError, EdgeDirection, GraphReader, GraphStore, GraphTransaction, IdIn, MemberKind, ValueType } from '../index.js';
+import { AccessDefault, AccessScope, CatalogModel, ConflictError, EdgeDirection, GraphEngine, GraphReader, GraphStore, GraphTransaction, IdIn, MemberKind, StorageKind, ValueType, type CatalogSnapshot } from '../index.js';
 
 /** Schema and helpers for the query-layer read tests. */
 class QueryFx
@@ -263,6 +264,43 @@ class QueryFx
                 assert.ok((await QueryFx.Settle(t1.Commit())) instanceof ConflictError);
                 await g.dispose();
             });
+
+            it('Links with a relationship walks and records only that relationship', async () =>
+            {
+                const g = await QueryFx.Defined(open);
+                await QueryFx.Commit(g, t =>
+                {
+                    t.CreateNode('s1', QueryFx.Server);
+                    t.CreateNode('s2', QueryFx.Server);
+                    t.Link('s1', QueryFx.Hosts, 's2');
+                    t.Link('s1', QueryFx.Peers, 's2');
+                });
+                await QueryFx.Read(g, AccessScope.System, async r =>
+                {
+                    assert.deepEqual(await r.Links('s1', EdgeDirection.Out, QueryFx.Hosts), [{ Relationship: QueryFx.Hosts, PublicId: 's2' }]);
+                    assert.deepEqual(await r.Links('s2', EdgeDirection.In, QueryFx.Peers), [{ Relationship: QueryFx.Peers, PublicId: 's1' }]);
+                    // A relationship the concept lacks (or a property name) yields none instead of throwing.
+                    assert.deepEqual(await r.Links('s1', EdgeDirection.Out, 'ghost'), []);
+                    assert.deepEqual(await r.Links('s1', EdgeDirection.Out, QueryFx.Name), []);
+                    assert.deepEqual(await r.Links('s1', EdgeDirection.In, 'ghost'), []);
+                });
+
+                // A concurrent link on another relationship of the same node does not conflict...
+                const t1 = await g.Begin(AccessScope.System);
+                assert.equal((await t1.Links('s1', EdgeDirection.Out, QueryFx.Hosts)).length, 1);
+                await QueryFx.Commit(g, t => t.CreateNode('s3', QueryFx.Server));
+                await QueryFx.Commit(g, t => t.Link('s1', QueryFx.Peers, 's3'));
+                t1.CreateNode('r1', QueryFx.Rack);
+                await t1.Commit();
+
+                // ...one on the same relationship does.
+                const t2 = await g.Begin(AccessScope.System);
+                assert.equal((await t2.Links('s1', EdgeDirection.Out, QueryFx.Hosts)).length, 1);
+                await QueryFx.Commit(g, t => t.Link('s1', QueryFx.Hosts, 's3'));
+                t2.CreateNode('r2', QueryFx.Rack);
+                assert.ok((await QueryFx.Settle(t2.Commit())) instanceof ConflictError);
+                await g.dispose();
+            });
         });
     }
 }
@@ -271,3 +309,31 @@ QueryFx.Register('memory', () => GraphStore.OpenMemory());
 QueryFx.Register('lmdb', () => GraphStore.OpenLmdb(QueryFx.Dir()));
 
 after(() => QueryFx.RemoveDirs());
+
+describe('GraphReader.Catalog', () =>
+{
+    it('is the snapshot catalog and stays fixed across a later upgrade', async () =>
+    {
+        const engine = await GraphEngine.Open({ Description: EngineDescriptions.V1, Storage: { Kind: StorageKind.Memory } });
+        try
+        {
+            const before = await engine.BeginRead(AccessScope.System);
+            const catalog = before.Catalog;
+            assert.equal(catalog, engine.Catalog);
+            const names = (c: CatalogSnapshot) => c.EffectiveMembers(EngineDescriptions.Note).map(m => m.Name);
+            assert.ok(names(catalog).includes(EngineDescriptions.Extra));
+            await engine.Upgrade(EngineDescriptions.V2);
+            assert.equal(before.Catalog, catalog, 'an open reader keeps its snapshot catalog');
+            assert.ok(names(before.Catalog).includes(EngineDescriptions.Extra));
+            const after = await engine.BeginRead(AccessScope.System);
+            assert.notEqual(after.Catalog, catalog);
+            assert.equal(names(after.Catalog).includes(EngineDescriptions.Extra), false);
+            before.dispose();
+            after.dispose();
+        }
+        finally
+        {
+            await engine.dispose();
+        }
+    });
+});
