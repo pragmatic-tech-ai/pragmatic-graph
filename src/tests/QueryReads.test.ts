@@ -130,6 +130,18 @@ class QueryFx
                 assert.ok(view !== undefined);
                 assert.equal(view.Properties.has(QueryFx.Secret), false);
                 assert.equal(view.Properties.get(QueryFx.Name), 'alpha');
+                // No Cell key is recorded for the hidden member: changing it does not conflict.
+                const t1 = await g.Begin(scope);
+                assert.ok((await t1.ReadNode('s1')) !== undefined);
+                await QueryFx.Commit(g, t => t.SetProperty('s1', QueryFx.Secret, 'y'));
+                t1.CreateNode('r1', QueryFx.Rack);
+                await t1.Commit();
+                // Control: a visible member read by ReadNode does conflict.
+                const t2 = await g.Begin(scope);
+                assert.ok((await t2.ReadNode('s1')) !== undefined);
+                await QueryFx.Commit(g, t => t.SetProperty('s1', QueryFx.Name, 'beta'));
+                t2.CreateNode('r2', QueryFx.Rack);
+                assert.ok((await QueryFx.Settle(t2.Commit())) instanceof ConflictError);
                 await g.dispose();
             });
 
@@ -194,6 +206,14 @@ class QueryFx
                 await QueryFx.Read(g, rows, async r =>
                 {
                     assert.deepEqual(await r.Links('s1', EdgeDirection.Out), [{ Relationship: QueryFx.Hosts, PublicId: 's2' }]);
+                    assert.deepEqual(await r.Links('s2', EdgeDirection.In), [{ Relationship: QueryFx.Hosts, PublicId: 's1' }]);
+                });
+                // s1 (the source of every edge) is row-invisible: it must not appear in Links(target, In).
+                const noSource = AccessScope.Build({ Default: AccessDefault.Allow, Rows: new Map([[QueryFx.Server, new IdIn(new Set(['s2', 's3']))]]) });
+                await QueryFx.Read(g, noSource, async r =>
+                {
+                    assert.deepEqual(await r.Links('s3', EdgeDirection.In), []);
+                    assert.deepEqual(await r.Links('s2', EdgeDirection.In), []);
                 });
                 const hidden = AccessScope.Build({ Default: AccessDefault.Allow, Hidden: new Map([[QueryFx.Server, new Set([QueryFx.Hosts])]]) });
                 await QueryFx.Read(g, hidden, async r =>
