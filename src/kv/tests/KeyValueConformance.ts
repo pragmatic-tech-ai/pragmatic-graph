@@ -18,6 +18,8 @@ export class KeyValueConformance
     private static readonly EmptyKeyPattern = /empty key/i;
     private static readonly ChangedPattern = /changed during the scan/i;
     private static readonly BulkKeys = 20000;
+    /** Timed attempts per size: Linearity keeps the fastest, so one load spike (parallel test files, disk flush) cannot fake superlinearity. */
+    private static readonly BulkAttempts = 3;
     private static readonly BulkLabel = 'random-order bulk stage + commit';
     private static readonly Space = Keyspace.Rows;
     private static readonly AllKeys: IKeyRange = {
@@ -512,10 +514,13 @@ export class KeyValueConformance
         const space = KeyValueConformance.Space;
         const small = KeyValueConformance.BulkKeys;
         const large = small * Linearity.Factor;
-        // Each run writes its own key block [base, base + n): the small run above the large run's keys.
+        // Every timed attempt writes its own fresh key block [base, base + n) so each one stages and commits genuinely
+        // new keys (never overwrites): large attempts fill [0, attempts * large), small attempts sit above them.
+        const attempts = KeyValueConformance.BulkAttempts;
+        const done = { small: 0, large: 0 };
         await Linearity.Check(KeyValueConformance.BulkLabel, small, n => store.Write(async txn =>
         {
-            const base = n === small ? large : 0;
+            const base = n === small ? large * attempts + small * done.small++ : large * done.large++;
             // A full-period LCG over 0..n-1 (n = 2^a * 5^b with a >= 2; multiplier - 1 divisible by 2*5*4): every key once, in scrambled order.
             let x = 12345 % n;
             for (let i = 0; i < n; i++)
@@ -524,10 +529,10 @@ export class KeyValueConformance
                 txn.Put(space, KeyValueConformance.Key(base + x), KeyValueConformance.Val(1));
             }
             assert.deepEqual(await KeyValueConformance.Keys(txn, KeyValueConformance.Range(base, base + n), 3), [0, 1, 2].map(k => KeyValueConformance.Key(base + k)));
-        }));
+        }), attempts, Linearity.CeilingMs, Linearity.DiskMaxRatio);
         const read = await store.BeginRead();
         const all = await KeyValueConformance.Keys(read, KeyValueConformance.Range(0, large));
-        const others = await KeyValueConformance.Keys(read, KeyValueConformance.Range(large, large + small));
+        const others = await KeyValueConformance.Keys(read, KeyValueConformance.Range(large * attempts, large * attempts + small));
         read.dispose();
         assert.equal(all.length, large);
         assert.deepEqual(all[large - 1], KeyValueConformance.Key(large - 1));
