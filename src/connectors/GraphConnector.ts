@@ -1,4 +1,5 @@
 import type { ConnectorChangeSet } from './ConnectorChangeSet.js';
+import type { ConnectorResidency } from './FetchContract.js';
 
 /**
  * The engine-declared write side of a connector (spec §5.3): the system that holds a binding's data.
@@ -13,6 +14,8 @@ export interface IGraphConnector
 {
     /** The name bindings refer to; unique among the installed connectors, never BindingTable.EngineStorage. */
     readonly Name: string;
+    /** Absent means Mirrored (ruling R96); External connectors implement IExternalConnector. */
+    readonly Residency?: ConnectorResidency;
     Begin(): Promise<IConnectorTransaction>;
 }
 

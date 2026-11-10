@@ -1,6 +1,7 @@
 import type { CatalogSnapshot } from '../catalog/CatalogSnapshot.js';
 import { GraphError, GraphErrorCode } from '../errors/GraphError.js';
 import type { IBindingDescription } from '../schema/SchemaDescription.js';
+import type { IFetchTarget } from './FetchContract.js';
 
 /**
  * Which connector holds a node's data, by (model, concept) (spec §5.1). Built from the description's
@@ -89,6 +90,73 @@ export class BindingTable
             }
         }
         return byConcept.get(BindingTable.ModelWide) ?? this.DefaultConnector;
+    }
+
+    /**
+     * The fetches an external read of `concept` needs (ruling R96): one per binding whose connector is in
+     * `external` and whose concept is `concept`, a subtype of it (fetched as the binding's concept) or an ancestor
+     * or carried aspect of it (fetched as `concept`); a model-wide external binding fetches `concept`. A model
+     * yields one target per fetched concept, the nearest binding winning. Ordered by model, then concept.
+     */
+    public ExternalTargets(concept: string, catalog: CatalogSnapshot, external: ReadonlySet<string>): readonly IFetchTarget[]
+    {
+        const targets: IFetchTarget[] = [];
+        for (const [model, byConcept] of this.models)
+        {
+            const found = new Map<string, IFetchTarget>();
+            for (const [bound, connector] of byConcept)
+            {
+                if (!external.has(connector) || bound === BindingTable.ModelWide)
+                {
+                    continue;
+                }
+                const fetched = BindingTable.FetchedConcept(bound, concept, catalog);
+                if (fetched !== undefined && (fetched === bound || !found.has(fetched)))
+                {
+                    found.set(fetched, { Model: model, Concept: fetched, Connector: connector });
+                }
+            }
+            const wide = byConcept.get(BindingTable.ModelWide);
+            if (wide !== undefined && external.has(wide) && !found.has(concept))
+            {
+                found.set(concept, { Model: model, Concept: concept, Connector: wide });
+            }
+            targets.push(...found.values());
+        }
+        return targets.sort((a, b) => BindingTable.Compare(a.Model, b.Model) || BindingTable.Compare(a.Concept, b.Concept));
+    }
+
+    /** True when a node of `concept` held by `owner` resolves to an external connector (it is a stub, not engine data). */
+    public IsStub(owner: string, concept: string, catalog: CatalogSnapshot, external: ReadonlySet<string>): boolean
+    {
+        const connector = this.Resolve(owner, concept, catalog);
+        return connector !== undefined && external.has(connector);
+    }
+
+    private static FetchedConcept(bound: string, concept: string, catalog: CatalogSnapshot): string | undefined
+    {
+        if (bound === concept)
+        {
+            return concept;
+        }
+        if (!catalog.Has(bound) || !catalog.Has(concept))
+        {
+            return undefined;
+        }
+        if (!catalog.IsAspect(bound) && catalog.IsA(bound, concept))
+        {
+            return bound;
+        }
+        if (!catalog.IsAspect(concept) && catalog.IsA(concept, bound))
+        {
+            return concept;
+        }
+        return undefined;
+    }
+
+    private static Compare(a: string, b: string): number
+    {
+        return a < b ? -1 : a > b ? 1 : 0;
     }
 
     /** True when `other` holds the same bindings (by model and concept) and the same DefaultConnector. */

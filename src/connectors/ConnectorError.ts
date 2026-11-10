@@ -12,6 +12,8 @@ export enum ConnectorPhase
      * The engine's Prepare did not return before the write-through deadline (Connector is BindingTable.EngineStorage).
      */
     Prepare = 'Prepare',
+    /** A Fetch from an external connector failed. */
+    Fetch = 'Fetch',
 }
 
 /**

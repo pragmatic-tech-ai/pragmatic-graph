@@ -7,6 +7,7 @@ import { type BatchOp, type IUnlinkOp, type WriteBatch, WriteOp } from '../txn/W
 import { BindingTable } from './BindingTable.js';
 import { type ConnectorChange, ConnectorChangeSet } from './ConnectorChangeSet.js';
 import { ConnectorError, ConnectorPhase } from './ConnectorError.js';
+import { ConnectorResidency, type IExternalConnector } from './FetchContract.js';
 import type { IConnectorTransaction, IGraphConnector } from './GraphConnector.js';
 
 /** The owner (model, '' for none) and concept a write routes by. */
@@ -218,6 +219,8 @@ export class ConnectorSetup
     private static readonly ErrUnknown = 'A binding names a connector that is not installed: ';
     private static readonly ErrDuplicate = 'Two installed connectors share the name: ';
     private static readonly ErrReserved = 'A connector cannot use the reserved name: ';
+    private static readonly ErrExternalDefault = 'An external connector cannot be the DefaultConnector: ';
+    private static readonly ErrExternalContract = 'An external connector needs Capabilities and Fetch: ';
     private static readonly ErrTimeout = 'Connector timeout must be a finite positive number of milliseconds: ';
 
     public readonly Connectors: ReadonlyMap<string, IGraphConnector>;
@@ -239,7 +242,12 @@ export class ConnectorSetup
             {
                 throw new GraphError(GraphErrorCode.InvalidArgument, ConnectorSetup.ErrDuplicate + c.Name);
             }
+            ConnectorSetup.CheckResidency(c);
             byName.set(c.Name, c);
+        }
+        if (Bindings.DefaultConnector !== undefined && byName.get(Bindings.DefaultConnector)?.Residency === ConnectorResidency.External)
+        {
+            throw new GraphError(GraphErrorCode.InvalidArgument, ConnectorSetup.ErrExternalDefault + Bindings.DefaultConnector);
         }
         for (const name of Bindings.ConnectorNames())
         {
@@ -249,6 +257,20 @@ export class ConnectorSetup
             }
         }
         this.Connectors = byName;
+    }
+
+    /** An External connector must implement the fetch contract (ruling R96). */
+    private static CheckResidency(connector: IGraphConnector): void
+    {
+        if (connector.Residency !== ConnectorResidency.External)
+        {
+            return;
+        }
+        const external = connector as Partial<IExternalConnector>;
+        if (typeof external.Fetch !== 'function' || typeof external.Capabilities !== 'object' || external.Capabilities === null)
+        {
+            throw new GraphError(GraphErrorCode.InvalidArgument, ConnectorSetup.ErrExternalContract + connector.Name);
+        }
     }
 
     /**
