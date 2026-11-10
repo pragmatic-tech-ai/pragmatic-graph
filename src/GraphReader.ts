@@ -1,4 +1,5 @@
 import type { AccessScope } from './access/AccessScope.js';
+import { FetchedNode } from './access/FetchedNode.js';
 import { HypotheticalNode } from './access/HypotheticalNode.js';
 import { ScopeEvaluator } from './access/ScopeEvaluator.js';
 import { CatalogError, CatalogErrorCode } from './catalog/CatalogError.js';
@@ -6,6 +7,7 @@ import type { MemberDef } from './catalog/CatalogTypes.js';
 import { CatalogSnapshot } from './catalog/CatalogSnapshot.js';
 import { MemberKind } from './catalog/ValueType.js';
 import type { CellValue } from './columns/CellValue.js';
+import type { IFetchedRow } from './connectors/FetchContract.js';
 import { GraphError, GraphErrorCode } from './errors/GraphError.js';
 import { EdgeDirection } from './format/FormatKeys.js';
 import { IndexKey, type IIndexRange } from './indexes/IndexKey.js';
@@ -132,6 +134,69 @@ export class GraphReader implements IGraphDisposable
             return false;
         }
         return this.evaluator === undefined || this.evaluator.Admits(node);
+    }
+
+    /**
+     * The row fetched from an External connector as this reader may see it (ruling R100). The row is first checked
+     * against the reader's catalog (FetchedNode.Validated: GraphError SchemaViolation for a concept that is unknown or an
+     * aspect, a Values key that is not an effective property, a value that does not fit its member, or a Links key that
+     * is not an effective relationship; nulls dropped, Int64 widened into Float64 when exact), under every scope. Then
+     * undefined when the scope does not let the reader see the row (ScopeEvaluator.VisibleFetched; Unknown is not
+     * visible), else the checked row with every member HiddenMembers(row.Concept) names removed from its Values and
+     * Links. Always a new row; the caller's is never changed. `owner` is the model the row was fetched for. Looks up the row's stub (the
+     * stored node of that public id owned by `owner` whose binding is External) and records that node read, whether or
+     * not one exists, so a transaction conflicts with a commit that creates or removes it.
+     */
+    public async AdmitFetched(fetched: IFetchedRow, owner: string): Promise<IFetchedRow | undefined>
+    {
+        this.RequireOpen();
+        const row = FetchedNode.Validated(this.Catalog, fetched);
+        const node = new FetchedNode(row, owner);
+        const stub = await this.recorded.StubOf(row.PublicId, owner);
+        if (stub !== undefined)
+        {
+            node.AttachStub(stub);
+        }
+        const evaluator = this.evaluator;
+        if (evaluator === undefined)
+        {
+            return row;
+        }
+        if (!(await evaluator.VisibleFetched(node)))
+        {
+            return undefined;
+        }
+        const hidden = evaluator.HiddenMembers(row.Concept);
+        if (hidden.size === 0)
+        {
+            return row;
+        }
+        return { PublicId: row.PublicId, Concept: row.Concept, Values: GraphReader.Without(row.Values, hidden), Links: GraphReader.Without(row.Links, hidden) };
+    }
+
+    /**
+     * The scope's row predicate for a fetch of `concept` (design ruling D4): the And of the applicable Rows predicates
+     * (the predicate itself when one applies), True when none applies and Default allows (and under a scope that
+     * restricts no read), False when Default denies. Advisory push-down: fetched rows still pass AdmitFetched.
+     */
+    public FetchPredicate(concept: string): Predicate
+    {
+        this.RequireOpen();
+        return this.evaluator?.RowsPredicate(concept) ?? Predicate.True;
+    }
+
+    /** A copy of `map` without the `hidden` keys. */
+    private static Without<T>(map: ReadonlyMap<string, T>, hidden: ReadonlySet<string>): ReadonlyMap<string, T>
+    {
+        const out = new Map<string, T>();
+        for (const [name, value] of map)
+        {
+            if (!hidden.has(name))
+            {
+                out.set(name, value);
+            }
+        }
+        return out;
     }
 
     /**

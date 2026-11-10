@@ -33,6 +33,8 @@ export class BindingTable
     private readonly models = new Map<string, Map<string, string>>();
     /** Per catalog, per concept: its specificity chain (see Resolve). */
     private readonly chains = new WeakMap<CatalogSnapshot, Map<string, readonly string[]>>();
+    /** Per catalog, per concept or aspect: the non-aspect concepts that IsA it (see ExternalTargets). */
+    private readonly members = new WeakMap<CatalogSnapshot, Map<string, readonly string[]>>();
 
     public constructor(bindings: readonly IBindingDescription[], public readonly DefaultConnector?: string)
     {
@@ -97,41 +99,41 @@ export class BindingTable
     }
 
     /**
-     * The fetches an external read of `concept` needs (rulings R96, D6). Per model: (a) one target for `concept`
-     * itself when the connector Resolve would pick for it (the nearest binding in the specificity chain, else the
-     * model-wide one) is in `external`, so a binding on an ancestor or carried aspect, or a model-wide one,
-     * fetches as `concept`, the nearest in the catalog's ancestor order then declared aspects order winning;
-     * (b) one target per external binding on a strict subtype of `concept`, fetched as that subtype. Within one
-     * (model, connector) a target whose concept IS-A another target's concept is dropped, because the broader
-     * fetch already covers it (no row is fetched twice); targets on different connectors are all kept, the
-     * fetch session dropping rows the more specific binding owns. Ordered by model, then concept.
+     * The fetches an external read of `label` (a concept or an aspect) needs (ruling R96, amended by R100 for aspects).
+     * Its members are every concept of the catalog that is not an aspect and IsA `label`: the concept itself and its
+     * subtypes, or for an aspect every concept carrying it and their subtypes (a name the catalog does not define
+     * stands for itself). For every model the table names, each member that Resolve (most specific binding winning)
+     * sends to a connector in `external` is a candidate (model, member, connector); so bindings keyed by the member, an
+     * ancestor, a carried aspect (also another aspect than `label`) or model-wide all count, and a member a more
+     * specific binding sends elsewhere is not fetched. Within one (model, connector) a candidate whose concept IsA
+     * another candidate's concept is dropped: one fetch of the most general concept covers it (rows of subtypes bound
+     * elsewhere are dropped by the session's re-resolution, D6). A fetch never names an aspect: an aspect read fetches
+     * its carriers. Ordered by model, then concept.
      */
-    public ExternalTargets(concept: string, catalog: CatalogSnapshot, external: ReadonlySet<string>): readonly IFetchTarget[]
+    public ExternalTargets(label: string, catalog: CatalogSnapshot, external: ReadonlySet<string>): readonly IFetchTarget[]
     {
         const targets: IFetchTarget[] = [];
-        for (const [model, byConcept] of this.models)
+        if (external.size === 0)
         {
-            const found = new Map<string, IFetchTarget>();
-            const own = BindingTable.NearestBinding(this.Chain(concept, catalog), byConcept);
-            if (own !== undefined && external.has(own))
+            return targets;
+        }
+        const members = this.Members(label, catalog);
+        for (const model of this.models.keys())
+        {
+            const candidates: IFetchTarget[] = [];
+            for (const concept of members)
             {
-                found.set(concept, { Model: model, Concept: concept, Connector: own });
-            }
-            for (const [bound, connector] of byConcept)
-            {
-                if (external.has(connector) && bound !== BindingTable.ModelWide && bound !== concept
-                    && catalog.Has(bound) && catalog.Has(concept) && !catalog.IsAspect(bound) && catalog.IsA(bound, concept))
+                const connector = this.Resolve(model, concept, catalog);
+                if (connector !== undefined && external.has(connector))
                 {
-                    found.set(bound, { Model: model, Concept: bound, Connector: connector });
+                    candidates.push({ Model: model, Concept: concept, Connector: connector });
                 }
             }
-            const all = [...found.values()];
-            for (const t of all)
+            for (const c of candidates)
             {
-                const covered = all.some(o => o !== t && o.Connector === t.Connector && catalog.Has(t.Concept) && !catalog.IsAspect(t.Concept) && catalog.Has(o.Concept) && catalog.IsA(t.Concept, o.Concept));
-                if (!covered)
+                if (!candidates.some(o => o !== c && o.Connector === c.Connector && BindingTable.Covers(o.Concept, c.Concept, catalog)))
                 {
-                    targets.push(t);
+                    targets.push(c);
                 }
             }
         }
@@ -145,18 +147,57 @@ export class BindingTable
         return connector !== undefined && external.has(connector);
     }
 
-    /** The connector Resolve would pick within one model: the first chain name with a binding, else model-wide. */
-    private static NearestBinding(chain: readonly string[], byConcept: ReadonlyMap<string, string>): string | undefined
+    /**
+     * True when some node that is, inherits from or carries `conceptOrAspect` could resolve to a connector in `external`:
+     * exactly when ExternalTargets of it is not empty, but stopping at the first member (see ExternalTargets) some model
+     * resolves to an external connector. Owners the table does not name resolve to DefaultConnector, never external
+     * (ConnectorSetup refuses an External default), so they never count.
+     */
+    public MayResolveExternal(conceptOrAspect: string, catalog: CatalogSnapshot, external: ReadonlySet<string>): boolean
     {
-        for (const name of chain)
+        if (external.size === 0)
         {
-            const connector = byConcept.get(name);
-            if (connector !== undefined)
+            return false;
+        }
+        const members = this.Members(conceptOrAspect, catalog);
+        for (const model of this.models.keys())
+        {
+            for (const concept of members)
             {
-                return connector;
+                const connector = this.Resolve(model, concept, catalog);
+                if (connector !== undefined && external.has(connector))
+                {
+                    return true;
+                }
             }
         }
-        return byConcept.get(BindingTable.ModelWide);
+        return false;
+    }
+
+    /** True when `general` and `specific` differ and a fetch of `general` covers nodes of `specific` (IsA). */
+    private static Covers(general: string, specific: string, catalog: CatalogSnapshot): boolean
+    {
+        return general !== specific && catalog.Has(general) && catalog.Has(specific) && catalog.IsA(specific, general);
+    }
+
+    /** The non-aspect concepts that IsA `label`, in definition order (cached per catalog); [label] for an unknown name. */
+    private Members(label: string, catalog: CatalogSnapshot): readonly string[]
+    {
+        let perCatalog = this.members.get(catalog);
+        if (perCatalog === undefined)
+        {
+            perCatalog = new Map();
+            this.members.set(catalog, perCatalog);
+        }
+        let found = perCatalog.get(label);
+        if (found === undefined)
+        {
+            found = Object.freeze(catalog.Has(label)
+                ? catalog.Definitions().filter(d => !d.IsAspect && catalog.IsA(d.Name, label)).map(d => d.Name)
+                : [label]);
+            perCatalog.set(label, found);
+        }
+        return found;
     }
 
     private static Compare(a: string, b: string): number

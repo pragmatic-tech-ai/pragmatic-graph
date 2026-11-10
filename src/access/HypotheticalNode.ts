@@ -59,8 +59,12 @@ export class HypotheticalNode
         return new HypotheticalNode(concept, values);
     }
 
-    /** `value` as a cell of `def` under the write path's value rules; GraphError SchemaViolation when it does not fit. */
-    private static Checked(concept: string, def: MemberDef, value: Exclude<CellValue, null>): CellValue
+    /**
+     * @internal `value` as a cell of `def` under the write path's value rules (an Int64 into a Float64 member widened when
+     * exactly representable); GraphError SchemaViolation naming `concept.member` when it does not fit. Also how
+     * FetchedNode.Validated checks fetched values.
+     */
+    public static Checked(concept: string, def: MemberDef, value: Exclude<CellValue, null>): CellValue
     {
         const label = concept + HypotheticalNode.Dot + def.Name;
         let cell: CellValue = value;
