@@ -1,5 +1,6 @@
 import type { AccessScope } from '../access/AccessScope.js';
 import { FetchSession } from '../connectors/FetchSession.js';
+import { FederatedReads } from '../FederatedReads.js';
 import type { GraphEngine } from '../GraphEngine.js';
 import type { GraphReader, ILinkView } from '../GraphReader.js';
 import type { Binding } from './Binding.js';
@@ -117,7 +118,7 @@ export class CypherEngine
     private static ReadSource(reader: GraphReader): ICypherSource
     {
         const base = new ReaderSource(reader);
-        const setup = reader.Connectors;
+        const setup = FederatedReads.Of(reader).Setup;
         if (setup === undefined || setup.External.size === 0)
         {
             return base;

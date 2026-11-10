@@ -136,9 +136,9 @@ export class OverlaySource implements ICypherSource
         return this.base.FetchTargets(label);
     }
 
-    public SeekEqual(label: string, member: string, value: CellValue, probe?: IReadProbe): AsyncIterable<CypherNode> | undefined
+    public SeekEqual(label: string, member: string, value: CellValue, probe?: IReadProbe, hint?: Predicate): AsyncIterable<CypherNode> | undefined
     {
-        const hits = this.base.SeekEqual(label, member, value, probe);
+        const hits = this.base.SeekEqual(label, member, value, probe, hint);
         return hits === undefined ? undefined : this.MergedSeek(hits, label, member, value, probe);
     }
 

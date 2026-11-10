@@ -14,8 +14,8 @@ import type { IOperator } from './IOperator.js';
  * a parameter) is evaluated once per pass, at run time. A null or non-scalar value matches nothing, exactly as
  * the `=` filter would; when the source has no usable index after all, the pass falls back to a label scan
  * filtered by the same equality, so the rows never depend on the index. The deadline is checked up front and per
- * stored entry examined (hidden ones included), on either path. `hint` (FetchHint) goes to the fallback scan; the seek
- * itself pushes its equality down (ICypherSource.SeekEqual). Explain lists the External fetches under it.
+ * stored entry examined (hidden ones included), on either path. `hint` (FetchHint) goes to the seek and to the fallback
+ * scan (ICypherSource.SeekEqual / ScanLabel). Explain lists the External fetches under it.
  */
 export class IndexSeek implements IOperator
 {
@@ -48,7 +48,7 @@ export class IndexSeek implements IOperator
         {
             return;
         }
-        const hits = this.source.SeekEqual(this.label, this.member, value.Value, probe);
+        const hits = this.source.SeekEqual(this.label, this.member, value.Value, probe, this.hint);
         if (hits !== undefined)
         {
             for await (const node of hits)

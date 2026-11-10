@@ -236,6 +236,19 @@ describe('FetchSession', () =>
         assert.equal(ticks, 3 + 3);
     });
 
+    it('lookup and reverse tick the probe per page and per row', async () =>
+    {
+        const ext = new FakeExternalConnector(SessionFx.Ext, [[SessionFx.Row('a'), SessionFx.Row('b')]]);
+        const session = await SessionFx.Session(ext);
+        let ticks = 0;
+        const probe = { Tick: () => { ticks++; } };
+        assert.equal((await session.Lookup('a', [SessionFx.Target()], probe))?.PublicId, 'a');
+        assert.equal(ticks, 1 + 1);
+        ticks = 0;
+        assert.deepEqual(await SessionFx.Drain(session.Reverse(SessionFx.Target(), SessionFx.Next, 't', probe)), ['a', 'b']);
+        assert.equal(ticks, 1 + 2);
+    });
+
     it('lookup after a narrow scan refetches the full row', async () =>
     {
         const ext = new FakeExternalConnector(SessionFx.Ext, []);

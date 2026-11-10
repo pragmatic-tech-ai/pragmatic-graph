@@ -5,7 +5,8 @@ import type { BindingTable } from '../connectors/BindingTable.js';
 import type { IFetchTarget, IFetchedRow } from '../connectors/FetchContract.js';
 import type { FetchSession } from '../connectors/FetchSession.js';
 import { EdgeDirection } from '../format/FormatKeys.js';
-import type { GraphReader, IFederatedLink, ILinkView, IReadProbe } from '../GraphReader.js';
+import { FederatedReads, type IFederatedLink } from '../FederatedReads.js';
+import type { GraphReader, ILinkView, IReadProbe } from '../GraphReader.js';
 import { And, Compare, CompareOp, Or, Predicate, PredicateKind } from '../predicate/Predicate.js';
 import { PredicateCodec } from '../predicate/PredicateCodec.js';
 import { CatalogSource } from './CatalogSource.js';
@@ -58,10 +59,12 @@ export class FederatedSource extends CatalogSource
     private readonly scopes = new Map<string, Predicate>();
     private readonly incoming = new Map<string, readonly MemberDef[]>();
     private declared: readonly MemberDef[] | undefined;
+    private readonly reads: FederatedReads;
 
     constructor(private readonly base: ReaderSource, private readonly reader: GraphReader, private readonly session: FetchSession, bindings: BindingTable)
     {
         super(reader.Catalog, reader.Scope.HiddenNames, bindings, session.ConnectorNames);
+        this.reads = FederatedReads.Of(reader);
     }
 
     public async *ScanLabel(label: string, probe?: IReadProbe, hint?: Predicate): AsyncIterable<CypherNode>
@@ -87,17 +90,23 @@ export class FederatedSource extends CatalogSource
         }
     }
 
-    public async Node(publicId: string): Promise<CypherNode | undefined>
+    public Node(publicId: string): Promise<CypherNode | undefined>
+    {
+        return this.NodeOf(publicId, undefined);
+    }
+
+    /** Node, with the probe a lookup it needs ticks (per page and per row). */
+    private async NodeOf(publicId: string, probe: IReadProbe | undefined): Promise<CypherNode | undefined>
     {
         const node = await this.base.Node(publicId);
         if (node !== undefined && !this.IsStub(node.Owner, node.Concept))
         {
             return node;
         }
-        const stub = node !== undefined ? { Concept: node.Concept, Owner: node.Owner } : await this.reader.StubIdentity(publicId);
+        const stub = node !== undefined ? { Concept: node.Concept, Owner: node.Owner } : await this.reads.StubIdentity(publicId);
         if (stub !== undefined)
         {
-            return this.Resolve(publicId, stub.Concept, stub.Owner);
+            return this.Resolve(publicId, stub.Concept, stub.Owner, probe);
         }
         const known = this.fetched.get(publicId);
         return known === undefined ? undefined : this.ToNode(known);
@@ -148,23 +157,24 @@ export class FederatedSource extends CatalogSource
 
     /**
      * The base seek (undefined when it has no index), then the label's External fetches with the hint
-     * Compare(member, Eq, value), each fetched node kept only when its member equals the value as the `=` filter
-     * decides (the connector may ignore the hint).
+     * And(Compare(member, Eq, value), anchor hint), each fetched node kept only when its member equals the value as the
+     * `=` filter decides (the connector may ignore the hint; the anchor's other filters stay in the plan).
      */
-    public SeekEqual(label: string, member: string, value: CellValue, probe?: IReadProbe): AsyncIterable<CypherNode> | undefined
+    public SeekEqual(label: string, member: string, value: CellValue, probe?: IReadProbe, hint?: Predicate): AsyncIterable<CypherNode> | undefined
     {
         const hits = this.base.SeekEqual(label, member, value, probe);
-        return hits === undefined ? undefined : this.MergedSeek(hits, this.labels.Resolve(label), member, value, probe);
+        return hits === undefined ? undefined : this.MergedSeek(hits, this.labels.Resolve(label), member, value, probe, hint);
     }
 
-    private async *MergedSeek(hits: AsyncIterable<CypherNode>, label: string, member: string, value: CellValue, probe: IReadProbe | undefined): AsyncIterable<CypherNode>
+    private async *MergedSeek(hits: AsyncIterable<CypherNode>, label: string, member: string, value: CellValue, probe: IReadProbe | undefined, anchor: Predicate | undefined): AsyncIterable<CypherNode>
     {
         yield* this.EngineNodes(hits);
         if (value === null)
         {
             return;
         }
-        const hint = new Compare(member, CompareOp.Eq, value);
+        const equality = new Compare(member, CompareOp.Eq, value);
+        const hint = anchor === undefined ? equality : new And([equality, anchor]);
         for (const target of this.FetchTargets(label))
         {
             for await (const node of this.Fetch(target, hint, probe))
@@ -203,7 +213,7 @@ export class FederatedSource extends CatalogSource
     }
 
     /** The external node behind a stub (or a link target) of `owner`: memoised per query, undefined when dangling or not visible. */
-    private async Resolve(publicId: string, concept: string, owner: string): Promise<CypherNode | undefined>
+    private async Resolve(publicId: string, concept: string, owner: string, probe: IReadProbe | undefined): Promise<CypherNode | undefined>
     {
         const known = this.fetched.get(publicId);
         if (known !== undefined && known.Owner === owner)
@@ -211,22 +221,31 @@ export class FederatedSource extends CatalogSource
             return this.ToNode(known);
         }
         const candidates = this.catalog.Has(concept) ? this.FetchTargets(concept).filter(t => t.Model === owner) : [];
-        return this.LookUp(publicId, candidates, owner);
+        return this.LookUp(publicId, candidates, owner, probe);
     }
 
-    private async LookUp(publicId: string, candidates: readonly IFetchTarget[], owner: string): Promise<CypherNode | undefined>
+    private async LookUp(publicId: string, candidates: readonly IFetchTarget[], owner: string, probe: IReadProbe | undefined): Promise<CypherNode | undefined>
     {
         if (candidates.length === 0)
         {
             return undefined;
         }
-        const row = await this.session.Lookup(publicId, candidates);
+        const row = await this.session.Lookup(publicId, candidates, probe);
         return row === undefined ? undefined : this.Admit(row, owner);
     }
 
-    /** The row as this reader may see it, recorded for Node and Expand; undefined when the scope does not admit it. */
+    /**
+     * The row as this reader may see it, recorded for Node and Expand; undefined when the scope does not admit it, and
+     * also, silently, when a stored engine node that is not a stub has its public id (visible or not, so nothing about
+     * a hidden node is revealed): the engine-resident node owns its id (design ruling D2). That check records the id
+     * read, so a transaction conflicts with a commit that creates or removes such a node.
+     */
     private async Admit(row: IFetchedRow, owner: string): Promise<CypherNode | undefined>
     {
+        if (await this.reads.StoredNonStub(row.PublicId))
+        {
+            return undefined;
+        }
         const admitted = await this.reader.AdmitFetched(row, owner);
         if (admitted === undefined)
         {
@@ -258,9 +277,9 @@ export class FederatedSource extends CatalogSource
         const external = this.fetched.get(publicId);
         if (external === undefined)
         {
-            for (const link of await this.reader.FederatedLinks(publicId, EdgeDirection.Out, relationship, probe))
+            for (const link of await this.reads.Links(publicId, EdgeDirection.Out, relationship, probe))
             {
-                const target = await this.LinkedNode(link);
+                const target = await this.LinkedNode(link, probe);
                 if (target !== undefined)
                 {
                     yield { Relationship: link.Relationship, Target: target };
@@ -278,7 +297,7 @@ export class FederatedSource extends CatalogSource
             for (const id of row.Links.get(def.Name) ?? [])
             {
                 probe?.Tick();
-                const target = await this.LinkTarget(id, def, external.Owner);
+                const target = await this.LinkTarget(id, def, external.Owner, probe);
                 if (target !== undefined)
                 {
                     yield { Relationship: def.Name, Target: target };
@@ -288,15 +307,15 @@ export class FederatedSource extends CatalogSource
     }
 
     /** An engine edge's far node: a stub resolved through its connector, any other node read from the engine. */
-    private LinkedNode(link: IFederatedLink): Promise<CypherNode | undefined>
+    private LinkedNode(link: IFederatedLink, probe: IReadProbe | undefined): Promise<CypherNode | undefined>
     {
-        return link.Stub === undefined ? this.base.Node(link.PublicId) : this.Resolve(link.PublicId, link.Stub.Concept, link.Stub.Owner);
+        return link.Stub === undefined ? this.base.Node(link.PublicId) : this.Resolve(link.PublicId, link.Stub.Concept, link.Stub.Owner, probe);
     }
 
     /** The far node of an external row's link: as Node, else a key lookup of the relationship's targets in the row's model. */
-    private async LinkTarget(publicId: string, relationship: MemberDef, owner: string): Promise<CypherNode | undefined>
+    private async LinkTarget(publicId: string, relationship: MemberDef, owner: string, probe: IReadProbe | undefined): Promise<CypherNode | undefined>
     {
-        const node = await this.Node(publicId);
+        const node = await this.NodeOf(publicId, probe);
         if (node !== undefined || this.fetched.has(publicId))
         {
             return node;
@@ -312,7 +331,7 @@ export class FederatedSource extends CatalogSource
                 }
             }
         }
-        return this.LookUp(publicId, candidates, owner);
+        return this.LookUp(publicId, candidates, owner, probe);
     }
 
     private async *In(publicId: string, relationship: string | undefined, probe: IReadProbe | undefined, seen: Set<string>): AsyncIterable<IExpandRow>
@@ -323,9 +342,9 @@ export class FederatedSource extends CatalogSource
         {
             return;
         }
-        for (const link of await this.reader.FederatedLinks(publicId, EdgeDirection.In, relationship, probe, external?.Owner))
+        for (const link of await this.reads.Links(publicId, EdgeDirection.In, relationship, probe, external?.Owner))
         {
-            const source = await this.LinkedNode(link);
+            const source = await this.LinkedNode(link, probe);
             if (source !== undefined && FederatedSource.FirstTime(seen, link.Relationship, source.PublicId))
             {
                 yield { Relationship: link.Relationship, Target: source };
@@ -335,9 +354,8 @@ export class FederatedSource extends CatalogSource
         {
             for (const target of this.FetchTargets(def.DeclaredBy))
             {
-                for await (const row of this.session.Reverse(target, def.Name, publicId))
+                for await (const row of this.session.Reverse(target, def.Name, publicId, probe))
                 {
-                    probe?.Tick();
                     const source = await this.Admit(row, target.Model);
                     if (source === undefined || !(this.fetched.get(source.PublicId)?.Row.Links.get(def.Name) ?? []).includes(publicId))
                     {

@@ -66,8 +66,11 @@ export class FetchSession
         yield* this.Drain(target, request, probe, undefined);
     }
 
-    /** The row of `publicId` from the first candidate that has it (hits, and misses per candidate, are memoised). */
-    public async Lookup(publicId: string, candidates: readonly IFetchTarget[]): Promise<IFetchedRow | undefined>
+    /**
+     * The row of `publicId` from the first candidate that has it (hits, and misses per candidate, are memoised); ticks the
+     * probe per page and per row returned, as Scan.
+     */
+    public async Lookup(publicId: string, candidates: readonly IFetchTarget[], probe?: IReadProbe): Promise<IFetchedRow | undefined>
     {
         for (const target of candidates)
         {
@@ -96,7 +99,7 @@ export class FetchSession
                 Members: required,
                 Keys: [publicId],
             };
-            for await (const row of this.Drain(target, request, undefined, publicId))
+            for await (const row of this.Drain(target, request, probe, publicId))
             {
                 this.memo.set(publicId, { Row: row, Model: target.Model, Members: new Set(required) });
                 return row;
@@ -106,8 +109,11 @@ export class FetchSession
         return undefined;
     }
 
-    /** Rows of the target that link to `targetId` by `relationship`; nothing when the connector cannot look up in reverse. */
-    public async *Reverse(target: IFetchTarget, relationship: string, targetId: string): AsyncIterable<IFetchedRow>
+    /**
+     * Rows of the target that link to `targetId` by `relationship`; nothing when the connector cannot look up in reverse.
+     * Ticks the probe per page and per row, as Scan.
+     */
+    public async *Reverse(target: IFetchTarget, relationship: string, targetId: string, probe?: IReadProbe): AsyncIterable<IFetchedRow>
     {
         if (!this.Connector(target).Capabilities.ReverseLookup)
         {
@@ -119,7 +125,7 @@ export class FetchSession
             Predicate: Predicate.True,
             Members: this.PropertyNames(target.Concept),
             Reverse: { Relationship: relationship, Target: targetId },
-        }, undefined, undefined);
+        }, probe, undefined);
     }
 
     /**
@@ -144,11 +150,11 @@ export class FetchSession
             probe?.Tick();
             for (const row of page.Rows)
             {
+                probe?.Tick();
                 if (onlyId !== undefined && row.PublicId !== onlyId)
                 {
                     continue;
                 }
-                probe?.Tick();
                 if (!this.Admit(target, row))
                 {
                     continue;

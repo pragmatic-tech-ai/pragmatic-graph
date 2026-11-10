@@ -61,7 +61,8 @@ export interface ICypherSource
     /**
      * Nodes of the label whose member equals the value, through an index; undefined when IndexFor finds none. A value
      * that can equal no stored value of the member (null, another type, a non-integral float against an Int64
-     * member) yields an empty iterable, as the equality filter would.
+     * member) yields an empty iterable, as the equality filter would. `hint` is the seek anchor's push-down hint, as for
+     * ScanLabel.
      */
-    SeekEqual(label: string, member: string, value: CellValue, probe?: IReadProbe): AsyncIterable<CypherNode> | undefined;
+    SeekEqual(label: string, member: string, value: CellValue, probe?: IReadProbe, hint?: Predicate): AsyncIterable<CypherNode> | undefined;
 }

@@ -8,9 +8,9 @@ import { CatalogSnapshot } from './catalog/CatalogSnapshot.js';
 import { MemberKind } from './catalog/ValueType.js';
 import type { CellValue } from './columns/CellValue.js';
 import type { IFetchedRow } from './connectors/FetchContract.js';
-import type { ConnectorSetup } from './connectors/WriteCoordinator.js';
 import { GraphError, GraphErrorCode } from './errors/GraphError.js';
 import { EdgeDirection } from './format/FormatKeys.js';
+import { FederatedReads } from './FederatedReads.js';
 import { IndexKey, type IIndexRange } from './indexes/IndexKey.js';
 import type { IKeyRange } from './kv/KeyValue.js';
 import type { GraphContext, IGraphDisposable, ReadSnapshot } from './GraphContext.js';
@@ -40,19 +40,6 @@ export interface ILinkView
 {
     readonly Relationship: string;
     readonly PublicId: string;
-}
-
-/** @internal A stub's identity: the concept and owner model it was created with (ruling R102). */
-export interface IStubIdentity
-{
-    readonly Concept: string;
-    readonly Owner: string;
-}
-
-/** @internal One edge as a federated read sees it: Stub is set when the far node is a stub (GraphReader.FederatedLinks). */
-export interface IFederatedLink extends ILinkView
-{
-    readonly Stub?: IStubIdentity;
 }
 
 /**
@@ -91,6 +78,8 @@ export class GraphReader implements IGraphDisposable
     private readonly evaluator: ScopeEvaluator | undefined;
     /** Only for a scope that restricts writes but not reads (WriteEvaluator). */
     private writeEvaluator: ScopeEvaluator | undefined;
+    /** The unscoped reads of a federated Cypher read (ruling R101): a hard-private field, reachable only through FederatedReads.Of. */
+    readonly #federated: FederatedReads;
     private disposed = false;
 
     /** @internal Created by GraphStore.BeginRead and GraphStore.Begin; `reads` only for a transaction. */
@@ -98,6 +87,7 @@ export class GraphReader implements IGraphDisposable
     {
         this.recorded = new RecordedReads(context, snapshot, reads);
         this.evaluator = scope.ReadsUnrestricted ? undefined : new ScopeEvaluator(scope, this.recorded);
+        this.#federated = new FederatedReads(this, this.recorded, this.evaluator, snapshot.Index);
         context.Track(this);
     }
 
@@ -318,85 +308,6 @@ export class GraphReader implements IGraphDisposable
             }
         }
         return out;
-    }
-
-    /**
-     * @internal For federated reads (ruling R101). The node's edges as Links reports them, except that a far node that
-     * is a stub is reported with its identity (IFederatedLink.Stub) without being decided: the engine cannot decide a
-     * stub (ruling R100), so the caller resolves it through its connector and admits the fetched row (AdmitFetched)
-     * before using it. With `stubOwner` the node itself is the stub of a fetched row the caller has admitted (its
-     * owner model): it is located as RecordedReads.StubOf does, without deciding its visibility, and has no edges
-     * when there is no such stub. Records what Links records, plus each far node's binding.
-     */
-    public async FederatedLinks(publicId: string, direction: EdgeDirection, relationship?: string, probe?: IReadProbe, stubOwner?: string): Promise<readonly IFederatedLink[]>
-    {
-        this.RequireOpen();
-        if (direction !== EdgeDirection.Out && direction !== EdgeDirection.In)
-        {
-            throw new GraphError(GraphErrorCode.InvalidArgument, GraphReader.ErrDirection + String(direction));
-        }
-        const node = stubOwner === undefined ? await this.Locate(publicId) : await this.recorded.StubOf(publicId, stubOwner);
-        const out: IFederatedLink[] = [];
-        if (node === undefined)
-        {
-            return out;
-        }
-        const evaluator = this.evaluator;
-        const rels = relationship !== undefined
-            ? this.recorded.RelationshipsOrNone(node.Concept, relationship, direction)
-            : direction === EdgeDirection.Out
-                ? this.snapshot.Index.Catalog.EffectiveMembers(node.Concept).filter(m => m.Kind === MemberKind.Relationship)
-                : this.snapshot.Index.IncomingRelationships(node.Concept);
-        const hidden = direction === EdgeDirection.Out ? evaluator?.HiddenMembers(node.Concept) : undefined;
-        for (const rel of rels)
-        {
-            if (hidden?.has(rel.Name) === true)
-            {
-                continue;
-            }
-            for await (const id of this.recorded.Adjacent(rel, node.Id, direction))
-            {
-                this.RequireOpen();
-                probe?.Tick();
-                const far = await this.recorded.NodeById(id);
-                // In: the edge is a member of the far node (its source), so the far node's Hidden decides.
-                if (direction === EdgeDirection.In && evaluator?.HiddenMembers(far.Concept).has(rel.Name) === true)
-                {
-                    continue;
-                }
-                if (await this.recorded.IsStub(far))
-                {
-                    out.push({ Relationship: rel.Name, PublicId: far.PublicId, Stub: { Concept: far.Concept, Owner: await this.recorded.Owner(far) } });
-                }
-                else if (evaluator === undefined || (await evaluator.IsVisible(far)))
-                {
-                    out.push({ Relationship: rel.Name, PublicId: far.PublicId });
-                }
-            }
-        }
-        return out;
-    }
-
-    /**
-     * @internal For federated reads (ruling R101): the identity of the stored stub with this public id, decided by
-     * nothing (the caller resolves it through its connector and admits the fetched row), or undefined when the id is
-     * not stored or is not a stub. Records the id's binding (also when missing).
-     */
-    public async StubIdentity(publicId: string): Promise<IStubIdentity | undefined>
-    {
-        this.RequireOpen();
-        const node = await this.recorded.Locate(publicId);
-        if (node === undefined || !(await this.recorded.IsStub(node)))
-        {
-            return undefined;
-        }
-        return { Concept: node.Concept, Owner: await this.recorded.Owner(node) };
-    }
-
-    /** @internal The bindings and connectors installed when the reader opened (fixed for its life); undefined when none. */
-    public get Connectors(): ConnectorSetup | undefined
-    {
-        return this.recorded.Setup;
     }
 
     /**
@@ -626,6 +537,7 @@ export class GraphReader implements IGraphDisposable
             return;
         }
         this.disposed = true;
+        this.#federated.Close();
         this.context.Forget(this);
         this.snapshot.dispose();
     }
