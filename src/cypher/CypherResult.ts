@@ -4,10 +4,12 @@ import type { CypherValue } from './CypherValue.js';
 import type { CypherWriteStats, CypherWriteStatsDto } from './write/CypherWriteStats.js';
 
 /**
- * One query's result table. Truncated: RowCap cut the rows (no paging). HasMore: a page (Skip given) has a further
- * row. Stats: what a write query changed (absent for a read). Commit: the commit number of a write query that
- * committed changes (for a read: the snapshot commit it ran at; absent for a write that changed nothing, which commits nothing). NextCursor: with HasMore on a keyset or Skip page, the cursor of the last returned row. Every node
- * reachable in a row from CypherEngine.Execute has its links filled, so CypherEngine.ToDto is synchronous.
+ * One query's result table. Truncated: RowCap cut the rows (no paging). HasMore: a page (Skip or After given) has a
+ * further row. Stats: what a write query changed (absent for a read). Commit: for a write, the commit number it
+ * committed (absent when it changed nothing, which commits nothing); for a read, the snapshot commit it ran at.
+ * NextCursor: on a page with HasMore, the cursor of the last returned row (pass it as Limits.After for the next
+ * page). Every node reachable in a row from CypherEngine.Execute has its links filled, so CypherEngine.ToDto is
+ * synchronous.
  */
 export class CypherResult
 {

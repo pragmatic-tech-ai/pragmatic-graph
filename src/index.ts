@@ -22,7 +22,7 @@ export { DateTimeValue, DateValue, DurationValue, type CellValue } from './colum
 export { EdgeDirection } from './format/FormatKeys.js';
 
 // Commits and change notification.
-export { WriteBatch, WriteOp, type BatchOp, type ICreateNodeOp, type ICreateNodeOptions, type IDeleteNodeOp, type IDeleteNodeOptions, type ILinkOp, type ISetOwnerOp, type ISetPropertyOp, type IUnlinkOp, type LinkOptions } from './txn/WriteBatch.js';
+export { WriteBatch, WriteOp, type BatchOp, type ICreateNodeOp, type ICreateNodeOptions, type IDeleteNodeOp, type IDeleteNodeOptions, type IExternalTarget, type ILinkOp, type ISetOwnerOp, type ISetPropertyOp, type IUnlinkOp, type LinkOptions } from './txn/WriteBatch.js';
 export { CommitKind, type ICommitApplied } from './txn/LogEntry.js';
 export type { IUpgradeCommit } from './txn/Committer.js';
 export type { ISignal, ISubscription } from './txn/Signal.js';
@@ -43,6 +43,7 @@ export { ConnectorChangeSet, type ConnectorChange } from './connectors/Connector
 export { ConnectorResidency, type IConnectorCapabilities, type IExternalConnector, type IFetchPage, type IFetchRequest, type IFetchTarget, type IFetchedRow } from './connectors/FetchContract.js';
 export { BindingTable } from './connectors/BindingTable.js';
 export { ConnectorError, ConnectorPhase } from './connectors/ConnectorError.js';
+export { FetchSession } from './connectors/FetchSession.js';
 
 // Predicate language and node-local evaluation.
 export { And, Compare, CompareOp, ConceptIs, FalsePredicate, IdIn, In, IsNull, Not, Or, OwnerIs, Predicate, PredicateKind, Reachable, Related, Seeded, TruePredicate, type IPathStep } from './predicate/Predicate.js';

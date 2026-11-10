@@ -29,6 +29,19 @@ export interface LinkOptions
     readonly AfterSibling?: string;
     readonly BeforeSibling?: string;
     readonly Properties?: ReadonlyMap<string, CellValue>;
+    /**
+     * The far end lives only in an external system (ruling R102): when `to` is not a stored node the commit creates
+     * the identity-only stub (to, Concept, Owner) first. Its binding must resolve to an External connector (else
+     * InvalidEdge); an existing node of another concept is TargetTypeMismatch.
+     */
+    readonly ExternalTarget?: IExternalTarget;
+}
+
+/** Identity of a node held by an external connector: its concept and the model that holds it. */
+export interface IExternalTarget
+{
+    readonly Concept: string;
+    readonly Owner: string;
 }
 
 /** Optional placement and ownership of a new node. Owner (the holding model's name) is set at creation; only seed synchronization re-owns a node (SetOwner, ruling R90). */
@@ -271,7 +284,8 @@ export class WriteBatch
     private static readonly FlagAfter = 2;
     private static readonly FlagBefore = 4;
     private static readonly FlagProperties = 8;
-    private static readonly KnownFlags = 15;
+    private static readonly FlagTarget = 16;
+    private static readonly KnownFlags = 31;
     private static readonly FlagHint = 1;
     private static readonly FlagOwner = 2;
     private static readonly KnownCreateFlags = 3;
@@ -292,6 +306,12 @@ export class WriteBatch
     // ES private fields: not own enumerable properties, so a sealed batch still deep-equals its unsealed copy.
     #sealed = false;
     #view: readonly BatchOp[] | undefined;
+
+    /** True for the ops that consume one allocated internal id (see BatchApplier.CreateHints). */
+    public static TakesId(op: BatchOp): boolean
+    {
+        return op.Op === WriteOp.CreateNode || (op.Op === WriteOp.Link && op.Options?.ExternalTarget !== undefined);
+    }
 
     public get Count(): number
     {
@@ -539,6 +559,7 @@ export class WriteBatch
         flags |= options.AfterSibling === undefined ? 0 : WriteBatch.FlagAfter;
         flags |= options.BeforeSibling === undefined ? 0 : WriteBatch.FlagBefore;
         flags |= options.Properties === undefined ? 0 : WriteBatch.FlagProperties;
+        flags |= options.ExternalTarget === undefined ? 0 : WriteBatch.FlagTarget;
         w.U8(flags);
         if (options.AfterSibling !== undefined)
         {
@@ -557,6 +578,11 @@ export class WriteBatch
                 WriteBatch.WriteValue(w, value);
             }
         }
+        if (options.ExternalTarget !== undefined)
+        {
+            w.Text(options.ExternalTarget.Concept);
+            w.Text(options.ExternalTarget.Owner);
+        }
     }
 
     private static ReadOptions(r: ByteReader): LinkOptions | undefined
@@ -570,7 +596,7 @@ export class WriteBatch
         {
             return undefined;
         }
-        const options: { AfterSibling?: string; BeforeSibling?: string; Properties?: ReadonlyMap<string, CellValue> } = {};
+        const options: { AfterSibling?: string; BeforeSibling?: string; Properties?: ReadonlyMap<string, CellValue>; ExternalTarget?: IExternalTarget } = {};
         if ((flags & WriteBatch.FlagAfter) !== 0)
         {
             options.AfterSibling = r.Text();
@@ -593,6 +619,11 @@ export class WriteBatch
                 properties.set(name, WriteBatch.ReadValue(r));
             }
             options.Properties = properties;
+        }
+        if ((flags & WriteBatch.FlagTarget) !== 0)
+        {
+            const concept = r.Text();
+            options.ExternalTarget = { Concept: concept, Owner: r.Text() };
         }
         return options;
     }
@@ -688,7 +719,7 @@ export class WriteBatch
 
     private static CopyOptions(options: LinkOptions): LinkOptions
     {
-        const copy: { AfterSibling?: string; BeforeSibling?: string; Properties?: ReadonlyMap<string, CellValue> } = {};
+        const copy: { AfterSibling?: string; BeforeSibling?: string; Properties?: ReadonlyMap<string, CellValue>; ExternalTarget?: IExternalTarget } = {};
         if (options.AfterSibling !== undefined)
         {
             WriteBatch.RequireText(options.AfterSibling);
@@ -707,6 +738,11 @@ export class WriteBatch
                 WriteBatch.RequireValue(value);
             }
             copy.Properties = new FrozenMap(options.Properties);
+        }
+        if (options.ExternalTarget !== undefined)
+        {
+            WriteBatch.RequireText(options.ExternalTarget.Concept, options.ExternalTarget.Owner);
+            copy.ExternalTarget = Object.freeze({ Concept: options.ExternalTarget.Concept, Owner: options.ExternalTarget.Owner });
         }
         return Object.freeze(copy);
     }

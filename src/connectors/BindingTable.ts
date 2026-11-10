@@ -14,6 +14,10 @@ import type { IFetchTarget } from './FetchContract.js';
  * first, each name once). Then the owner's model-wide binding (no Concept), then DefaultConnector, else
  * undefined. A concept the catalog does not define matches only its own name. A result equal to
  * EngineStorage, or undefined, means engine-only: no connector takes part.
+ *
+ * Engine storage as the default (ruling R97, D9): a runtime description sets `DefaultConnector:
+ * BindingTable.EngineStorage` to say unbound nodes are stored by the engine itself. There is no connector class for
+ * it; EngineStorage is this binding, and it behaves exactly like no default (no connector takes part).
  */
 export class BindingTable
 {

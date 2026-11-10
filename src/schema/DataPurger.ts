@@ -11,6 +11,7 @@ import type { PublicIdIndex } from '../identity/PublicIdIndex.js';
 import type { RowIndex } from '../identity/RowIndex.js';
 import type { IWriteTransaction } from '../kv/KeyValue.js';
 import type { CatalogIndex } from '../txn/CatalogIndex.js';
+import { StubRule } from '../txn/StubRule.js';
 import { ConflictKeys } from '../txn/ConflictKeys.js';
 import type { WriteKeySet } from '../txn/WriteKeySet.js';
 import type { CatalogDiff } from './CatalogDiff.js';
@@ -43,6 +44,8 @@ interface IDoomedNode
     readonly Location: Location;
     readonly Concept: string;
     readonly TypeKept: boolean;
+    /** An identity-only stub (ruling R102): it has no cells and no index entries to remove. */
+    readonly Stub?: true;
 }
 
 /** One edge to remove, with the old relationship definition and the position its scan found. */
@@ -103,6 +106,7 @@ class PurgeRun
         private readonly rows: RowIndex,
         private readonly ids: PublicIdIndex,
         private readonly indexes: IndexStore,
+        private readonly stubs: StubRule,
     )
     {
         this.removedTypes = diff.RemovedTypes.filter(d => !d.IsAspect);
@@ -119,6 +123,7 @@ class PurgeRun
         }
         await this.CollectRemovedMembers();
         await this.CollectRejectedTargets();
+        await this.CollectOrphanedStubs();
         await this.CollectIndexes();
         const modified = await this.ModifiedNodes();
 
@@ -176,7 +181,7 @@ class PurgeRun
             {
                 for (const node of this.doomed.values())
                 {
-                    if (node.Location.TypeId === def.TypeId)
+                    if (node.Location.TypeId === def.TypeId && node.Stub !== true)
                     {
                         await this.CollectEntries(def.TypeId, node.Id, node.Location.Slot, rest);
                     }
@@ -272,6 +277,90 @@ class PurgeRun
                 await this.CountColumn(type.TypeId, member);
             }
         }
+        await this.CollectRemovedStubs();
+    }
+
+    /**
+     * Stubs have no node-id cell, so Live cannot see them: the nodes of a removed concept that remain are found
+     * through the public-id index and the row index (one scan of the Ids keyspace, only when a concept is removed).
+     */
+    private async CollectRemovedStubs(): Promise<void>
+    {
+        if (this.removedTypes.length === 0)
+        {
+            return;
+        }
+        const names = new Map(this.removedTypes.map(t => [t.TypeId, t.Name]));
+        for await (const id of this.ids.Scan(this.txn))
+        {
+            const location = await this.rows.Locate(this.txn, id);
+            const name = location === undefined ? undefined : names.get(location.TypeId);
+            if (location !== undefined && name !== undefined && !this.doomed.has(id))
+            {
+                this.doomed.set(id, { Id: id, Location: location, Concept: name, TypeKept: false, Stub: true });
+            }
+        }
+    }
+
+    /**
+     * Stubs of surviving concepts that the doomed edges leave without any edge are removed with them, in the same
+     * commit (ruling R102): a stub never outlives its last edge.
+     */
+    private async CollectOrphanedStubs(): Promise<void>
+    {
+        if (!this.stubs.IsActive)
+        {
+            return;
+        }
+        const candidates = new Set<bigint>();
+        for (const edge of this.doomedEdges.values())
+        {
+            candidates.add(edge.From);
+            candidates.add(edge.To);
+        }
+        for (const id of candidates)
+        {
+            if (this.doomed.has(id))
+            {
+                continue;
+            }
+            const location = await this.rows.Locate(this.txn, id);
+            const concept = location === undefined ? undefined : this.old.ConceptOf(location.TypeId);
+            if (location === undefined || concept === undefined || !this.keptConcepts.some(d => d.TypeId === location.TypeId))
+            {
+                continue;
+            }
+            if (this.stubs.IsStub(await this.ids.OwnerOf(this.txn, id), concept, this.next.Catalog) && !(await this.HasSurvivingEdge(id, concept)))
+            {
+                this.doomed.set(id, { Id: id, Location: location, Concept: concept, TypeKept: true, Stub: true });
+            }
+        }
+    }
+
+    /** True when the node has an edge, in either direction, that the purge does not remove. */
+    private async HasSurvivingEdge(id: bigint, concept: string): Promise<boolean>
+    {
+        const outgoing = this.old.Catalog.EffectiveMembers(concept).filter(m => m.Kind === MemberKind.Relationship).map(rel => [rel, EdgeDirection.Out] as const);
+        const incoming = this.old.IncomingRelationships(concept).map(rel => [rel, EdgeDirection.In] as const);
+        for (const [rel, direction] of [...outgoing, ...incoming])
+        {
+            for await (const edge of this.edges.Adjacent(this.txn, rel, id, direction))
+            {
+                const from = direction === EdgeDirection.Out ? id : edge.Node;
+                const to = direction === EdgeDirection.Out ? edge.Node : id;
+                if (!this.doomedEdges.has(PurgeRun.EdgeKey(rel, from, to, edge.Position)))
+                {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private static EdgeKey(rel: MemberDef, from: bigint, to: bigint, position: Uint8Array): string
+    {
+        const s = PurgeRun.Separator;
+        return rel.Id + s + from + s + to + s + ConflictKeys.Hex(position);
     }
 
     /**
@@ -402,7 +491,10 @@ class PurgeRun
                 this.values += 1;
             }
         }
-        await this.columns.WriteCell(this.txn, node.Location, CatalogSnapshot.NodeIdMember, null);
+        if (node.Stub !== true)
+        {
+            await this.columns.WriteCell(this.txn, node.Location, CatalogSnapshot.NodeIdMember, null);
+        }
     }
 
     /** Counts the column's values on live nodes and records its Cell keys and Column key. */
@@ -427,8 +519,7 @@ class PurgeRun
         {
             const from = direction === EdgeDirection.Out ? node : edge.Node;
             const to = direction === EdgeDirection.Out ? edge.Node : node;
-            const s = PurgeRun.Separator;
-            const id = rel.Id + s + from + s + to + s + ConflictKeys.Hex(edge.Position);
+            const id = PurgeRun.EdgeKey(rel, from, to, edge.Position);
             if (!this.doomedEdges.has(id))
             {
                 this.doomedEdges.set(id, { Relationship: rel, From: from, To: to, Position: edge.Position.slice() });
@@ -522,10 +613,11 @@ export class DataPurger
 
     /**
      * `old` is the catalog the stored data conforms to, `next` the one being installed and `diff` the
-     * plan's diff between them. The logical write keys of everything removed are added to `keys`.
+     * plan's diff between them. The logical write keys of everything removed are added to `keys`. `stubs`
+     * says which surviving nodes are stubs: one left without an edge is removed too (ruling R102).
      */
-    public Purge(txn: IWriteTransaction, old: CatalogIndex, next: CatalogIndex, diff: CatalogDiff, keys: WriteKeySet): Promise<IPurgeStats>
+    public Purge(txn: IWriteTransaction, old: CatalogIndex, next: CatalogIndex, diff: CatalogDiff, keys: WriteKeySet, stubs: StubRule = new StubRule()): Promise<IPurgeStats>
     {
-        return new PurgeRun(txn, old, next, diff, keys, this.columns, this.edges, this.rows, this.ids, this.indexes).Run();
+        return new PurgeRun(txn, old, next, diff, keys, this.columns, this.edges, this.rows, this.ids, this.indexes, stubs).Run();
     }
 }

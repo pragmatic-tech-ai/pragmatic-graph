@@ -6,7 +6,7 @@ import { CypherCursor } from '../CypherCursor.js';
 import { CypherEngine } from '../CypherEngine.js';
 import type { CypherResult } from '../CypherResult.js';
 import { CypherNode } from '../CypherNode.js';
-import { NodeValue, ScalarValue } from '../CypherValue.js';
+import { CypherValue, NodeValue, ScalarValue } from '../CypherValue.js';
 import { CypherFixture } from './CypherFixture.js';
 import { EngineHarness } from './EngineHarness.js';
 
@@ -77,6 +77,49 @@ describe('CypherCursor keyset paging', () =>
         }
     });
 
+    test('keyset with ORDER BY DESC pages correctly', async () =>
+    {
+        const query = 'MATCH (a:Service) RETURN a.name ORDER BY a.name DESC';
+        const full = EngineHarness.Col(await h.Execute(query));
+        const got: unknown[] = [];
+        let cursor: CypherCursor | undefined;
+        do
+        {
+            const page = await h.Execute(query, undefined, cursor === undefined ? { RowCap: 7, Skip: 0 } : { RowCap: 7, After: cursor });
+            got.push(...EngineHarness.Col(page));
+            cursor = page.NextCursor;
+        }
+        while (cursor !== undefined);
+        assert.deepEqual(got, full);
+        assert.equal(got[0], CursorFixture.Name(24));
+        const skipped = EngineHarness.Col(await h.Execute(query, undefined, { RowCap: 7, Skip: 7 }));
+        assert.deepEqual(skipped, full.slice(7, 14));
+    });
+
+    test('keyset with ORDER BY on a non-returned expression is InvalidArgument', async () =>
+    {
+        const cursor = new CypherCursor(0n, [new ScalarValue('s01')]);
+        await assert.rejects(h.Execute("MATCH (a:Service) RETURN a.name AS n ORDER BY n + 'x'", undefined, { RowCap: 5, After: cursor }),
+            (e: unknown) => e instanceof GraphError && e.GraphCode === GraphErrorCode.InvalidArgument);
+    });
+
+    test('duplicate rows across a page boundary are all returned', async () =>
+    {
+        const F = CypherFixture;
+        const seed = [];
+        for (let i = 0; i < 5; i++) seed.push(F.Node(`d${i}`, 'Service', { name: 'same' }));
+        const d = await EngineHarness.Open([F.Concept('Element', []), F.Concept('Service', [F.Text('name')], 'Element')], seed);
+        try
+        {
+            const pages = await CursorFixture.Chain(d, 2);
+            assert.deepEqual(pages.map((p) => p.Rows.length), [2, 2, 1]);
+        }
+        finally
+        {
+            await d.dispose();
+        }
+    });
+
     test('cursor round-trips, including temporal and node cells', () =>
     {
         const node = new CypherNode('n1', 'Service', 'o', new Map([['name', 'x']]));
@@ -86,12 +129,24 @@ describe('CypherCursor keyset paging', () =>
             new ScalarValue(new DateValue(19000)), new ScalarValue(new DateTimeValue(1_700_000_000_000_000n, 'Europe/Paris')),
             new ScalarValue(new DurationValue(1, 2, 3n)), new NodeValue(node),
         ];
-        const text = new CypherCursor(1n << 60n, values).Encode();
+        const text = new CypherCursor(1n << 60n, values, 3).Encode();
         assert.ok(text.startsWith('1.'));
         const back = CypherCursor.Decode(text);
         assert.equal(back.Commit, 1n << 60n);
         assert.equal(back.Encode(), text);
+        assert.equal(back.Ties, 3);
         assert.equal(back.After.length, values.length);
+        for (let i = 0; i < values.length; i++)
+        {
+            assert.equal(CypherValue.Compare(back.After[i]!, values[i]!), 0, `cell ${i}`);
+        }
+        assert.deepEqual((back.After[3] as ScalarValue).Value, new DateValue(19000));
+        assert.deepEqual((back.After[4] as ScalarValue).Value, new DateTimeValue(1_700_000_000_000_000n, 'Europe/Paris'));
+        assert.deepEqual((back.After[5] as ScalarValue).Value, new DurationValue(1, 2, 3n));
+        const decoded = back.After[6] as NodeValue;
+        assert.equal(decoded.Id, 'n1');
+        assert.equal(decoded.Concept, 'Service');
+        assert.equal(decoded.Owner, 'o');
     });
 
     test('malformed cursor is InvalidArgument', () =>
@@ -112,7 +167,7 @@ describe('CypherCursor keyset paging', () =>
     test('resume at a later commit is allowed', async () =>
     {
         const first = await h.Execute(CursorFixture.Query, undefined, { RowCap: 10, Skip: 0 });
-        const stale = new CypherCursor(first.Commit! - 5n, first.NextCursor!.After);
+        const stale = new CypherCursor(first.Commit! - 5n, first.NextCursor!.After, first.NextCursor!.Ties);
         const second = await h.Execute(CursorFixture.Query, undefined, { RowCap: 10, After: stale });
         assert.equal(EngineHarness.Col(second)[0], CursorFixture.Name(10));
     });

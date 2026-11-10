@@ -14,7 +14,7 @@ import { CypherResult, type CypherResultDto } from './CypherResult.js';
 import type { ICypherSource } from './CypherSource.js';
 import { CypherValue, NodeValue, NullValue, type ParameterValue } from './CypherValue.js';
 import { CancelProbe, type ExecutionLimits, type ICancellation } from './ExecutionLimits.js';
-import { LogicalPlanner, type PlannerOptions } from './LogicalPlanner.js';
+import { LogicalPlanner, type IKeyColumn, type PlannerOptions } from './LogicalPlanner.js';
 import type { IOperator } from './operators/IOperator.js';
 import { ParameterBinder } from './ParameterBinder.js';
 import { PlanSource } from './PlanSource.js';
@@ -22,6 +22,12 @@ import { ReaderSource } from './ReaderSource.js';
 import { ListValue, MapValue, PathValue } from './StructuredValues.js';
 import type { INodePlacement } from './write/NodePlacement.js';
 import { WriteQueryRunner } from './write/WriteQueryRunner.js';
+
+interface IPageOutcome
+{
+    readonly Result: CypherResult;
+    readonly Ties: number;
+}
 
 export interface ICypherRunOptions
 {
@@ -48,6 +54,7 @@ export class CypherEngine
     private static readonly AfterWithSkip = 'paging After cannot be combined with Skip';
     private static readonly AfterWidth = 'paging After does not match the result columns';
     private static readonly InvalidPageSize = 'paging RowCap must be a positive integer when Skip is supplied';
+    private static readonly InvalidKeysetPageSize = 'paging RowCap must be a positive integer when After is supplied';
 
     constructor(private readonly engine: GraphEngine, private readonly options?: PlannerOptions)
     {
@@ -68,12 +75,13 @@ export class CypherEngine
         try
         {
             const view = new ReaderSource(reader);
-            const plan = new LogicalPlanner(view, parameters, this.options, limits?.Cancel, paging).Plan(model);
+            const planner = new LogicalPlanner(view, parameters, this.options, limits?.Cancel, paging, undefined, limits?.After !== undefined);
+            const plan = planner.Plan(model);
             const columns = model.FinalColumns();
             if (limits?.After !== undefined && limits.After.After.length !== columns.length) throw new GraphError(GraphErrorCode.InvalidArgument, CypherEngine.AfterWidth);
-            const result = paging ? await CypherEngine.Page(plan, columns, limits!) : await CypherEngine.Collect(plan, columns, limits);
-            await CypherEngine.FillLinks(result.Rows, view, limits?.Cancel);
-            return CypherEngine.WithSnapshot(result, reader.SnapshotCommit);
+            const outcome = paging ? await CypherEngine.Page(plan, columns, limits!, planner.FinalOrder) : { Result: await CypherEngine.Collect(plan, columns, limits), Ties: 0 };
+            await CypherEngine.FillLinks(outcome.Result.Rows, view, limits?.Cancel);
+            return CypherEngine.WithSnapshot(outcome.Result, reader.SnapshotCommit, outcome.Ties);
         }
         finally
         {
@@ -145,10 +153,10 @@ export class CypherEngine
 
     // A read's result carries its snapshot commit; a page with more rows carries the cursor of its last row (cut at
     // that snapshot). Built after FillLinks so a node key can be encoded.
-    private static WithSnapshot(result: CypherResult, commit: bigint): CypherResult
+    private static WithSnapshot(result: CypherResult, commit: bigint, ties: number): CypherResult
     {
         const last = result.HasMore ? result.Rows[result.Rows.length - 1] : undefined;
-        const cursor = last === undefined ? undefined : new CypherCursor(commit, last);
+        const cursor = last === undefined ? undefined : new CypherCursor(commit, last, ties);
         return new CypherResult(result.Columns, result.Rows, result.Truncated, result.HasMore, undefined, commit, cursor);
     }
 
@@ -171,35 +179,54 @@ export class CypherEngine
         return new CypherResult(columns, rows, truncated);
     }
 
-    // Paging: discard the first Skip bindings without materializing them, collect up to RowCap rows, then peek exactly
-    // one further binding to report HasMore. Truncated is never set on a page.
-    private static async Page(plan: IOperator, columns: readonly string[], limits: ExecutionLimits): Promise<CypherResult>
+    // Paging: walk the sorted stream, discarding the first Skip rows (or, with After, every row up to the cursor's key
+    // and as many rows equal to it as it records in Ties), collect up to RowCap rows, then peek exactly one further row to
+    // report HasMore. Truncated is never set on a page. Every row is materialized to track Ties: the number of rows
+    // equal to the last returned row seen so far in the stream.
+    private static async Page(plan: IOperator, columns: readonly string[], limits: ExecutionLimits, order: readonly IKeyColumn[] | undefined): Promise<IPageOutcome>
     {
         const skip = limits.Skip ?? 0;
-        const after = limits.After?.After;
+        const after = limits.After;
+        const keys = CypherEngine.KeyOrder(columns, order);
         const rows: CypherValue[][] = [];
         let skipped = 0;
+        let tiesLeft = after?.Ties ?? 0;
         let hasMore = false;
+        let previous: CypherValue[] | undefined;
+        let run = 0;
+        let ties = 0;
         const probe = new CancelProbe(limits.Cancel);
         probe.Begin();
         for await (const binding of plan.Rows())
         {
             probe.Tick();
+            const row = CypherEngine.Materialize(binding, columns);
+            run = previous !== undefined && CypherEngine.CompareKey(row, previous, keys) === 0 ? run + 1 : 1;
+            previous = row;
             if (skipped < skip)
             {
                 skipped++;
                 continue;
             }
-            const row = CypherEngine.Materialize(binding, columns);
-            if (after !== undefined && CypherEngine.CompareKey(row, after) <= 0) continue;
+            if (after !== undefined)
+            {
+                const c = CypherEngine.CompareKey(row, after.After, keys);
+                if (c < 0) continue;
+                if (c === 0 && tiesLeft > 0)
+                {
+                    tiesLeft--;
+                    continue;
+                }
+            }
             if (rows.length >= limits.RowCap!)
             {
                 hasMore = true;
                 break;
             }
             rows.push(row);
+            ties = run;
         }
-        return new CypherResult(columns, rows, false, hasMore);
+        return { Result: new CypherResult(columns, rows, false, hasMore), Ties: ties };
     }
 
     // Paging limits are fail-fast: a bad Skip must not silently act as 0, and Skip without a page size is a misuse.
@@ -208,20 +235,27 @@ export class CypherEngine
         if (limits.After !== undefined && limits.Skip !== undefined) throw new GraphError(GraphErrorCode.InvalidArgument, CypherEngine.AfterWithSkip);
         if (limits.Skip === undefined)
         {
-            if (!Number.isInteger(limits.RowCap) || limits.RowCap! <= 0) throw new CypherSemanticError(`${CypherEngine.InvalidPageSize}: ${limits.RowCap}`);
+            if (!Number.isInteger(limits.RowCap) || limits.RowCap! <= 0) throw new CypherSemanticError(`${CypherEngine.InvalidKeysetPageSize}: ${limits.RowCap}`);
             return;
         }
         if (!Number.isInteger(limits.Skip) || limits.Skip! < 0) throw new CypherSemanticError(`${CypherEngine.InvalidSkip}: ${limits.Skip}`);
         if (!Number.isInteger(limits.RowCap) || limits.RowCap! <= 0) throw new CypherSemanticError(`${CypherEngine.InvalidPageSize}: ${limits.RowCap}`);
     }
 
-    // Lexicographic over the columns, ascending: the implicit paging order.
-    private static CompareKey(row: readonly CypherValue[], key: readonly CypherValue[]): number
+    // The effective sort as (row index, direction) pairs; every column ascending when the plan recorded none.
+    private static KeyOrder(columns: readonly string[], order: readonly IKeyColumn[] | undefined): readonly { Index: number; Descending: boolean }[]
     {
-        for (let i = 0; i < key.length; i++)
+        if (order === undefined) return columns.map((_, i) => ({ Index: i, Descending: false }));
+        return order.map((k) => ({ Index: columns.indexOf(k.Column), Descending: k.Descending }));
+    }
+
+    // Lexicographic in the effective order: negative when `row` sorts before `key`.
+    private static CompareKey(row: readonly CypherValue[], key: readonly CypherValue[], order: readonly { Index: number; Descending: boolean }[]): number
+    {
+        for (const k of order)
         {
-            const c = CypherValue.Compare(row[i]!, key[i]!);
-            if (c !== 0) return c;
+            const c = CypherValue.Compare(row[k.Index]!, key[k.Index]!);
+            if (c !== 0) return k.Descending ? -c : c;
         }
         return 0;
     }

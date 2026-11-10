@@ -19,8 +19,8 @@
 - **D3 Fetch lifetime.** One `FetchSession` per Cypher read (`Execute` without writes) and per `GraphTransaction`. Within it, key lookups and fetched rows are memoised by public id, so one query sees one consistent value per external node. Nothing outlives the session (spec §5.2, §12). Connector resume tokens are used only inside a session to drain a fetch page by page.
 - **D4 Push-down is advisory.** `FetchRequest.Predicate` is `And(scope row predicate for the fetched concept, query hint)`. The connector may apply any part of it or none. The engine always evaluates the scope (D5) and every query filter on each returned row, so correctness never depends on the connector.
 - **D5 Scoping fetched rows (Kleene).** Values, `IdIn`, `OwnerIs` and `ConceptIs` are known; `Seeded` is False.
-  - `Related` Out is evaluated over the row's links. A target that is an engine-resident node is decided as today. An external target is Unknown, except when `Target` is True.
-  - `Related` In is decided through the stub's engine edges when a stub exists. With no stub it is False, unless some External binding could hold a source of that relationship, in which case it is Unknown.
+  - `Related` Out is evaluated over the row's links. A target that is an engine-resident node is decided as today. An external target is Unknown, always (amended during execution, ruling P7: fail closed).
+  - `Related` In: True when the stub's engine edges make it True; otherwise Unknown when a source of the relationship could be externally held, else the engine result (amended, ruling P7; Reachable likewise). With no stub it is False, unless some External binding could hold a source of that relationship, in which case it is Unknown.
   - `Reachable` is True when the id is in `From`. Otherwise it is decided through the stub (engine BFS) when a stub exists, else Unknown.
   - Unknown at the top means not visible. Hidden members are removed from the row before it becomes a `CypherNode`.
 - **D6 Row validation.**
