@@ -79,6 +79,16 @@ export class RecordedReads
         return setup !== undefined && setup.External.size > 0 && setup.Bindings.ExternalTargets(concept, this.Catalog, setup.External).length > 0;
     }
 
+    /**
+     * True iff some External binding could hold a source of a relationship named `name` (any concept declaring one):
+     * edges from such a source live in the connector, never in engine storage.
+     */
+    public ExternallyHeldSource(name: string): boolean
+    {
+        const setup = this.connectors;
+        return setup !== undefined && setup.External.size > 0 && this.Index.RelationshipsNamed(name).some(r => this.ExternallyHeld(r.DeclaredBy));
+    }
+
     public get Index(): CatalogIndex
     {
         return this.snapshot.Index;

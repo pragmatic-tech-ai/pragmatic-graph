@@ -137,16 +137,20 @@ export class GraphReader implements IGraphDisposable
     }
 
     /**
-     * The row fetched from an External connector as this reader may see it (ruling R100): undefined when the scope does
-     * not let it see the row (ScopeEvaluator.VisibleFetched; Unknown is not visible), else the row with every member
-     * HiddenMembers(row.Concept) names removed from its Values and Links (a new row; the caller's is never changed, and
-     * returned as-is when nothing is hidden). `owner` is the model the row was fetched for. Looks up the row's stub (the
+     * The row fetched from an External connector as this reader may see it (ruling R100). The row is first checked
+     * against the reader's catalog (FetchedNode.Validated: GraphError SchemaViolation for a concept that is unknown or an
+     * aspect, a Values key that is not an effective property, a value that does not fit its member, or a Links key that
+     * is not an effective relationship; nulls dropped, Int64 widened into Float64 when exact), under every scope. Then
+     * undefined when the scope does not let the reader see the row (ScopeEvaluator.VisibleFetched; Unknown is not
+     * visible), else the checked row with every member HiddenMembers(row.Concept) names removed from its Values and
+     * Links. Always a new row; the caller's is never changed. `owner` is the model the row was fetched for. Looks up the row's stub (the
      * stored node of that public id owned by `owner` whose binding is External) and records that node read, whether or
      * not one exists, so a transaction conflicts with a commit that creates or removes it.
      */
-    public async AdmitFetched(row: IFetchedRow, owner: string): Promise<IFetchedRow | undefined>
+    public async AdmitFetched(fetched: IFetchedRow, owner: string): Promise<IFetchedRow | undefined>
     {
         this.RequireOpen();
+        const row = FetchedNode.Validated(this.Catalog, fetched);
         const node = new FetchedNode(row, owner);
         const stub = await this.recorded.StubOf(row.PublicId, owner);
         if (stub !== undefined)

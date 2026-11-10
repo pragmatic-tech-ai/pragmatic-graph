@@ -8,11 +8,12 @@ import { MemberKind, ValueType } from '../../catalog/ValueType.js';
 import type { CellValue } from '../../columns/CellValue.js';
 import { BindingTable } from '../../connectors/BindingTable.js';
 import { ConnectorResidency, type IExternalConnector, type IFetchedRow } from '../../connectors/FetchContract.js';
+import { GraphError, GraphErrorCode } from '../../errors/GraphError.js';
 import { EdgeDirection } from '../../format/FormatKeys.js';
 import type { GraphReader } from '../../GraphReader.js';
 import { GraphStore } from '../../GraphStore.js';
 import type { GraphTransaction } from '../../GraphTransaction.js';
-import { And, Compare, CompareOp, ConceptIs, FalsePredicate, IdIn, Not, OwnerIs, type Predicate, Reachable, Related, Seeded, TruePredicate } from '../../predicate/Predicate.js';
+import { And, Compare, CompareOp, ConceptIs, FalsePredicate, IdIn, IsNull, Not, OwnerIs, type Predicate, Reachable, Related, Seeded, TruePredicate } from '../../predicate/Predicate.js';
 import type { ISchemaDescription } from '../../schema/SchemaDescription.js';
 import { ConflictError } from '../../txn/ConflictError.js';
 import { AccessDefault, AccessScope } from '../AccessScope.js';
@@ -34,6 +35,8 @@ class FetchedFx
     public static readonly Tag = 'tag';
     public static readonly Cpu = 'cpu';
     public static readonly Secret = 'secret';
+    public static readonly Load = 'load';
+    public static readonly Nope = 'Nope';
     public static readonly TeamRel = 'team';
     public static readonly Peer = 'peer';
     public static readonly Name = 'name';
@@ -82,6 +85,7 @@ class FetchedFx
                     Name: FetchedFx.Server, IsAspect: false, Parent: null, Aspects: [FetchedFx.Tagged], Members: [
                         FetchedFx.Prop(FetchedFx.Cpu, ValueType.Int64),
                         FetchedFx.Prop(FetchedFx.Secret, ValueType.String),
+                        FetchedFx.Prop(FetchedFx.Load, ValueType.Float64),
                         FetchedFx.Rel(FetchedFx.TeamRel, FetchedFx.Team, false),
                         FetchedFx.Rel(FetchedFx.Peer, FetchedFx.Server, true),
                     ],
@@ -173,6 +177,11 @@ class FetchedFx
         });
     }
 
+    public static IsSchemaViolation(e: unknown): boolean
+    {
+        return e instanceof GraphError && e.GraphCode === GraphErrorCode.SchemaViolation;
+    }
+
     public static ServerScope(p: Predicate): AccessScope
     {
         return FetchedFx.Rows([[FetchedFx.Server, p]]);
@@ -244,13 +253,14 @@ class FetchedFx
                 g.dispose();
             });
 
-            it('Related out to an external target is Unknown unless Target is True', async () =>
+            it('Related out to an external target is Unknown, also when Target is True', async () =>
             {
                 const g = await FetchedFx.Ready(open);
                 // Peer 'x' is a stub (external), 'zz' is not stored at all: both are external targets.
                 const rows = [FetchedFx.Row('a', [], [[FetchedFx.Peer, [FetchedFx.X]]]), FetchedFx.Row('b', [], [[FetchedFx.Peer, ['zz']]]), FetchedFx.Row('c')];
                 const any = new Related(FetchedFx.Peer, EdgeDirection.Out, TruePredicate.Instance);
-                assert.deepEqual(await FetchedFx.Admitted(g, FetchedFx.ServerScope(any), rows), [true, true, false]);
+                assert.deepEqual(await FetchedFx.Admitted(g, FetchedFx.ServerScope(any), rows), [false, false, false]);
+                assert.deepEqual(await FetchedFx.Admitted(g, FetchedFx.ServerScope(new Not(any)), rows), [false, false, true]);
                 const big = new Related(FetchedFx.Peer, EdgeDirection.Out, new Compare(FetchedFx.Cpu, CompareOp.Gt, 4n));
                 assert.deepEqual(await FetchedFx.Admitted(g, FetchedFx.ServerScope(big), rows), [false, false, false]);
                 assert.deepEqual(await FetchedFx.Admitted(g, FetchedFx.ServerScope(new Not(big)), rows), [false, false, true]);
@@ -278,6 +288,88 @@ class FetchedFx
                     [FetchedFx.Team, new Related(FetchedFx.Assigned, EdgeDirection.Out, TruePredicate.Instance)],
                 ]);
                 assert.deepEqual(await FetchedFx.Admitted(g, scope, [FetchedFx.Row(FetchedFx.X)]), [false]);
+                g.dispose();
+            });
+
+            it('Not(Related In) with a stub present is not visible', async () =>
+            {
+                // Stub x exists (Team t assigns it), but an external Server may link to x by peer: no engine edge says so.
+                const g = await FetchedFx.Ready(open);
+                const peerIn = new Related(FetchedFx.Peer, EdgeDirection.In, TruePredicate.Instance);
+                assert.deepEqual(await FetchedFx.Admitted(g, FetchedFx.ServerScope(peerIn), [FetchedFx.Row(FetchedFx.X)]), [false]);
+                assert.deepEqual(await FetchedFx.Admitted(g, FetchedFx.ServerScope(new Not(peerIn)), [FetchedFx.Row(FetchedFx.X)]), [false]);
+                // An engine-only source still decides through the stub, both ways.
+                const assignedIn = new Related(FetchedFx.Assigned, EdgeDirection.In, new IdIn(new Set([FetchedFx.U])));
+                assert.deepEqual(await FetchedFx.Admitted(g, FetchedFx.ServerScope(new Not(assignedIn)), [FetchedFx.Row(FetchedFx.X)]), [true]);
+                g.dispose();
+            });
+
+            it('Not(Reachable) with a stub present and an externally held step source is not visible', async () =>
+            {
+                const g = await FetchedFx.Ready(open);
+                // From u nothing is reached in the engine, but a peer step could pass through external Servers.
+                const steps = [{ Relationship: FetchedFx.Assigned, Direction: EdgeDirection.Out }, { Relationship: FetchedFx.Peer, Direction: EdgeDirection.Out }];
+                const fromU = new Reachable(new Set([FetchedFx.U]), steps, 2);
+                assert.deepEqual(await FetchedFx.Admitted(g, FetchedFx.ServerScope(fromU), [FetchedFx.Row(FetchedFx.X)]), [false]);
+                assert.deepEqual(await FetchedFx.Admitted(g, FetchedFx.ServerScope(new Not(fromU)), [FetchedFx.Row(FetchedFx.X)]), [false]);
+                // Reached through the stub is True whatever the steps.
+                const fromT = new Reachable(new Set([FetchedFx.T]), steps, 2);
+                assert.deepEqual(await FetchedFx.Admitted(g, FetchedFx.ServerScope(fromT), [FetchedFx.Row(FetchedFx.X)]), [true]);
+                g.dispose();
+            });
+
+            it('an engine rule over a stub is Unknown, never decided from its empty cells', async () =>
+            {
+                const g = await FetchedFx.Ready(open);
+                const empty = new Related(FetchedFx.Assigned, EdgeDirection.Out, new IsNull(FetchedFx.Cpu));
+                await FetchedFx.Read(g, FetchedFx.Rows([[FetchedFx.Team, empty]]), async r =>
+                {
+                    assert.equal(await r.ConceptOf(FetchedFx.T), undefined);
+                    assert.equal(await r.ConceptOf(FetchedFx.U), undefined);
+                });
+                await FetchedFx.Read(g, FetchedFx.Rows([[FetchedFx.Team, new Not(empty)]]), async r =>
+                {
+                    assert.equal(await r.ConceptOf(FetchedFx.T), undefined);
+                    assert.equal(await r.ConceptOf(FetchedFx.U), FetchedFx.Team);
+                });
+                // The stub itself: a Rows entry on its concept cannot be decided from storage; Default decides without one.
+                await FetchedFx.Read(g, FetchedFx.ServerScope(new IsNull(FetchedFx.Cpu)), async r =>
+                {
+                    assert.equal(await r.ConceptOf(FetchedFx.X), undefined);
+                    assert.equal(await r.ConceptOf(FetchedFx.T), FetchedFx.Team);
+                });
+                await FetchedFx.Read(g, FetchedFx.Rows([[FetchedFx.Team, TruePredicate.Instance]]), async r =>
+                {
+                    assert.equal(await r.ConceptOf(FetchedFx.X), FetchedFx.Server);
+                });
+                g.dispose();
+            });
+
+            it('fetched rows are checked against the catalog', async () =>
+            {
+                const g = await FetchedFx.Ready(open);
+                for (const scope of [AccessScope.System, FetchedFx.ServerScope(TruePredicate.Instance)])
+                {
+                    await FetchedFx.Read(g, scope, async r =>
+                    {
+                        const bad: IFetchedRow[] = [
+                            FetchedFx.Row('a', [[FetchedFx.Cpu, 'eight']]),
+                            { ...FetchedFx.Row('a'), Concept: FetchedFx.Nope },
+                            { ...FetchedFx.Row('a'), Concept: FetchedFx.Tagged },
+                            FetchedFx.Row('a', [['unknown', 1n]]),
+                            FetchedFx.Row('a', [[FetchedFx.TeamRel, FetchedFx.T]]),
+                            FetchedFx.Row('a', [], [[FetchedFx.Cpu, [FetchedFx.T]]]),
+                            FetchedFx.Row('a', [], [['unknown', [FetchedFx.T]]]),
+                        ];
+                        for (const row of bad)
+                        {
+                            await assert.rejects(r.AdmitFetched(row, FetchedFx.Ext), FetchedFx.IsSchemaViolation);
+                        }
+                        const ok = await r.AdmitFetched(FetchedFx.Row('a', [[FetchedFx.Load, 2n], [FetchedFx.Secret, null]]), FetchedFx.Ext);
+                        assert.ok(ok !== undefined);
+                        assert.deepEqual([...ok.Values], [[FetchedFx.Load, 2]]);
+                    });
+                }
                 g.dispose();
             });
 

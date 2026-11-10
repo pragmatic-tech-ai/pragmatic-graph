@@ -141,10 +141,11 @@ export class ScopeEvaluator
      * rule that comes back to it through engine edges hits the guard. Values come from the row (absent = null); IdIn,
      * OwnerIs (the fetch target's model) and ConceptIs (the row's concept) are known; Seeded is False. Related Out walks
      * the row's Links: an engine-resident target is decided as for engine nodes, an external one (a stub, or no stored
-     * node) is Unknown unless Target is True. Related In is decided through the stub's engine edges when there is a
-     * stub; without one it is False, or Unknown when some External binding could hold a source of the relationship.
-     * Reachable is True when the row's id is in From, else decided by the engine BFS through the stub, else Unknown.
-     * Unknown at the top is not visible. Records the reads it makes; caches nothing about the row.
+     * node) is Unknown, whatever Target is. Related In is True when the stub's engine edges make it True; otherwise
+     * Unknown when some External binding could hold a source of the relationship (its edges are not in the engine),
+     * else the engine result (False without a stub). Reachable is True when the row's id is in From or the engine BFS
+     * reaches the stub; otherwise Unknown without a stub or when some step's relationship could have an externally held
+     * source, else False. Unknown at the top is not visible. Records the reads it makes; caches nothing about the row.
      */
     public async VisibleFetched(node: FetchedNode): Promise<boolean>
     {
@@ -306,6 +307,11 @@ export class ScopeEvaluator
         {
             return known ? Truth.True : Truth.False;
         }
+        // A stub's data is external: engine storage cannot decide it, so it is never a settled verdict (never cached).
+        if (await this.reads.IsStub(node))
+        {
+            return Truth.Unknown;
+        }
         const memo = evaluation.Memo.get(node.Id);
         // A memoised result depended on the guard, so whoever uses it does too; likewise a guard or budget hit.
         if (memo !== undefined || evaluation.Deciding.has(node.Id) || evaluation.Decisions >= ScopeEvaluator.MaxDecisions)
@@ -443,9 +449,16 @@ export class ScopeEvaluator
         return result;
     }
 
-    /** One neighbor's part of a Related: (neighbor visible AND Target), Kleene. */
+    /**
+     * One neighbor's part of a Related: (neighbor visible AND Target), Kleene. A stub neighbor is Unknown: its data is
+     * external, so neither its visibility nor Target can be decided from its (empty) stored cells.
+     */
     private async Neighbor(p: Related, neighbor: IReadNode, evaluation: Evaluation): Promise<Truth>
     {
+        if (await this.reads.IsStub(neighbor))
+        {
+            return Truth.Unknown;
+        }
         const visible = await this.Decide(neighbor, evaluation);
         if (visible === Truth.False)
         {
@@ -466,8 +479,16 @@ export class ScopeEvaluator
         {
             return NodeEvaluator.Evaluate(p, node.Row.Values, node.PublicId);
         }
-        switch (p.Kind)
+        const kind = p.Kind;
+        switch (kind)
         {
+            case PredicateKind.True:
+            case PredicateKind.False:
+            case PredicateKind.Compare:
+            case PredicateKind.In:
+            case PredicateKind.IsNull:
+            case PredicateKind.IdIn:
+                return NodeEvaluator.Evaluate(p, node.Row.Values, node.PublicId);
             case PredicateKind.And:
                 return this.CombineFetched((p as And).Terms, node, evaluation, Truth.False, Truth.True);
             case PredicateKind.Or:
@@ -491,7 +512,10 @@ export class ScopeEvaluator
             case PredicateKind.ConceptIs:
                 return node.Concept === (p as ConceptIs).Concept ? Truth.True : Truth.False;
             default:
-                throw new GraphError(GraphErrorCode.Internal, ScopeEvaluator.ErrKind + String(p.Kind));
+            {
+                const unknown: never = kind;
+                throw new GraphError(GraphErrorCode.Internal, ScopeEvaluator.ErrKind + String(unknown));
+            }
         }
     }
 
@@ -519,7 +543,8 @@ export class ScopeEvaluator
 
     /**
      * Related Out over the row's Links: an engine-resident target (stored and not a stub) decides as for engine nodes;
-     * an external one is Unknown, or True when Target is True (the link exists).
+     * an external one (a stub, or no stored node) is Unknown, also when Target is True: a link id says nothing about
+     * the reader's right to see its target.
      */
     private async FetchedOut(p: Related, node: FetchedNode, evaluation: Evaluation): Promise<Truth>
     {
@@ -531,9 +556,8 @@ export class ScopeEvaluator
         for (const target of node.Row.Links.get(p.Relationship) ?? ScopeEvaluator.NoLinks)
         {
             const stored = await this.reads.Locate(target);
-            const t = stored === undefined || (await this.reads.IsStub(stored))
-                ? (p.Target.Kind === PredicateKind.True ? Truth.True : Truth.Unknown)
-                : await this.Neighbor(p, stored, evaluation);
+            // Neighbor makes a stub Unknown.
+            const t = stored === undefined ? Truth.Unknown : await this.Neighbor(p, stored, evaluation);
             if (t === Truth.True)
             {
                 return Truth.True;
@@ -547,15 +571,17 @@ export class ScopeEvaluator
     }
 
     /**
-     * Related In: through the stub's engine edges when there is a stub; otherwise False, or Unknown when some External
-     * binding could hold a source of a relationship of that name targeting the row's concept.
+     * Related In: True when the stub's engine edges make it True; otherwise Unknown when some External binding could
+     * hold a source of a relationship of that name targeting the row's concept (such edges never reach engine storage),
+     * else the engine result (False without a stub).
      */
     private async FetchedIn(p: Related, node: FetchedNode, evaluation: Evaluation): Promise<Truth>
     {
         const stub = node.StubNode;
-        if (stub !== undefined)
+        const engine = stub === undefined ? Truth.False : await this.EvalRelated(p, stub, evaluation);
+        if (engine === Truth.True)
         {
-            return this.EvalRelated(p, stub, evaluation);
+            return Truth.True;
         }
         for (const rel of this.reads.RelationshipsOrNone(node.Concept, p.Relationship, EdgeDirection.In))
         {
@@ -564,10 +590,14 @@ export class ScopeEvaluator
                 return Truth.Unknown;
             }
         }
-        return Truth.False;
+        return engine;
     }
 
-    /** Reachable: True when the row's id is in From, else the engine BFS through the stub decides, else Unknown. */
+    /**
+     * Reachable: True when the row's id is in From or the engine BFS reaches the stub; otherwise Unknown without a stub,
+     * or when some step's relationship could have an externally held source (a path through external data the engine
+     * BFS cannot walk), else False.
+     */
     private async FetchedReachable(p: Reachable, node: FetchedNode): Promise<Truth>
     {
         if (p.From.has(node.PublicId))
@@ -579,7 +609,11 @@ export class ScopeEvaluator
         {
             return Truth.Unknown;
         }
-        return (await this.ReachableSet(p)).has(stub) ? Truth.True : Truth.False;
+        if ((await this.ReachableSet(p)).has(stub))
+        {
+            return Truth.True;
+        }
+        return p.Steps.some(step => this.reads.ExternallyHeldSource(step.Relationship)) ? Truth.Unknown : Truth.False;
     }
 
     private ReachableSet(p: Reachable): Promise<ReadonlySet<bigint>>

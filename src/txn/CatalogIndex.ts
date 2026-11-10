@@ -50,6 +50,12 @@ export class CatalogIndex
         return this.propertyById.get(memberId);
     }
 
+    /** Every relationship (each once, by id) named `name`, on any concept or aspect. */
+    public RelationshipsNamed(name: string): readonly MemberDef[]
+    {
+        return this.relationships.filter(r => r.Name === name);
+    }
+
     /** True when a node of `concept` may be the target of `relationship`. */
     public Accepts(relationship: MemberDef, concept: string): boolean
     {
