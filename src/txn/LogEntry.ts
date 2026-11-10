@@ -1,7 +1,7 @@
 import { CatalogSnapshot } from '../catalog/CatalogSnapshot.js';
 import { CatalogStore } from '../catalog/CatalogStore.js';
 import { GraphError, GraphErrorCode } from '../errors/GraphError.js';
-import { WriteBatch, WriteOp } from './WriteBatch.js';
+import { WriteBatch } from './WriteBatch.js';
 
 /** What a commit did: applied a write batch, extended the schema, or upgraded it to a description. */
 export enum CommitKind

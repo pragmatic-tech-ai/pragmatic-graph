@@ -61,6 +61,7 @@ export class GraphStore
         this.CommitApplied = new SignalView(context.Committer.CommitApplied);
         this.ConnectorRevertFailed = new SignalView(context.ConnectorRevertFailed);
         this.ConnectorApplied = new SignalView(context.ConnectorApplied);
+        GraphContext.Register(this, context);
     }
 
     /**
@@ -133,12 +134,6 @@ export class GraphStore
     {
         this.RequireLive();
         this.context.SetConnectors(bindings, connectors, timeoutMs);
-    }
-
-    /** @internal The installed bindings and connectors (undefined until installed); for the engine host. */
-    public get Connectors(): ConnectorSetup | undefined
-    {
-        return this.context.Connectors;
     }
 
     /** The Version of the description the last upgrade applied (Meta("schemaVersion")); undefined before any. */

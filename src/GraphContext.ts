@@ -1,3 +1,4 @@
+import { GraphError, GraphErrorCode } from './errors/GraphError.js';
 import type { AccessScope } from './access/AccessScope.js';
 import { ScopeValidator } from './access/ScopeValidator.js';
 import { CatalogStore } from './catalog/CatalogStore.js';
@@ -62,6 +63,10 @@ export class ReadSnapshot
  */
 export class GraphContext
 {
+    private static readonly ErrNoContext = 'The store has no internal context';
+    /** Each GraphStore's context, for engine code (GraphEngine) only: the internal channel (P12, final review m6). */
+    private static readonly Stores = new WeakMap<object, GraphContext>();
+
     public readonly Columns = new ColumnStore();
     public readonly Edges = new EdgeStore();
     public readonly Rows = new RowIndex();
@@ -80,6 +85,23 @@ export class GraphContext
 
     public constructor(public readonly Store: IKeyValueStore, public readonly Committer: Committer)
     {
+    }
+
+    /** Registers `store`'s context (the GraphStore constructor). */
+    public static Register(store: object, context: GraphContext): void
+    {
+        GraphContext.Stores.set(store, context);
+    }
+
+    /** The context `store` registered; GraphError Internal for an object that registered none. */
+    public static Of(store: object): GraphContext
+    {
+        const context = GraphContext.Stores.get(store);
+        if (context === undefined)
+        {
+            throw new GraphError(GraphErrorCode.Internal, GraphContext.ErrNoContext);
+        }
+        return context;
     }
 
     /**

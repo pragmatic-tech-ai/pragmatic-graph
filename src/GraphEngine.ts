@@ -7,6 +7,7 @@ import type { IExternalConnector } from './connectors/FetchContract.js';
 import type { IGraphConnector } from './connectors/GraphConnector.js';
 import { ConnectorSetup } from './connectors/WriteCoordinator.js';
 import { GraphError, GraphErrorCode } from './errors/GraphError.js';
+import { GraphContext } from './GraphContext.js';
 import type { GraphReader } from './GraphReader.js';
 import { GraphStore } from './GraphStore.js';
 import type { GraphTransaction } from './GraphTransaction.js';
@@ -158,13 +159,13 @@ export class GraphEngine
      */
     public ExternalConnectors(): ReadonlyMap<string, IExternalConnector>
     {
-        return this.store.Connectors?.ExternalConnectors() ?? GraphEngine.NoExternal;
+        return GraphContext.Of(this.store).Connectors?.ExternalConnectors() ?? GraphEngine.NoExternal;
     }
 
     /** The installed binding table (the latest committed upgrade's Bindings and DefaultConnector). */
     public get Bindings(): BindingTable
     {
-        return this.store.Connectors?.Bindings ?? GraphEngine.NoBindings;
+        return GraphContext.Of(this.store).Connectors?.Bindings ?? GraphEngine.NoBindings;
     }
 
     /**

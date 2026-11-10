@@ -13,7 +13,13 @@ export enum ConnectorResidency
     External = 2,
 }
 
-/** What an external connector can do natively; advisory (the engine re-checks every fetched row). */
+/**
+ * What an external connector can do natively (the engine re-checks every fetched row whatever it declares; final review
+ * m4). KeyLookup false: a key lookup never relies on IFetchRequest.Keys, it fetches the candidate concept with the
+ * predicate And(scope, IdIn{id}) and keeps the row of that id. ReverseLookup false: the rows linking to an id are found by
+ * fetching the declaring concept under the scope and keeping those whose Links hold the id. PushDown is informational
+ * only: the engine pushes the same advisory predicate whatever it lists, and never relies on the connector applying it.
+ */
 export interface IConnectorCapabilities
 {
     readonly KeyLookup: boolean;

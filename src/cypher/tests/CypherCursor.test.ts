@@ -172,6 +172,18 @@ describe('CypherCursor keyset paging', () =>
         assert.equal(EngineHarness.Col(second)[0], CursorFixture.Name(10));
     });
 
+    test('a Skip page ordered by a non-returned expression has more rows but no cursor', async () =>
+    {
+        const query = 'MATCH (a:Service) RETURN a.name AS n ORDER BY size(n) DESC, n';
+        const page = await h.Execute(query, undefined, { RowCap: 5, Skip: 0 });
+        assert.equal(page.HasMore, true);
+        assert.equal(page.NextCursor, undefined);
+        assert.equal(CypherEngine.ToDto(page).NextCursor, undefined);
+        // Skip paging still works for such an order.
+        const next = await h.Execute(query, undefined, { RowCap: 5, Skip: 5 });
+        assert.equal(next.Rows.length, 5);
+    });
+
     test('a read reports its snapshot commit and the cursor survives the DTO', async () =>
     {
         const page = await h.Execute(CursorFixture.Query, undefined, { RowCap: 3, Skip: 0 });

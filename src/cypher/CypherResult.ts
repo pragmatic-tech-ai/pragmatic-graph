@@ -8,7 +8,8 @@ import type { CypherWriteStats, CypherWriteStatsDto } from './write/CypherWriteS
  * further row. Stats: what a write query changed (absent for a read). Commit: for a write, the commit number it
  * committed (absent when it changed nothing, which commits nothing); for a read, the snapshot commit it ran at.
  * NextCursor: on a page with HasMore, the cursor of the last returned row (pass it as Limits.After for the next
- * page). Every node reachable in a row from CypherEngine.Execute has its links filled, so CypherEngine.ToDto is
+ * page); none when the page's order is not over returned columns (an ORDER BY expression that is no column: page such
+ * a query with Skip). Every node reachable in a row from CypherEngine.Execute has its links filled, so CypherEngine.ToDto is
  * synchronous.
  */
 export class CypherResult

@@ -84,7 +84,7 @@ export class CypherEngine
             if (limits?.After !== undefined && limits.After.After.length !== columns.length) throw new GraphError(GraphErrorCode.InvalidArgument, CypherEngine.AfterWidth);
             const outcome = paging ? await CypherEngine.Page(plan, columns, limits!, planner.FinalOrder) : { Result: await CypherEngine.Collect(plan, columns, limits), Ties: 0 };
             await CypherEngine.FillLinks(outcome.Result.Rows, view, limits?.Cancel);
-            return CypherEngine.WithSnapshot(outcome.Result, reader.SnapshotCommit, outcome.Ties);
+            return CypherEngine.WithSnapshot(outcome.Result, reader.SnapshotCommit, outcome.Ties, planner.FinalOrder !== undefined);
         }
         finally
         {
@@ -172,10 +172,12 @@ export class CypherEngine
     }
 
     // A read's result carries its snapshot commit; a page with more rows carries the cursor of its last row (cut at
-    // that snapshot). Built after FillLinks so a node key can be encoded.
-    private static WithSnapshot(result: CypherResult, commit: bigint, ties: number): CypherResult
+    // that snapshot) when its order is over returned columns (`keyed`, the planner's FinalOrder): a cursor can only
+    // compare returned columns, so a Skip page ordered otherwise has none (final review m2). Built after FillLinks so a
+    // node key can be encoded.
+    private static WithSnapshot(result: CypherResult, commit: bigint, ties: number, keyed: boolean): CypherResult
     {
-        const last = result.HasMore ? result.Rows[result.Rows.length - 1] : undefined;
+        const last = result.HasMore && keyed ? result.Rows[result.Rows.length - 1] : undefined;
         const cursor = last === undefined ? undefined : new CypherCursor(commit, last, ties);
         return new CypherResult(result.Columns, result.Rows, result.Truncated, result.HasMore, undefined, commit, cursor);
     }
