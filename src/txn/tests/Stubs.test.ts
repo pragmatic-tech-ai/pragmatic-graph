@@ -36,6 +36,7 @@ class StubFx
     public static readonly Jira = 'jira';
     public static readonly Other = 'other';
     public static readonly Ref = 'ref';
+    public static readonly Req = 'req';
     public static readonly ByRef = 'byRef';
     public static readonly UniqRef = 'uniqRef';
     public static readonly Ext = 'ext';
@@ -221,13 +222,13 @@ class StubFx
     }
 
     /** A schema over the same names: ticket (bound to ext under jira), team, and optionally team.assigned. */
-    public static Description(version: string, withTicket: boolean, withAssigned: boolean): ISchemaDescription
+    public static Description(version: string, withTicket: boolean, withAssigned: boolean, required: boolean = false): ISchemaDescription
     {
         const assigned = { Name: StubFx.Assigned, Kind: MemberKind.Relationship as const, Targets: [StubFx.Ticket], Many: true };
         return {
             Version: version,
             Definitions: [
-                ...(withTicket ? [{ Name: StubFx.Ticket, IsAspect: false, Parent: null, Aspects: [], Members: [] }] : []),
+                ...(withTicket ? [{ Name: StubFx.Ticket, IsAspect: false, Parent: null, Aspects: [], Members: required ? [{ Name: StubFx.Req, Kind: MemberKind.Property as const, Type: ValueType.String, Nullable: false }] : [] }] : []),
                 { Name: StubFx.Team, IsAspect: false, Parent: null, Aspects: [], Members: withAssigned ? [assigned] : [] },
             ],
             Indexes: [],
@@ -327,13 +328,13 @@ class StubFx
                 await g.dispose();
             });
 
-            it('stub of an indexed concept has no index entries', async () =>
+            it('stub of an indexed concept has no index entries (non-unique and unique)', async () =>
             {
                 const g = await StubFx.Ready(open);
                 const before = await StubFx.IndexEntries(g);
                 await StubFx.LinkStub(g, StubFx.A, StubFx.X);
                 await StubFx.LinkStub(g, StubFx.A, StubFx.Y);
-                assert.equal(await StubFx.IndexEntries(g), before, 'no entries for two stubs, and no unique violation');
+                assert.equal(await StubFx.IndexEntries(g), before, 'neither index holds an entry for either stub');
                 await StubFx.Commit(g, t => t.Unlink(StubFx.A, StubFx.Assigned, StubFx.Y));
                 assert.equal(await StubFx.IndexEntries(g), before);
                 await g.dispose();
@@ -390,6 +391,16 @@ class StubFx
                     r.dispose();
                 }
                 assert.equal(await StubFx.Exists(g, StubFx.A), true);
+                await g.dispose();
+            });
+
+            it("required property added to a stub's concept keeps its stubs", async () =>
+            {
+                const g = await StubFx.Purgeable(open);
+                await g.Upgrade(StubFx.Description('v2', true, true, true), [StubFx.External()]);
+                assert.deepEqual(await StubFx.ConceptOwner(g, StubFx.X), [StubFx.Ticket, StubFx.Jira]);
+                assert.deepEqual(await StubFx.OutLinks(g, StubFx.A), [StubFx.X]);
+                assert.deepEqual(await StubFx.OutLinks(g, StubFx.B), [StubFx.Y]);
                 await g.dispose();
             });
 
