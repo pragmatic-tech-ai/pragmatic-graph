@@ -46,3 +46,13 @@ Scope entries apply to a concept's subconcepts and to every concept carrying an 
 `Explain(text, scope?, options?)` returns the operator tree `Execute(scope, text, options)` would run, without reading or writing anything; write queries are explained too. The scope is used only for plan-time metadata (members it hides rule out indexes, as at `Execute`; without a scope nothing is hidden), and the options supply the parameters and the limits (with `Skip`, the implicit paging sort shows).
 
 Licensed under Apache-2.0. See NOTICE for attribution.
+
+## External bindings
+
+A binding can name a connector that is the source of truth for a concept instead of mirroring the engine's data. A connector's `Residency` is `Mirrored` (the default: the engine stores the data and writes through to the connector) or `External` (`IExternalConnector`: the engine stores no property data and reads the connector on demand). An External connector provides `Capabilities` and `Fetch(IFetchRequest): Promise<IFetchPage>`; it cannot be the `DefaultConnector`. Failures surface as `ConnectorError` with `ConnectorPhase.Fetch`.
+
+Push-down is advisory. `IFetchRequest.Predicate` carries the access scope and the query's filter hints; the connector may apply any part of it or none, because the engine re-checks the scope and every filter on each returned row. One `FetchSession` serves each Cypher read and each `GraphTransaction`; it memoises rows by public id so a query sees one consistent value per external node, and nothing is reused across queries or transactions.
+
+When an engine node links to an external node, the engine stores a stub: an identity-only node (public id, concept, owner, no property cells). A link to a stub resolves through the connector, and a dangling one reads as absent. Access scopes fail closed over fetched rows: a `Related` rule that goes Out to an external target is always Unknown, so it never admits a row by itself.
+
+Writes to external nodes go to the connector only, with no optimistic-concurrency check on the external data. Changes the connector makes by itself are pushed in through `GraphEngine.ConnectorApplied` (`IConnectorApplied`). For paging, `Cypher.CypherCursor` (`After`, `Ties`) resumes a read after the last returned row, with `ORDER BY` over returned columns; `CypherResult.NextCursor` carries it. Details: `docs/decisions.md`, R96-R104.
