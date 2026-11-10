@@ -38,6 +38,8 @@ export class RecordedReads
 
     /** The bindings and connectors installed when the reader opened (fixed for its life, as its snapshot is). */
     private readonly connectors: ConnectorSetup | undefined;
+    /** Per concept or aspect name, the ExternallyHeld answer. */
+    private readonly externallyHeld = new Map<string, boolean>();
 
     public constructor(private readonly context: GraphContext, private readonly snapshot: ReadSnapshot, public readonly Reads: ReadSet | undefined)
     {
@@ -72,11 +74,25 @@ export class RecordedReads
         return node;
     }
 
-    /** True iff some External binding could hold a node of `concept` (BindingTable.ExternalTargets is not empty). */
-    public ExternallyHeld(concept: string): boolean
+    /**
+     * True iff some External binding could hold a node that is, inherits from or carries `conceptOrAspect`
+     * (BindingTable.MayResolveExternal; an aspect counts through every concept carrying it). Cached per name: the
+     * reader's catalog and connector setup are fixed for its life.
+     */
+    public ExternallyHeld(conceptOrAspect: string): boolean
     {
         const setup = this.connectors;
-        return setup !== undefined && setup.External.size > 0 && setup.Bindings.ExternalTargets(concept, this.Catalog, setup.External).length > 0;
+        if (setup === undefined || setup.External.size === 0)
+        {
+            return false;
+        }
+        let held = this.externallyHeld.get(conceptOrAspect);
+        if (held === undefined)
+        {
+            held = setup.Bindings.MayResolveExternal(conceptOrAspect, this.Catalog, setup.External);
+            this.externallyHeld.set(conceptOrAspect, held);
+        }
+        return held;
     }
 
     /**

@@ -10,6 +10,7 @@ export class CatalogIndex
     private readonly propertyById = new Map<number, MemberDef>();
     private readonly relationships: MemberDef[] = [];
     private readonly incoming = new Map<string, readonly MemberDef[]>();
+    private readonly named = new Map<string, readonly MemberDef[]>();
     private readonly indexes = new Map<string, readonly ConceptIndex[]>();
 
     public constructor(public readonly Catalog: CatalogSnapshot)
@@ -50,10 +51,16 @@ export class CatalogIndex
         return this.propertyById.get(memberId);
     }
 
-    /** Every relationship (each once, by id) named `name`, on any concept or aspect. */
+    /** Every relationship (each once, by id) named `name`, on any concept or aspect (cached per name). */
     public RelationshipsNamed(name: string): readonly MemberDef[]
     {
-        return this.relationships.filter(r => r.Name === name);
+        let found = this.named.get(name);
+        if (found === undefined)
+        {
+            found = this.relationships.filter(r => r.Name === name);
+            this.named.set(name, found);
+        }
+        return found;
     }
 
     /** True when a node of `concept` may be the target of `relationship`. */

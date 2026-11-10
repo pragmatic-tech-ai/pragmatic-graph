@@ -14,7 +14,7 @@ import type { GraphReader } from '../../GraphReader.js';
 import { GraphStore } from '../../GraphStore.js';
 import type { GraphTransaction } from '../../GraphTransaction.js';
 import { And, Compare, CompareOp, ConceptIs, FalsePredicate, IdIn, IsNull, Not, OwnerIs, type Predicate, Reachable, Related, Seeded, TruePredicate } from '../../predicate/Predicate.js';
-import type { ISchemaDescription } from '../../schema/SchemaDescription.js';
+import type { IBindingDescription, ISchemaDescription } from '../../schema/SchemaDescription.js';
 import { ConflictError } from '../../txn/ConflictError.js';
 import { AccessDefault, AccessScope } from '../AccessScope.js';
 
@@ -36,6 +36,8 @@ class FetchedFx
     public static readonly Cpu = 'cpu';
     public static readonly Secret = 'secret';
     public static readonly Load = 'load';
+    public static readonly Linked = 'Linked';
+    public static readonly Link = 'link';
     public static readonly Nope = 'Nope';
     public static readonly TeamRel = 'team';
     public static readonly Peer = 'peer';
@@ -81,8 +83,9 @@ class FetchedFx
             Version: 'v1',
             Definitions: [
                 { Name: FetchedFx.Tagged, IsAspect: true, Parent: null, Aspects: [], Members: [FetchedFx.Prop(FetchedFx.Tag, ValueType.String)] },
+                { Name: FetchedFx.Linked, IsAspect: true, Parent: null, Aspects: [], Members: [FetchedFx.Rel(FetchedFx.Link, FetchedFx.Server, true)] },
                 {
-                    Name: FetchedFx.Server, IsAspect: false, Parent: null, Aspects: [FetchedFx.Tagged], Members: [
+                    Name: FetchedFx.Server, IsAspect: false, Parent: null, Aspects: [FetchedFx.Tagged, FetchedFx.Linked], Members: [
                         FetchedFx.Prop(FetchedFx.Cpu, ValueType.Int64),
                         FetchedFx.Prop(FetchedFx.Secret, ValueType.String),
                         FetchedFx.Prop(FetchedFx.Load, ValueType.Float64),
@@ -97,6 +100,11 @@ class FetchedFx
             Bindings: [],
         };
     }
+
+    /** Ext's Servers bound to ExtC (the default fixture binding). */
+    public static readonly ServerBinding: readonly IBindingDescription[] = [{ Model: FetchedFx.Ext, Concept: FetchedFx.Server, Connector: FetchedFx.ExtC }];
+    /** Ext's nodes carrying Tagged bound to ExtC: keyed by an aspect, not by the concept that carries it. */
+    public static readonly TaggedBinding: readonly IBindingDescription[] = [{ Model: FetchedFx.Ext, Concept: FetchedFx.Tagged, Connector: FetchedFx.ExtC }];
 
     public static External(): IExternalConnector
     {
@@ -113,7 +121,7 @@ class FetchedFx
      * A store with engine Teams t (name core, assigned -> stub x) and u (name other); `stub` false leaves x out (no
      * stub, no edge). Then the Ext/Server binding to ExtC is installed.
      */
-    public static async Ready(open: () => Promise<GraphStore>, stub = true): Promise<GraphStore>
+    public static async Ready(open: () => Promise<GraphStore>, stub = true, bindings: readonly IBindingDescription[] = FetchedFx.ServerBinding): Promise<GraphStore>
     {
         const g = await open();
         await g.Upgrade(FetchedFx.Description());
@@ -129,7 +137,7 @@ class FetchedFx
                 t.Link(FetchedFx.T, FetchedFx.Assigned, FetchedFx.X);
             }
         });
-        g.SetConnectors(new BindingTable([{ Model: FetchedFx.Ext, Concept: FetchedFx.Server, Connector: FetchedFx.ExtC }]), [FetchedFx.External()]);
+        g.SetConnectors(new BindingTable(bindings), [FetchedFx.External()]);
         return g;
     }
 
@@ -370,6 +378,20 @@ class FetchedFx
                         assert.deepEqual([...ok.Values], [[FetchedFx.Load, 2]]);
                     });
                 }
+                g.dispose();
+            });
+
+            it('Related In over an aspect-declared relationship carried by an external concept is Unknown', async () =>
+            {
+                // link is declared on aspect Linked, carried by Server; Ext's Servers are external through a Tagged binding
+                // (so the stub x exists, but no engine edge says whether an external Server links to it).
+                const g = await FetchedFx.Ready(open, true, FetchedFx.TaggedBinding);
+                const linkIn = new Related(FetchedFx.Link, EdgeDirection.In, TruePredicate.Instance);
+                assert.deepEqual(await FetchedFx.Admitted(g, FetchedFx.ServerScope(linkIn), [FetchedFx.Row(FetchedFx.X)]), [false]);
+                assert.deepEqual(await FetchedFx.Admitted(g, FetchedFx.ServerScope(new Not(linkIn)), [FetchedFx.Row(FetchedFx.X)]), [false]);
+                // Reachable over that relationship cannot be settled False through the stub either.
+                const fromU = new Reachable(new Set([FetchedFx.U]), [{ Relationship: FetchedFx.Link, Direction: EdgeDirection.Out }], 1);
+                assert.deepEqual(await FetchedFx.Admitted(g, FetchedFx.ServerScope(new Not(fromU)), [FetchedFx.Row(FetchedFx.X)]), [false]);
                 g.dispose();
             });
 

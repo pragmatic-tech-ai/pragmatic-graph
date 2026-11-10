@@ -133,6 +133,37 @@ export class BindingTable
         return connector !== undefined && external.has(connector);
     }
 
+    /**
+     * True when some node that is, inherits from or carries `conceptOrAspect` could resolve to a connector in `external`:
+     * for some model the table names, some concept of the catalog (not an aspect) whose IsA holds for `conceptOrAspect`
+     * resolves (Resolve, most specific binding winning) to an external connector. Covers bindings keyed by an aspect,
+     * by an ancestor of a carrier, or model-wide, which ExternalTargets does not list for an aspect. A name the catalog
+     * does not define matches only itself. Owners the table does not name resolve to DefaultConnector, never external
+     * (ConnectorSetup refuses an External default), so they are not considered.
+     */
+    public MayResolveExternal(conceptOrAspect: string, catalog: CatalogSnapshot, external: ReadonlySet<string>): boolean
+    {
+        if (external.size === 0)
+        {
+            return false;
+        }
+        const carriers = catalog.Has(conceptOrAspect)
+            ? catalog.Definitions().filter(d => !d.IsAspect && catalog.IsA(d.Name, conceptOrAspect)).map(d => d.Name)
+            : [conceptOrAspect];
+        for (const model of this.models.keys())
+        {
+            for (const concept of carriers)
+            {
+                const connector = this.Resolve(model, concept, catalog);
+                if (connector !== undefined && external.has(connector))
+                {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
     private static FetchedConcept(bound: string, concept: string, catalog: CatalogSnapshot): string | undefined
     {
         if (bound === concept)
