@@ -14,6 +14,10 @@ import type { IFetchTarget } from './FetchContract.js';
  * first, each name once). Then the owner's model-wide binding (no Concept), then DefaultConnector, else
  * undefined. A concept the catalog does not define matches only its own name. A result equal to
  * EngineStorage, or undefined, means engine-only: no connector takes part.
+ *
+ * Engine storage as the default (ruling R97, D9): a runtime description sets `DefaultConnector:
+ * BindingTable.EngineStorage` to say unbound nodes are stored by the engine itself. There is no connector class for
+ * it; EngineStorage is this binding, and it behaves exactly like no default (no connector takes part).
  */
 export class BindingTable
 {
@@ -93,10 +97,14 @@ export class BindingTable
     }
 
     /**
-     * The fetches an external read of `concept` needs (ruling R96): one per binding whose connector is in
-     * `external` and whose concept is `concept`, a subtype of it (fetched as the binding's concept) or an ancestor
-     * or carried aspect of it (fetched as `concept`); a model-wide external binding fetches `concept`. A model
-     * yields one target per fetched concept, the nearest binding winning. Ordered by model, then concept.
+     * The fetches an external read of `concept` needs (rulings R96, D6). Per model: (a) one target for `concept`
+     * itself when the connector Resolve would pick for it (the nearest binding in the specificity chain, else the
+     * model-wide one) is in `external`, so a binding on an ancestor or carried aspect, or a model-wide one,
+     * fetches as `concept`, the nearest in the catalog's ancestor order then declared aspects order winning;
+     * (b) one target per external binding on a strict subtype of `concept`, fetched as that subtype. Within one
+     * (model, connector) a target whose concept IS-A another target's concept is dropped, because the broader
+     * fetch already covers it (no row is fetched twice); targets on different connectors are all kept, the
+     * fetch session dropping rows the more specific binding owns. Ordered by model, then concept.
      */
     public ExternalTargets(concept: string, catalog: CatalogSnapshot, external: ReadonlySet<string>): readonly IFetchTarget[]
     {
@@ -104,24 +112,28 @@ export class BindingTable
         for (const [model, byConcept] of this.models)
         {
             const found = new Map<string, IFetchTarget>();
+            const own = BindingTable.NearestBinding(this.Chain(concept, catalog), byConcept);
+            if (own !== undefined && external.has(own))
+            {
+                found.set(concept, { Model: model, Concept: concept, Connector: own });
+            }
             for (const [bound, connector] of byConcept)
             {
-                if (!external.has(connector) || bound === BindingTable.ModelWide)
+                if (external.has(connector) && bound !== BindingTable.ModelWide && bound !== concept
+                    && catalog.Has(bound) && catalog.Has(concept) && !catalog.IsAspect(bound) && catalog.IsA(bound, concept))
                 {
-                    continue;
-                }
-                const fetched = BindingTable.FetchedConcept(bound, concept, catalog);
-                if (fetched !== undefined && (fetched === bound || !found.has(fetched)))
-                {
-                    found.set(fetched, { Model: model, Concept: fetched, Connector: connector });
+                    found.set(bound, { Model: model, Concept: bound, Connector: connector });
                 }
             }
-            const wide = byConcept.get(BindingTable.ModelWide);
-            if (wide !== undefined && external.has(wide) && !found.has(concept))
+            const all = [...found.values()];
+            for (const t of all)
             {
-                found.set(concept, { Model: model, Concept: concept, Connector: wide });
+                const covered = all.some(o => o !== t && o.Connector === t.Connector && catalog.Has(t.Concept) && !catalog.IsAspect(t.Concept) && catalog.Has(o.Concept) && catalog.IsA(t.Concept, o.Concept));
+                if (!covered)
+                {
+                    targets.push(t);
+                }
             }
-            targets.push(...found.values());
         }
         return targets.sort((a, b) => BindingTable.Compare(a.Model, b.Model) || BindingTable.Compare(a.Concept, b.Concept));
     }
@@ -133,25 +145,18 @@ export class BindingTable
         return connector !== undefined && external.has(connector);
     }
 
-    private static FetchedConcept(bound: string, concept: string, catalog: CatalogSnapshot): string | undefined
+    /** The connector Resolve would pick within one model: the first chain name with a binding, else model-wide. */
+    private static NearestBinding(chain: readonly string[], byConcept: ReadonlyMap<string, string>): string | undefined
     {
-        if (bound === concept)
+        for (const name of chain)
         {
-            return concept;
+            const connector = byConcept.get(name);
+            if (connector !== undefined)
+            {
+                return connector;
+            }
         }
-        if (!catalog.Has(bound) || !catalog.Has(concept))
-        {
-            return undefined;
-        }
-        if (!catalog.IsAspect(bound) && catalog.IsA(bound, concept))
-        {
-            return bound;
-        }
-        if (!catalog.IsAspect(concept) && catalog.IsA(concept, bound))
-        {
-            return concept;
-        }
-        return undefined;
+        return byConcept.get(BindingTable.ModelWide);
     }
 
     private static Compare(a: string, b: string): number

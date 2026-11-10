@@ -37,7 +37,7 @@ class FetchFx
     public static readonly V2 = 'f2';
     public static readonly NodeId = 'n1';
     private static readonly Label = 'label';
-    private static readonly ReadOnly = 'read-only';
+    public static readonly ReadOnly = 'read-only';
 
     public static Concept(name: string, parent: string | null): IDefinitionDescription
     {
@@ -95,7 +95,7 @@ describe('Connector read contract', () =>
 
     it('open rejects external residency without Fetch', async () =>
     {
-        const bad = { Name: FetchFx.Ext, Residency: ConnectorResidency.External, Begin: () => Promise.reject(new Error('x')) } as IGraphConnector;
+        const bad = { Name: FetchFx.Ext, Residency: ConnectorResidency.External, Begin: () => Promise.reject(new Error(FetchFx.ReadOnly)) } as IGraphConnector;
         const description = FetchFx.Description([{ Model: FetchFx.M1, Concept: FetchFx.Server, Connector: FetchFx.Ext }]);
         await assert.rejects(FetchFx.Open(description, [bad]), FetchFx.IsInvalidArgument);
     });
@@ -158,6 +158,70 @@ describe('Connector read contract', () =>
             assert.equal(table.IsStub(FetchFx.M1, FetchFx.Server, engine.Catalog, external), true);
             assert.equal(table.IsStub(FetchFx.M1, FetchFx.Laptop, engine.Catalog, external), false);
             assert.equal(table.IsStub(FetchFx.M4, FetchFx.Server, engine.Catalog, external), false);
+        }
+        finally
+        {
+            await engine.dispose();
+        }
+    });
+
+    it('overlapping targets on one connector collapse', async () =>
+    {
+        const bindings: IBindingDescription[] = [
+            { Model: FetchFx.M1, Concept: FetchFx.Server, Connector: FetchFx.Ext },
+            { Model: FetchFx.M1, Concept: FetchFx.Asset, Connector: FetchFx.Ext },
+        ];
+        const engine = await FetchFx.Open(FetchFx.Description(bindings), [FetchFx.External(FetchFx.Ext)]);
+        try
+        {
+            const table = new BindingTable(bindings);
+            const targets = table.ExternalTargets(FetchFx.Asset, engine.Catalog, new Set([FetchFx.Ext]));
+            assert.deepEqual(targets, [{ Model: FetchFx.M1, Concept: FetchFx.Asset, Connector: FetchFx.Ext }]);
+        }
+        finally
+        {
+            await engine.dispose();
+        }
+    });
+
+    it('different connectors keep both', async () =>
+    {
+        const bindings: IBindingDescription[] = [
+            { Model: FetchFx.M1, Concept: FetchFx.Server, Connector: FetchFx.Other },
+            { Model: FetchFx.M1, Concept: FetchFx.Asset, Connector: FetchFx.Ext },
+        ];
+        const engine = await FetchFx.Open(FetchFx.Description(bindings), [FetchFx.External(FetchFx.Ext), FetchFx.External(FetchFx.Other)]);
+        try
+        {
+            const table = new BindingTable(bindings);
+            const targets = table.ExternalTargets(FetchFx.Asset, engine.Catalog, new Set([FetchFx.Ext, FetchFx.Other]));
+            assert.deepEqual(targets.map(t => `${t.Concept}:${t.Connector}`), ['Asset:ext', 'Server:other']);
+        }
+        finally
+        {
+            await engine.dispose();
+        }
+    });
+
+    it('the nearest ancestor binding wins', async () =>
+    {
+        const description = {
+            ...FetchFx.Description([]),
+            Definitions: [FetchFx.Concept(FetchFx.Asset, null), FetchFx.Concept(FetchFx.Server, FetchFx.Asset), FetchFx.Concept(FetchFx.Laptop, FetchFx.Server)],
+        };
+        const engine = await FetchFx.Open(description, []);
+        try
+        {
+            const order = [
+                { Model: FetchFx.M1, Concept: FetchFx.Asset, Connector: FetchFx.Other },
+                { Model: FetchFx.M1, Concept: FetchFx.Server, Connector: FetchFx.Ext },
+            ];
+            const external = new Set([FetchFx.Ext, FetchFx.Other]);
+            for (const bindings of [order, [...order].reverse()])
+            {
+                const targets = new BindingTable(bindings).ExternalTargets(FetchFx.Laptop, engine.Catalog, external);
+                assert.deepEqual(targets, [{ Model: FetchFx.M1, Concept: FetchFx.Laptop, Connector: FetchFx.Ext }]);
+            }
         }
         finally
         {
