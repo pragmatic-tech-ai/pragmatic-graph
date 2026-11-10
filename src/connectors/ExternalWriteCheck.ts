@@ -47,17 +47,49 @@ export class ExternalWriteCheck
     {
     }
 
-    /** A CreateNode of an external node; `stored`: the snapshot holds an engine node (not a stub) with the id. */
-    public Created(op: ICreateNodeOp, stored: boolean): void
+    /**
+     * A CreateNode of an external node; `engine`: the id's latest origin (the snapshot's node, or an earlier CreateNode of
+     * the batch) is an engine node, not a stub. DuplicatePublicId while that node, or an earlier external create of the
+     * id, is live.
+     */
+    public Created(op: ICreateNodeOp, engine: boolean): void
     {
         BatchApplier.RequirePublicId(op.PublicId);
         BatchApplier.Catalog(() => this.index.Catalog.RequireInstantiable(op.Concept));
-        if (stored && !this.deleted.has(op.PublicId))
+        if ((engine && !this.deleted.has(op.PublicId)) || this.created.has(op.PublicId))
         {
             throw new CommitError(CommitErrorCode.DuplicatePublicId, ExternalWriteCheck.ErrDuplicate + op.PublicId);
         }
         this.deleted.delete(op.PublicId);
         this.created.set(op.PublicId, { Concept: op.Concept, Set: new Set() });
+    }
+
+    /** An engine CreateNode: DuplicatePublicId when the batch created an external node of the id that is still live. */
+    public EngineCreated(publicId: string): void
+    {
+        if (this.created.has(publicId))
+        {
+            throw new CommitError(CommitErrorCode.DuplicatePublicId, ExternalWriteCheck.ErrDuplicate + publicId);
+        }
+        this.deleted.delete(publicId);
+    }
+
+    /** True when the batch deleted the id and has not re-created it since. */
+    public IsDeleted(publicId: string): boolean
+    {
+        return this.deleted.has(publicId);
+    }
+
+    /**
+     * An engine-source Link to an id the batch deleted: UnknownNode when the target is external (its stub went with the
+     * delete, and a link must not re-create it). An engine target is the engine's to reject.
+     */
+    public EngineLink(op: ILinkOp, external: boolean): void
+    {
+        if (external && this.deleted.has(op.To))
+        {
+            throw new CommitError(CommitErrorCode.UnknownNode, ExternalWriteCheck.ErrUnknownNode + op.To);
+        }
     }
 
     /** Any DeleteNode (an engine one too: a later external create of its id is then no duplicate). */

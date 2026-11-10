@@ -5,6 +5,7 @@ import type { PreparedCommit } from '../txn/PreparedCommit.js';
 import type { Signal } from '../txn/Signal.js';
 import { type BatchOp, type IUnlinkOp, WriteBatch, WriteOp } from '../txn/WriteBatch.js';
 import { BindingTable } from './BindingTable.js';
+import type { IConnectorApplied } from './ConnectorApplied.js';
 import { type ConnectorChange, ConnectorChangeSet } from './ConnectorChangeSet.js';
 import { ConnectorError, ConnectorPhase } from './ConnectorError.js';
 import { ExternalWriteCheck } from './ExternalWriteCheck.js';
@@ -181,7 +182,7 @@ class ChangeRouter
     }
 
     /** True when the origin binds to an External connector: the node's data lives only there (ruling R103). */
-    public IsExternal(origin: INodeOrigin | undefined): boolean
+    public IsExternal(origin: INodeOrigin | undefined): origin is INodeOrigin
     {
         if (origin === undefined || this.external.size === 0)
         {
@@ -382,7 +383,7 @@ export class WriteCoordinator
     /** The connector call last started, for wrapping a non-connector error should one ever escape. */
     private current: { readonly Connector: string; readonly Phase: ConnectorPhase } = { Connector: BindingTable.EngineStorage, Phase: ConnectorPhase.Prepare };
 
-    public constructor(private readonly setup: ConnectorSetup, private readonly lateFailures: Signal<ConnectorError>)
+    public constructor(private readonly setup: ConnectorSetup, private readonly lateFailures: Signal<ConnectorError>, private readonly applied: Signal<IConnectorApplied>)
     {
     }
 
@@ -421,13 +422,15 @@ export class WriteCoordinator
                 case WriteOp.CreateNode:
                 {
                     const origin = { Owner: op.Owner ?? WriteCoordinator.NoOwner, Concept: op.Concept };
+                    // The id's latest origin, the batch's own creates included, so an in-batch collision is caught too.
+                    const prior = await router.Origin(op.PublicId);
                     if (router.IsExternal(origin))
                     {
-                        const prior = await origins.Origin(op.PublicId);
                         check.Created(op, prior !== undefined && prior.Fetched !== true && !router.IsExternal(prior));
                     }
                     else
                     {
+                        check.EngineCreated(op.PublicId);
                         engine.Append(op);
                     }
                     router.Created(op.PublicId, origin);
@@ -475,10 +478,15 @@ export class WriteCoordinator
                     const source = await router.Origin(op.From);
                     if (router.IsExternal(source))
                     {
-                        check.Link(op, source as INodeOrigin, await router.Origin(op.To));
+                        check.Link(op, source, await router.Origin(op.To));
                     }
                     else
                     {
+                        // An external target the batch deleted has no stub to link to: it must not be re-created.
+                        if (check.IsDeleted(op.To))
+                        {
+                            check.EngineLink(op, router.IsExternal(await router.Origin(op.To)));
+                        }
                         engine.Append(op);
                     }
                     router.Emit(op, source);
@@ -490,7 +498,7 @@ export class WriteCoordinator
                     const source = await router.Origin(op.From);
                     if (router.IsExternal(source))
                     {
-                        check.Unlink(op, source as INodeOrigin);
+                        check.Unlink(op, source);
                     }
                     else
                     {
@@ -504,7 +512,7 @@ export class WriteCoordinator
                     const origin = await router.Origin(op.PublicId);
                     if (router.IsExternal(origin))
                     {
-                        check.SetProperty(op, origin as INodeOrigin);
+                        check.SetProperty(op, origin);
                     }
                     else
                     {
@@ -530,8 +538,14 @@ export class WriteCoordinator
         throw new GraphError(GraphErrorCode.Internal, WriteCoordinator.ErrUnhandled + String((op as BatchOp).Op));
     }
 
-    /** Runs the write-through of `sets` (from Route, non-empty); resolves with the engine's commit number. */
-    public async Run(prepare: () => Promise<PreparedCommit>, sets: ReadonlyMap<string, ConnectorChangeSet>): Promise<bigint>
+    /**
+     * Runs the write-through of `sets` (from Route, non-empty); resolves with the engine's commit number. With `unchanged`
+     * (the engine part of the batch is empty, controller ruling P13) the prepared commit only guards the engine reads
+     * during the connector phase: once every connector committed it is released, not finalized, and Run resolves with
+     * `unchanged` (no engine commit, no log entry, no CommitApplied). On success ConnectorApplied is raised once, after
+     * the engine commit when there is one (a throwing subscriber is ignored).
+     */
+    public async Run(prepare: () => Promise<PreparedCommit>, sets: ReadonlyMap<string, ConnectorChangeSet>, unchanged?: bigint): Promise<bigint>
     {
         this.deadline = new Promise(resolve =>
         {
@@ -543,7 +557,9 @@ export class WriteCoordinator
         });
         try
         {
-            return await this.Drive(prepare, sets);
+            const commit = await this.Drive(prepare, sets, unchanged);
+            this.RaiseApplied(sets, unchanged === undefined ? commit : undefined);
+            return commit;
         }
         finally
         {
@@ -551,7 +567,26 @@ export class WriteCoordinator
         }
     }
 
-    private async Drive(prepare: () => Promise<PreparedCommit>, sets: ReadonlyMap<string, ConnectorChangeSet>): Promise<bigint>
+    /** ConnectorApplied for a successful write-through: per connector, the distinct concepts of its change set, sorted. */
+    private RaiseApplied(sets: ReadonlyMap<string, ConnectorChangeSet>, commit: bigint | undefined): void
+    {
+        const connectors = new Map<string, readonly string[]>();
+        for (const [name, set] of sets)
+        {
+            connectors.set(name, Object.freeze([...new Set(set.Changes.map(c => c.Concept))].sort()));
+        }
+        const applied: IConnectorApplied = commit === undefined ? { Connectors: connectors } : { Commit: commit, Connectors: connectors };
+        try
+        {
+            this.applied.Raise(Object.freeze(applied));
+        }
+        catch
+        {
+            // Subscriber failures cannot undo the connectors' commits; Signal already ran every handler.
+        }
+    }
+
+    private async Drive(prepare: () => Promise<PreparedCommit>, sets: ReadonlyMap<string, ConnectorChangeSet>, unchanged: bigint | undefined): Promise<bigint>
     {
         const prepared = await this.Prepared(prepare);
         try
@@ -575,6 +610,12 @@ export class WriteCoordinator
         {
             prepared.Abort();
             throw await this.Failed(error instanceof ConnectorError ? error : new ConnectorError(this.current.Connector, this.current.Phase, error));
+        }
+        if (unchanged !== undefined)
+        {
+            // Nothing for engine storage: the reservation guarded the engine reads until the connectors committed.
+            prepared.Abort();
+            return unchanged;
         }
         try
         {

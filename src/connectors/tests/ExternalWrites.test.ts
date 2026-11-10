@@ -22,6 +22,7 @@ import { CommitError, CommitErrorCode } from '../../txn/CommitError.js';
 import type { ICommitApplied } from '../../txn/LogEntry.js';
 import { type BatchOp, WriteOp } from '../../txn/WriteBatch.js';
 import type { ConnectorChange } from '../ConnectorChangeSet.js';
+import type { IConnectorApplied } from '../ConnectorApplied.js';
 import { ConnectorError, ConnectorPhase } from '../ConnectorError.js';
 import type { IFetchedRow } from '../FetchContract.js';
 import type { IConnectorTransaction } from '../GraphConnector.js';
@@ -103,15 +104,19 @@ class ExtFx
     public static readonly DoneState = 'done';
     public static readonly ExtBegin = 'ext.Begin';
     public static readonly ExtRevert = 'ext.Revert';
+    public static readonly Boom = 'subscriber failure';
+    public static readonly NoOwner = '';
     public static readonly Target = Object.freeze({ Concept: ExtFx.Ticket, Owner: ExtFx.Jira });
     private static readonly Space = ' ';
     private static readonly Dot = '.';
 
     private readonly applied: ICommitApplied[] = [];
+    private readonly pushed: IConnectorApplied[] = [];
 
     private constructor(public readonly Engine: GraphEngine, public readonly Connector: TicketSystem, public readonly Cypher: CypherEngine)
     {
         Engine.CommitApplied.Subscribe(c => this.applied.push(c));
+        Engine.ConnectorApplied.Subscribe(c => this.pushed.push(c));
     }
 
     public static Dir(): string
@@ -168,6 +173,18 @@ class ExtFx
     public get Applied(): readonly ICommitApplied[]
     {
         return this.applied;
+    }
+
+    /** Every ConnectorApplied raised since the fixture opened. */
+    public get Pushed(): readonly IConnectorApplied[]
+    {
+        return this.pushed;
+    }
+
+    /** A ConnectorApplied as plain data: its commit and its connectors' concepts. */
+    public static PushShape(applied: IConnectorApplied): { Commit: bigint | undefined; Connectors: Record<string, readonly string[]> }
+    {
+        return { Commit: applied.Commit, Connectors: Object.fromEntries(applied.Connectors) };
     }
 
     public Run(text: string, scope: AccessScope = AccessScope.System, placement?: INodePlacement): Promise<CypherResult>
@@ -345,7 +362,8 @@ class ExternalWritesSuite
                     assert.equal(await fx.StoredOwner(ExtFx.New), undefined);
                     assert.deepEqual(await fx.Stored(ExtFx.Ticket), [ExtFx.Local]);
                     // Nothing external reached the engine batch.
-                    for (const c of fx.Applied.slice(before)) assert.equal(c.Batch.Count, 0);
+                    // An all-external write makes no engine commit (ruling P13).
+                    assert.equal(fx.Applied.length, before);
                 }
                 finally
                 {
@@ -498,7 +516,8 @@ class ExternalWritesSuite
                     const before = fx.Applied.length;
                     await fx.Run('MATCH (t:Ticket {id: \'c\'}), (b:Team {name: \'other\'}) CREATE (t)-[:team]->(b)');
                     assert.deepEqual(fx.Connector.Changes().map(c => ExtFx.Shape(c)), ['Link c team b']);
-                    for (const c of fx.Applied.slice(before)) assert.equal(c.Batch.Count, 0);
+                    // An all-external write makes no engine commit (ruling P13).
+                    assert.equal(fx.Applied.length, before);
                     assert.equal(await fx.StoredOwner(ExtFx.Closed), undefined);
                     // A write that does not fit the schema is rejected before any connector begins.
                     const bad = await ExtFx.Rejection(fx.Commit(AccessScope.System, async t =>
@@ -583,6 +602,161 @@ class ExternalWritesSuite
                     // Indistinguishable: the same code and the same message shape, naming only the requested id.
                     assert.equal((external as Error).message.replace(ExtFx.Nope, ExtFx.Local), (engine as Error).message);
                     assert.equal(await fx.StoredOwner(ExtFx.Nope), undefined);
+                }
+                finally
+                {
+                    await fx.dispose();
+                }
+            });
+
+            it('all-external commit makes no engine commit', async () =>
+            {
+                const fx = await ExtFx.Open(storage());
+                try
+                {
+                    const before = fx.Applied.length;
+                    const commit = await fx.LastCommit();
+                    let snapshot = -1n;
+                    const answered = await fx.Commit(AccessScope.System, async t =>
+                    {
+                        snapshot = t.SnapshotCommit;
+                        await ExtFx.Fetch(t, ExtFx.X);
+                        t.SetProperty(ExtFx.X, ExtFx.State, ExtFx.DoneState);
+                    });
+                    assert.equal(answered, snapshot);
+                    assert.equal(fx.Applied.length, before);
+                    assert.equal(await fx.LastCommit(), commit);
+                    assert.deepEqual(fx.Connector.Changes().map(c => ExtFx.Shape(c)), ['SetProperty x.state']);
+                    // The next engine commit takes the very next number.
+                    const next = await fx.Commit(AccessScope.System, async t => t.SetProperty(ExtFx.B, ExtFx.Name, ExtFx.Core));
+                    assert.equal(next, commit + 1n);
+                }
+                finally
+                {
+                    await fx.dispose();
+                }
+            });
+
+            it('ConnectorApplied reports concepts per connector', async () =>
+            {
+                const fx = await ExtFx.Open(storage());
+                try
+                {
+                    await fx.Commit(AccessScope.System, async t =>
+                    {
+                        await ExtFx.Fetch(t, ExtFx.X);
+                        t.SetProperty(ExtFx.X, ExtFx.State, ExtFx.DoneState);
+                        t.CreateNode(ExtFx.New, ExtFx.Ticket, { Owner: ExtFx.Jira });
+                    });
+                    assert.deepEqual(fx.Pushed.map(p => ExtFx.PushShape(p)), [{ Commit: undefined, Connectors: { ext: [ExtFx.Ticket] } }]);
+                    const mixed = await fx.Commit(AccessScope.System, async t =>
+                    {
+                        await ExtFx.Fetch(t, ExtFx.X);
+                        t.SetProperty(ExtFx.X, ExtFx.State, ExtFx.OpenState);
+                        t.SetProperty(ExtFx.B, ExtFx.Name, ExtFx.Core);
+                    });
+                    assert.deepEqual(fx.Pushed.slice(1).map(p => ExtFx.PushShape(p)), [{ Commit: mixed, Connectors: { ext: [ExtFx.Ticket] } }]);
+                    // An engine-only commit raises none; a throwing subscriber does not affect the commit.
+                    await fx.Commit(AccessScope.System, async t => t.SetProperty(ExtFx.A, ExtFx.Name, ExtFx.Other));
+                    assert.equal(fx.Pushed.length, 2);
+                    const subscription = fx.Engine.ConnectorApplied.Subscribe(() => { throw new Error(ExtFx.Boom); });
+                    try
+                    {
+                        await fx.Commit(AccessScope.System, async t =>
+                        {
+                            await ExtFx.Fetch(t, ExtFx.Closed);
+                            t.SetProperty(ExtFx.Closed, ExtFx.State, ExtFx.DoneState);
+                        });
+                    }
+                    finally
+                    {
+                        subscription.dispose();
+                    }
+                    assert.equal(fx.Pushed.length, 3);
+                }
+                finally
+                {
+                    await fx.dispose();
+                }
+            });
+
+            it('failed write-through raises no ConnectorApplied', async () =>
+            {
+                const fx = await ExtFx.Open(storage());
+                try
+                {
+                    fx.Connector.Writes.FailAt = FakeStep.Commit;
+                    await ExtFx.Rejection(fx.Commit(AccessScope.System, async t =>
+                    {
+                        await ExtFx.Fetch(t, ExtFx.X);
+                        t.SetProperty(ExtFx.X, ExtFx.State, ExtFx.DoneState);
+                    }));
+                    fx.Connector.Writes.FailAt = undefined;
+                    // A gate refusal never reaches the connectors either.
+                    await ExtFx.Rejection(fx.Commit(ExternalWritesSuite.OpenOnly, async t => t.SetProperty(ExtFx.X, ExtFx.State, ExtFx.DoneState)));
+                    assert.equal(fx.Pushed.length, 0);
+                }
+                finally
+                {
+                    await fx.dispose();
+                }
+            });
+
+            it('an engine link to an external node the batch deleted is UnknownNode', async () =>
+            {
+                const fx = await ExtFx.Open(storage());
+                try
+                {
+                    await fx.LinkStub(ExtFx.A, ExtFx.X);
+                    const error = await ExtFx.Rejection(fx.Commit(AccessScope.System, async t =>
+                    {
+                        await ExtFx.Fetch(t, ExtFx.X);
+                        t.DeleteNode(ExtFx.X);
+                        t.Link(ExtFx.B, ExtFx.Assigned, ExtFx.X, { ExternalTarget: ExtFx.Target });
+                    }));
+                    assert.ok(error instanceof CommitError && error.Code === CommitErrorCode.UnknownNode, String(error));
+                    assert.equal(fx.Connector.Log.includes(ExtFx.ExtBegin), false);
+                    assert.deepEqual(await fx.LinksOf(ExtFx.A), [ExtFx.X]);
+                    assert.deepEqual(await fx.LinksOf(ExtFx.B), []);
+                }
+                finally
+                {
+                    await fx.dispose();
+                }
+            });
+
+            it('an engine and an external create of one id in a batch are DuplicatePublicId, in either order', async () =>
+            {
+                const fx = await ExtFx.Open(storage());
+                try
+                {
+                    const engineFirst = await ExtFx.Rejection(fx.Commit(AccessScope.System, async t =>
+                    {
+                        t.CreateNode(ExtFx.New, ExtFx.Ticket);
+                        t.CreateNode(ExtFx.New, ExtFx.Ticket, { Owner: ExtFx.Jira });
+                    }));
+                    assert.ok(engineFirst instanceof CommitError && engineFirst.Code === CommitErrorCode.DuplicatePublicId, String(engineFirst));
+                    const externalFirst = await ExtFx.Rejection(fx.Commit(AccessScope.System, async t =>
+                    {
+                        t.CreateNode(ExtFx.New, ExtFx.Ticket, { Owner: ExtFx.Jira });
+                        t.CreateNode(ExtFx.New, ExtFx.Ticket);
+                    }));
+                    assert.ok(externalFirst instanceof CommitError && externalFirst.Code === CommitErrorCode.DuplicatePublicId, String(externalFirst));
+                    const twice = await ExtFx.Rejection(fx.Commit(AccessScope.System, async t =>
+                    {
+                        t.CreateNode(ExtFx.New, ExtFx.Ticket, { Owner: ExtFx.Jira });
+                        t.CreateNode(ExtFx.New, ExtFx.Ticket, { Owner: ExtFx.Jira });
+                    }));
+                    assert.ok(twice instanceof CommitError && twice.Code === CommitErrorCode.DuplicatePublicId, String(twice));
+                    // Deleted first, an id may be created again by the other side.
+                    await fx.Commit(AccessScope.System, async t =>
+                    {
+                        t.CreateNode(ExtFx.New, ExtFx.Ticket, { Owner: ExtFx.Jira });
+                        t.DeleteNode(ExtFx.New);
+                        t.CreateNode(ExtFx.New, ExtFx.Ticket);
+                    });
+                    assert.equal(await fx.StoredOwner(ExtFx.New), ExtFx.NoOwner);
+                    assert.equal(fx.Connector.Log.filter(e => e === ExtFx.ExtBegin).length, 1);
                 }
                 finally
                 {

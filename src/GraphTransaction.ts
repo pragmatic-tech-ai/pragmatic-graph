@@ -37,7 +37,8 @@ import { type ICreateNodeOptions, type IDeleteNodeOptions, type LinkOptions, Wri
  * owner and concept, a stored stub, or a row the transaction fetched) is written to that connector only, never to engine
  * storage. The commit decides such writes against the row the transaction fetched: a row it never fetched, or one its
  * scope does not admit, is AccessError InvisibleNode, as a missing engine node is. Fetched rows carry no conflict
- * detection (spec §6): only the engine reads are validated.
+ * detection (spec §6): only the engine reads are validated. A commit whose writes are all external makes no engine
+ * commit and resolves with SnapshotCommit (ruling P13); every successful write-through raises ConnectorApplied.
  */
 export class GraphTransaction extends GraphReader
 {
@@ -148,7 +149,9 @@ export class GraphTransaction extends GraphReader
                 if (routed.Sets.size > 0)
                 {
                     const prepare = () => this.context.Committer.Prepare(routed.Engine, this.Reads, this.ValidationCommit(), began, setup.TimeoutMs, generation);
-                    return await new WriteCoordinator(setup, this.context.ConnectorRevertFailed).Run(prepare, routed.Sets);
+                    // An all-external write makes no engine commit (controller ruling P13): it answers like an empty batch.
+                    const unchanged = routed.Engine.Count === 0 ? this.SnapshotCommit : undefined;
+                    return await new WriteCoordinator(setup, this.context.ConnectorRevertFailed, this.context.ConnectorApplied).Run(prepare, routed.Sets, unchanged);
                 }
                 return await this.context.Committer.Submit(routed.Engine, this.Reads, this.ValidationCommit(), began, generation);
             }
@@ -206,8 +209,9 @@ export class GraphTransaction extends GraphReader
     /** The row this transaction's FetchSession holds for the id, as a FetchedNode of its model; undefined when none. */
     private async FetchedRow(publicId: string): Promise<FetchedNode | undefined>
     {
-        const known = FederatedReads.Of(this).OpenSession?.Known(publicId);
-        return known === undefined ? undefined : this.FetchedNodeOf(known.Row, known.Model);
+        const channel = FederatedReads.Of(this);
+        const known = channel.OpenSession?.Known(publicId);
+        return known === undefined ? undefined : channel.FetchedNodeOf(known.Row, known.Model);
     }
 
     /** The stored node's origin (NodeOrigin), else that of the row this transaction fetched for the id. */

@@ -2,6 +2,7 @@ import type { AccessScope } from './access/AccessScope.js';
 import { ScopeValidator } from './access/ScopeValidator.js';
 import { CatalogStore } from './catalog/CatalogStore.js';
 import { ColumnStore } from './columns/ColumnStore.js';
+import type { IConnectorApplied } from './connectors/ConnectorApplied.js';
 import type { BindingTable } from './connectors/BindingTable.js';
 import type { ConnectorError } from './connectors/ConnectorError.js';
 import type { IGraphConnector } from './connectors/GraphConnector.js';
@@ -70,6 +71,8 @@ export class GraphContext
      * Raised when reverting a connector call that was still hanging at the write-through timeout failed (ruling R72).
      */
     public readonly ConnectorRevertFailed = new Signal<ConnectorError>();
+    /** Raised once per successful write-through, after every participating connector committed (ruling R103). */
+    public readonly ConnectorApplied = new Signal<IConnectorApplied>();
 
     private readonly open = new Set<IGraphDisposable>();
     /** Per scope, the catalog version it was last validated against (ruling R63). */

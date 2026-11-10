@@ -2,6 +2,7 @@ import { AccessScope } from './access/AccessScope.js';
 import { CatalogModel } from './catalog/CatalogModel.js';
 import type { CatalogSnapshot } from './catalog/CatalogSnapshot.js';
 import { CatalogStore } from './catalog/CatalogStore.js';
+import type { IConnectorApplied } from './connectors/ConnectorApplied.js';
 import { BindingTable } from './connectors/BindingTable.js';
 import type { ConnectorError } from './connectors/ConnectorError.js';
 import type { IGraphConnector } from './connectors/GraphConnector.js';
@@ -47,6 +48,11 @@ export class GraphStore
      * reverting its transaction then failed (the commit itself had already failed with ConnectorError).
      */
     public readonly ConnectorRevertFailed: ISignal<ConnectorError>;
+    /**
+     * Raised once per successful write-through (Mirrored or External connectors), after every participating connector
+     * committed and after the engine commit, when there is one, is durable (ruling R103). Subscribe-only.
+     */
+    public readonly ConnectorApplied: ISignal<IConnectorApplied>;
 
     private disposing: Promise<void> | undefined;
 
@@ -54,6 +60,7 @@ export class GraphStore
     {
         this.CommitApplied = new SignalView(context.Committer.CommitApplied);
         this.ConnectorRevertFailed = new SignalView(context.ConnectorRevertFailed);
+        this.ConnectorApplied = new SignalView(context.ConnectorApplied);
     }
 
     /**
@@ -294,6 +301,7 @@ export class GraphStore
         await this.context.Committer.dispose();
         this.context.DisposeReaders();
         this.context.ConnectorRevertFailed.dispose();
+        this.context.ConnectorApplied.dispose();
         await this.context.Store.dispose();
     }
 }

@@ -1,5 +1,7 @@
+import { FetchedNode } from './access/FetchedNode.js';
 import type { ScopeEvaluator } from './access/ScopeEvaluator.js';
 import { MemberKind } from './catalog/ValueType.js';
+import type { IFetchedRow } from './connectors/FetchContract.js';
 import { FetchSession } from './connectors/FetchSession.js';
 import type { ConnectorSetup } from './connectors/WriteCoordinator.js';
 import { GraphError, GraphErrorCode } from './errors/GraphError.js';
@@ -115,6 +117,23 @@ export class FederatedReads
             return undefined;
         }
         return { Concept: node.Concept, Owner: await this.recorded.Owner(node) };
+    }
+
+    /**
+     * The fetched row checked against the reader's catalog (FetchedNode.Validated) as a FetchedNode of `owner`, with its
+     * stub attached when one is stored (recording that read, also when there is none). Decides nothing: the caller
+     * (GraphReader.AdmitFetched, the transaction's write gate) decides it under the scope.
+     */
+    public async FetchedNodeOf(fetched: IFetchedRow, owner: string): Promise<FetchedNode>
+    {
+        this.RequireOpen();
+        const node = new FetchedNode(FetchedNode.Validated(this.index.Catalog, fetched), owner);
+        const stub = await this.recorded.StubOf(node.PublicId, owner);
+        if (stub !== undefined)
+        {
+            node.AttachStub(stub);
+        }
+        return node;
     }
 
     /**

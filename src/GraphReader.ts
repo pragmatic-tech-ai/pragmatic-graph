@@ -1,5 +1,4 @@
 import type { AccessScope } from './access/AccessScope.js';
-import { FetchedNode } from './access/FetchedNode.js';
 import { HypotheticalNode } from './access/HypotheticalNode.js';
 import { ScopeEvaluator } from './access/ScopeEvaluator.js';
 import { CatalogError, CatalogErrorCode } from './catalog/CatalogError.js';
@@ -154,7 +153,7 @@ export class GraphReader implements IGraphDisposable
     public async AdmitFetched(fetched: IFetchedRow, owner: string): Promise<IFetchedRow | undefined>
     {
         this.RequireOpen();
-        const node = await this.FetchedNodeOf(fetched, owner);
+        const node = await this.federated.FetchedNodeOf(fetched, owner);
         const row = node.Row;
         const evaluator = this.evaluator;
         if (evaluator === undefined)
@@ -182,21 +181,6 @@ export class GraphReader implements IGraphDisposable
     {
         this.RequireOpen();
         return this.evaluator?.RowsPredicate(concept) ?? Predicate.True;
-    }
-
-    /**
-     * The fetched row checked against the catalog (FetchedNode.Validated) as a FetchedNode of `owner`, with its stub
-     * attached when one is stored (recording that read, also when there is none). Decides nothing.
-     */
-    protected async FetchedNodeOf(fetched: IFetchedRow, owner: string): Promise<FetchedNode>
-    {
-        const node = new FetchedNode(FetchedNode.Validated(this.Catalog, fetched), owner);
-        const stub = await this.recorded.StubOf(node.PublicId, owner);
-        if (stub !== undefined)
-        {
-            node.AttachStub(stub);
-        }
-        return node;
     }
 
     /** A copy of `map` without the `hidden` keys. */

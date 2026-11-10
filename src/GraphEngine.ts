@@ -1,5 +1,6 @@
 import type { AccessScope } from './access/AccessScope.js';
 import type { CatalogSnapshot } from './catalog/CatalogSnapshot.js';
+import type { IConnectorApplied } from './connectors/ConnectorApplied.js';
 import { BindingTable } from './connectors/BindingTable.js';
 import type { ConnectorError } from './connectors/ConnectorError.js';
 import type { IExternalConnector } from './connectors/FetchContract.js';
@@ -77,6 +78,12 @@ export class GraphEngine
      * was answered, and failed (ruling R72): the last place such a failure can be reported.
      */
     public readonly ConnectorRevertFailed: ISignal<ConnectorError>;
+    /**
+     * Raised once per successful write-through, after every participating connector (Mirrored or External) committed and
+     * after the engine commit, when the batch had engine ops, is durable (ruling R103): how change push learns about
+     * writes that never reach engine storage. Subscribe-only; a throwing subscriber never affects the commit.
+     */
+    public readonly ConnectorApplied: ISignal<IConnectorApplied>;
 
     private version: string;
     private catalog: CatalogSnapshot;
@@ -94,6 +101,7 @@ export class GraphEngine
     {
         this.CommitApplied = store.CommitApplied;
         this.ConnectorRevertFailed = store.ConnectorRevertFailed;
+        this.ConnectorApplied = store.ConnectorApplied;
         this.version = description.Version;
         this.catalog = result.Catalog;
     }
