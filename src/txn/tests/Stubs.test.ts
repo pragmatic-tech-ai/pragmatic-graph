@@ -11,6 +11,7 @@ import { FalsePredicate } from '../../predicate/Predicate.js';
 import type { ISchemaDescription } from '../../schema/SchemaDescription.js';
 import { BindingTable } from '../../connectors/BindingTable.js';
 import { ConnectorResidency, type IExternalConnector } from '../../connectors/FetchContract.js';
+import type { IGraphConnector } from '../../connectors/GraphConnector.js';
 import { GraphError, GraphErrorCode } from '../../errors/GraphError.js';
 import { EdgeDirection } from '../../format/FormatKeys.js';
 import { FederatedReads } from '../../FederatedReads.js';
@@ -21,6 +22,8 @@ import { EngineInternals } from '../../tests/EngineInternals.js';
 import { CommitError, CommitErrorCode } from '../CommitError.js';
 import { CommitKind } from '../LogEntry.js';
 import { WriteBatch } from '../WriteBatch.js';
+import type { DataPurger } from '../../schema/DataPurger.js';
+import { GraphEngine, StorageKind } from '../../GraphEngine.js';
 import { FakeConnector } from '../../connectors/tests/FakeConnector.js';
 
 /**
@@ -55,6 +58,10 @@ class StubFx
     public static readonly V2 = 'v2';
     public static readonly Jira2 = 'jira2';
     public static readonly Parent = 'parent';
+    public static readonly Crm = 'crm';
+    public static readonly Mirror = 'mirror';
+    public static readonly Mirror2 = 'mirror2';
+    public static readonly Ext2 = 'ext2';
     private static readonly NoExternal = 'no external connector';
 
     public static readonly Target = Object.freeze({ Concept: StubFx.Ticket, Owner: StubFx.Jira });
@@ -74,10 +81,10 @@ class StubFx
         }
     }
 
-    public static External(): IExternalConnector
+    public static External(name: string = StubFx.Ext): IExternalConnector
     {
         return {
-            Name: StubFx.Ext,
+            Name: name,
             Residency: ConnectorResidency.External,
             Capabilities: { KeyLookup: false, ReverseLookup: false, PushDown: new Set() },
             Begin: () => Promise.reject(new Error(StubFx.NoExternal)),
@@ -113,6 +120,13 @@ class StubFx
         {
             t.dispose();
         }
+    }
+
+    /** Creates team a linked to the stub x. */
+    public static async LinkStubAfter(g: GraphStore): Promise<void>
+    {
+        await StubFx.Commit(g, t => t.CreateNode(StubFx.A, StubFx.Team));
+        await StubFx.LinkStub(g, StubFx.A, StubFx.X);
     }
 
     /** Links `from` to a stub target, e.g. (a, x). */
@@ -270,6 +284,23 @@ class StubFx
             Seed: [],
             Bindings: bindings,
         };
+    }
+
+    /** Counts the committer's residency reconciliations (the purger test seam, ruling R52). */
+    public static CountReconciles(g: GraphStore): { Count: number }
+    {
+        const host = EngineInternals.CommitterParts(g);
+        const real = host.purger;
+        const counter = { Count: 0 };
+        host.purger = {
+            Purge: (...args: Parameters<DataPurger['Purge']>) => real.Purge(...args),
+            Reconcile: (...args: Parameters<DataPurger['Reconcile']>) =>
+            {
+                counter.Count++;
+                return real.Reconcile(...args);
+            },
+        } as unknown as DataPurger;
+        return counter;
     }
 
     /** The store's last commit number. */
@@ -653,6 +684,34 @@ class StubFx
                 await g.dispose();
             });
 
+            it('setups that keep the stub rule are accepted by SetConnectors and reconcile nothing on Upgrade', async () =>
+            {
+                const jira = { Model: StubFx.Jira, Concept: StubFx.Ticket, Connector: StubFx.Ext };
+                const crm = (connector: string) => ({ Model: StubFx.Crm, Connector: connector });
+                const described = (bindings: readonly { Model: string; Concept?: string; Connector: string }[]): ISchemaDescription => ({ ...StubFx.Residency(StubFx.V1, true), Bindings: bindings });
+                const connectors = (...extra: IGraphConnector[]): IGraphConnector[] => [StubFx.External(), new FakeConnector(StubFx.Mirror, []), new FakeConnector(StubFx.Mirror2, []), ...extra];
+                const g = await open();
+                await g.Upgrade(described([jira, crm(StubFx.Mirror)]), connectors());
+                await StubFx.LinkStubAfter(g);
+                const reconciles = StubFx.CountReconciles(g);
+                const last = StubFx.Last(g);
+                // Re-pointing a Mirrored binding, then adding an unused External connector: the same stub rule.
+                g.SetConnectors(new BindingTable([jira, crm(StubFx.Mirror2)]), connectors());
+                g.SetConnectors(new BindingTable([jira, crm(StubFx.Mirror2)]), connectors(StubFx.External(StubFx.Ext2)));
+                await g.Upgrade(described([jira, crm(StubFx.Mirror)]), connectors(StubFx.External(StubFx.Ext2)));
+                assert.equal(reconciles.Count, 0);
+                assert.equal(await StubFx.CommitsAfter(g, last), 0);
+                assert.deepEqual(await StubFx.ConceptOwner(g, StubFx.X), [StubFx.Ticket, StubFx.Jira]);
+                // A non-External binding shadowing an External one is part of the rule: removing it is a residency change.
+                const shadowed = [{ Model: StubFx.Jira, Connector: StubFx.Ext }, { Model: StubFx.Jira, Concept: StubFx.Person, Connector: StubFx.Mirror }, jira];
+                await g.Upgrade(described(shadowed), connectors());
+                assert.equal(reconciles.Count, 1);
+                const invalid = (e: unknown): boolean => e instanceof GraphError && e.GraphCode === GraphErrorCode.InvalidArgument;
+                assert.throws(() => g.SetConnectors(new BindingTable([shadowed[0]!, jira]), connectors()), invalid);
+                g.SetConnectors(new BindingTable([shadowed[0]!, { ...shadowed[1]!, Connector: StubFx.Mirror2 }, jira]), connectors());
+                await g.dispose();
+            });
+
             it('stub linked and unlinked in one batch leaves no stub', async () =>
             {
                 const g = await StubFx.Ready(open);
@@ -710,6 +769,32 @@ describe('stubs across a reopen (lmdb)', () =>
         assert.deepEqual(await StubFx.OutLinks(g, StubFx.A), []);
         assert.equal(await StubFx.RawRef(g, StubFx.Local), StubFx.R1);
         await g.dispose();
+    });
+
+    it('GraphEngine.Open with a binding no longer External and no connectors deletes the stubs and their edges', async () =>
+    {
+        const dir = await Seeded();
+        const engine = await GraphEngine.Open({ Description: StubFx.Residency(StubFx.V1, false), Storage: { Kind: StorageKind.Lmdb, Path: dir } });
+        try
+        {
+            const r = await engine.BeginRead(AccessScope.System);
+            try
+            {
+                assert.equal(await r.ConceptOf(StubFx.X), undefined);
+                assert.equal(await r.OwnerOf(StubFx.X), undefined);
+                assert.deepEqual(await FederatedReads.Of(r).Links(StubFx.A, EdgeDirection.Out), []);
+                assert.equal(await r.ConceptOf(StubFx.A), StubFx.Team);
+                assert.equal(await r.GetProperty(StubFx.Local, StubFx.Ref), StubFx.R1);
+            }
+            finally
+            {
+                r.dispose();
+            }
+        }
+        finally
+        {
+            await engine.dispose();
+        }
     });
 
     it('reopen flipping the binding on External strips engine data once', async () =>

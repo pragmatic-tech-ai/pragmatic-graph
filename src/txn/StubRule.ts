@@ -22,21 +22,18 @@ export class StubRule
     public static readonly Inactive = '';
 
     /**
-     * A canonical text of the rule: Inactive without an External connector, else the binding table's fingerprint and the
-     * sorted External connector names. Two rules make the same nodes stubs under any one catalog exactly when their
-     * fingerprints are equal. Stored as Meta("stubRule"): the rule the stored data conforms to (final review residual).
+     * A canonical text of the rule (BindingTable.StubFingerprint over the installed External connectors): Inactive when
+     * no binding names an External connector. Two rules have equal fingerprints exactly when their binding tables make
+     * the same (model, concept) keys External, so under every catalog they make the same nodes stubs; Mirrored or
+     * engine re-pointing and unused External connectors do not change it. Stored as Meta("stubRule"): the rule the
+     * stored data conforms to (final review residual rounds).
      */
     public get Fingerprint(): string
     {
-        if (!this.IsActive)
-        {
-            return StubRule.Inactive;
-        }
-        const setup = this.setup as ConnectorSetup;
-        return JSON.stringify([setup.Bindings.Fingerprint(), [...setup.External].sort()]);
+        return this.IsActive ? (this.setup as ConnectorSetup).Bindings.StubFingerprint((this.setup as ConnectorSetup).External) : StubRule.Inactive;
     }
 
-    /** True when this rule and `other` make the same nodes stubs under any one catalog (equal fingerprints). */
+    /** True when this rule and `other` make the same nodes stubs under every catalog (equal fingerprints). */
     public SameAs(other: StubRule): boolean
     {
         return this.Fingerprint === other.Fingerprint;

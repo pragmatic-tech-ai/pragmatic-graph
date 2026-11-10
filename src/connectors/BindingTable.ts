@@ -29,7 +29,7 @@ export class BindingTable
     private static readonly ErrBinding = 'A binding needs a non-empty Model and Connector: ';
     private static readonly ConceptSeparator = ', concept ';
     private static readonly ModelWide = '';
-    private static readonly FingerprintSeparator = '\u0000';
+    private static readonly NoStubs = '';
 
     /** Per model: concept name (ModelWide for the model-wide binding) → connector. */
     private readonly models = new Map<string, Map<string, string>>();
@@ -247,21 +247,31 @@ export class BindingTable
     }
 
     /**
-     * A canonical text of the table: the DefaultConnector and every (model, concept, connector) binding, sorted. Two
-     * tables have the same fingerprint exactly when SameAs holds.
+     * A canonical text of exactly what decides which nodes resolve to a connector in `external` (the stub rule, final
+     * review): '' when no binding names one. Otherwise, sorted, every binding (model, concept or '' for model-wide,
+     * External or not) of each model that has a binding to an External connector; which connector a binding names
+     * is left out, only whether it is External (a non-External binding of such a model can shadow an External one in
+     * some catalog, so it counts; models without an External binding never resolve External, because the
+     * DefaultConnector is never External, ConnectorSetup). Two tables have the same stub fingerprint exactly when
+     * they assign External or not to the same (model, concept) keys in models binding External, so under every catalog
+     * they make the same nodes stubs; re-pointing a binding between connectors of the same residency, adding an
+     * unbound connector or changing a model without External bindings keeps it.
      */
-    public Fingerprint(): string
+    public StubFingerprint(external: ReadonlySet<string>): string
     {
-        const rows: string[][] = [];
+        const rows: string[] = [];
         for (const [model, byConcept] of this.models)
         {
+            if (![...byConcept.values()].some(c => external.has(c)))
+            {
+                continue;
+            }
             for (const [concept, connector] of byConcept)
             {
-                rows.push([model, concept, connector]);
+                rows.push(JSON.stringify([model, concept, external.has(connector)]));
             }
         }
-        rows.sort((a, b) => BindingTable.Compare(a.join(BindingTable.FingerprintSeparator), b.join(BindingTable.FingerprintSeparator)));
-        return JSON.stringify([this.DefaultConnector ?? null, rows]);
+        return rows.length === 0 ? BindingTable.NoStubs : JSON.stringify(rows.sort(BindingTable.Compare));
     }
 
     /** True when `other` holds the same bindings (by model and concept) and the same DefaultConnector. */
