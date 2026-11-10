@@ -19,7 +19,9 @@ import type { GraphTransaction } from '../../GraphTransaction.js';
 import { Keyspace } from '../../kv/Keyspace.js';
 import { EngineInternals } from '../../tests/EngineInternals.js';
 import { CommitError, CommitErrorCode } from '../CommitError.js';
+import { CommitKind } from '../LogEntry.js';
 import { WriteBatch } from '../WriteBatch.js';
+import { FakeConnector } from '../../connectors/tests/FakeConnector.js';
 
 /**
  * Schema: team { assigned -> ticket (many) }, ticket, person. jira models hold tickets in the external
@@ -46,6 +48,10 @@ class StubFx
     public static readonly A = 'a';
     public static readonly B = 'b';
     public static readonly Local = 'local';
+    public static readonly Z = 'z';
+    public static readonly R1 = 'r1';
+    public static readonly R2 = 'r2';
+    public static readonly V1 = 'v1';
     private static readonly NoExternal = 'no external connector';
 
     public static readonly Target = Object.freeze({ Concept: StubFx.Ticket, Owner: StubFx.Jira });
@@ -238,6 +244,44 @@ class StubFx
             Seed: [],
             Bindings: withTicket ? [{ Model: StubFx.Jira, Concept: StubFx.Ticket, Connector: StubFx.Ext }] : [],
         };
+    }
+
+    /**
+     * ticket { ref } indexed by byRef and uniqRef, team { assigned -> ticket }; jira's tickets bound to ext when
+     * `external`, else engine-held. No seed.
+     */
+    public static Residency(version: string, external: boolean): ISchemaDescription
+    {
+        return {
+            Version: version,
+            Definitions: [
+                { Name: StubFx.Ticket, IsAspect: false, Parent: null, Aspects: [], Members: [{ Name: StubFx.Ref, Kind: MemberKind.Property, Type: ValueType.String, Nullable: true }] },
+                { Name: StubFx.Team, IsAspect: false, Parent: null, Aspects: [], Members: [{ Name: StubFx.Assigned, Kind: MemberKind.Relationship, Targets: [StubFx.Ticket], Many: true }] },
+            ],
+            Indexes: [
+                { Name: StubFx.ByRef, On: StubFx.Ticket, Members: [StubFx.Ref], Unique: false },
+                { Name: StubFx.UniqRef, On: StubFx.Ticket, Members: [StubFx.Ref], Unique: true },
+            ],
+            Seed: [],
+            Bindings: external ? [{ Model: StubFx.Jira, Concept: StubFx.Ticket, Connector: StubFx.Ext }] : [],
+        };
+    }
+
+    /** The raw stored cell of the node's ref (engine storage, bypassing every reader rule); undefined when the node is gone. */
+    public static async RawRef(g: GraphStore, publicId: string): Promise<unknown>
+    {
+        const context = EngineInternals.Context(g);
+        const txn = await context.Store.BeginRead();
+        try
+        {
+            const id = await context.Ids.Resolve(txn, publicId);
+            const location = id === undefined ? undefined : await context.Rows.Locate(txn, id);
+            return location === undefined ? undefined : await context.Columns.ReadCell(txn, location, context.Committer.Catalog.Member(StubFx.Ticket, StubFx.Ref));
+        }
+        finally
+        {
+            txn.dispose();
+        }
     }
 
     /** A store upgraded to the full description, teams a and b, and stubs x (from a) and y (from b). */
@@ -453,6 +497,80 @@ class StubFx
                 assert.equal(await StubFx.Exists(g, StubFx.Y), false);
                 assert.equal(await StubFx.Exists(g, StubFx.A), true);
                 await g.dispose();
+            });
+
+            it('upgrade flipping a binding to External strips engine data to a stub', async () =>
+            {
+                const g = await open();
+                await g.Upgrade(StubFx.Residency(StubFx.V1, false), [StubFx.External()]);
+                await StubFx.Commit(g, t =>
+                {
+                    t.CreateNode(StubFx.A, StubFx.Team);
+                    t.CreateNode(StubFx.Local, StubFx.Ticket);
+                });
+                // The entries the engine-held ticket keeps.
+                const empty = await StubFx.IndexEntries(g);
+                const data = await StubFx.Commit(g, t =>
+                {
+                    t.CreateNode(StubFx.X, StubFx.Ticket, { Owner: StubFx.Jira });
+                    t.SetProperty(StubFx.X, StubFx.Ref, StubFx.R1);
+                    t.CreateNode(StubFx.Z, StubFx.Ticket, { Owner: StubFx.Jira });
+                    t.SetProperty(StubFx.Z, StubFx.Ref, StubFx.R2);
+                    t.Link(StubFx.A, StubFx.Assigned, StubFx.X);
+                });
+                assert.equal(await StubFx.RawRef(g, StubFx.X), StubFx.R1);
+                assert.ok((await StubFx.IndexEntries(g)) > empty);
+                // The same version: only the residency changes.
+                const upgrade = await g.Upgrade(StubFx.Residency(StubFx.V1, true), [StubFx.External()]);
+                assert.equal(upgrade.Changed, false);
+                // An Upgrade commit of its own, logged and replayable from the changefeed.
+                assert.equal(upgrade.Commit, data + 1n);
+                const logged: CommitKind[] = [];
+                for await (const entry of g.ReadChanges(data)) logged.push(entry.Kind);
+                assert.deepEqual(logged, [CommitKind.Upgrade]);
+                // x keeps its identity, owner and incoming edge; its cells and index entries are gone.
+                assert.deepEqual(await StubFx.ConceptOwner(g, StubFx.X), [StubFx.Ticket, StubFx.Jira]);
+                assert.deepEqual(await StubFx.OutLinks(g, StubFx.A), [StubFx.X]);
+                assert.equal(await StubFx.RawRef(g, StubFx.X), null);
+                assert.deepEqual(await StubFx.Scanned(g, StubFx.Ticket), [StubFx.Local]);
+                assert.equal(await StubFx.IndexEntries(g), empty);
+                // z, left without an edge, does not survive as a stub (ruling R102).
+                assert.equal(await StubFx.Exists(g, StubFx.Z), false);
+                // The engine-held ticket stays engine data.
+                assert.deepEqual(await StubFx.ConceptOwner(g, StubFx.Local), [StubFx.Ticket, '']);
+                // The stub behaves as one: unlinking its last edge removes it.
+                await StubFx.Commit(g, t => t.Unlink(StubFx.A, StubFx.Assigned, StubFx.X));
+                assert.equal(await StubFx.Exists(g, StubFx.X), false);
+                await g.dispose();
+            });
+
+            it('upgrade flipping a binding off External deletes its stubs and their edges', async () =>
+            {
+                for (const connectors of [[StubFx.External()], [new FakeConnector(StubFx.Ext, [])]])
+                {
+                    const g = await open();
+                    await g.Upgrade(StubFx.Residency(StubFx.V1, true), [StubFx.External()]);
+                    await StubFx.Commit(g, t =>
+                    {
+                        t.CreateNode(StubFx.A, StubFx.Team);
+                        t.CreateNode(StubFx.B, StubFx.Team);
+                    });
+                    await StubFx.LinkStub(g, StubFx.A, StubFx.X);
+                    await StubFx.LinkStub(g, StubFx.B, StubFx.X);
+                    await StubFx.LinkStub(g, StubFx.A, StubFx.Y);
+                    // Engine-held again (no binding), or bound to a connector that is no longer External.
+                    const bound = connectors[0] instanceof FakeConnector;
+                    await g.Upgrade(StubFx.Residency(StubFx.V1, bound), connectors);
+                    assert.equal(await StubFx.Exists(g, StubFx.X), false);
+                    assert.equal(await StubFx.Exists(g, StubFx.Y), false);
+                    assert.deepEqual(await StubFx.OutLinks(g, StubFx.A), []);
+                    assert.deepEqual(await StubFx.OutLinks(g, StubFx.B), []);
+                    assert.equal(await StubFx.Exists(g, StubFx.A), true);
+                    // The id is free for an engine node now.
+                    await StubFx.Commit(g, t => t.CreateNode(StubFx.X, StubFx.Ticket, { Owner: StubFx.Jira }));
+                    assert.deepEqual(await StubFx.Scanned(g, StubFx.Ticket), [StubFx.X]);
+                    await g.dispose();
+                }
             });
 
             it('stub linked and unlinked in one batch leaves no stub', async () =>

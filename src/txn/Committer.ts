@@ -46,8 +46,8 @@ export interface ISchemaCommit
 export interface IUpgradeCommit
 {
     /**
-     * The Upgrade entry's commit number; when the catalog is unchanged, LastCommit() at the upgrade's turn (before any
-     * seed commit).
+     * The Upgrade entry's commit number (also written for an unchanged catalog when the residency reconciliation changed
+     * stored data, final review I2); otherwise LastCommit() at the upgrade's turn (before any seed commit).
      */
     readonly Commit: bigint;
     /** The catalog in force after the upgrade (the unchanged one when Changed is false). */
@@ -777,13 +777,14 @@ export class Committer
      * unchanged (a read decides: no write transaction). Otherwise one Write purges and saves a changed
      * catalog (Upgrade entry), applies the seed (Batch entry, when it has a data op; markers alone are no entry) and
      * writes the version. Seed ids come from a pre-pass outside the Write (ruling R16); when the purge removed a node
-     * the pre-pass saw, the upgrade re-runs once with those ids too, and a second miss is Internal.
+     * the pre-pass saw, the upgrade re-runs once with those ids too, and a second miss is Internal. A change of the stub
+     * rule (Committer.Reconciles) is never skipped: an unchanged catalog and version still write the reconciliation.
      */
     private async RunUpgrade(description: ISchemaDescription, connectors: ConnectorSetup | undefined): Promise<IUpgradeCommit>
     {
         const old = this.index;
         const plan = CatalogPlanner.Plan(old.Catalog, description);
-        if (!plan.Changed && (await this.StoredSchemaVersion()) === description.Version)
+        if (!plan.Changed && !this.Reconciles(plan, connectors) && (await this.StoredSchemaVersion()) === description.Version)
         {
             if (connectors !== undefined)
             {
@@ -843,35 +844,64 @@ export class Committer
         return out;
     }
 
-    /** One upgrade attempt: a single store.Write, then history, catalog and signals. */
+    /**
+     * True when the upgrade must reconcile stored data with the stub rule (final review I2): some External connector is
+     * installed before or after it, and either the catalog changes (a hierarchy change can move a node's binding) or the
+     * rule itself does (StubRule.SameAs over the installed and the new setup).
+     */
+    private Reconciles(plan: ICatalogPlan, connectors: ConnectorSetup | undefined): boolean
+    {
+        const before = new StubRule(this.connectors);
+        const after = new StubRule(connectors ?? this.connectors);
+        return (before.IsActive || after.IsActive) && (plan.Changed || !before.SameAs(after));
+    }
+
+    /**
+     * One upgrade attempt: a single store.Write, then history, catalog and signals. The purge (a changed catalog) and the
+     * residency reconciliation (DataPurger.Reconcile, when Reconciles) run first; an upgrade whose reconciliation changed
+     * stored data is an Upgrade commit (entry, history keys, signal) even when the catalog is unchanged.
+     */
     private async WriteUpgrade(description: ISchemaDescription, plan: ICatalogPlan, ids: ReadonlyMap<string, bigint>, connectors: ConnectorSetup | undefined): Promise<IUpgradeCommit>
     {
         const old = this.index;
         const next = plan.Changed ? new CatalogIndex(plan.Catalog) : old;
         const last = this.history.Last;
-        const upgradeCommit = plan.Changed ? last + 1n : undefined;
-        const seedCommit = (upgradeCommit ?? last) + 1n;
+        const before = new StubRule(this.connectors);
+        const after = new StubRule(connectors ?? this.connectors);
+        const reconciles = this.Reconciles(plan, connectors);
+        let upgradeCommit: bigint | undefined;
+        let seedCommit = last + 1n;
         const keys = new WriteKeySet();
         const seed = await this.store.Write(async txn =>
         {
             await this.RequireCurrent(txn);
-            let change: ISeedCatalogChange | undefined;
+            const modified = new Set<string>();
             if (plan.Changed)
             {
-                const stats = await this.purger.Purge(txn, old, next, plan.Diff, keys, new StubRule(connectors ?? this.connectors));
-                change = { Modified: new Set(stats.ModifiedNodes) };
+                const stats = await this.purger.Purge(txn, old, next, plan.Diff, keys, after);
+                stats.ModifiedNodes.forEach(id => modified.add(id));
             }
+            let reconciled = false;
+            if (reconciles)
+            {
+                const stats = await this.purger.Reconcile(txn, old, next, keys, before, after);
+                reconciled = stats.NodesStripped + stats.NodesRemoved + stats.EdgesRemoved > 0;
+                stats.ModifiedNodes.forEach(id => modified.add(id));
+            }
+            upgradeCommit = plan.Changed || reconciled ? last + 1n : undefined;
+            seedCommit = (upgradeCommit ?? last) + 1n;
+            const change: ISeedCatalogChange | undefined = upgradeCommit === undefined ? undefined : { Modified: modified };
             const applied = await this.ApplySeed(txn, next, description.Seed, ids, change);
             await this.Compact(txn, next);
             this.Flush(txn);
-            if (upgradeCommit !== undefined)
+            if (plan.Changed)
             {
                 await CatalogStore.Save(txn, plan.Catalog);
             }
             FormatMeta.WriteSchemaVersion(txn, description.Version);
             if (upgradeCommit !== undefined)
             {
-                this.log.Append(txn, upgradeCommit, LogEntry.EncodeUpgrade(plan.Catalog, description.Version));
+                this.log.Append(txn, upgradeCommit, LogEntry.EncodeUpgrade(next.Catalog, description.Version));
             }
             if (applied !== undefined)
             {
@@ -905,10 +935,10 @@ export class Committer
             this.RaiseApplied({
                 Commit: upgradeCommit,
                 Kind: CommitKind.Upgrade,
-                CatalogVersion: plan.Catalog.Version,
+                CatalogVersion: next.Catalog.Version,
                 Batch: Committer.EmptyBatch,
                 CreatedIds: Object.freeze([]),
-                Catalog: plan.Catalog,
+                Catalog: next.Catalog,
                 SchemaVersion: description.Version,
             });
         }
