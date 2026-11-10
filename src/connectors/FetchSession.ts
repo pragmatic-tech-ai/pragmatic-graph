@@ -77,7 +77,7 @@ export class FetchSession
                     return entry.Row;
                 }
             }
-            else if (this.misses.has(missKey))
+            if (this.misses.has(missKey))
             {
                 continue;
             }
@@ -152,7 +152,11 @@ export class FetchSession
         while (resume !== undefined);
     }
 
-    /** The newer fetch replaces a non-covering entry whole: merging two fetches values would mix moments within one entry (D3). Records the row unless the session already holds one covering the request's members; returns the row to use. */
+    /**
+     * Records the row unless the session already holds one covering the request's members; returns the row to use.
+     * The newer fetch replaces a non-covering entry whole: merging two fetches' values would mix moments within one
+     * entry (D3). A stored row clears the recorded misses of its id.
+     */
     private Remember(target: IFetchTarget, request: IFetchRequest, row: IFetchedRow): IFetchedRow
     {
         const entry = this.memo.get(row.PublicId);
@@ -160,6 +164,7 @@ export class FetchSession
         {
             return entry.Row;
         }
+        this.ClearMisses(row.PublicId);
         this.memo.set(row.PublicId, { Row: row, Model: target.Model, Members: new Set(request.Members) });
         return row;
     }
@@ -212,6 +217,18 @@ export class FetchSession
             catch (cause)
             {
                 throw new GraphError(GraphErrorCode.SchemaViolation, FetchSession.ErrValue + name, cause);
+            }
+        }
+    }
+
+    private ClearMisses(publicId: string): void
+    {
+        const prefix = publicId + FetchSession.KeySeparator;
+        for (const key of [...this.misses])
+        {
+            if (key.startsWith(prefix))
+            {
+                this.misses.delete(key);
             }
         }
     }

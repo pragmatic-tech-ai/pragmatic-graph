@@ -312,6 +312,18 @@ describe('FetchSession', () =>
         assert.equal(ext.Requests.length, 2);
     });
 
+    it('a recorded miss is honoured even with a non-covering entry', async () =>
+    {
+        const ext = new FakeExternalConnector(SessionFx.Ext, [[SessionFx.Row('x', SessionFx.Server, [])]]);
+        const session = await SessionFx.Session(ext);
+        await SessionFx.Drain(session.Scan(SessionFx.Target(), Predicate.True, []));
+        ext.Override = () => ({ Rows: [] });
+        assert.equal(await session.Lookup('x', [SessionFx.Target()]), undefined);
+        assert.equal(ext.Requests.length, 2);
+        assert.equal(await session.Lookup('x', [SessionFx.Target()]), undefined);
+        assert.equal(ext.Requests.length, 2);
+    });
+
     it('reverse with capability fetches and memoises', async () =>
     {
         const ext = new FakeExternalConnector(SessionFx.Ext, [[SessionFx.Row('a')]]);
