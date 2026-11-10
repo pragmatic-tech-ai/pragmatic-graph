@@ -52,6 +52,12 @@ export class RecordedReads
         return this.connectors;
     }
 
+    /** True when the reader opened with at least one External connector installed (else no node is a stub). */
+    public get HasExternal(): boolean
+    {
+        return this.connectors !== undefined && this.connectors.External.size > 0;
+    }
+
     /**
      * True iff the stored node is a stub (ruling D2): its (owner, concept) resolves to an External connector. Records the
      * node's binding (through Owner) when any External connector is installed; reads nothing otherwise.

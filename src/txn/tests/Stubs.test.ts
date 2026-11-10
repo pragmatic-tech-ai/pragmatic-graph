@@ -13,6 +13,7 @@ import type { ISchemaDescription } from '../../schema/SchemaDescription.js';
 import { BindingTable } from '../../connectors/BindingTable.js';
 import { ConnectorResidency, type IExternalConnector } from '../../connectors/FetchContract.js';
 import { EdgeDirection } from '../../format/FormatKeys.js';
+import { FederatedReads } from '../../FederatedReads.js';
 import { GraphStore } from '../../GraphStore.js';
 import type { GraphTransaction } from '../../GraphTransaction.js';
 import { Keyspace } from '../../kv/Keyspace.js';
@@ -150,12 +151,13 @@ class StubFx
         return (await StubFx.ConceptOwner(g, id))[0] !== undefined;
     }
 
+    /** The node's assigned edges as stored, stub far ends included (the internal channel: the public reader omits them). */
     public static async OutLinks(g: GraphStore, id: string): Promise<string[]>
     {
         const r = await g.BeginRead(AccessScope.System);
         try
         {
-            return (await r.Links(id, EdgeDirection.Out, StubFx.Assigned)).map(l => l.PublicId);
+            return (await FederatedReads.Of(r).Links(id, EdgeDirection.Out, StubFx.Assigned)).map(l => l.PublicId);
         }
         finally
         {
@@ -273,6 +275,38 @@ class StubFx
                 assert.deepEqual(await StubFx.Scanned(g, StubFx.Ticket), [StubFx.Local], 'a stub is not engine data');
                 await StubFx.Commit(g, t => t.Unlink(StubFx.A, StubFx.Assigned, StubFx.X));
                 assert.equal(await StubFx.CellEntries(g), before, 'deleting the stub wrote no cell either');
+                await g.dispose();
+            });
+
+            it('the scoped reader serves no stub data and omits stub far ends, but keeps its identity', async () =>
+            {
+                const g = await StubFx.Ready(open);
+                await StubFx.LinkStub(g, StubFx.A, StubFx.X);
+                await StubFx.Commit(g, t => t.Link(StubFx.A, StubFx.Assigned, StubFx.Local));
+                const allow = Scope.Build({ Default: AccessDefault.Allow });
+                for (const scope of [AccessScope.System, allow])
+                {
+                    const r = await g.BeginRead(scope);
+                    try
+                    {
+                        assert.equal(await r.GetProperty(StubFx.X, StubFx.Ref), undefined);
+                        assert.equal(await r.ReadNode(StubFx.X), undefined);
+                        assert.deepEqual((await r.Links(StubFx.A, EdgeDirection.Out)).map(l => l.PublicId), [StubFx.Local]);
+                        assert.deepEqual((await r.Links(StubFx.A, EdgeDirection.Out, StubFx.Assigned)).map(l => l.PublicId), [StubFx.Local]);
+                        assert.deepEqual(await r.Neighbors(StubFx.A, StubFx.Assigned, EdgeDirection.Out), [StubFx.Local]);
+                        // Identity stays readable (ruling D2): the stub exists, owned by its model, unseeded.
+                        assert.equal(await r.ConceptOf(StubFx.X), StubFx.Ticket);
+                        assert.equal(await r.OwnerOf(StubFx.X), StubFx.Jira);
+                        assert.equal(await r.IsSeeded(StubFx.X), false);
+                        // Engine nodes are unaffected.
+                        assert.equal((await r.ReadNode(StubFx.Local))?.Concept, StubFx.Ticket);
+                        assert.equal(await r.GetProperty(StubFx.Local, StubFx.Ref), null);
+                    }
+                    finally
+                    {
+                        r.dispose();
+                    }
+                }
                 await g.dispose();
             });
 

@@ -199,7 +199,8 @@ export class GraphReader implements IGraphDisposable
 
     /**
      * The property's value (null for an unset nullable property or a member the scope hides), or
-     * undefined when no visible node has the public id. Errors are GraphErrors with the codes a commit
+     * undefined when no visible node has the public id or the node is a stub (ruling D2, final review I3: a stub's
+     * data lives in its External connector; this reader serves engine data only). Errors are GraphErrors with the codes a commit
      * uses for the same mistake (ruling F8): unknown members are a CatalogError and relationship members
      * a GraphError (both SchemaViolation); public ids over 400 UTF-8 bytes a PublicIdTooLongError
      * (InvalidArgument).
@@ -207,7 +208,7 @@ export class GraphReader implements IGraphDisposable
     public async GetProperty(publicId: string, member: string): Promise<CellValue | undefined>
     {
         this.RequireOpen();
-        const node = await this.Locate(publicId);
+        const node = await this.EngineNode(publicId);
         if (node === undefined)
         {
             return undefined;
@@ -226,13 +227,13 @@ export class GraphReader implements IGraphDisposable
 
     /**
      * The whole node: concept, owner and every effective property the scope does not hide (null for an
-     * unset one), in effective member order. Undefined when no visible node has the public id. Records
-     * the node's binding and one Cell key per returned property, as GetProperty does.
+     * unset one), in effective member order. Undefined when no visible node has the public id or the node is a stub
+     * (as GetProperty). Records the node's binding and one Cell key per returned property, as GetProperty does.
      */
     public async ReadNode(publicId: string): Promise<INodeView | undefined>
     {
         this.RequireOpen();
-        const node = await this.Locate(publicId);
+        const node = await this.EngineNode(publicId);
         if (node === undefined)
         {
             return undefined;
@@ -253,8 +254,9 @@ export class GraphReader implements IGraphDisposable
      * Every edge of the node in `direction` whose far node is visible: Out follows each relationship
      * effective on the node's concept in effective member order (parent's, then aspects', then own),
      * In each relationship targeting the concept (catalog order); within one relationship in edge order.
-     * A relationship the scope hides on its source concept is omitted. A missing or invisible node has
-     * none. Records the node's binding and the adjacency ranges, as Neighbors does. With `relationship`
+     * A relationship the scope hides on its source concept is omitted, and so is an edge whose far node is a stub
+     * (final review I3: this reader serves engine data only; Cypher resolves stubs through its connector). A missing
+     * or invisible node has none. Records the node's binding and the adjacency ranges, as Neighbors does. With `relationship`
      * only edges of that relationship are walked and only its adjacency ranges are recorded; a node whose
      * concept has no such relationship (in that direction) has none, rather than an error as in Neighbors.
      * `probe` ticks once per adjacency entry examined.
@@ -289,15 +291,10 @@ export class GraphReader implements IGraphDisposable
             {
                 this.RequireOpen();
                 probe?.Tick();
-                if (evaluator === undefined)
+                const neighbor = await this.EngineNeighbor(id, rel.Name, direction);
+                if (neighbor !== undefined)
                 {
-                    out.push({ Relationship: rel.Name, PublicId: await this.recorded.PublicIdOf(id) });
-                    continue;
-                }
-                const neighbor = await evaluator.VisibleById(id);
-                if (neighbor !== undefined && (direction === EdgeDirection.Out || !evaluator.HiddenMembers(neighbor.Concept).has(rel.Name)))
-                {
-                    out.push({ Relationship: rel.Name, PublicId: neighbor.PublicId });
+                    out.push({ Relationship: rel.Name, PublicId: neighbor });
                 }
             }
         }
@@ -308,7 +305,8 @@ export class GraphReader implements IGraphDisposable
      * Public ids of the visible nodes at the far end of the node's `relationship` edges, in edge order
      * (ordered relationships keep their insertion order). Out follows the node's own relationship; In
      * follows every relationship of that name whose targets admit the node's concept. A missing or
-     * invisible node has none; a relationship the scope hides on its source concept yields none.
+     * invisible node has none; a relationship the scope hides on its source concept yields none; a far node that is
+     * a stub is omitted (as Links).
      */
     public async Neighbors(publicId: string, relationship: string, direction: EdgeDirection): Promise<string[]>
     {
@@ -323,20 +321,8 @@ export class GraphReader implements IGraphDisposable
             return [];
         }
         const rels = this.recorded.Relationships(node.Concept, relationship, direction);
-        const evaluator = this.evaluator;
         const out: string[] = [];
-        if (evaluator === undefined)
-        {
-            for (const rel of rels)
-            {
-                for await (const id of this.recorded.Adjacent(rel, node.Id, direction))
-                {
-                    out.push(await this.recorded.PublicIdOf(id));
-                }
-            }
-            return out;
-        }
-        if (direction === EdgeDirection.Out && evaluator.HiddenMembers(node.Concept).has(relationship))
+        if (direction === EdgeDirection.Out && this.evaluator?.HiddenMembers(node.Concept).has(relationship) === true)
         {
             return out;
         }
@@ -344,15 +330,45 @@ export class GraphReader implements IGraphDisposable
         {
             for await (const id of this.recorded.Adjacent(rel, node.Id, direction))
             {
-                const neighbor = await evaluator.VisibleById(id);
-                // In: the edge is a member of the neighbor (its source), so the neighbor's Hidden decides.
-                if (neighbor !== undefined && (direction === EdgeDirection.Out || !evaluator.HiddenMembers(neighbor.Concept).has(relationship)))
+                const neighbor = await this.EngineNeighbor(id, relationship, direction);
+                if (neighbor !== undefined)
                 {
-                    out.push(neighbor.PublicId);
+                    out.push(neighbor);
                 }
             }
         }
         return out;
+    }
+
+    /** The located node unless it is a stub (Locate's recording, plus the node's binding when External connectors exist). */
+    private async EngineNode(publicId: string): Promise<IReadNode | undefined>
+    {
+        const node = await this.Locate(publicId);
+        return node === undefined || (await this.recorded.IsStub(node)) ? undefined : node;
+    }
+
+    /**
+     * The public id of an edge's far node as Links and Neighbors report it: undefined when it is a stub or invisible, or
+     * for an In edge whose source (the far node) hides the relationship.
+     */
+    private async EngineNeighbor(id: bigint, relationship: string, direction: EdgeDirection): Promise<string | undefined>
+    {
+        const evaluator = this.evaluator;
+        if (evaluator === undefined && !this.recorded.HasExternal)
+        {
+            return this.recorded.PublicIdOf(id);
+        }
+        const far = evaluator === undefined ? await this.recorded.NodeById(id) : await evaluator.VisibleById(id);
+        if (far === undefined || (await this.recorded.IsStub(far)))
+        {
+            return undefined;
+        }
+        // In: the edge is a member of the far node (its source), so the far node's Hidden decides.
+        if (direction === EdgeDirection.In && evaluator?.HiddenMembers(far.Concept).has(relationship) === true)
+        {
+            return undefined;
+        }
+        return far.PublicId;
     }
 
     /**

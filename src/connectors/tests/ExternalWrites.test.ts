@@ -283,12 +283,13 @@ class ExtFx
         }
     }
 
+    /** The node's stored out-edges, stub far ends included (the internal channel: the public reader omits them). */
     public async LinksOf(publicId: string): Promise<readonly string[]>
     {
         const r = await this.Engine.BeginRead(AccessScope.System);
         try
         {
-            return (await r.Links(publicId, EdgeDirection.Out)).map(l => l.PublicId);
+            return (await FederatedReads.Of(r).Links(publicId, EdgeDirection.Out)).map(l => l.PublicId);
         }
         finally
         {
