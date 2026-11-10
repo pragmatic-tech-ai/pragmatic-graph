@@ -162,7 +162,7 @@ describe('FetchSession', () =>
         let ticks = 0;
         const ids = await SessionFx.Drain(session.Scan(SessionFx.Target(), Predicate.True, [SessionFx.Label], { Tick: () => { ticks++; } }));
         assert.deepEqual(ids, ['a', 'b', 'c', 'd']);
-        assert.equal(ticks, 4);
+        assert.equal(ticks, 3 + 4);
         assert.deepEqual(ext.Requests.map(r => r.Resume), [undefined, '1', '2']);
     });
 
@@ -224,6 +224,79 @@ describe('FetchSession', () =>
         const session = await SessionFx.Session(ext);
         assert.deepEqual(await SessionFx.Drain(session.Reverse(SessionFx.Target(), SessionFx.Next, 't')), []);
         assert.equal(ext.Requests.length, 0);
+    });
+
+    it('dropped rows and empty pages tick the probe', async () =>
+    {
+        const ext = new FakeExternalConnector(SessionFx.Ext, [[SessionFx.Row('l', SessionFx.Laptop)], [], [SessionFx.Row('a'), SessionFx.Row('l2', SessionFx.Laptop)]]);
+        const session = await SessionFx.Session(ext);
+        let ticks = 0;
+        const ids = await SessionFx.Drain(session.Scan(SessionFx.Target(), Predicate.True, [SessionFx.Label], { Tick: () => { ticks++; } }));
+        assert.deepEqual(ids, ['a']);
+        assert.equal(ticks, 3 + 3);
+    });
+
+    it('lookup after a narrow scan refetches the full row', async () =>
+    {
+        const ext = new FakeExternalConnector(SessionFx.Ext, []);
+        ext.Override = request => ({ Rows: [request.Keys === undefined ? SessionFx.Row('a', SessionFx.Server, []) : SessionFx.Row('a')] });
+        const session = await SessionFx.Session(ext);
+        await SessionFx.Drain(session.Scan(SessionFx.Target(), Predicate.True, []));
+        const full = await session.Lookup('a', [SessionFx.Target()]);
+        assert.equal(full?.Values.get(SessionFx.Label), 'a');
+        assert.equal(ext.Requests.length, 2);
+        assert.equal(await session.Lookup('a', [SessionFx.Target()]), full);
+        assert.equal(ext.Requests.length, 2);
+    });
+
+    it('scan after a full lookup yields the full row', async () =>
+    {
+        const ext = new FakeExternalConnector(SessionFx.Ext, []);
+        ext.Override = request => ({ Rows: [request.Keys === undefined ? SessionFx.Row('a', SessionFx.Server, []) : SessionFx.Row('a')] });
+        const session = await SessionFx.Session(ext);
+        const full = await session.Lookup('a', [SessionFx.Target()]);
+        const rows: IFetchedRow[] = [];
+        for await (const row of session.Scan(SessionFx.Target(), Predicate.True, []))
+        {
+            rows.push(row);
+        }
+        assert.deepEqual(rows, [full]);
+        assert.equal(rows[0], full);
+        assert.equal(await session.Lookup('a', [SessionFx.Target()]), full);
+    });
+
+    it('lookup ignores rows of other ids without validating or memoising them', async () =>
+    {
+        const ext = new FakeExternalConnector(SessionFx.Ext, []);
+        ext.Override = () => ({ Rows: [SessionFx.Row('foreign', SessionFx.Gadget, []), SessionFx.Row('a')] });
+        const session = await SessionFx.Session(ext);
+        assert.equal((await session.Lookup('a', [SessionFx.Target()]))?.PublicId, 'a');
+        ext.Override = () => ({ Rows: [] });
+        assert.equal(await session.Lookup('foreign', [SessionFx.Target()]), undefined);
+        assert.equal(ext.Requests.length, 2);
+    });
+
+    it('a scan replaces a memoised miss', async () =>
+    {
+        const ext = new FakeExternalConnector(SessionFx.Ext, []);
+        ext.Override = request => ({ Rows: request.Keys === undefined ? [SessionFx.Row('z')] : [] });
+        const session = await SessionFx.Session(ext);
+        assert.equal(await session.Lookup('z', [SessionFx.Target()]), undefined);
+        await SessionFx.Drain(session.Scan(SessionFx.Target(), Predicate.True, [SessionFx.Label]));
+        assert.equal((await session.Lookup('z', [SessionFx.Target()]))?.PublicId, 'z');
+        assert.equal(ext.Requests.length, 2);
+    });
+
+    it('a memo hit that does not satisfy the candidates is not found and not evicted', async () =>
+    {
+        const ext = new FakeExternalConnector(SessionFx.Ext, [[SessionFx.Row('a')]]);
+        const session = await SessionFx.Session(ext);
+        await SessionFx.Drain(session.Scan(SessionFx.Target(), Predicate.True, [SessionFx.Label]));
+        ext.Override = () => ({ Rows: [] });
+        assert.equal(await session.Lookup('a', [SessionFx.Target(SessionFx.Laptop)]), undefined);
+        const other: IFetchTarget = { Model: 'm2', Concept: SessionFx.Asset, Connector: SessionFx.Ext };
+        assert.equal(await session.Lookup('a', [other]), undefined);
+        assert.equal((await session.Lookup('a', [SessionFx.Target()]))?.PublicId, 'a');
     });
 
     it('reverse with capability fetches and memoises', async () =>
