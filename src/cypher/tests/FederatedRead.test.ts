@@ -24,25 +24,31 @@ import { CypherFixture } from './CypherFixture.js';
 
 /**
  * A scripted External connector holding Ticket rows. Requests are logged; with Honour it applies the node-local
- * request predicate (as a push-down connector would), else it ignores it. Pages hold two rows (Resume tokens).
- * Keys and Reverse requests are answered from the rows; Fail makes every Fetch reject, FailKeys every key lookup.
+ * request predicate (as a push-down connector would), else it ignores it; with HonourMembers it returns only the
+ * requested Members' values. Pages hold two rows (Resume tokens). Keys and Reverse requests are answered from the rows
+ * (IgnoreKeys answers a Keys request as a scan); Fail makes every Fetch reject, FailKeys every key lookup. ByModel gives
+ * a model its own rows instead of Rows.
  */
 class TicketConnector implements IExternalConnector
 {
     private static readonly ReadOnly = 'read-only';
     private static readonly Boom = 'ticket source down';
     private static readonly PageSize = 2;
+    private static readonly Root = 'Ticket';
 
     public readonly Residency = ConnectorResidency.External as const;
     public readonly Requests: IFetchRequest[] = [];
     public readonly Capabilities: IConnectorCapabilities;
     public Honour = false;
+    public HonourMembers = false;
+    public IgnoreKeys = false;
     public Fail = false;
     public FailKeys = false;
+    public readonly ByModel = new Map<string, IFetchedRow[]>();
 
-    public constructor(public readonly Name: string, public Rows: IFetchedRow[], reverse: boolean)
+    public constructor(public readonly Name: string, public Rows: IFetchedRow[], reverse: boolean, keyLookup = true)
     {
-        this.Capabilities = { KeyLookup: true, ReverseLookup: reverse, PushDown: new Set([PredicateKind.Compare, PredicateKind.In, PredicateKind.IsNull, PredicateKind.And]) };
+        this.Capabilities = { KeyLookup: keyLookup, ReverseLookup: reverse, PushDown: new Set([PredicateKind.Compare, PredicateKind.In, PredicateKind.IsNull, PredicateKind.And]) };
     }
 
     public Begin(): Promise<IConnectorTransaction>
@@ -57,12 +63,22 @@ class TicketConnector implements IExternalConnector
         {
             return Promise.reject(new Error(TicketConnector.Boom));
         }
-        if (request.Keys !== undefined)
+        let rows = this.ByModel.get(request.Model) ?? this.Rows;
+        if (request.Concept !== TicketConnector.Root)
+        {
+            // A fetch of a subtype returns that subtype's rows only (the fixture's subtypes have no subtypes).
+            rows = rows.filter(r => r.Concept === request.Concept);
+        }
+        if (this.HonourMembers)
+        {
+            const wanted = new Set(request.Members);
+            rows = rows.map(r => ({ ...r, Values: new Map([...r.Values].filter(([name]) => wanted.has(name))) }));
+        }
+        if (request.Keys !== undefined && !this.IgnoreKeys)
         {
             const keys = new Set(request.Keys);
-            return Promise.resolve({ Rows: this.Rows.filter(r => keys.has(r.PublicId)) });
+            return Promise.resolve({ Rows: rows.filter(r => keys.has(r.PublicId)) });
         }
-        let rows = this.Rows;
         if (request.Reverse !== undefined)
         {
             const reverse = request.Reverse;
@@ -81,8 +97,12 @@ class TicketConnector implements IExternalConnector
 interface IFedOptions
 {
     readonly Reverse?: boolean;
+    /** False: the connector declares no KeyLookup. */
+    readonly KeyLookup?: boolean;
     /** Rows the connector holds beyond FedFx.Rows. */
     readonly Extra?: readonly IFetchedRow[];
+    /** Also binds model jira2's Tickets to ext. */
+    readonly SecondModel?: boolean;
 }
 
 /**
@@ -100,6 +120,7 @@ class FedFx
     public static readonly Ticket = 'Ticket';
     public static readonly Bug = 'Bug';
     public static readonly Jira = 'jira';
+    public static readonly Jira2 = 'jira2';
     public static readonly Ext = 'ext';
     public static readonly NoOwner = '';
     public static readonly Assigned = 'assigned';
@@ -131,6 +152,13 @@ class FedFx
     public static readonly One = 'one';
     public static readonly Two = 'two';
     public static readonly Three = 'three';
+    public static readonly Five = 'five';
+    public static readonly Nine = 'nine';
+    public static readonly OtherOne = 'other one';
+    public static readonly Zed = 'zed';
+    public static readonly T5 = 't5';
+    public static readonly T9 = 't9';
+    public static readonly Z1 = 'z1';
     public static readonly Dup = 'dup';
     public static readonly S1 = 's1';
     public static readonly S2 = 's2';
@@ -173,7 +201,12 @@ class FedFx
 
     public static async Open(storage: IEngineStorage, options: IFedOptions = {}): Promise<FedFx>
     {
-        const connector = new TicketConnector(FedFx.Ext, [...FedFx.Rows(), ...(options.Extra ?? [])], options.Reverse ?? true);
+        const connector = new TicketConnector(FedFx.Ext, [...FedFx.Rows(), ...(options.Extra ?? [])], options.Reverse ?? true, options.KeyLookup ?? true);
+        const bindings = [{ Model: FedFx.Jira, Concept: FedFx.Ticket, Connector: FedFx.Ext }];
+        if (options.SecondModel === true)
+        {
+            bindings.push({ Model: FedFx.Jira2, Concept: FedFx.Ticket, Connector: FedFx.Ext });
+        }
         const engine = await GraphEngine.Open({
             Description: {
                 Version: FedFx.Version,
@@ -191,7 +224,7 @@ class FedFx
                     CypherFixture.Node(FedFx.B, FedFx.Team, { name: FedFx.Other }),
                     CypherFixture.Node(FedFx.Local, FedFx.Ticket, { title: FedFx.Zero, state: FedFx.OpenState, rank: 0n }),
                 ],
-                Bindings: [{ Model: FedFx.Jira, Concept: FedFx.Ticket, Connector: FedFx.Ext }],
+                Bindings: bindings,
             },
             Storage: storage,
             Connectors: [connector],
@@ -314,6 +347,12 @@ class FederatedSuite
         Default: AccessDefault.Allow,
         Rows: new Map<string, Predicate>([[FedFx.Ticket, new IsNull(FedFx.Secret)]]),
         Hidden: new Map([[FedFx.Ticket, new Set([FedFx.Secret])]]),
+    });
+
+    /** Bugs are visible only without a severity; Tickets always. */
+    private static readonly NoSeverityBugs = AccessScope.Build({
+        Default: AccessDefault.Allow,
+        Rows: new Map<string, Predicate>([[FedFx.Bug, new IsNull(FedFx.Severity)]]),
     });
 
     /** Default Deny with a Rows entry on the subtype only: Tickets are invisible, open Bugs visible. */
@@ -563,8 +602,9 @@ class FederatedSuite
                 const blind = await FedFx.Open(storage(), { Reverse: false });
                 try
                 {
+                    // No ReverseLookup: the incoming expand scans the declaring concept under the scope instead.
                     const reverse = await blind.Run('MATCH (a:Team {name: \'core\'})<-[:team]-(t) RETURN t');
-                    assert.deepEqual(FedFx.Col(reverse), []);
+                    assert.deepEqual(FedFx.Col(reverse), [FedFx.T1]);
                     assert.ok(blind.Connector.Requests.every(r => r.Reverse === undefined));
                 }
                 finally
@@ -754,6 +794,141 @@ class FederatedSuite
                     }
                     assert.deepEqual(pages, full);
                     assert.equal(new Set(pages).size, 4);
+                }
+                finally
+                {
+                    await fx.dispose();
+                }
+            });
+
+            it('a subtype reached through a link or a reverse fetch carries its own properties, so IsNull fails closed', async () =>
+            {
+                const extra = [
+                    FedFx.Row(FedFx.T9, { title: FedFx.Nine, state: FedFx.OpenState }, { parent: [FedFx.B1] }),
+                    FedFx.Row(FedFx.B1, { title: FedFx.B1, state: FedFx.OpenState, severity: FedFx.High }, {}, FedFx.Bug),
+                    FedFx.Row(FedFx.B2, { title: FedFx.B2, state: FedFx.OpenState, severity: FedFx.High }, { parent: [FedFx.T9] }, FedFx.Bug),
+                ];
+                const fx = await FedFx.Open(storage(), { Extra: extra });
+                try
+                {
+                    // Push-down and member projection honoured: the scan returns t9 alone, so b1 and b2 come from a
+                    // key lookup and a reverse fetch, each of which must ask for Bug's severity.
+                    fx.Connector.Honour = true;
+                    fx.Connector.HonourMembers = true;
+                    const link = 'MATCH (t:Ticket {title: \'nine\'})-[:parent]->(p) RETURN p, p.severity';
+                    const reverse = 'MATCH (x:Ticket {title: \'nine\'})<-[:parent]-(c) RETURN c, c.severity';
+                    assert.deepEqual(FedFx.Col(await fx.Run(link, FederatedSuite.NoSeverityBugs)), []);
+                    assert.deepEqual(FedFx.Col(await fx.Run(reverse, FederatedSuite.NoSeverityBugs)), []);
+                    const linked = await fx.Run(link);
+                    assert.deepEqual(FedFx.Col(linked), [FedFx.B1]);
+                    assert.deepEqual(FedFx.Col(linked, 1), [FedFx.High]);
+                    const back = await fx.Run(reverse);
+                    assert.deepEqual(FedFx.Col(back), [FedFx.B2]);
+                    assert.deepEqual(FedFx.Col(back, 1), [FedFx.High]);
+                    assert.ok(fx.Connector.Requests.every(q => q.Members.includes(FedFx.Severity)));
+                }
+                finally
+                {
+                    await fx.dispose();
+                }
+            });
+
+            it('one query sees one value per external node across a reverse fetch then a scan', async () =>
+            {
+                const extra = [
+                    FedFx.Row(FedFx.T9, { title: FedFx.Nine, state: FedFx.OpenState }),
+                    FedFx.Row(FedFx.B2, { title: FedFx.B2, state: FedFx.OpenState, severity: FedFx.High }, { parent: [FedFx.T9] }, FedFx.Bug),
+                ];
+                const fx = await FedFx.Open(storage(), { Extra: extra });
+                try
+                {
+                    fx.Connector.Honour = true;
+                    fx.Connector.HonourMembers = true;
+                    const r = await fx.Run('MATCH (x:Ticket {title: \'nine\'})<-[:parent]-(c) WITH c MATCH (b:Bug) WHERE b.title = c.title RETURN c.severity, b.severity');
+                    assert.deepEqual(FedFx.Col(r), [FedFx.High]);
+                    assert.deepEqual(FedFx.Col(r, 1), [FedFx.High]);
+                }
+                finally
+                {
+                    await fx.dispose();
+                }
+            });
+
+            it('two models claiming one public id each yield their own row', async () =>
+            {
+                const fx = await FedFx.Open(storage(), { SecondModel: true });
+                try
+                {
+                    fx.Connector.ByModel.set(FedFx.Jira2, [FedFx.Row(FedFx.T1, { title: FedFx.OtherOne, state: FedFx.OpenState })]);
+                    const r = await fx.Run('MATCH (n:Ticket) RETURN n.title, n ORDER BY n.title');
+                    const pairs = r.Rows.map(row => [FedFx.Plain(row[0]!), (row[1] as NodeValue).Node.Owner]);
+                    assert.deepEqual(pairs, [[FedFx.One, FedFx.Jira], [FedFx.OtherOne, FedFx.Jira2], [FedFx.Three, FedFx.Jira], [FedFx.Two, FedFx.Jira], [FedFx.Zero, FedFx.NoOwner]]);
+                    // Node(id) and Expand see the first admitted owner (jira, scanned first).
+                    const parent = await fx.Run('MATCH (t:Ticket {title: \'two\'})-[:parent]->(p) RETURN p.title, p');
+                    assert.deepEqual(FedFx.Col(parent), [FedFx.One]);
+                    assert.equal(FedFx.NodeAt(parent, 0, 1).Node.Owner, FedFx.Jira);
+                }
+                finally
+                {
+                    await fx.dispose();
+                }
+            });
+
+            it('an external link whose target lives in another model resolves through that model\'s connector', async () =>
+            {
+                const fx = await FedFx.Open(storage(), { SecondModel: true, Extra: [FedFx.Row(FedFx.T5, { title: FedFx.Five, state: FedFx.OpenState }, { parent: [FedFx.Z1] })] });
+                try
+                {
+                    fx.Connector.ByModel.set(FedFx.Jira2, [FedFx.Row(FedFx.Z1, { title: FedFx.Zed, state: FedFx.OpenState })]);
+                    fx.Connector.Honour = true;
+                    const r = await fx.Run('MATCH (t:Ticket {title: \'five\'})-[:parent]->(p) RETURN p, p.title');
+                    assert.deepEqual(FedFx.Col(r), [FedFx.Z1]);
+                    assert.deepEqual(FedFx.Col(r, 1), [FedFx.Zed]);
+                    assert.equal(FedFx.NodeAt(r, 0).Node.Owner, FedFx.Jira2);
+                    // The row's own model is asked first.
+                    assert.deepEqual(fx.Connector.Requests.filter(q => q.Keys !== undefined).map(q => q.Model), [FedFx.Jira, FedFx.Jira2]);
+                }
+                finally
+                {
+                    await fx.dispose();
+                }
+            });
+
+            it('an incoming expand agrees with the outgoing phrasing, with and without ReverseLookup', async () =>
+            {
+                for (const reverse of [true, false])
+                {
+                    const fx = await FedFx.Open(storage(), { Reverse: reverse });
+                    try
+                    {
+                        const out = await fx.Run('MATCH (t:Ticket)-[:team]->(a:Team {name: \'core\'}) RETURN t ORDER BY t.title');
+                        const back = await fx.Run('MATCH (a:Team {name: \'core\'})<-[:team]-(t:Ticket) RETURN t ORDER BY t.title');
+                        assert.deepEqual(FedFx.Col(out), [FedFx.T1]);
+                        assert.deepEqual(FedFx.Col(back), FedFx.Col(out), String(reverse));
+                        const scoped = await fx.Run('MATCH (a:Team {name: \'other\'})<-[:team]-(t:Ticket) RETURN t', FederatedSuite.OpenOnly);
+                        assert.deepEqual(FedFx.Col(scoped), []);
+                        assert.equal(fx.Connector.Requests.some(q => q.Reverse !== undefined), reverse);
+                    }
+                    finally
+                    {
+                        await fx.dispose();
+                    }
+                }
+            });
+
+            it('a connector without KeyLookup resolves a stub through a scan under the scope and IdIn', async () =>
+            {
+                const fx = await FedFx.Open(storage(), { KeyLookup: false });
+                try
+                {
+                    fx.Connector.IgnoreKeys = true;
+                    await fx.LinkStub(FedFx.A, FedFx.T3);
+                    const r = await fx.Run('MATCH (a:Team)-[:assigned]->(t) RETURN t, t.title', FederatedSuite.OpenOnly);
+                    assert.deepEqual(FedFx.Col(r), [FedFx.T3]);
+                    assert.deepEqual(FedFx.Col(r, 1), [FedFx.Three]);
+                    assert.ok(fx.Connector.Requests.every(q => q.Keys === undefined));
+                    const lookup = fx.Connector.Requests.find(q => FedFx.Terms(q.Predicate).some(t => t.Kind === PredicateKind.IdIn))!;
+                    assert.ok(FedFx.HasCompare(lookup.Predicate, FedFx.State, CompareOp.Eq, FedFx.OpenState));
                 }
                 finally
                 {

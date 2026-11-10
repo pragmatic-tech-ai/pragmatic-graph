@@ -5,6 +5,7 @@ import type { CellValue } from '../columns/CellValue.js';
 import type { IFetchedRow } from '../connectors/FetchContract.js';
 import { GraphError, GraphErrorCode } from '../errors/GraphError.js';
 import type { IReadNode } from '../RecordedReads.js';
+import { BatchApplier } from '../txn/BatchApplier.js';
 import { HypotheticalNode } from './HypotheticalNode.js';
 
 /**
@@ -18,6 +19,8 @@ export class FetchedNode
     private static readonly ErrConcept = 'Fetched row concept is not an instantiable concept: ';
     private static readonly ErrValue = 'Fetched row carries a value for a member that is not a property: ';
     private static readonly ErrLink = 'Fetched row carries links for a member that is not a relationship: ';
+    private static readonly ErrPublicId = 'Fetched row has an invalid public id';
+    private static readonly ErrTargetId = 'Fetched row links to an invalid public id: ';
     private static readonly Dot = '.';
 
     private stub: IReadNode | undefined;
@@ -27,15 +30,18 @@ export class FetchedNode
     }
 
     /**
-     * The row checked against `catalog` as HypotheticalNode.Build checks a hypothetical node (ruling R95): its concept
-     * must be defined and not an aspect, every Values key an effective property of it and every Links key an effective
-     * relationship of it, else GraphError SchemaViolation (the same code FetchSession's D6 checks use). A null or
-     * undefined value reads as absent and is dropped; any other value must fit its member as a write would
-     * (HypotheticalNode.Checked: an Int64 widens into a Float64 member when exact), else SchemaViolation naming
-     * `Concept.member`. Returns a new row (link lists copied); the caller's is never changed.
+     * The one validator of a fetched row (rulings R95, R100; final review I5), used by FetchSession on every fetched row
+     * and again by GraphReader.AdmitFetched (a no-op re-check for a row the session already validated). Its public id
+     * and every link target id must be valid public ids (BatchApplier.RequirePublicId: non-empty, at most 400 UTF-8
+     * bytes, no NUL); its concept must be defined and not an aspect, every Values key an effective property of it and
+     * every Links key an effective relationship of it. Every failure is GraphError SchemaViolation (FetchSession wraps it
+     * as ConnectorError Fetch). A null or undefined value reads as absent and is dropped; any other value must fit its
+     * member as a write would (HypotheticalNode.Checked: an Int64 widens into a Float64 member when exact), else
+     * SchemaViolation naming `Concept.member`. Returns a new row (link lists copied); the caller's is never changed.
      */
     public static Validated(catalog: CatalogSnapshot, row: IFetchedRow): IFetchedRow
     {
+        FetchedNode.RequireId(row.PublicId, FetchedNode.ErrPublicId);
         if (!catalog.Has(row.Concept) || catalog.IsAspect(row.Concept))
         {
             throw new GraphError(GraphErrorCode.SchemaViolation, FetchedNode.ErrConcept + row.Concept);
@@ -65,9 +71,30 @@ export class FetchedNode
             {
                 throw new GraphError(GraphErrorCode.SchemaViolation, FetchedNode.ErrLink + row.Concept + FetchedNode.Dot + name);
             }
+            for (const target of targets)
+            {
+                FetchedNode.RequireId(target, FetchedNode.ErrTargetId + row.Concept + FetchedNode.Dot + name);
+            }
             links.set(name, Object.freeze([...targets]));
         }
         return { PublicId: row.PublicId, Concept: row.Concept, Values: values, Links: links };
+    }
+
+    /** GraphError SchemaViolation (cause the CommitError InvalidPublicId) unless `publicId` is a valid public id. */
+    private static RequireId(publicId: string, message: string): void
+    {
+        if (typeof publicId !== 'string')
+        {
+            throw new GraphError(GraphErrorCode.SchemaViolation, message);
+        }
+        try
+        {
+            BatchApplier.RequirePublicId(publicId);
+        }
+        catch (cause)
+        {
+            throw new GraphError(GraphErrorCode.SchemaViolation, message, cause);
+        }
     }
 
     public get PublicId(): string

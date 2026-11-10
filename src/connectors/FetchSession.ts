@@ -1,23 +1,13 @@
+import { FetchedNode } from '../access/FetchedNode.js';
 import type { CatalogSnapshot } from '../catalog/CatalogSnapshot.js';
-import { MemberKind } from '../catalog/ValueType.js';
-import { ValueCodec } from '../columns/ValueCodec.js';
 import { GraphError, GraphErrorCode } from '../errors/GraphError.js';
 import type { IReadProbe } from '../GraphReader.js';
-import { Predicate } from '../predicate/Predicate.js';
-import { BatchApplier } from '../txn/BatchApplier.js';
+import { And, IdIn, Predicate } from '../predicate/Predicate.js';
 import { ConnectorError, ConnectorPhase } from './ConnectorError.js';
 import type { BindingTable } from './BindingTable.js';
 import type { IExternalConnector, IFetchPage, IFetchRequest, IFetchTarget, IFetchedRow } from './FetchContract.js';
 
-/** What the session remembers about one public id: the row (undefined for a miss), its model and the members it was fetched with. */
-interface IMemoEntry
-{
-    readonly Row: IFetchedRow;
-    readonly Model: string;
-    readonly Members: ReadonlySet<string>;
-}
-
-/** A row a session fetched and the model it was fetched for (FetchSession.Known). */
+/** A row a session fetched and the model it was fetched for (FetchSession.Known, FetchSession.Lookup). */
 export interface IFetchedEntry
 {
     readonly Row: IFetchedRow;
@@ -25,29 +15,57 @@ export interface IFetchedEntry
 }
 
 /**
+ * The scope's row predicate for a fetch of a concept (GraphReader.FetchPredicate, Or'ed over the family by
+ * FederatedSource): what a fallback scan pushes down when a connector cannot look up by key or in reverse (D4, advisory).
+ */
+export interface IFetchScope
+{
+    RowPredicate(concept: string): Predicate;
+}
+
+/** The scope of a caller that gives none: every row may match (the engine still decides every fetched row). */
+class UnscopedFetch implements IFetchScope
+{
+    public RowPredicate(): Predicate
+    {
+        return Predicate.True;
+    }
+}
+
+/**
  * The reader of external connectors for one query (rulings R98, R99). One session serves one Cypher read or one
  * GraphTransaction: key lookups and fetched rows are memoised by public id, so a query sees one value per external
  * node, and nothing outlives the session. Resume tokens are used only to drain one fetch page by page.
  *
- * Every connector throw is wrapped as ConnectorError (Phase Fetch). A fetched row is validated: one owned by a more
- * specific binding is dropped silently; a row with an undefined, aspect or unrelated concept, a non-property or
- * mistyped value or an invalid public id fails the fetch (cause GraphError SchemaViolation). A target naming a
- * connector the session was not given throws GraphError InvalidArgument: that is a setup error, not a connector failure.
+ * Members (final review C1): every fetch kind (Scan, Lookup, Reverse) asks for BindingTable.FamilyProperties of its
+ * target concept, the properties of the whole family hidden ones included. A fetched row's concept IsA the target
+ * concept, so every row carries every property of its own concept whichever fetch returned it: a memo entry always
+ * covers what any later fetch of that id would ask for, and is never refetched or replaced.
  *
- * A memo entry records the members it was fetched with. Lookup needs every property and refetches when the entry does
- * not cover them; a Scan yields the session's entry when it covers the scan's members, else replaces it.
+ * Memo (final review I4): an entry serves a fetch of a target only when it was fetched for the target's model and its
+ * concept IsA the target's concept. Otherwise a Lookup skips that candidate, and a Scan or Reverse yields its own row
+ * without replacing the entry: the first admitted (model, row) of an id is the one Known and Lookup return.
+ *
+ * Every connector throw is wrapped as ConnectorError (Phase Fetch). Every fetched row passes the one validator
+ * FetchedNode.Validated (public id and link target ids, concept, members, values with exact Int64 → Float64 widening;
+ * final review I5) and must have a concept that IsA the target's; any failure fails the fetch as ConnectorError Fetch
+ * whose cause is the GraphError SchemaViolation. A valid row owned by a more specific binding is dropped silently. A
+ * target naming a connector the session was not given throws GraphError InvalidArgument: that is a setup error, not a
+ * connector failure.
+ *
+ * Capabilities (final review I7, m4): a connector without KeyLookup is asked for a key by a scan of the candidate with
+ * the predicate And(scope, IdIn{id}); one without ReverseLookup is asked for the rows linking to an id by a scan of the
+ * target with the scope predicate, keeping rows whose Links hold the id. Correct, only slower. PushDown is informational.
  */
 export class FetchSession
 {
-    private static readonly ErrConcept = 'Fetched row has an unusable concept: ';
-    private static readonly ErrMember = 'Fetched row has a value for a non-property member: ';
-    private static readonly ErrValue = 'Fetched row has a mistyped value for member: ';
-    private static readonly ErrPublicId = 'Fetched row has an invalid public id';
+    private static readonly ErrConcept = 'Fetched row has a concept that is not the fetched concept: ';
     private static readonly ErrUnknownConnector = 'No connector named ';
     private static readonly Separator = ' / ';
     private static readonly KeySeparator = '\u0000';
+    private static readonly Unscoped: IFetchScope = new UnscopedFetch();
 
-    private readonly memo = new Map<string, IMemoEntry>();
+    private readonly memo = new Map<string, IFetchedEntry>();
     private readonly misses = new Set<string>();
     private readonly names: ReadonlySet<string>;
 
@@ -67,60 +85,53 @@ export class FetchSession
     }
 
     /**
-     * The row this session holds for the public id (from any earlier Scan, Lookup or Reverse) and the model it was fetched
-     * for; undefined when it fetched none. Fetches nothing: how a transaction's commit decides writes against what the
-     * transaction itself read (ruling R103). The row is as the connector returned it, before any scope decision.
+     * The row this session holds for the public id (the first admitted by any Scan, Lookup or Reverse) and the model it
+     * was fetched for; undefined when it fetched none. Fetches nothing: how a transaction's commit decides writes
+     * against what the transaction itself read (ruling R103). The row is validated but not yet decided by any scope.
      */
     public Known(publicId: string): IFetchedEntry | undefined
     {
-        const entry = this.memo.get(publicId);
-        return entry === undefined ? undefined : { Row: entry.Row, Model: entry.Model };
+        return this.memo.get(publicId);
     }
 
     /** Every row of the target matching the predicate, draining resume tokens; ticks the probe per page and per row examined. */
-    public async *Scan(target: IFetchTarget, predicate: Predicate, members: readonly string[], probe?: IReadProbe): AsyncIterable<IFetchedRow>
+    public async *Scan(target: IFetchTarget, predicate: Predicate, probe?: IReadProbe): AsyncIterable<IFetchedRow>
     {
-        const request: IFetchRequest = { Model: target.Model, Concept: target.Concept, Predicate: predicate, Members: members };
-        yield* this.Drain(target, request, probe, undefined);
+        yield* this.Drain(target, this.Request(target, predicate), probe, undefined);
     }
 
     /**
-     * The row of `publicId` from the first candidate that has it (hits, and misses per candidate, are memoised); ticks the
-     * probe per page and per row returned, as Scan.
+     * The row of `publicId` from the first candidate that has it, with the candidate's model (hits, and misses per
+     * candidate, are memoised); ticks the probe per page and per row returned, as Scan. A memo entry another candidate
+     * does not satisfy (see the class comment) makes Lookup skip that candidate. `scope` gives the predicate a fallback
+     * scan pushes down for a connector without KeyLookup.
      */
-    public async Lookup(publicId: string, candidates: readonly IFetchTarget[], probe?: IReadProbe): Promise<IFetchedRow | undefined>
+    public async Lookup(publicId: string, candidates: readonly IFetchTarget[], probe?: IReadProbe, scope: IFetchScope = FetchSession.Unscoped): Promise<IFetchedEntry | undefined>
     {
         for (const target of candidates)
         {
-            const required = this.PropertyNames(target.Concept);
             const entry = this.memo.get(publicId);
-            const missKey = this.MissKey(publicId, target);
             if (entry !== undefined)
             {
-                if (entry.Model !== target.Model || !this.catalog.IsA(entry.Row.Concept, target.Concept))
+                if (this.Serves(entry, target))
                 {
-                    continue;
+                    return entry;
                 }
-                if (required.every(name => entry.Members.has(name)))
-                {
-                    return entry.Row;
-                }
+                continue;
             }
+            const missKey = this.MissKey(publicId, target);
             if (this.misses.has(missKey))
             {
                 continue;
             }
-            const request: IFetchRequest = {
-                Model: target.Model,
-                Concept: target.Concept,
-                Predicate: Predicate.True,
-                Members: required,
-                Keys: [publicId],
-            };
+            const request = this.Connector(target).Capabilities.KeyLookup
+                ? { ...this.Request(target, Predicate.True), Keys: [publicId] }
+                : this.Request(target, new And([scope.RowPredicate(target.Concept), new IdIn(new Set([publicId]))]));
             for await (const row of this.Drain(target, request, probe, publicId))
             {
-                this.memo.set(publicId, { Row: row, Model: target.Model, Members: new Set(required) });
-                return row;
+                const found = { Row: row, Model: target.Model };
+                this.memo.set(publicId, found);
+                return found;
             }
             this.misses.add(missKey);
         }
@@ -128,22 +139,30 @@ export class FetchSession
     }
 
     /**
-     * Rows of the target that link to `targetId` by `relationship`; nothing when the connector cannot look up in reverse.
-     * Ticks the probe per page and per row, as Scan.
+     * Rows of the target that link to `targetId` by `relationship`, as the session holds them; ticks the probe per page
+     * and per row, as Scan. Through the connector's reverse lookup when it declares ReverseLookup, else through a scan of
+     * the target with `predicate` (the scope's), keeping the rows whose Links[relationship] holds the id.
      */
-    public async *Reverse(target: IFetchTarget, relationship: string, targetId: string, probe?: IReadProbe): AsyncIterable<IFetchedRow>
+    public async *Reverse(target: IFetchTarget, relationship: string, targetId: string, predicate: Predicate, probe?: IReadProbe): AsyncIterable<IFetchedRow>
     {
-        if (!this.Connector(target).Capabilities.ReverseLookup)
+        if (this.Connector(target).Capabilities.ReverseLookup)
         {
+            yield* this.Drain(target, { ...this.Request(target, predicate), Reverse: { Relationship: relationship, Target: targetId } }, probe, undefined);
             return;
         }
-        yield* this.Drain(target, {
-            Model: target.Model,
-            Concept: target.Concept,
-            Predicate: Predicate.True,
-            Members: this.PropertyNames(target.Concept),
-            Reverse: { Relationship: relationship, Target: targetId },
-        }, probe, undefined);
+        for await (const row of this.Drain(target, this.Request(target, predicate), probe, undefined))
+        {
+            if ((row.Links.get(relationship) ?? []).includes(targetId))
+            {
+                yield row;
+            }
+        }
+    }
+
+    /** A fetch of the target's whole family's properties (see the class comment). */
+    private Request(target: IFetchTarget, predicate: Predicate): IFetchRequest
+    {
+        return { Model: target.Model, Concept: target.Concept, Predicate: predicate, Members: this.bindings.FamilyProperties(target.Concept, this.catalog) };
     }
 
     /**
@@ -166,18 +185,19 @@ export class FetchSession
                 throw new ConnectorError(target.Connector, ConnectorPhase.Fetch, cause);
             }
             probe?.Tick();
-            for (const row of page.Rows)
+            for (const fetched of page.Rows)
             {
                 probe?.Tick();
-                if (onlyId !== undefined && row.PublicId !== onlyId)
+                if (onlyId !== undefined && fetched.PublicId !== onlyId)
                 {
                     continue;
                 }
-                if (!this.Admit(target, row))
+                const row = this.Admit(target, fetched);
+                if (row === undefined)
                 {
                     continue;
                 }
-                yield onlyId === undefined ? this.Remember(target, request, row) : row;
+                yield onlyId === undefined ? this.Remember(target, row) : row;
             }
             resume = page.Resume;
         }
@@ -185,72 +205,44 @@ export class FetchSession
     }
 
     /**
-     * Records the row unless the session already holds one covering the request's members; returns the row to use.
-     * The newer fetch replaces a non-covering entry whole: merging two fetches' values would mix moments within one
-     * entry (D3). A stored row clears the recorded misses of its id.
+     * The row to use for a scanned row: the session's entry when it serves the target, else the scanned row itself. The
+     * first row of an id is recorded (clearing the id's recorded misses); a later one never replaces it (D3).
      */
-    private Remember(target: IFetchTarget, request: IFetchRequest, row: IFetchedRow): IFetchedRow
+    private Remember(target: IFetchTarget, row: IFetchedRow): IFetchedRow
     {
         const entry = this.memo.get(row.PublicId);
-        if (entry !== undefined && request.Members.every(name => entry.Members.has(name)))
+        if (entry !== undefined)
         {
-            return entry.Row;
+            return this.Serves(entry, target) ? entry.Row : row;
         }
         this.ClearMisses(row.PublicId);
-        this.memo.set(row.PublicId, { Row: row, Model: target.Model, Members: new Set(request.Members) });
+        this.memo.set(row.PublicId, { Row: row, Model: target.Model });
         return row;
     }
 
-    /** False for a row another binding owns; throws ConnectorError for an invalid row. */
-    private Admit(target: IFetchTarget, row: IFetchedRow): boolean
+    /** True when the entry may stand for a row of the target: fetched for its model, of a concept that IsA its concept. */
+    private Serves(entry: IFetchedEntry, target: IFetchTarget): boolean
     {
+        return entry.Model === target.Model && this.catalog.IsA(entry.Row.Concept, target.Concept);
+    }
+
+    /** The validated row, or undefined for a row another binding owns; ConnectorError Fetch for an invalid row. */
+    private Admit(target: IFetchTarget, fetched: IFetchedRow): IFetchedRow | undefined
+    {
+        let row: IFetchedRow;
         try
         {
-            this.RequireValid(target, row);
+            row = FetchedNode.Validated(this.catalog, fetched);
+            if (!this.catalog.IsA(row.Concept, target.Concept))
+            {
+                throw new GraphError(GraphErrorCode.SchemaViolation, FetchSession.ErrConcept + row.Concept + FetchSession.Separator + target.Concept);
+            }
         }
         catch (cause)
         {
             throw new ConnectorError(target.Connector, ConnectorPhase.Fetch, cause);
         }
-        return this.bindings.Resolve(target.Model, row.Concept, this.catalog) === target.Connector;
-    }
-
-    private RequireValid(target: IFetchTarget, row: IFetchedRow): void
-    {
-        try
-        {
-            BatchApplier.RequirePublicId(row.PublicId);
-        }
-        catch (cause)
-        {
-            throw new GraphError(GraphErrorCode.SchemaViolation, FetchSession.ErrPublicId, cause);
-        }
-        const catalog = this.catalog;
-        if (!catalog.Has(row.Concept) || catalog.IsAspect(row.Concept) || !catalog.IsA(row.Concept, target.Concept))
-        {
-            throw new GraphError(GraphErrorCode.SchemaViolation, FetchSession.ErrConcept + row.Concept + FetchSession.Separator + target.Concept);
-        }
-        const members = catalog.EffectiveMembers(row.Concept);
-        for (const [name, value] of row.Values)
-        {
-            const member = members.find(m => m.Name === name);
-            if (member === undefined || member.Kind !== MemberKind.Property || member.Type === undefined)
-            {
-                throw new GraphError(GraphErrorCode.SchemaViolation, FetchSession.ErrMember + name);
-            }
-            if (value === null)
-            {
-                continue;
-            }
-            try
-            {
-                ValueCodec.Check(member.Type, value);
-            }
-            catch (cause)
-            {
-                throw new GraphError(GraphErrorCode.SchemaViolation, FetchSession.ErrValue + name, cause);
-            }
-        }
+        return this.bindings.Resolve(target.Model, row.Concept, this.catalog) === target.Connector ? row : undefined;
     }
 
     private ClearMisses(publicId: string): void
@@ -268,11 +260,6 @@ export class FetchSession
     private MissKey(publicId: string, target: IFetchTarget): string
     {
         return [publicId, target.Model, target.Concept, target.Connector].join(FetchSession.KeySeparator);
-    }
-
-    private PropertyNames(concept: string): readonly string[]
-    {
-        return this.catalog.EffectiveMembers(concept).filter(m => m.Kind === MemberKind.Property).map(m => m.Name);
     }
 
     private Connector(target: IFetchTarget): IExternalConnector

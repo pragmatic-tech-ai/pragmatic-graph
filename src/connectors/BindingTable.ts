@@ -1,4 +1,5 @@
 import type { CatalogSnapshot } from '../catalog/CatalogSnapshot.js';
+import { MemberKind } from '../catalog/ValueType.js';
 import { GraphError, GraphErrorCode } from '../errors/GraphError.js';
 import type { IBindingDescription } from '../schema/SchemaDescription.js';
 import type { IFetchTarget } from './FetchContract.js';
@@ -33,8 +34,10 @@ export class BindingTable
     private readonly models = new Map<string, Map<string, string>>();
     /** Per catalog, per concept: its specificity chain (see Resolve). */
     private readonly chains = new WeakMap<CatalogSnapshot, Map<string, readonly string[]>>();
-    /** Per catalog, per concept or aspect: the non-aspect concepts that IsA it (see ExternalTargets). */
-    private readonly members = new WeakMap<CatalogSnapshot, Map<string, readonly string[]>>();
+    /** Per catalog, per concept or aspect: the non-aspect concepts that IsA it (see Family). */
+    private readonly families = new WeakMap<CatalogSnapshot, Map<string, readonly string[]>>();
+    /** Per catalog, per concept or aspect: every property of its family (see FamilyProperties). */
+    private readonly familyProperties = new WeakMap<CatalogSnapshot, Map<string, readonly string[]>>();
 
     public constructor(bindings: readonly IBindingDescription[], public readonly DefaultConnector?: string)
     {
@@ -117,7 +120,7 @@ export class BindingTable
         {
             return targets;
         }
-        const members = this.Members(label, catalog);
+        const members = this.Family(label, catalog);
         for (const model of this.models.keys())
         {
             const candidates: IFetchTarget[] = [];
@@ -159,7 +162,7 @@ export class BindingTable
         {
             return false;
         }
-        const members = this.Members(conceptOrAspect, catalog);
+        const members = this.Family(conceptOrAspect, catalog);
         for (const model of this.models.keys())
         {
             for (const concept of members)
@@ -180,22 +183,59 @@ export class BindingTable
         return general !== specific && catalog.Has(general) && catalog.Has(specific) && catalog.IsA(specific, general);
     }
 
-    /** The non-aspect concepts that IsA `label`, in definition order (cached per catalog); [label] for an unknown name. */
-    private Members(label: string, catalog: CatalogSnapshot): readonly string[]
+    /**
+     * The family of `label` (a concept or an aspect): every concept of the catalog that is not an aspect and IsA it, in
+     * definition order; [label] for a name the catalog does not define. What a fetch of `label` returns rows of (cached
+     * per catalog).
+     */
+    public Family(label: string, catalog: CatalogSnapshot): readonly string[]
     {
-        let perCatalog = this.members.get(catalog);
+        return BindingTable.Cached(this.families, catalog, label, () => catalog.Has(label)
+            ? catalog.Definitions().filter(d => !d.IsAspect && catalog.IsA(d.Name, label)).map(d => d.Name)
+            : [label]);
+    }
+
+    /**
+     * Every property of every concept of Family(label), hidden ones included, in first-seen order (cached per catalog):
+     * the members every fetch of `label` asks for (ruling R99, final review C1), so a row of any concept of the family
+     * carries all its properties whichever fetch returned it. Empty for a name the catalog does not define.
+     */
+    public FamilyProperties(label: string, catalog: CatalogSnapshot): readonly string[]
+    {
+        return BindingTable.Cached(this.familyProperties, catalog, label, () =>
+        {
+            const names = new Set<string>();
+            for (const concept of this.Family(label, catalog))
+            {
+                if (!catalog.Has(concept))
+                {
+                    continue;
+                }
+                for (const def of catalog.EffectiveMembers(concept))
+                {
+                    if (def.Kind === MemberKind.Property)
+                    {
+                        names.add(def.Name);
+                    }
+                }
+            }
+            return [...names];
+        });
+    }
+
+    private static Cached(cache: WeakMap<CatalogSnapshot, Map<string, readonly string[]>>, catalog: CatalogSnapshot, key: string, build: () => string[]): readonly string[]
+    {
+        let perCatalog = cache.get(catalog);
         if (perCatalog === undefined)
         {
             perCatalog = new Map();
-            this.members.set(catalog, perCatalog);
+            cache.set(catalog, perCatalog);
         }
-        let found = perCatalog.get(label);
+        let found = perCatalog.get(key);
         if (found === undefined)
         {
-            found = Object.freeze(catalog.Has(label)
-                ? catalog.Definitions().filter(d => !d.IsAspect && catalog.IsA(d.Name, label)).map(d => d.Name)
-                : [label]);
-            perCatalog.set(label, found);
+            found = Object.freeze(build());
+            perCatalog.set(key, found);
         }
         return found;
     }

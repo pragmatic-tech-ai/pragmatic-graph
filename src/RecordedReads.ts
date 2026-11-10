@@ -63,7 +63,7 @@ export class RecordedReads
         {
             return false;
         }
-        return setup.Bindings.IsStub(await this.Owner(node), node.Concept, this.Catalog, setup.External);
+        return setup.IsStub(await this.Owner(node), node.Concept, this.Catalog);
     }
 
     /**

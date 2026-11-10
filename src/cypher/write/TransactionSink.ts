@@ -297,7 +297,7 @@ export class TransactionSink implements ICypherSink
     private ExternalTarget(node: CypherNode): IExternalTarget | undefined
     {
         const setup = FederatedReads.Of(this.transaction).Setup;
-        if (setup === undefined || !setup.Bindings.IsStub(node.Owner, node.Concept, this.catalog, setup.External))
+        if (setup === undefined || !setup.IsStub(node.Owner, node.Concept, this.catalog))
         {
             return undefined;
         }

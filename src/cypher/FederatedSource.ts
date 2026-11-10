@@ -3,7 +3,7 @@ import { MemberKind } from '../catalog/ValueType.js';
 import type { CellValue } from '../columns/CellValue.js';
 import type { BindingTable } from '../connectors/BindingTable.js';
 import type { IFetchTarget, IFetchedRow } from '../connectors/FetchContract.js';
-import type { FetchSession } from '../connectors/FetchSession.js';
+import type { FetchSession, IFetchScope } from '../connectors/FetchSession.js';
 import { EdgeDirection } from '../format/FormatKeys.js';
 import { FederatedReads, type IFederatedLink } from '../FederatedReads.js';
 import type { GraphReader, ILinkView, IReadProbe } from '../GraphReader.js';
@@ -36,26 +36,27 @@ interface IAdmittedRow
  * target concept and its subtypes when they differ (a fetch of a concept also returns its subtypes' rows, which their own
  * Rows entries decide). The hint part keeps only the terms whose members are properties of the target concept that the
  * scope hides on none of the fetched concepts (a hidden member reads null in the query, so its true value must not narrow
- * the fetch). Members are every property of the target concept and its subtypes, hidden ones included: the scope may
- * rule on a hidden member, and a key lookup needs every property, so the scan's memo entry serves later lookups.
+ * the fetch). Members are chosen by the session (FetchSession: every property of the target concept's family, hidden
+ * ones included; the scope may rule on a hidden member, and AdmitFetched removes it).
  *
  * Node(id): an engine node as is; a stub resolved through a key lookup restricted to the stub's owner model (undefined
- * when dangling); a node fetched in this query; else undefined. Links of an engine node come from
- * GraphReader.FederatedLinks, stubs resolved as Node does and dangling ones omitted. Links of an external node are its
- * row's Links in relationship declaration order, each target resolved as Node does, or else (an id neither stored nor
- * fetched) through a key lookup of the relationship's target concepts in the row's model. Incoming edges are the engine
- * edges into the node (or into its stub) plus Reverse fetches over every External target of each concept or aspect
- * declaring an incoming relationship; a reverse row counts only when its admitted Links hold the edge.
+ * when dangling); a node fetched in this query; else undefined. Two models claiming one public id: the first admitted
+ * owner is the one Node and Expand see (R98). Links of an engine node come from FederatedReads.Links, stubs resolved as
+ * Node does and dangling ones omitted. Links of an external node are its row's Links in relationship declaration order,
+ * each target resolved as Node does, or else (an id neither stored nor fetched) through a key lookup of the External
+ * targets of the relationship's target concepts, the row's own model first, then every other model in model order (spec
+ * §5.4). Incoming edges are the engine edges into the node (or into its stub) plus FetchSession.Reverse over every
+ * External target of each concept or aspect declaring an incoming relationship (a reverse lookup, or a scan under the
+ * scope for a connector without ReverseLookup); a reverse row counts only when its admitted Links hold the edge.
+ * Fallback scans and key-less lookups push the scope down through IFetchScope (RowPredicate).
  */
-export class FederatedSource extends CatalogSource
+export class FederatedSource extends CatalogSource implements IFetchScope
 {
     private static readonly UnknownDirection = 'unknown relationship direction';
     private static readonly StepSeparator = '\u0000';
     private static readonly AnyRelationship = '';
 
     private readonly fetched = new Map<string, IAdmittedRow>();
-    private readonly families = new Map<string, readonly string[]>();
-    private readonly members = new Map<string, readonly string[]>();
     private readonly scopes = new Map<string, Predicate>();
     private readonly incoming = new Map<string, readonly MemberDef[]>();
     private declared: readonly MemberDef[] | undefined;
@@ -202,7 +203,7 @@ export class FederatedSource extends CatalogSource
     private async *Fetch(target: IFetchTarget, hint: Predicate | undefined, probe: IReadProbe | undefined): AsyncIterable<CypherNode>
     {
         const predicate = new And([this.ScopePredicate(target.Concept), this.UsableHint(hint, target.Concept) ?? Predicate.True]);
-        for await (const row of this.session.Scan(target, predicate, this.FetchMembers(target.Concept), probe))
+        for await (const row of this.session.Scan(target, predicate, probe))
         {
             const node = await this.Admit(row, target.Model);
             if (node !== undefined)
@@ -221,17 +222,24 @@ export class FederatedSource extends CatalogSource
             return this.ToNode(known);
         }
         const candidates = this.catalog.Has(concept) ? this.FetchTargets(concept).filter(t => t.Model === owner) : [];
-        return this.LookUp(publicId, candidates, owner, probe);
+        return this.LookUp(publicId, candidates, probe);
     }
 
-    private async LookUp(publicId: string, candidates: readonly IFetchTarget[], owner: string, probe: IReadProbe | undefined): Promise<CypherNode | undefined>
+    /** The first candidate's row of the id (FetchSession.Lookup), admitted as a node of the model it was fetched for. */
+    private async LookUp(publicId: string, candidates: readonly IFetchTarget[], probe: IReadProbe | undefined): Promise<CypherNode | undefined>
     {
         if (candidates.length === 0)
         {
             return undefined;
         }
-        const row = await this.session.Lookup(publicId, candidates, probe);
-        return row === undefined ? undefined : this.Admit(row, owner);
+        const entry = await this.session.Lookup(publicId, candidates, probe, this);
+        return entry === undefined ? undefined : this.Admit(entry.Row, entry.Model);
+    }
+
+    /** IFetchScope: the scope's row predicate for a fetch of the concept (ScopePredicate), what fallback scans push down. */
+    public RowPredicate(concept: string): Predicate
+    {
+        return this.ScopePredicate(concept);
     }
 
     /**
@@ -252,7 +260,11 @@ export class FederatedSource extends CatalogSource
             return undefined;
         }
         const entry = { Row: admitted, Owner: owner };
-        this.fetched.set(admitted.PublicId, entry);
+        // Two models claiming one public id: the first admitted owner is the one Node(id) and Expand see (R98).
+        if (!this.fetched.has(admitted.PublicId))
+        {
+            this.fetched.set(admitted.PublicId, entry);
+        }
         return this.ToNode(entry);
     }
 
@@ -312,7 +324,11 @@ export class FederatedSource extends CatalogSource
         return link.Stub === undefined ? this.base.Node(link.PublicId) : this.Resolve(link.PublicId, link.Stub.Concept, link.Stub.Owner, probe);
     }
 
-    /** The far node of an external row's link: as Node, else a key lookup of the relationship's targets in the row's model. */
+    /**
+     * The far node of an external row's link: as Node, else a key lookup of the External targets of the relationship's
+     * target concepts, those of the row's own model first, then those of every other model in model order (spec §5.4,
+     * final review I6).
+     */
     private async LinkTarget(publicId: string, relationship: MemberDef, owner: string, probe: IReadProbe | undefined): Promise<CypherNode | undefined>
     {
         const node = await this.NodeOf(publicId, probe);
@@ -320,18 +336,21 @@ export class FederatedSource extends CatalogSource
         {
             return node;
         }
-        const candidates: IFetchTarget[] = [];
+        const own: IFetchTarget[] = [];
+        const others: IFetchTarget[] = [];
         for (const concept of relationship.Targets ?? [])
         {
             for (const target of this.FetchTargets(concept))
             {
-                if (target.Model === owner && !candidates.some(c => c.Concept === target.Concept && c.Connector === target.Connector))
+                const into = target.Model === owner ? own : others;
+                if (!into.some(c => c.Model === target.Model && c.Concept === target.Concept && c.Connector === target.Connector))
                 {
-                    candidates.push(target);
+                    into.push(target);
                 }
             }
         }
-        return this.LookUp(publicId, candidates, owner, probe);
+        others.sort((a, b) => (a.Model < b.Model ? -1 : a.Model > b.Model ? 1 : 0));
+        return this.LookUp(publicId, [...own, ...others], probe);
     }
 
     private async *In(publicId: string, relationship: string | undefined, probe: IReadProbe | undefined, seen: Set<string>): AsyncIterable<IExpandRow>
@@ -354,7 +373,7 @@ export class FederatedSource extends CatalogSource
         {
             for (const target of this.FetchTargets(def.DeclaredBy))
             {
-                for await (const row of this.session.Reverse(target, def.Name, publicId, probe))
+                for await (const row of this.session.Reverse(target, def.Name, publicId, this.ScopePredicate(target.Concept), probe))
                 {
                     const source = await this.Admit(row, target.Model);
                     if (source === undefined || !(this.fetched.get(source.PublicId)?.Row.Links.get(def.Name) ?? []).includes(publicId))
@@ -390,41 +409,6 @@ export class FederatedSource extends CatalogSource
         return this.bindings.IsStub(owner, concept, this.catalog, this.external);
     }
 
-    /** The concept and every concept that is not an aspect and IsA it, in definition order: what a fetch of it returns. */
-    private Family(concept: string): readonly string[]
-    {
-        let family = this.families.get(concept);
-        if (family === undefined)
-        {
-            family = this.catalog.Definitions().filter(d => !d.IsAspect && this.catalog.IsA(d.Name, concept)).map(d => d.Name);
-            this.families.set(concept, family);
-        }
-        return family;
-    }
-
-    /** Every property of the concept's family, hidden ones included (AdmitFetched removes them), in first-seen order. */
-    private FetchMembers(concept: string): readonly string[]
-    {
-        let names = this.members.get(concept);
-        if (names === undefined)
-        {
-            const set = new Set<string>();
-            for (const name of this.Family(concept))
-            {
-                for (const def of this.catalog.EffectiveMembers(name))
-                {
-                    if (def.Kind === MemberKind.Property)
-                    {
-                        set.add(def.Name);
-                    }
-                }
-            }
-            names = [...set];
-            this.members.set(concept, names);
-        }
-        return names;
-    }
-
     /** The scope's row predicate for a fetch of the concept: FetchPredicate of each family member, Or'ed when they differ. */
     private ScopePredicate(concept: string): Predicate
     {
@@ -432,7 +416,7 @@ export class FederatedSource extends CatalogSource
         if (predicate === undefined)
         {
             const distinct = new Map<string, Predicate>();
-            for (const name of this.Family(concept))
+            for (const name of this.bindings.Family(concept, this.catalog))
             {
                 const p = this.reader.FetchPredicate(name);
                 distinct.set(JSON.stringify(PredicateCodec.ToJson(p)), p);
@@ -452,7 +436,7 @@ export class FederatedSource extends CatalogSource
             return undefined;
         }
         const properties = new Set(this.catalog.EffectiveMembers(concept).filter(m => m.Kind === MemberKind.Property).map(m => m.Name));
-        const family = this.Family(concept);
+        const family = this.bindings.Family(concept, this.catalog);
         const usable = (hint.Kind === PredicateKind.And ? (hint as And).Terms : [hint]).filter(term =>
             [...Predicate.MemberNames(term)].every(name => properties.has(name) && !family.some(c => this.reader.HiddenMembers(c).has(name))));
         if (usable.length === 0)

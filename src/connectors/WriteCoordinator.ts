@@ -1,3 +1,4 @@
+import type { CatalogSnapshot } from '../catalog/CatalogSnapshot.js';
 import { MemberKind } from '../catalog/ValueType.js';
 import { GraphError, GraphErrorCode } from '../errors/GraphError.js';
 import type { CatalogIndex } from '../txn/CatalogIndex.js';
@@ -184,12 +185,7 @@ class ChangeRouter
     /** True when the origin binds to an External connector: the node's data lives only there (ruling R103). */
     public IsExternal(origin: INodeOrigin | undefined): origin is INodeOrigin
     {
-        if (origin === undefined || this.external.size === 0)
-        {
-            return false;
-        }
-        const name = this.table.Resolve(origin.Owner, origin.Concept, this.index.Catalog);
-        return name !== undefined && this.external.has(name);
+        return origin !== undefined && this.external.size > 0 && this.table.IsStub(origin.Owner, origin.Concept, this.index.Catalog, this.external);
     }
 
     /** Records the origin a CreateNode gives its id for the batch's later ops. */
@@ -288,6 +284,15 @@ export class ConnectorSetup
         }
         this.Connectors = byName;
         this.External = new Set([...byName.values()].filter(c => c.Residency === ConnectorResidency.External).map(c => c.Name));
+    }
+
+    /**
+     * True when a node of `concept` held by `owner` resolves to an installed External connector: it is a stub (ruling
+     * R102), its data lives only in the connector. The one "resolves to External" rule (BindingTable.IsStub over External).
+     */
+    public IsStub(owner: string, concept: string, catalog: CatalogSnapshot): boolean
+    {
+        return this.External.size > 0 && this.Bindings.IsStub(owner, concept, catalog, this.External);
     }
 
     /** The installed External connectors by name (ruling R96): what a FetchSession fetches from. */
