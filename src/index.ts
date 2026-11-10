@@ -43,6 +43,7 @@ export { ConnectorChangeSet, type ConnectorChange } from './connectors/Connector
 export { ConnectorResidency, type IConnectorCapabilities, type IExternalConnector, type IFetchPage, type IFetchRequest, type IFetchTarget, type IFetchedRow } from './connectors/FetchContract.js';
 export { BindingTable } from './connectors/BindingTable.js';
 export { ConnectorError, ConnectorPhase } from './connectors/ConnectorError.js';
+export { FetchSession } from './connectors/FetchSession.js';
 
 // Predicate language and node-local evaluation.
 export { And, Compare, CompareOp, ConceptIs, FalsePredicate, IdIn, In, IsNull, Not, Or, OwnerIs, Predicate, PredicateKind, Reachable, Related, Seeded, TruePredicate, type IPathStep } from './predicate/Predicate.js';
