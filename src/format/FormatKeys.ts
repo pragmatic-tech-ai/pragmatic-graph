@@ -54,6 +54,12 @@ export class FormatKeys
         return TupleCodec.Encode([IdsTag.PublicToInternal, publicId]);
     }
 
+    /** Every InternalToPublic key (a scan of all stored nodes' public ids). */
+    public static InternalToPublicRange(): IKeyRange
+    {
+        return FormatKeys.PrefixRange(TupleCodec.Encode([IdsTag.InternalToPublic]));
+    }
+
     public static InternalToPublic(id: bigint): Uint8Array
     {
         return TupleCodec.Encode([IdsTag.InternalToPublic, id]);
