@@ -128,6 +128,12 @@ export class GraphStore
         this.context.SetConnectors(bindings, connectors, timeoutMs);
     }
 
+    /** @internal The installed bindings and connectors (undefined until installed); for the engine host. */
+    public get Connectors(): ConnectorSetup | undefined
+    {
+        return this.context.Connectors;
+    }
+
     /** The Version of the description the last upgrade applied (Meta("schemaVersion")); undefined before any. */
     public async SchemaVersion(): Promise<string | undefined>
     {

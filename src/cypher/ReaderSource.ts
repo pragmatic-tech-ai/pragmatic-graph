@@ -29,6 +29,7 @@ export class ReaderSource extends CatalogSource
         super(reader.Catalog, reader.Scope.HiddenNames);
     }
 
+    /** The engine's nodes of the label; a hint is for External connectors and is not used here. */
     public async *ScanLabel(label: string, probe?: IReadProbe): AsyncIterable<CypherNode>
     {
         yield* this.Scan(this.labels.Resolve(label), probe);
@@ -37,12 +38,9 @@ export class ReaderSource extends CatalogSource
     /** Root concepts in definition order, each with its subtypes (ScanNodes order): every concept exactly once. */
     public async *ScanAll(probe?: IReadProbe): AsyncIterable<CypherNode>
     {
-        for (const def of this.catalog.Definitions())
+        for (const root of this.RootConcepts())
         {
-            if (!def.IsAspect && def.Parent === null)
-            {
-                yield* this.Scan(def.Name, probe);
-            }
+            yield* this.Scan(root, probe);
         }
     }
 

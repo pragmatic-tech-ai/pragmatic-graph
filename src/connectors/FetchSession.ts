@@ -42,6 +42,7 @@ export class FetchSession
 
     private readonly memo = new Map<string, IMemoEntry>();
     private readonly misses = new Set<string>();
+    private readonly names: ReadonlySet<string>;
 
     public constructor(
         private readonly connectors: ReadonlyMap<string, IExternalConnector>,
@@ -49,6 +50,13 @@ export class FetchSession
         private readonly catalog: CatalogSnapshot,
     )
     {
+        this.names = new Set(connectors.keys());
+    }
+
+    /** The names of the connectors this session fetches from (the External connectors it was given). */
+    public get ConnectorNames(): ReadonlySet<string>
+    {
+        return this.names;
     }
 
     /** Every row of the target matching the predicate, draining resume tokens; ticks the probe per page and per row examined. */

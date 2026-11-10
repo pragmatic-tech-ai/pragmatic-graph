@@ -1,5 +1,7 @@
 import type { CellValue } from '../../columns/CellValue.js';
+import type { IFetchTarget } from '../../connectors/FetchContract.js';
 import type { ILinkView, IReadProbe } from '../../GraphReader.js';
+import type { Predicate } from '../../predicate/Predicate.js';
 import { Binding, EvalContext } from '../Binding.js';
 import { ComparisonOp, RelDirection } from '../CypherEnums.js';
 import type { CypherNode } from '../CypherNode.js';
@@ -44,9 +46,10 @@ export class OverlaySource implements ICypherSource
         return !this.overlay.IsDeleted(node.PublicId) && this.base.IsA(node, label);
     }
 
-    public async *ScanLabel(label: string, probe?: IReadProbe): AsyncIterable<CypherNode>
+    /** The hint goes to the base untouched: a created node is never fetched, and every node still passes the filters. */
+    public async *ScanLabel(label: string, probe?: IReadProbe, hint?: Predicate): AsyncIterable<CypherNode>
     {
-        for await (const node of this.base.ScanLabel(label, probe))
+        for await (const node of this.base.ScanLabel(label, probe, hint))
         {
             const current = this.Current(node);
             if (current !== undefined) yield current;
@@ -126,6 +129,11 @@ export class OverlaySource implements ICypherSource
     public IndexFor(label: string, member: string): string | undefined
     {
         return this.base.IndexFor(label, member);
+    }
+
+    public FetchTargets(label: string | undefined): readonly IFetchTarget[]
+    {
+        return this.base.FetchTargets(label);
     }
 
     public SeekEqual(label: string, member: string, value: CellValue, probe?: IReadProbe): AsyncIterable<CypherNode> | undefined

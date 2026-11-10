@@ -2,6 +2,7 @@ import type { AccessScope } from './access/AccessScope.js';
 import type { CatalogSnapshot } from './catalog/CatalogSnapshot.js';
 import { BindingTable } from './connectors/BindingTable.js';
 import type { ConnectorError } from './connectors/ConnectorError.js';
+import type { IExternalConnector } from './connectors/FetchContract.js';
 import type { IGraphConnector } from './connectors/GraphConnector.js';
 import { ConnectorSetup } from './connectors/WriteCoordinator.js';
 import { GraphError, GraphErrorCode } from './errors/GraphError.js';
@@ -66,6 +67,8 @@ export class GraphEngine
     private static readonly ErrKind = 'Unknown StorageKind: ';
     private static readonly ErrDisposed = 'Graph engine has been disposed';
     private static readonly ErrCleanup = 'Opening the engine failed and closing its store failed too';
+    private static readonly NoExternal: ReadonlyMap<string, IExternalConnector> = new Map();
+    private static readonly NoBindings = new BindingTable([]);
 
     /** Raised once per applied commit, in commit order, after the commit is durable. Subscribe-only. */
     public readonly CommitApplied: ISignal<ICommitApplied>;
@@ -139,6 +142,21 @@ export class GraphEngine
     public get Catalog(): CatalogSnapshot
     {
         return this.catalog;
+    }
+
+    /**
+     * The installed connectors whose Residency is External, by name (ruling R96); empty when none is installed. A read
+     * of a concept such a connector is bound to is federated (ruling R101).
+     */
+    public ExternalConnectors(): ReadonlyMap<string, IExternalConnector>
+    {
+        return this.store.Connectors?.ExternalConnectors() ?? GraphEngine.NoExternal;
+    }
+
+    /** The installed binding table (the latest committed upgrade's Bindings and DefaultConnector). */
+    public get Bindings(): BindingTable
+    {
+        return this.store.Connectors?.Bindings ?? GraphEngine.NoBindings;
     }
 
     /**

@@ -46,6 +46,12 @@ export class RecordedReads
         this.connectors = context.Connectors;
     }
 
+    /** The bindings and connectors installed when the reader opened; undefined when none were. */
+    public get Setup(): ConnectorSetup | undefined
+    {
+        return this.connectors;
+    }
+
     /**
      * True iff the stored node is a stub (ruling D2): its (owner, concept) resolves to an External connector. Records the
      * node's binding (through Owner) when any External connector is installed; reads nothing otherwise.

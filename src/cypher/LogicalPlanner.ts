@@ -9,7 +9,9 @@ import type { ICypherSource } from './CypherSource.js';
 import { ScalarValue, type CypherValue } from './CypherValue.js';
 import type { ICancellation } from './ExecutionLimits.js';
 import { GraphError, GraphErrorCode } from '../errors/GraphError.js';
+import type { Predicate } from '../predicate/Predicate.js';
 import { Comparison, FunctionCall, Literal, PropertyAccess, VariableRef, type Expression } from './Expression.js';
+import { FetchHint } from './FetchHint.js';
 import { OperatorPrinter } from './OperatorPrinter.js';
 import { OptionalMatchPlan } from './OptionalMatchPlan.js';
 import { CypherParser } from './CypherParser.js';
@@ -343,7 +345,7 @@ export class LogicalPlanner
         let op = input;
         for (const path of match.Paths)
         {
-            op = this.compilePath(op, path, bound, seeks, consumed);
+            op = this.compilePath(op, path, bound, seeks, consumed, conjuncts);
         }
         if (op === undefined) op = new SingleRow();
         if (match.Where !== undefined)
@@ -367,7 +369,7 @@ export class LogicalPlanner
         return new OptionalApply(source, plan, optionalVars);
     }
 
-    private compilePath(input: IOperator | undefined, path: PatternPath, bound: Set<string>, seeks: readonly SeekEquality[], consumed: Set<Expression>): IOperator
+    private compilePath(input: IOperator | undefined, path: PatternPath, bound: Set<string>, seeks: readonly SeekEquality[], consumed: Set<Expression>, conjuncts: readonly Expression[]): IOperator
     {
         this.validateRels(path);
         const names = path.Nodes.map((n, i) => n.Variable ?? `${LogicalPlanner.AnonPrefix}${i}`);
@@ -381,8 +383,9 @@ export class LogicalPlanner
         }
         else
         {
-            const seek = this.trySeek(anchor, names[0]!, seeks);
-            const scan = seek?.Op ?? this.anchor(anchor, names[0]!);
+            const hint = FetchHint.For(anchor, conjuncts, this.parameters);
+            const seek = this.trySeek(anchor, names[0]!, seeks, hint);
+            const scan = seek?.Op ?? this.anchor(anchor, names[0]!, hint);
             if (seek?.Source !== undefined) consumed.add(seek.Source);
             op = input === undefined ? scan : new CartesianProduct(input, scan, this.cancel);
             op = this.foldNodeProperties(op, anchor, names[0]!, seek?.InlineKey);
@@ -609,16 +612,17 @@ export class LogicalPlanner
         throw new CypherSemanticError(LogicalPlanner.NonNumericLimit);
     }
 
-    private anchor(node: NodePattern, name: string): IOperator
+    // `hint`: the anchor's push-down hint (FetchHint); an unlabelled scan takes none.
+    private anchor(node: NodePattern, name: string, hint: Predicate | undefined): IOperator
     {
         const label = this.resolve(node.Label);
-        return label === undefined ? new AllNodesScan(this.source, name, this.cancel) : new LabelScan(this.source, name, label, this.cancel);
+        return label === undefined ? new AllNodesScan(this.source, name, this.cancel) : new LabelScan(this.source, name, label, this.cancel, hint);
     }
 
     // An index seek for a freshly bound labelled anchor: an inline property first, then a top-level WHERE equality on
     // the anchor's variable, whichever has a usable index. The consumed inline key or WHERE conjunct is not filtered
     // again.
-    private trySeek(node: NodePattern, name: string, seeks: readonly SeekEquality[]): ISeekChoice | undefined
+    private trySeek(node: NodePattern, name: string, seeks: readonly SeekEquality[], hint: Predicate | undefined): ISeekChoice | undefined
     {
         const label = this.resolve(node.Label);
         if (label === undefined) return undefined;
@@ -627,7 +631,7 @@ export class LogicalPlanner
             const index = this.source.IndexFor(label, key);
             if (index !== undefined)
             {
-                return { Op: new IndexSeek(this.source, name, label, key, index, new Literal(value), this.parameters, this.cancel), InlineKey: key, Source: undefined };
+                return { Op: new IndexSeek(this.source, name, label, key, index, new Literal(value), this.parameters, this.cancel, hint), InlineKey: key, Source: undefined };
             }
         }
         if (node.Variable === undefined) return undefined;
@@ -636,7 +640,7 @@ export class LogicalPlanner
             const index = seek.Variable === node.Variable ? this.source.IndexFor(label, seek.Property) : undefined;
             if (index !== undefined)
             {
-                return { Op: new IndexSeek(this.source, name, label, seek.Property, index, seek.Value, this.parameters, this.cancel), InlineKey: undefined, Source: seek.Source };
+                return { Op: new IndexSeek(this.source, name, label, seek.Property, index, seek.Value, this.parameters, this.cancel, hint), InlineKey: undefined, Source: seek.Source };
             }
         }
         return undefined;

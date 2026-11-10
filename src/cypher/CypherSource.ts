@@ -1,5 +1,7 @@
 import type { CellValue } from '../columns/CellValue.js';
+import type { IFetchTarget } from '../connectors/FetchContract.js';
 import type { ILinkView, IReadProbe } from '../GraphReader.js';
+import type { Predicate } from '../predicate/Predicate.js';
 import type { RelDirection } from './CypherEnums.js';
 import type { CypherNode } from './CypherNode.js';
 
@@ -28,8 +30,17 @@ export interface ICypherSource
     HasRelationship(name: string): boolean;
     /** True when the node's concept is, inherits from, or carries the label (a label or a resolved name). */
     IsA(node: CypherNode, label: string): boolean;
-    /** Nodes that are the label (subtypes and aspect carriers included), per matching concept then slot order. */
-    ScanLabel(label: string, probe?: IReadProbe): AsyncIterable<CypherNode>;
+    /**
+     * Nodes that are the label (subtypes and aspect carriers included), per matching concept then slot order. `hint`
+     * (ruling R101) is a node-local predicate every node the query keeps satisfies: a source may pass it to an External
+     * connector as push-down, never use it to drop a node itself (the query's filters stay in the plan).
+     */
+    ScanLabel(label: string, probe?: IReadProbe, hint?: Predicate): AsyncIterable<CypherNode>;
+    /**
+     * The External fetches a scan of the label (every concept when undefined) adds to the engine's rows (ruling
+     * R101), in fetch order; none for a source that reads the engine only. Plan-time metadata: nothing is read.
+     */
+    FetchTargets(label: string | undefined): readonly IFetchTarget[];
     /** Every visible node, per concept then slot order. */
     ScanAll(probe?: IReadProbe): AsyncIterable<CypherNode>;
     /** The node, or undefined when no visible node has the public id. */

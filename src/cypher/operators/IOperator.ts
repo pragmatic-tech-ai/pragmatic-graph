@@ -8,4 +8,6 @@ export interface IOperator
     Inputs?(): readonly IOperator[];
     /** The operator name with its salient detail (explain output); the class name when absent. */
     Describe?(): string;
+    /** Extra explain lines shown under the operator, before its inputs (the External fetches a scan adds). */
+    Details?(): readonly string[];
 }

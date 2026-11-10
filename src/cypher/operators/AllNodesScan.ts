@@ -2,6 +2,7 @@ import { Binding } from '../Binding.js';
 import type { ICypherSource } from '../CypherSource.js';
 import { NodeValue } from '../CypherValue.js';
 import { CancelProbe, type ICancellation } from '../ExecutionLimits.js';
+import { OperatorPrinter } from '../OperatorPrinter.js';
 import type { IOperator } from './IOperator.js';
 
 /**
@@ -29,5 +30,10 @@ export class AllNodesScan implements IOperator
     public Describe(): string
     {
         return `${AllNodesScan.Name}(${this.variable})`;
+    }
+
+    public Details(): readonly string[]
+    {
+        return OperatorPrinter.FetchLines(this.source.FetchTargets(undefined));
     }
 }

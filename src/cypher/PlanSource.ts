@@ -1,4 +1,5 @@
 import type { CatalogSnapshot } from '../catalog/CatalogSnapshot.js';
+import type { BindingTable } from '../connectors/BindingTable.js';
 import type { ILinkView } from '../GraphReader.js';
 import { CatalogSource } from './CatalogSource.js';
 import { CypherError } from './CypherError.js';
@@ -15,10 +16,13 @@ export class PlanSource extends CatalogSource
     private static readonly NoReads = 'an explained plan reads nothing';
     private static readonly NoHidden: ReadonlySet<string> = new Set();
 
-    /** `hidden`: the explained scope's AccessScope.HiddenNames (none without a scope). */
-    constructor(catalog: CatalogSnapshot, hidden: ReadonlySet<string> = PlanSource.NoHidden)
+    /**
+     * `hidden`: the explained scope's AccessScope.HiddenNames (none without a scope). `bindings` and `external` (the
+     * installed External connector names) let the plan show its fetches (FetchTargets); none by default.
+     */
+    constructor(catalog: CatalogSnapshot, hidden: ReadonlySet<string> = PlanSource.NoHidden, bindings?: BindingTable, external?: ReadonlySet<string>)
     {
-        super(catalog, hidden);
+        super(catalog, hidden, bindings, external);
     }
 
     public ScanLabel(): AsyncIterable<CypherNode>

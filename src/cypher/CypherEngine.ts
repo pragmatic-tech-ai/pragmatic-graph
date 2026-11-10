@@ -1,6 +1,7 @@
 import type { AccessScope } from '../access/AccessScope.js';
+import { FetchSession } from '../connectors/FetchSession.js';
 import type { GraphEngine } from '../GraphEngine.js';
-import type { ILinkView } from '../GraphReader.js';
+import type { GraphReader, ILinkView } from '../GraphReader.js';
 import type { Binding } from './Binding.js';
 import { GraphError, GraphErrorCode } from '../errors/GraphError.js';
 import { CypherCellCodec } from './CypherCellCodec.js';
@@ -14,6 +15,7 @@ import { CypherResult, type CypherResultDto } from './CypherResult.js';
 import type { ICypherSource } from './CypherSource.js';
 import { CypherValue, NodeValue, NullValue, type ParameterValue } from './CypherValue.js';
 import { CancelProbe, type ExecutionLimits, type ICancellation } from './ExecutionLimits.js';
+import { FederatedSource } from './FederatedSource.js';
 import { LogicalPlanner, type IKeyColumn, type PlannerOptions } from './LogicalPlanner.js';
 import type { IOperator } from './operators/IOperator.js';
 import { ParameterBinder } from './ParameterBinder.js';
@@ -74,7 +76,7 @@ export class CypherEngine
         const reader = await this.engine.BeginRead(scope);
         try
         {
-            const view = new ReaderSource(reader);
+            const view = CypherEngine.ReadSource(reader);
             const planner = new LogicalPlanner(view, parameters, this.options, limits?.Cancel, paging, undefined, limits?.After !== undefined);
             const plan = planner.Plan(model);
             const columns = model.FinalColumns();
@@ -103,7 +105,24 @@ export class CypherEngine
         const limits = options.Limits;
         const paging = !model.HasWrites() && (limits?.Skip !== undefined || limits?.After !== undefined);
         if (paging) CypherEngine.ValidatePaging(limits!);
-        return LogicalPlanner.Explain(new PlanSource(this.engine.Catalog, scope?.HiddenNames), model, parameters, this.options, paging);
+        const external = new Set(this.engine.ExternalConnectors().keys());
+        return LogicalPlanner.Explain(new PlanSource(this.engine.Catalog, scope?.HiddenNames, this.engine.Bindings, external), model, parameters, this.options, paging);
+    }
+
+    /**
+     * The source a read runs on (ruling R101): a FederatedSource over the reader with one FetchSession for this query
+     * when the reader's connector setup has External connectors, else the plain ReaderSource. A ConnectorError from any
+     * fetch rejects the read; no partial result is returned.
+     */
+    private static ReadSource(reader: GraphReader): ICypherSource
+    {
+        const base = new ReaderSource(reader);
+        const setup = reader.Connectors;
+        if (setup === undefined || setup.External.size === 0)
+        {
+            return base;
+        }
+        return new FederatedSource(base, reader, new FetchSession(setup.ExternalConnectors(), setup.Bindings, reader.Catalog), setup.Bindings);
     }
 
     public static ToDto(result: CypherResult): CypherResultDto

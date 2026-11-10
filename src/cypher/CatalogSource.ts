@@ -1,7 +1,10 @@
 import type { CatalogSnapshot } from '../catalog/CatalogSnapshot.js';
 import type { IndexDef, MemberDef } from '../catalog/CatalogTypes.js';
 import type { CellValue } from '../columns/CellValue.js';
+import { BindingTable } from '../connectors/BindingTable.js';
+import type { IFetchTarget } from '../connectors/FetchContract.js';
 import type { ILinkView, IReadProbe } from '../GraphReader.js';
+import type { Predicate } from '../predicate/Predicate.js';
 import type { RelDirection } from './CypherEnums.js';
 import type { CypherNode } from './CypherNode.js';
 import type { ICypherSource, IExpandRow } from './CypherSource.js';
@@ -15,16 +18,58 @@ import { LabelResolver } from './LabelResolver.js';
 export abstract class CatalogSource implements ICypherSource
 {
     private static readonly IndexKeySeparator = '\u0000';
+    private static readonly NoTargets: readonly IFetchTarget[] = Object.freeze([]);
+    private static readonly NoExternal: ReadonlySet<string> = new Set();
+    private static readonly NoBindings = new BindingTable([]);
 
     protected readonly labels: LabelResolver;
     private readonly relationships: ReadonlySet<string>;
     private readonly indexCache = new Map<string, IndexDef | undefined>();
+    private readonly targetCache = new Map<string, readonly IFetchTarget[]>();
 
-    /** `hidden`: every member name the scope hides on any concept (AccessScope.HiddenNames: Hidden and HiddenExact). */
-    protected constructor(protected readonly catalog: CatalogSnapshot, private readonly hidden: ReadonlySet<string>)
+    /**
+     * `hidden`: every member name the scope hides on any concept (AccessScope.HiddenNames: Hidden and HiddenExact).
+     * `bindings` and `external` (the External connector names): where FetchTargets looks; none by default.
+     */
+    protected constructor(
+        protected readonly catalog: CatalogSnapshot,
+        private readonly hidden: ReadonlySet<string>,
+        protected readonly bindings: BindingTable = CatalogSource.NoBindings,
+        protected readonly external: ReadonlySet<string> = CatalogSource.NoExternal,
+    )
     {
         this.labels = new LabelResolver(catalog);
         this.relationships = new Set(catalog.Relationships());
+    }
+
+    /**
+     * BindingTable.ExternalTargets of the resolved label; for undefined, of every root concept in definition order (as
+     * ScanAll walks them). Cached per label.
+     */
+    public FetchTargets(label: string | undefined): readonly IFetchTarget[]
+    {
+        if (this.external.size === 0)
+        {
+            return CatalogSource.NoTargets;
+        }
+        if (label === undefined)
+        {
+            return this.RootConcepts().flatMap(root => this.FetchTargets(root));
+        }
+        const name = this.labels.Resolve(label);
+        let targets = this.targetCache.get(name);
+        if (targets === undefined)
+        {
+            targets = this.bindings.ExternalTargets(name, this.catalog, this.external);
+            this.targetCache.set(name, targets);
+        }
+        return targets;
+    }
+
+    /** The concepts that are not aspects and have no parent, in definition order: ScanAll's order. */
+    protected RootConcepts(): readonly string[]
+    {
+        return this.catalog.Definitions().filter(d => !d.IsAspect && d.Parent === null).map(d => d.Name);
     }
 
     public ResolveLabel(label: string): string
@@ -47,7 +92,7 @@ export abstract class CatalogSource implements ICypherSource
         return this.FindIndex(this.labels.Resolve(label), member)?.Name;
     }
 
-    public abstract ScanLabel(label: string, probe?: IReadProbe): AsyncIterable<CypherNode>;
+    public abstract ScanLabel(label: string, probe?: IReadProbe, hint?: Predicate): AsyncIterable<CypherNode>;
     public abstract ScanAll(probe?: IReadProbe): AsyncIterable<CypherNode>;
     public abstract Node(publicId: string): Promise<CypherNode | undefined>;
     public abstract Expand(publicId: string, relationship: string | undefined, direction: RelDirection, probe?: IReadProbe): AsyncIterable<IExpandRow>;

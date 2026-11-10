@@ -1,3 +1,4 @@
+import type { Predicate } from '../../predicate/Predicate.js';
 import { Binding, EvalContext } from '../Binding.js';
 import { ComparisonOp } from '../CypherEnums.js';
 import { CypherUnparser } from '../CypherUnparser.js';
@@ -5,6 +6,7 @@ import type { ICypherSource } from '../CypherSource.js';
 import { NodeValue, ScalarValue, type CypherValue } from '../CypherValue.js';
 import { CancelProbe, type ICancellation } from '../ExecutionLimits.js';
 import { BooleanExpression, Comparison, PropertyAccess, type Expression } from '../Expression.js';
+import { OperatorPrinter } from '../OperatorPrinter.js';
 import type { IOperator } from './IOperator.js';
 
 /**
@@ -12,7 +14,8 @@ import type { IOperator } from './IOperator.js';
  * a parameter) is evaluated once per pass, at run time. A null or non-scalar value matches nothing, exactly as
  * the `=` filter would; when the source has no usable index after all, the pass falls back to a label scan
  * filtered by the same equality, so the rows never depend on the index. The deadline is checked up front and per
- * stored entry examined (hidden ones included), on either path.
+ * stored entry examined (hidden ones included), on either path. `hint` (FetchHint) goes to the fallback scan; the seek
+ * itself pushes its equality down (ICypherSource.SeekEqual). Explain lists the External fetches under it.
  */
 export class IndexSeek implements IOperator
 {
@@ -31,6 +34,7 @@ export class IndexSeek implements IOperator
         private readonly value: Expression,
         private readonly parameters: ReadonlyMap<string, CypherValue>,
         private readonly cancel?: ICancellation,
+        private readonly hint?: Predicate,
     )
     {
     }
@@ -54,7 +58,7 @@ export class IndexSeek implements IOperator
             return;
         }
         const equality = new Comparison(new PropertyAccess(this.variable, this.member), ComparisonOp.Eq, this.value);
-        for await (const node of this.source.ScanLabel(this.label, probe))
+        for await (const node of this.source.ScanLabel(this.label, probe, this.hint))
         {
             const row = new Binding().With(this.variable, new NodeValue(node));
             if (BooleanExpression.Truthy(equality.Evaluate(new EvalContext(row, this.parameters))))
@@ -67,5 +71,10 @@ export class IndexSeek implements IOperator
     public Describe(): string
     {
         return `IndexSeek${IndexSeek.Open}${this.indexName}${IndexSeek.Close}${IndexSeek.Space}${this.variable}${IndexSeek.Dot}${this.member}${IndexSeek.Equals}${new CypherUnparser().ExpressionText(this.value)}`;
+    }
+
+    public Details(): readonly string[]
+    {
+        return OperatorPrinter.FetchLines(this.source.FetchTargets(this.label));
     }
 }

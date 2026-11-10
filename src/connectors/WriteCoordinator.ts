@@ -262,6 +262,17 @@ export class ConnectorSetup
         this.External = new Set([...byName.values()].filter(c => c.Residency === ConnectorResidency.External).map(c => c.Name));
     }
 
+    /** The installed External connectors by name (ruling R96): what a FetchSession fetches from. */
+    public ExternalConnectors(): ReadonlyMap<string, IExternalConnector>
+    {
+        const out = new Map<string, IExternalConnector>();
+        for (const name of this.External)
+        {
+            out.set(name, this.Connectors.get(name) as IExternalConnector);
+        }
+        return out;
+    }
+
     /** An External connector must implement the fetch contract (ruling R96). */
     private static CheckResidency(connector: IGraphConnector): void
     {
