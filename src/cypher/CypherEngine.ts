@@ -2,7 +2,9 @@ import type { AccessScope } from '../access/AccessScope.js';
 import type { GraphEngine } from '../GraphEngine.js';
 import type { ILinkView } from '../GraphReader.js';
 import type { Binding } from './Binding.js';
+import { GraphError, GraphErrorCode } from '../errors/GraphError.js';
 import { CypherCellCodec } from './CypherCellCodec.js';
+import { CypherCursor } from './CypherCursor.js';
 import { CypherSemanticError } from './CypherError.js';
 import type { CypherNode } from './CypherNode.js';
 import { CypherParser } from './CypherParser.js';
@@ -10,7 +12,7 @@ import type { CypherQuery } from './CypherQuery.js';
 import type { CypherQueryModel } from './CypherQueryModel.js';
 import { CypherResult, type CypherResultDto } from './CypherResult.js';
 import type { ICypherSource } from './CypherSource.js';
-import { NodeValue, NullValue, type CypherValue, type ParameterValue } from './CypherValue.js';
+import { CypherValue, NodeValue, NullValue, type ParameterValue } from './CypherValue.js';
 import { CancelProbe, type ExecutionLimits, type ICancellation } from './ExecutionLimits.js';
 import { LogicalPlanner, type PlannerOptions } from './LogicalPlanner.js';
 import type { IOperator } from './operators/IOperator.js';
@@ -43,6 +45,8 @@ export class CypherEngine
 {
     private static readonly EmptyParams: ReadonlyMap<string, ParameterValue> = new Map();
     private static readonly InvalidSkip = 'paging Skip must be a non-negative integer';
+    private static readonly AfterWithSkip = 'paging After cannot be combined with Skip';
+    private static readonly AfterWidth = 'paging After does not match the result columns';
     private static readonly InvalidPageSize = 'paging RowCap must be a positive integer when Skip is supplied';
 
     constructor(private readonly engine: GraphEngine, private readonly options?: PlannerOptions)
@@ -58,7 +62,7 @@ export class CypherEngine
             return this.ExecuteWrite(scope, model, parameters, options);
         }
         const limits = options.Limits;
-        const paging = limits?.Skip !== undefined;
+        const paging = limits?.Skip !== undefined || limits?.After !== undefined;
         if (paging) CypherEngine.ValidatePaging(limits!);
         const reader = await this.engine.BeginRead(scope);
         try
@@ -66,9 +70,10 @@ export class CypherEngine
             const view = new ReaderSource(reader);
             const plan = new LogicalPlanner(view, parameters, this.options, limits?.Cancel, paging).Plan(model);
             const columns = model.FinalColumns();
+            if (limits?.After !== undefined && limits.After.After.length !== columns.length) throw new GraphError(GraphErrorCode.InvalidArgument, CypherEngine.AfterWidth);
             const result = paging ? await CypherEngine.Page(plan, columns, limits!) : await CypherEngine.Collect(plan, columns, limits);
             await CypherEngine.FillLinks(result.Rows, view, limits?.Cancel);
-            return result;
+            return CypherEngine.WithSnapshot(result, reader.SnapshotCommit);
         }
         finally
         {
@@ -88,7 +93,7 @@ export class CypherEngine
         const model = typeof source === 'string' ? new CypherParser(source).Parse() : source.ToModel();
         const parameters = ParameterBinder.FromInputMap(options.Parameters ?? CypherEngine.EmptyParams);
         const limits = options.Limits;
-        const paging = !model.HasWrites() && limits?.Skip !== undefined;
+        const paging = !model.HasWrites() && (limits?.Skip !== undefined || limits?.After !== undefined);
         if (paging) CypherEngine.ValidatePaging(limits!);
         return LogicalPlanner.Explain(new PlanSource(this.engine.Catalog, scope?.HiddenNames), model, parameters, this.options, paging);
     }
@@ -108,6 +113,10 @@ export class CypherEngine
         if (result.Commit !== undefined)
         {
             dto.Commit = result.Commit.toString();
+        }
+        if (result.NextCursor !== undefined)
+        {
+            dto.NextCursor = result.NextCursor.Encode();
         }
         return dto;
     }
@@ -134,6 +143,15 @@ export class CypherEngine
         }
     }
 
+    // A read's result carries its snapshot commit; a page with more rows carries the cursor of its last row (cut at
+    // that snapshot). Built after FillLinks so a node key can be encoded.
+    private static WithSnapshot(result: CypherResult, commit: bigint): CypherResult
+    {
+        const last = result.HasMore ? result.Rows[result.Rows.length - 1] : undefined;
+        const cursor = last === undefined ? undefined : new CypherCursor(commit, last);
+        return new CypherResult(result.Columns, result.Rows, result.Truncated, result.HasMore, undefined, commit, cursor);
+    }
+
     private static async Collect(plan: IOperator, columns: readonly string[], limits?: ExecutionLimits): Promise<CypherResult>
     {
         const rows: CypherValue[][] = [];
@@ -157,7 +175,8 @@ export class CypherEngine
     // one further binding to report HasMore. Truncated is never set on a page.
     private static async Page(plan: IOperator, columns: readonly string[], limits: ExecutionLimits): Promise<CypherResult>
     {
-        const skip = limits.Skip!;
+        const skip = limits.Skip ?? 0;
+        const after = limits.After?.After;
         const rows: CypherValue[][] = [];
         let skipped = 0;
         let hasMore = false;
@@ -171,12 +190,14 @@ export class CypherEngine
                 skipped++;
                 continue;
             }
+            const row = CypherEngine.Materialize(binding, columns);
+            if (after !== undefined && CypherEngine.CompareKey(row, after) <= 0) continue;
             if (rows.length >= limits.RowCap!)
             {
                 hasMore = true;
                 break;
             }
-            rows.push(CypherEngine.Materialize(binding, columns));
+            rows.push(row);
         }
         return new CypherResult(columns, rows, false, hasMore);
     }
@@ -184,8 +205,25 @@ export class CypherEngine
     // Paging limits are fail-fast: a bad Skip must not silently act as 0, and Skip without a page size is a misuse.
     private static ValidatePaging(limits: ExecutionLimits): void
     {
+        if (limits.After !== undefined && limits.Skip !== undefined) throw new GraphError(GraphErrorCode.InvalidArgument, CypherEngine.AfterWithSkip);
+        if (limits.Skip === undefined)
+        {
+            if (!Number.isInteger(limits.RowCap) || limits.RowCap! <= 0) throw new CypherSemanticError(`${CypherEngine.InvalidPageSize}: ${limits.RowCap}`);
+            return;
+        }
         if (!Number.isInteger(limits.Skip) || limits.Skip! < 0) throw new CypherSemanticError(`${CypherEngine.InvalidSkip}: ${limits.Skip}`);
         if (!Number.isInteger(limits.RowCap) || limits.RowCap! <= 0) throw new CypherSemanticError(`${CypherEngine.InvalidPageSize}: ${limits.RowCap}`);
+    }
+
+    // Lexicographic over the columns, ascending: the implicit paging order.
+    private static CompareKey(row: readonly CypherValue[], key: readonly CypherValue[]): number
+    {
+        for (let i = 0; i < key.length; i++)
+        {
+            const c = CypherValue.Compare(row[i]!, key[i]!);
+            if (c !== 0) return c;
+        }
+        return 0;
     }
 
     private static Materialize(binding: Binding, columns: readonly string[]): CypherValue[]

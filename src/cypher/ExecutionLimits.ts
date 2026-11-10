@@ -1,3 +1,4 @@
+import type { CypherCursor } from './CypherCursor.js';
 import { CypherTimeout } from './CypherError.js';
 
 export interface ICancellation
@@ -28,6 +29,9 @@ export interface ExecutionLimits
     // rows are discarded, Truncated stays false and HasMore reports whether a further row exists.
     readonly RowCap?: number;
     readonly Skip?: number;
+    // Keyset paging (instead of Skip): rows strictly after this cursor's key in the implicit total order; RowCap is the
+    // page size. Not combinable with Skip.
+    readonly After?: CypherCursor;
     readonly Cancel?: ICancellation;
 }
 

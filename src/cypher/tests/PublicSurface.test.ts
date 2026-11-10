@@ -7,7 +7,7 @@ import { Cypher } from '../../index.js';
 class Surface
 {
     public static readonly Values = [
-        'BooleanOp', 'ComparisonOp', 'CypherCellCodec', 'CypherEngine', 'CypherError', 'CypherErrorCode', 'CypherNode', 'CypherParser',
+        'BooleanOp', 'ComparisonOp', 'CypherCellCodec', 'CypherCursor', 'CypherEngine', 'CypherError', 'CypherErrorCode', 'CypherNode', 'CypherParser',
         'CypherQuery', 'CypherResult', 'CypherSemanticError', 'CypherSyntaxError', 'CypherTimeout', 'CypherUnparser', 'CypherValue',
         'CypherWriteError', 'CypherWriteErrorCode', 'CypherWriteStats', 'Deadline', 'Expr', 'ExprBuilder', 'Fn', 'GuidPlacement', 'Hops',
         'ListValue', 'MapValue', 'NodeBuilder', 'NodeValue', 'NullValue', 'PathValue', 'Pattern', 'ReferencedLabels', 'RelDirection',

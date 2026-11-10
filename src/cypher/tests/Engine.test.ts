@@ -580,8 +580,8 @@ describe('CypherResult commit number', () =>
             assert.equal(noop.Commit, undefined);
             assert.equal('Commit' in CypherEngine.ToDto(noop), false);
             const read = await h.Execute('MATCH (a:Service) RETURN a.name');
-            assert.equal(read.Commit, undefined);
-            assert.equal('Commit' in CypherEngine.ToDto(read), false);
+            assert.equal(typeof read.Commit, 'bigint');
+            assert.equal(CypherEngine.ToDto(read).Commit, read.Commit!.toString());
         }
         finally
         {

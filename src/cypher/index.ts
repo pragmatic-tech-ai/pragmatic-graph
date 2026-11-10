@@ -3,6 +3,7 @@
 export { CypherEngine } from './CypherEngine.js';
 export type { ICypherRunOptions } from './CypherEngine.js';
 export type { PlannerOptions } from './LogicalPlanner.js';
+export { CypherCursor } from './CypherCursor.js';
 export { CypherResult } from './CypherResult.js';
 export type { CypherResultDto } from './CypherResult.js';
 export { CypherParser } from './CypherParser.js';
