@@ -541,7 +541,8 @@ export class WriteCoordinator
     /**
      * Runs the write-through of `sets` (from Route, non-empty); resolves with the engine's commit number. With `unchanged`
      * (the engine part of the batch is empty, controller ruling P13) the prepared commit only guards the engine reads
-     * during the connector phase: once every connector committed it is released, not finalized, and Run resolves with
+     * during the connector phase: once every connector committed it is released, not finalized (PreparedCommit.Release, which
+     * fails where Finalize would: then every connector is reverted, as for a failed Finalize), and Run resolves with
      * `unchanged` (no engine commit, no log entry, no CommitApplied). On success ConnectorApplied is raised once, after
      * the engine commit when there is one (a throwing subscriber is ignored).
      */
@@ -613,8 +614,16 @@ export class WriteCoordinator
         }
         if (unchanged !== undefined)
         {
-            // Nothing for engine storage: the reservation guarded the engine reads until the connectors committed.
-            prepared.Abort();
+            // Nothing for engine storage: the reservation guarded the engine reads until the connectors committed, and
+            // it must still hold now, as Finalize would require; else every connector is compensated.
+            try
+            {
+                prepared.Release();
+            }
+            catch (error)
+            {
+                throw await this.Failed(new ConnectorError(BindingTable.EngineStorage, ConnectorPhase.Finalize, error));
+            }
             return unchanged;
         }
         try

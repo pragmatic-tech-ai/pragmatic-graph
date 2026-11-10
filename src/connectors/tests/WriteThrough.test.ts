@@ -20,6 +20,7 @@ import { ConflictError } from '../../txn/ConflictError.js';
 import type { PreparedCommit } from '../../txn/PreparedCommit.js';
 import { WriteOp } from '../../txn/WriteBatch.js';
 import { BindingTable } from '../BindingTable.js';
+import type { IConnectorApplied } from '../ConnectorApplied.js';
 import { ConnectorError, ConnectorPhase } from '../ConnectorError.js';
 import { FakeConnector, FakeStep } from './FakeConnector.js';
 
@@ -238,6 +239,35 @@ class ThroughFx
                 const engineDefault = ThroughFx.Install(g, [], BindingTable.EngineStorage);
                 await ThroughFx.Commit(g, t => t.SetProperty('h', ThroughFx.Name, ThroughFx.Changed));
                 assert.deepEqual(engineDefault.Log, []);
+                await g.dispose();
+            });
+
+            it('a write-through to Mirrored connectors raises ConnectorApplied with its commit and the touched concepts', async () =>
+            {
+                const g = await ThroughFx.Ready(open);
+                const fx = ThroughFx.Install(g, ThroughFx.TwoModels);
+                const pushed: IConnectorApplied[] = [];
+                const subscription = g.ConnectorApplied.Subscribe(applied => pushed.push(applied));
+                try
+                {
+                    const commit = await ThroughFx.Commit(g, t =>
+                    {
+                        t.SetProperty('x', ThroughFx.Name, ThroughFx.Written);
+                        t.SetProperty('t', 'tag', ThroughFx.Written);
+                        t.SetProperty('h', ThroughFx.Name, ThroughFx.Written);
+                    });
+                    assert.equal(pushed.length, 1);
+                    assert.equal(pushed[0]!.Commit, commit);
+                    assert.deepEqual([...pushed[0]!.Connectors], [[ThroughFx.A, [ThroughFx.Bug, ThroughFx.Item]], [ThroughFx.B, [ThroughFx.Item]]]);
+                    assert.ok(fx.Log.includes('A.Commit') && fx.Log.includes('B.Commit'));
+                    // A commit no connector takes part in raises none.
+                    await ThroughFx.Commit(g, t => t.SetProperty('e', ThroughFx.Name, ThroughFx.Written));
+                    assert.equal(pushed.length, 1);
+                }
+                finally
+                {
+                    subscription.dispose();
+                }
                 await g.dispose();
             });
 

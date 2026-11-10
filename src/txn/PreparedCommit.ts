@@ -49,6 +49,17 @@ export class PreparedCommit
         return this.committer.SubmitPrepared(this);
     }
 
+    /**
+     * Ends the prepared commit without committing its batch, failing exactly where Finalize would (ConflictError after
+     * Abort, expiry, a schema change, upgrade or binding change since Prepare; Disposed): how a write-through whose
+     * engine part is empty confirms its engine reads held until its connectors committed (controller ruling P13).
+     * Releases the reservation either way; no commit number, no log entry, no CommitApplied.
+     */
+    public Release(): void
+    {
+        this.committer.ReleasePrepared(this);
+    }
+
     /** Releases the reservation without committing; a no-op once Finalize was called or it ended. */
     public Abort(): void
     {

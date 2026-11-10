@@ -560,6 +560,37 @@ export class Committer
         });
     }
 
+    /**
+     * @internal PreparedCommit.Release: ends the prepared commit without committing anything, after checking it could
+     * still have finalized (controller ruling P13: a write-through whose engine part is empty). Throws what Finalize
+     * would reject with: ConflictError when the reservation was aborted, expired or invalidated (a schema change, upgrade
+     * or binding change since Prepare), when the catalog version or the connector-setup generation changed (R77);
+     * GraphError Disposed or InvalidArgument (another committer's, or already finalizing). Releases the reservation either way.
+     */
+    public ReleasePrepared(prepared: PreparedCommit): void
+    {
+        if (this.disposed)
+        {
+            throw new GraphError(GraphErrorCode.Disposed, Committer.ErrDisposed);
+        }
+        if (!prepared.Reservation.BelongsTo(this.reservations))
+        {
+            throw new GraphError(GraphErrorCode.InvalidArgument, Committer.ErrForeign);
+        }
+        const refused = this.reservations.BeginFinalize(prepared.Reservation);
+        if (refused !== undefined)
+        {
+            prepared.Reservation.Abort();
+            throw refused;
+        }
+        const stale = Committer.VersionConflict(prepared.CatalogVersion, this.index.Catalog.Version) ?? this.GenerationConflict(prepared.BindingGeneration);
+        this.reservations.End(prepared.Reservation, stale === undefined ? ReservationState.Aborted : ReservationState.Failed);
+        if (stale !== undefined)
+        {
+            throw stale;
+        }
+    }
+
     /** Diagnostics: prepared commits whose reservations currently block other commits. */
     public get ReservationCount(): number
     {

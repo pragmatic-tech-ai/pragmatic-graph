@@ -1,6 +1,7 @@
 import type { ColumnStore } from '../columns/ColumnStore.js';
 import type { EdgeStore } from '../edges/EdgeStore.js';
 import type { GraphContext } from '../GraphContext.js';
+import type { GraphEngine } from '../GraphEngine.js';
 import type { GraphStore } from '../GraphStore.js';
 import type { GraphTransaction } from '../GraphTransaction.js';
 import type { PublicIdIndex } from '../identity/PublicIdIndex.js';
@@ -44,6 +45,12 @@ interface ITransactionInternals
  */
 export class EngineInternals
 {
+    /** The engine's store. */
+    public static Store(engine: GraphEngine): GraphStore
+    {
+        return (engine as unknown as { store: GraphStore }).store;
+    }
+
     /** The store's internal context. */
     public static Context(store: GraphStore): GraphContext
     {

@@ -16,12 +16,16 @@ import { GraphErrorCode } from '../../errors/GraphError.js';
 import { EdgeDirection } from '../../format/FormatKeys.js';
 import { FederatedReads } from '../../FederatedReads.js';
 import { GraphEngine, type IEngineStorage, StorageKind } from '../../GraphEngine.js';
+import type { ISchemaDescription } from '../../schema/SchemaDescription.js';
+import { EngineInternals } from '../../tests/EngineInternals.js';
+import { ConflictError } from '../../txn/ConflictError.js';
 import type { GraphTransaction } from '../../GraphTransaction.js';
 import { Compare, CompareOp, type Predicate } from '../../predicate/Predicate.js';
 import { CommitError, CommitErrorCode } from '../../txn/CommitError.js';
 import type { ICommitApplied } from '../../txn/LogEntry.js';
 import { type BatchOp, WriteOp } from '../../txn/WriteBatch.js';
 import type { ConnectorChange } from '../ConnectorChangeSet.js';
+import { BindingTable } from '../BindingTable.js';
 import type { IConnectorApplied } from '../ConnectorApplied.js';
 import { ConnectorError, ConnectorPhase } from '../ConnectorError.js';
 import type { IFetchedRow } from '../FetchContract.js';
@@ -76,6 +80,8 @@ class ExtFx
     private static readonly DirPrefix = 'pragmatic-graph-external-writes-';
     private static readonly Dirs: string[] = [];
     private static readonly Version = 'external-writes-v1';
+    private static readonly VersionExtra = 'external-writes-v2';
+    public static readonly Extra = 'Extra';
     public static readonly Team = 'Team';
     public static readonly Ticket = 'Ticket';
     public static readonly Jira = 'jira';
@@ -146,27 +152,52 @@ class ExtFx
             ExtFx.Row(ExtFx.Locked, ExtFx.LockedState),
             ExtFx.Row(ExtFx.Closed, ExtFx.ClosedState),
         ]);
-        const engine = await GraphEngine.Open({
-            Description: {
-                Version: ExtFx.Version,
-                Definitions: [
-                    CypherFixture.Concept(ExtFx.Team, [CypherFixture.Text(ExtFx.Name), CypherFixture.Rel(ExtFx.Assigned, [ExtFx.Ticket])]),
-                    CypherFixture.Concept(ExtFx.Ticket, [
-                        CypherFixture.Text(ExtFx.Id), CypherFixture.Text(ExtFx.State), CypherFixture.Text(ExtFx.Title), CypherFixture.Rel(ExtFx.TeamRel, [ExtFx.Team]),
-                    ]),
-                ],
-                Indexes: [],
-                Seed: [
-                    CypherFixture.Node(ExtFx.A, ExtFx.Team, { name: ExtFx.Core }),
-                    CypherFixture.Node(ExtFx.B, ExtFx.Team, { name: ExtFx.Other }),
-                    CypherFixture.Node(ExtFx.Local, ExtFx.Ticket, { id: ExtFx.Local, state: ExtFx.ClosedState }),
-                ],
-                Bindings: [{ Model: ExtFx.Jira, Concept: ExtFx.Ticket, Connector: ExtFx.Ext }],
-            },
-            Storage: storage,
-            Connectors: [connector],
-        });
+        const engine = await GraphEngine.Open({ Description: ExtFx.Description(false), Storage: storage, Connectors: [connector] });
         return new ExtFx(engine, connector, new CypherEngine(engine));
+    }
+
+    /** The fixture's schema; `extra` adds an unrelated concept (an upgrade that changes nothing the tests read). */
+    public static Description(extra: boolean): ISchemaDescription
+    {
+        const definitions = [
+            CypherFixture.Concept(ExtFx.Team, [CypherFixture.Text(ExtFx.Name), CypherFixture.Rel(ExtFx.Assigned, [ExtFx.Ticket])]),
+            CypherFixture.Concept(ExtFx.Ticket, [
+                CypherFixture.Text(ExtFx.Id), CypherFixture.Text(ExtFx.State), CypherFixture.Text(ExtFx.Title), CypherFixture.Rel(ExtFx.TeamRel, [ExtFx.Team]),
+            ]),
+        ];
+        if (extra)
+        {
+            definitions.push(CypherFixture.Concept(ExtFx.Extra, [CypherFixture.Text(ExtFx.Name)]));
+        }
+        return {
+            Version: extra ? ExtFx.VersionExtra : ExtFx.Version,
+            Definitions: definitions,
+            Indexes: [],
+            Seed: [
+                CypherFixture.Node(ExtFx.A, ExtFx.Team, { name: ExtFx.Core }),
+                CypherFixture.Node(ExtFx.B, ExtFx.Team, { name: ExtFx.Other }),
+                CypherFixture.Node(ExtFx.Local, ExtFx.Ticket, { id: ExtFx.Local, state: ExtFx.ClosedState }),
+            ],
+            Bindings: [{ Model: ExtFx.Jira, Concept: ExtFx.Ticket, Connector: ExtFx.Ext }],
+        };
+    }
+
+    /** An all-external write of x whose connector Commit runs `during` first (a concurrent change in the connector phase). */
+    public async ExternalWriteDuring(during: () => Promise<void>): Promise<unknown>
+    {
+        this.Connector.Writes.OnCommit = during;
+        try
+        {
+            return await ExtFx.Rejection(this.Commit(AccessScope.System, async t =>
+            {
+                await ExtFx.Fetch(t, ExtFx.X);
+                t.SetProperty(ExtFx.X, ExtFx.State, ExtFx.DoneState);
+            }));
+        }
+        finally
+        {
+            this.Connector.Writes.OnCommit = undefined;
+        }
     }
 
     /** The engine batches committed since the fixture opened (its seed included). */
@@ -673,6 +704,43 @@ class ExternalWritesSuite
                         subscription.dispose();
                     }
                     assert.equal(fx.Pushed.length, 3);
+                }
+                finally
+                {
+                    await fx.dispose();
+                }
+            });
+
+            it('all-external commit conflicts when an upgrade invalidates its reads during the connector phase', async () =>
+            {
+                const fx = await ExtFx.Open(storage());
+                try
+                {
+                    const error = await fx.ExternalWriteDuring(async () => { await fx.Engine.Upgrade(ExtFx.Description(true)); });
+                    assert.ok(error instanceof ConnectorError && error.Connector === BindingTable.EngineStorage && error.Phase === ConnectorPhase.Finalize, String(error));
+                    assert.ok(error.cause instanceof ConflictError, String(error.cause));
+                    assert.ok(fx.Connector.Log.includes(ExtFx.ExtRevert), fx.Connector.Log.join());
+                    assert.equal(fx.Pushed.length, 0);
+                }
+                finally
+                {
+                    await fx.dispose();
+                }
+            });
+
+            it('all-external commit conflicts when the connector setup is replaced during the connector phase', async () =>
+            {
+                const fx = await ExtFx.Open(storage());
+                try
+                {
+                    const store = EngineInternals.Store(fx.Engine);
+                    const setup = EngineInternals.Context(store).Connectors!;
+                    // Another connector object under the same name routes differently (R77): the generation changes.
+                    const error = await fx.ExternalWriteDuring(async () => store.SetConnectors(setup.Bindings, [new TicketSystem(ExtFx.Ext, [])], setup.TimeoutMs));
+                    assert.ok(error instanceof ConnectorError && error.Connector === BindingTable.EngineStorage && error.Phase === ConnectorPhase.Finalize, String(error));
+                    assert.ok(error.cause instanceof ConflictError, String(error.cause));
+                    assert.ok(fx.Connector.Log.includes(ExtFx.ExtRevert), fx.Connector.Log.join());
+                    assert.equal(fx.Pushed.length, 0);
                 }
                 finally
                 {
