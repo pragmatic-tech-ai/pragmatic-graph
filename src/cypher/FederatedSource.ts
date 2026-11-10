@@ -250,6 +250,13 @@ export class FederatedSource extends CatalogSource implements IFetchScope
      */
     private async Admit(row: IFetchedRow, owner: string): Promise<CypherNode | undefined>
     {
+        const entry = await this.AdmitEntry(row, owner);
+        return entry === undefined ? undefined : this.ToNode(entry);
+    }
+
+    /** Admit's admitted row and owner (this row's, not necessarily the first admitted one of its id). */
+    private async AdmitEntry(row: IFetchedRow, owner: string): Promise<IAdmittedRow | undefined>
+    {
         if (await this.reads.StoredNonStub(row.PublicId))
         {
             return undefined;
@@ -265,7 +272,7 @@ export class FederatedSource extends CatalogSource implements IFetchScope
         {
             this.fetched.set(admitted.PublicId, entry);
         }
-        return this.ToNode(entry);
+        return entry;
     }
 
     /** A fresh CypherNode for the admitted row: every visible property of its concept, null when the row has none. */
@@ -375,14 +382,15 @@ export class FederatedSource extends CatalogSource implements IFetchScope
             {
                 for await (const row of this.session.Reverse(target, def.Name, publicId, this.ScopePredicate(target.Concept), probe))
                 {
-                    const source = await this.Admit(row, target.Model);
-                    if (source === undefined || !(this.fetched.get(source.PublicId)?.Row.Links.get(def.Name) ?? []).includes(publicId))
+                    // The row just admitted decides the edge (not the id's first admitted row, which may be another model's).
+                    const admitted = await this.AdmitEntry(row, target.Model);
+                    if (admitted === undefined || !(admitted.Row.Links.get(def.Name) ?? []).includes(publicId))
                     {
                         continue;
                     }
-                    if (FederatedSource.FirstTime(seen, def.Name, source.PublicId))
+                    if (FederatedSource.FirstTime(seen, def.Name, admitted.Row.PublicId))
                     {
-                        yield { Relationship: def.Name, Target: source };
+                        yield { Relationship: def.Name, Target: this.ToNode(admitted) };
                     }
                 }
             }

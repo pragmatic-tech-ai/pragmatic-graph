@@ -6,7 +6,6 @@ import { join } from 'node:path';
 import type { MemberInput } from '../../catalog/CatalogTypes.js';
 import { MemberKind, ValueType } from '../../catalog/ValueType.js';
 import type { CellValue } from '../../columns/CellValue.js';
-import { BindingTable } from '../../connectors/BindingTable.js';
 import { ConnectorResidency, type IExternalConnector, type IFetchedRow } from '../../connectors/FetchContract.js';
 import { GraphError, GraphErrorCode } from '../../errors/GraphError.js';
 import { EdgeDirection } from '../../format/FormatKeys.js';
@@ -143,7 +142,8 @@ class FetchedFx
                 t.Link(FetchedFx.T, FetchedFx.Assigned, FetchedFx.X);
             }
         });
-        g.SetConnectors(new BindingTable(bindings), [FetchedFx.External()]);
+        // A residency change goes through an upgrade (ruling P19): it strips x to a stub.
+        await g.Upgrade({ ...FetchedFx.Description(), Bindings: bindings }, [FetchedFx.External()]);
         return g;
     }
 

@@ -67,6 +67,8 @@ export interface ICommitterOptions
     readonly LastCommit?: bigint;
     /** Id allocator over the same store; opened on first use when absent. */
     readonly Allocator?: IdAllocator;
+    /** The stored Meta("stubRule") fingerprint; Committer.Open reads it. Default StubRule.Inactive. */
+    readonly StubRule?: string;
 }
 
 /** One submitted batch waiting for (or inside) a group. */
@@ -322,6 +324,7 @@ export class Committer
     public static readonly DefaultPrepareTimeoutMs = 30000;
 
     private static readonly ErrSnapshot = 'Snapshot commit is after the last commit: ';
+    private static readonly ErrResidencyChange = 'A connector setup that changes which nodes are stubs must be installed by an upgrade (GraphStore.Upgrade), which reconciles stored nodes';
     private static readonly ErrStale = 'Stored last commit does not match the committer (another writer, or not opened with Committer.Open): stored ';
     private static readonly ErrExpected = ', expected ';
     private static readonly ErrDisposed = 'Committer has been disposed';
@@ -362,12 +365,19 @@ export class Committer
     private connectors: ConnectorSetup | undefined;
     /** Bumped by every InstallConnectors that changes the routing; 0 while none was ever installed (ruling R77). */
     private generation = 0;
+    /**
+     * The fingerprint of the stub rule the stored data conforms to (Meta("stubRule"), StubRule.Fingerprint): what the
+     * last reconciling upgrade wrote, read at Open. Every upgrade whose setup's rule differs reconciles and rewrites it;
+     * SetConnectors refuses a setup whose rule differs (ruling P19).
+     */
+    private stubRule: string;
 
     public constructor(private readonly store: IKeyValueStore, catalog: CatalogSnapshot, options?: ICommitterOptions)
     {
         this.index = new CatalogIndex(catalog);
         this.history = new ConflictHistory(options?.LastCommit ?? 0n);
         this.allocator = options?.Allocator === undefined ? undefined : Promise.resolve(options.Allocator);
+        this.stubRule = options?.StubRule ?? StubRule.Inactive;
     }
 
     /** Opens a committer that continues from the store's stored last commit. */
@@ -375,15 +385,17 @@ export class Committer
     {
         const txn = await store.BeginRead();
         let last: bigint;
+        let stubRule: string | undefined;
         try
         {
             last = await CommitLog.ReadLastCommit(txn);
+            stubRule = await FormatMeta.ReadStubRule(txn);
         }
         finally
         {
             txn.dispose();
         }
-        return new Committer(store, catalog, { LastCommit: last, Allocator: await IdAllocator.Open(store) });
+        return new Committer(store, catalog, { LastCommit: last, Allocator: await IdAllocator.Open(store), StubRule: stubRule ?? StubRule.Inactive });
     }
 
     public LastCommit(): bigint
@@ -438,6 +450,26 @@ export class Committer
      * SubmitUpgrade installs inside the upgrade's own turn instead.
      */
     public InstallConnectors(setup: ConnectorSetup): void
+    {
+        this.InstallRouting(setup);
+    }
+
+    /**
+     * SetConnectors' install (ruling P19): GraphError InvalidArgument, installing nothing, when the setup's stub rule
+     * differs from the one the stored data conforms to (StubRule.Fingerprint against Meta("stubRule"); either side
+     * having an External connector): a residency change must go through an upgrade, which reconciles stored nodes.
+     * Otherwise as InstallConnectors.
+     */
+    public SetConnectors(setup: ConnectorSetup): void
+    {
+        if (new StubRule(setup).Fingerprint !== this.stubRule)
+        {
+            throw new GraphError(GraphErrorCode.InvalidArgument, Committer.ErrResidencyChange);
+        }
+        this.InstallRouting(setup);
+    }
+
+    private InstallRouting(setup: ConnectorSetup): void
     {
         const same = this.connectors !== undefined && this.connectors.RoutesLike(setup);
         this.connectors = setup;
@@ -845,15 +877,20 @@ export class Committer
     }
 
     /**
-     * True when the upgrade must reconcile stored data with the stub rule (final review I2): some External connector is
-     * installed before or after it, and either the catalog changes (a hierarchy change can move a node's binding) or the
-     * rule itself does (StubRule.SameAs over the installed and the new setup).
+     * True when the upgrade must reconcile stored data with the stub rule (final review I2, residual round): a setup is
+     * given or installed (without one the stored data keeps its stored rule), and either its rule's fingerprint differs
+     * from the stored Meta("stubRule") (also across a reopen: the stored value, not the in-memory previous setup, is the
+     * rule the data conforms to) or the catalog changes under an active rule (a hierarchy change can move a binding).
      */
     private Reconciles(plan: ICatalogPlan, connectors: ConnectorSetup | undefined): boolean
     {
-        const before = new StubRule(this.connectors);
-        const after = new StubRule(connectors ?? this.connectors);
-        return (before.IsActive || after.IsActive) && (plan.Changed || !before.SameAs(after));
+        const setup = connectors ?? this.connectors;
+        if (setup === undefined)
+        {
+            return false;
+        }
+        const fingerprint = new StubRule(setup).Fingerprint;
+        return fingerprint !== this.stubRule || (plan.Changed && fingerprint !== StubRule.Inactive);
     }
 
     /**
@@ -866,7 +903,6 @@ export class Committer
         const old = this.index;
         const next = plan.Changed ? new CatalogIndex(plan.Catalog) : old;
         const last = this.history.Last;
-        const before = new StubRule(this.connectors);
         const after = new StubRule(connectors ?? this.connectors);
         const reconciles = this.Reconciles(plan, connectors);
         let upgradeCommit: bigint | undefined;
@@ -878,15 +914,16 @@ export class Committer
             const modified = new Set<string>();
             if (plan.Changed)
             {
-                const stats = await this.purger.Purge(txn, old, next, plan.Diff, keys, after);
+                const stats = await this.purger.Purge(txn, old, next, plan.Diff, keys);
                 stats.ModifiedNodes.forEach(id => modified.add(id));
             }
             let reconciled = false;
             if (reconciles)
             {
-                const stats = await this.purger.Reconcile(txn, old, next, keys, before, after);
+                const stats = await this.purger.Reconcile(txn, next, keys, after);
                 reconciled = stats.NodesStripped + stats.NodesRemoved + stats.EdgesRemoved > 0;
                 stats.ModifiedNodes.forEach(id => modified.add(id));
+                FormatMeta.WriteStubRule(txn, after.Fingerprint);
             }
             upgradeCommit = plan.Changed || reconciled ? last + 1n : undefined;
             seedCommit = (upgradeCommit ?? last) + 1n;
@@ -926,6 +963,10 @@ export class Committer
         }
         this.history.Prune();
         this.index = next;
+        if (reconciles)
+        {
+            this.stubRule = after.Fingerprint;
+        }
         if (connectors !== undefined)
         {
             this.InstallConnectors(connectors);

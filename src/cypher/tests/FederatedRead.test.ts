@@ -874,6 +874,23 @@ class FederatedSuite
                 }
             });
 
+            it('a reverse row is decided by its own links, not by another model\'s row of the same id', async () =>
+            {
+                const fx = await FedFx.Open(storage(), { SecondModel: true });
+                try
+                {
+                    // jira's t1 links team a; jira2's t1 links team b. jira's row is admitted first (the scan).
+                    fx.Connector.ByModel.set(FedFx.Jira2, [FedFx.Row(FedFx.T1, { title: FedFx.OtherOne, state: FedFx.OpenState }, { team: [FedFx.B] })]);
+                    const r = await fx.Run('MATCH (n:Ticket) WITH count(n) AS c MATCH (b:Team {name: \'other\'})<-[:team]-(t:Ticket) RETURN t.title, t ORDER BY t.title');
+                    assert.deepEqual(FedFx.Col(r), [FedFx.OtherOne, FedFx.Two]);
+                    assert.equal(FedFx.NodeAt(r, 0, 1).Node.Owner, FedFx.Jira2);
+                }
+                finally
+                {
+                    await fx.dispose();
+                }
+            });
+
             it('an external link whose target lives in another model resolves through that model\'s connector', async () =>
             {
                 const fx = await FedFx.Open(storage(), { SecondModel: true, Extra: [FedFx.Row(FedFx.T5, { title: FedFx.Five, state: FedFx.OpenState }, { parent: [FedFx.Z1] })] });

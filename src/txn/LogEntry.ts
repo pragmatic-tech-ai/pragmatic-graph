@@ -13,8 +13,11 @@ export enum CommitKind
 }
 
 /**
- * One applied commit, as raised by CommitApplied and replayed by GraphStore.ReadChanges (ruling F4):
- * self-sufficient for deterministic replay.
+ * One applied commit, as raised by CommitApplied and read back by GraphStore.ReadChanges (ruling F4). A Batch or
+ * SchemaChange entry carries everything it changed. An Upgrade entry does NOT carry its discards as ops: what the
+ * purge and the residency reconciliation removed or stripped (the latter also depends on the connector setup, which is
+ * not logged) is not listed, so a consumer must treat an Upgrade commit as "re-read the affected data" (the new catalog
+ * says which concepts changed; any data may have been discarded). The engine never replays the log to rebuild storage.
  */
 export interface ICommitApplied
 {
@@ -34,8 +37,8 @@ export interface ICommitApplied
     /** SchemaChange and Upgrade: the complete catalog after the change. */
     readonly Catalog?: CatalogSnapshot;
     /**
-     * Upgrade only: the description's opaque version. Replaying an Upgrade installs Catalog; the data it
-     * discarded follows from the previous catalog and Catalog (DataPurger), so it is not listed.
+     * Upgrade only: the description's opaque version. The data the upgrade discarded (DataPurger.Purge) or reconciled
+     * with the connector setup's stub rule (DataPurger.Reconcile) is not listed: re-read affected data after an Upgrade.
      */
     readonly SchemaVersion?: string;
 }

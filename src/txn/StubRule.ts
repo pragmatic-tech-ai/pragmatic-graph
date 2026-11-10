@@ -18,19 +18,28 @@ export class StubRule
         return this.setup !== undefined && this.setup.External.size > 0;
     }
 
+    /** The fingerprint of a rule that makes no node a stub (no External connector installed). */
+    public static readonly Inactive = '';
+
     /**
-     * True when this rule and `other` make the same nodes stubs under any one catalog: both inactive, or the same
-     * bindings (BindingTable.SameAs) and the same External connector names.
+     * A canonical text of the rule: Inactive without an External connector, else the binding table's fingerprint and the
+     * sorted External connector names. Two rules make the same nodes stubs under any one catalog exactly when their
+     * fingerprints are equal. Stored as Meta("stubRule"): the rule the stored data conforms to (final review residual).
      */
+    public get Fingerprint(): string
+    {
+        if (!this.IsActive)
+        {
+            return StubRule.Inactive;
+        }
+        const setup = this.setup as ConnectorSetup;
+        return JSON.stringify([setup.Bindings.Fingerprint(), [...setup.External].sort()]);
+    }
+
+    /** True when this rule and `other` make the same nodes stubs under any one catalog (equal fingerprints). */
     public SameAs(other: StubRule): boolean
     {
-        if (!this.IsActive || !other.IsActive)
-        {
-            return this.IsActive === other.IsActive;
-        }
-        const mine = this.setup as ConnectorSetup;
-        const theirs = other.setup as ConnectorSetup;
-        return mine.Bindings.SameAs(theirs.Bindings) && mine.External.size === theirs.External.size && [...mine.External].every(name => theirs.External.has(name));
+        return this.Fingerprint === other.Fingerprint;
     }
 
     /** True when a node of `concept` held by `owner` resolves to an External connector. */

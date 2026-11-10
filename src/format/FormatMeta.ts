@@ -27,6 +27,8 @@ export class FormatMeta
     public static readonly CurrentVersion = 1n;
     private static readonly FormatKeyName = 'format';
     private static readonly SchemaVersionKeyName = 'schemaVersion';
+    private static readonly StubRuleKeyName = 'stubRule';
+    private static readonly ErrStubRule = 'Corrupt Meta("stubRule"): not a single string';
     private static readonly ErrSchemaVersion = 'Corrupt Meta("schemaVersion"): not a single string';
 
     public static async Initialize(txn: IWriteTransaction): Promise<void>
@@ -71,6 +73,39 @@ export class FormatMeta
             throw new GraphError(GraphErrorCode.Corrupt, FormatMeta.ErrSchemaVersion);
         }
         return decoded[0];
+    }
+
+    /**
+     * The fingerprint of the stub rule the stored data conforms to (StubRule.Fingerprint), written by the upgrade that
+     * reconciled the data with it; undefined before any (no stored node is then a stub by rule).
+     */
+    public static async ReadStubRule(txn: IReadTransaction): Promise<string | undefined>
+    {
+        const raw = await txn.Get(Keyspace.Meta, FormatKeys.Meta(FormatMeta.StubRuleKeyName));
+        if (raw === undefined)
+        {
+            return undefined;
+        }
+        let decoded: unknown[];
+        try
+        {
+            decoded = TupleCodec.Decode(raw);
+        }
+        catch (error)
+        {
+            throw new GraphError(GraphErrorCode.Corrupt, FormatMeta.ErrStubRule, error);
+        }
+        if (decoded.length !== 1 || typeof decoded[0] !== 'string')
+        {
+            throw new GraphError(GraphErrorCode.Corrupt, FormatMeta.ErrStubRule);
+        }
+        return decoded[0];
+    }
+
+    /** Written only by the committer, in the write transaction of the upgrade that reconciled the data with the rule. */
+    public static WriteStubRule(txn: IWriteTransaction, fingerprint: string): void
+    {
+        txn.Put(Keyspace.Meta, FormatKeys.Meta(FormatMeta.StubRuleKeyName), TupleCodec.Encode([fingerprint]));
     }
 
     /** Written only by the committer, in the write transaction of the upgrade it belongs to. */

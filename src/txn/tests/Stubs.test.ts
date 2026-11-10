@@ -4,7 +4,6 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { AccessScope } from '../../access/AccessScope.js';
-import { CatalogModel } from '../../catalog/CatalogModel.js';
 import { MemberKind, ValueType } from '../../catalog/ValueType.js';
 import { AccessDefault, AccessScope as Scope } from '../../access/AccessScope.js';
 import { AccessError, AccessErrorCode } from '../../access/AccessError.js';
@@ -12,6 +11,7 @@ import { FalsePredicate } from '../../predicate/Predicate.js';
 import type { ISchemaDescription } from '../../schema/SchemaDescription.js';
 import { BindingTable } from '../../connectors/BindingTable.js';
 import { ConnectorResidency, type IExternalConnector } from '../../connectors/FetchContract.js';
+import { GraphError, GraphErrorCode } from '../../errors/GraphError.js';
 import { EdgeDirection } from '../../format/FormatKeys.js';
 import { FederatedReads } from '../../FederatedReads.js';
 import { GraphStore } from '../../GraphStore.js';
@@ -52,6 +52,9 @@ class StubFx
     public static readonly R1 = 'r1';
     public static readonly R2 = 'r2';
     public static readonly V1 = 'v1';
+    public static readonly V2 = 'v2';
+    public static readonly Jira2 = 'jira2';
+    public static readonly Parent = 'parent';
     private static readonly NoExternal = 'no external connector';
 
     public static readonly Target = Object.freeze({ Concept: StubFx.Ticket, Owner: StubFx.Jira });
@@ -86,24 +89,16 @@ class StubFx
     public static async Ready(open: () => Promise<GraphStore>): Promise<GraphStore>
     {
         const g = await open();
-        await g.DefineSchema(m => StubFx.Define(m));
+        await g.Upgrade(StubFx.Residency(StubFx.V1, false), [StubFx.External()]);
         await StubFx.Commit(g, t =>
         {
             t.CreateNode(StubFx.A, StubFx.Team);
             t.CreateNode(StubFx.B, StubFx.Team);
             t.CreateNode(StubFx.Local, StubFx.Ticket);
         });
-        g.SetConnectors(new BindingTable([{ Model: StubFx.Jira, Concept: StubFx.Ticket, Connector: StubFx.Ext }]), [StubFx.External()]);
+        // A residency change goes through an upgrade (ruling P19).
+        await g.Upgrade(StubFx.Residency(StubFx.V1, true), [StubFx.External()]);
         return g;
-    }
-
-    public static Define(m: CatalogModel): void
-    {
-        m.DefineConcept(StubFx.Ticket, null, [], [{ Name: StubFx.Ref, Kind: MemberKind.Property, Type: ValueType.String, Nullable: true }]);
-        m.DefineIndex(StubFx.ByRef, StubFx.Ticket, [StubFx.Ref], false);
-        m.DefineIndex(StubFx.UniqRef, StubFx.Ticket, [StubFx.Ref], true);
-        m.DefineConcept(StubFx.Person, null, [], []);
-        m.DefineConcept(StubFx.Team, null, [], [{ Name: StubFx.Assigned, Kind: MemberKind.Relationship, Targets: [StubFx.Ticket], Many: true }]);
     }
 
     public static async Commit(g: GraphStore, build: (t: GraphTransaction) => void): Promise<bigint>
@@ -250,21 +245,48 @@ class StubFx
      * ticket { ref } indexed by byRef and uniqRef, team { assigned -> ticket }; jira's tickets bound to ext when
      * `external`, else engine-held. No seed.
      */
-    public static Residency(version: string, external: boolean): ISchemaDescription
+    public static Residency(version: string, external: boolean, options: { readonly Assigned?: boolean; readonly Jira2?: boolean } = {}): ISchemaDescription
     {
+        const bindings = external ? [{ Model: StubFx.Jira, Concept: StubFx.Ticket, Connector: StubFx.Ext }] : [];
+        if (options.Jira2 === true)
+        {
+            bindings.push({ Model: StubFx.Jira2, Concept: StubFx.Ticket, Connector: StubFx.Ext });
+        }
+        const assigned = options.Assigned === false ? [] : [{ Name: StubFx.Assigned, Kind: MemberKind.Relationship as const, Targets: [StubFx.Ticket], Many: true }];
         return {
             Version: version,
             Definitions: [
-                { Name: StubFx.Ticket, IsAspect: false, Parent: null, Aspects: [], Members: [{ Name: StubFx.Ref, Kind: MemberKind.Property, Type: ValueType.String, Nullable: true }] },
-                { Name: StubFx.Team, IsAspect: false, Parent: null, Aspects: [], Members: [{ Name: StubFx.Assigned, Kind: MemberKind.Relationship, Targets: [StubFx.Ticket], Many: true }] },
+                { Name: StubFx.Ticket, IsAspect: false, Parent: null, Aspects: [], Members: [
+                    { Name: StubFx.Ref, Kind: MemberKind.Property, Type: ValueType.String, Nullable: true },
+                    { Name: StubFx.Parent, Kind: MemberKind.Relationship, Targets: [StubFx.Ticket], Many: true },
+                ] },
+                { Name: StubFx.Person, IsAspect: false, Parent: null, Aspects: [], Members: [] },
+                { Name: StubFx.Team, IsAspect: false, Parent: null, Aspects: [], Members: assigned },
             ],
             Indexes: [
                 { Name: StubFx.ByRef, On: StubFx.Ticket, Members: [StubFx.Ref], Unique: false },
                 { Name: StubFx.UniqRef, On: StubFx.Ticket, Members: [StubFx.Ref], Unique: true },
             ],
             Seed: [],
-            Bindings: external ? [{ Model: StubFx.Jira, Concept: StubFx.Ticket, Connector: StubFx.Ext }] : [],
+            Bindings: bindings,
         };
+    }
+
+    /** The store's last commit number. */
+    public static Last(g: GraphStore): bigint
+    {
+        return EngineInternals.Context(g).Committer.LastCommit();
+    }
+
+    /** How many commits the changefeed holds after `after`. */
+    public static async CommitsAfter(g: GraphStore, after: bigint): Promise<number>
+    {
+        let n = 0;
+        for await (const _ of g.ReadChanges(after))
+        {
+            n++;
+        }
+        return n;
     }
 
     /** The raw stored cell of the node's ref (engine storage, bypassing every reader rule); undefined when the node is gone. */
@@ -573,6 +595,64 @@ class StubFx
                 }
             });
 
+            it('catalog change and residency flip in one upgrade remove an orphaned new stub as engine data', async () =>
+            {
+                const g = await open();
+                await g.Upgrade(StubFx.Residency(StubFx.V1, false), [StubFx.External()]);
+                await StubFx.Commit(g, t =>
+                {
+                    t.CreateNode(StubFx.A, StubFx.Team);
+                    t.CreateNode(StubFx.Local, StubFx.Ticket);
+                });
+                const baseline = await StubFx.IndexEntries(g);
+                await StubFx.Commit(g, t =>
+                {
+                    t.CreateNode(StubFx.X, StubFx.Ticket, { Owner: StubFx.Jira });
+                    t.SetProperty(StubFx.X, StubFx.Ref, StubFx.R1);
+                    t.Link(StubFx.A, StubFx.Assigned, StubFx.X);
+                });
+                // v2 drops team.assigned (x's only edge) and binds jira's tickets to ext in the same upgrade.
+                await g.Upgrade(StubFx.Residency(StubFx.V2, true, { Assigned: false }), [StubFx.External()]);
+                assert.equal(await StubFx.Exists(g, StubFx.X), false);
+                assert.deepEqual(await StubFx.Scanned(g, StubFx.Ticket), [StubFx.Local]);
+                assert.equal(await StubFx.IndexEntries(g), baseline, 'no stale index entry of x');
+                await g.dispose();
+            });
+
+            it('stripping a node removes a stub its dropped out-edge orphaned', async () =>
+            {
+                const g = await open();
+                await g.Upgrade(StubFx.Residency(StubFx.V1, false, { Jira2: true }), [StubFx.External()]);
+                await StubFx.Commit(g, t =>
+                {
+                    t.CreateNode(StubFx.A, StubFx.Team);
+                    t.CreateNode(StubFx.X, StubFx.Ticket, { Owner: StubFx.Jira });
+                    t.Link(StubFx.A, StubFx.Assigned, StubFx.X);
+                    // y: a stub of jira2 (external in both versions), linked only from x.
+                    t.Link(StubFx.X, StubFx.Parent, StubFx.Y, { ExternalTarget: { Concept: StubFx.Ticket, Owner: StubFx.Jira2 } });
+                });
+                assert.deepEqual(await StubFx.ConceptOwner(g, StubFx.Y), [StubFx.Ticket, StubFx.Jira2]);
+                await g.Upgrade(StubFx.Residency(StubFx.V1, true, { Jira2: true }), [StubFx.External()]);
+                assert.deepEqual(await StubFx.ConceptOwner(g, StubFx.X), [StubFx.Ticket, StubFx.Jira], 'x is a stub, still linked from a');
+                assert.equal(await StubFx.Exists(g, StubFx.Y), false, 'y lost its last edge');
+                await g.dispose();
+            });
+
+            it('SetConnectors refuses a residency change', async () =>
+            {
+                const g = await open();
+                await g.Upgrade(StubFx.Residency(StubFx.V1, false), [StubFx.External()]);
+                const external = new BindingTable(StubFx.Residency(StubFx.V1, true).Bindings ?? []);
+                const invalid = (e: unknown): boolean => e instanceof GraphError && e.GraphCode === GraphErrorCode.InvalidArgument;
+                assert.throws(() => g.SetConnectors(external, [StubFx.External()]), invalid);
+                // A setup making the same nodes stubs (none) is accepted, as is reinstalling the same External rule.
+                g.SetConnectors(new BindingTable([]), [StubFx.External()]);
+                await g.Upgrade(StubFx.Residency(StubFx.V1, true), [StubFx.External()]);
+                g.SetConnectors(external, [StubFx.External()]);
+                assert.throws(() => g.SetConnectors(new BindingTable([]), [StubFx.External()]), invalid);
+                await g.dispose();
+            });
+
             it('stub linked and unlinked in one batch leaves no stub', async () =>
             {
                 const g = await StubFx.Ready(open);
@@ -587,6 +667,79 @@ class StubFx
         });
     }
 }
+
+describe('stubs across a reopen (lmdb)', () =>
+{
+    /** A closed LMDB store whose jira tickets are external, with teams a (with a stub x) and an engine ticket local. */
+    const Seeded = async (): Promise<string> =>
+    {
+        const dir = StubFx.Dir();
+        const g = await GraphStore.OpenLmdb(dir);
+        await g.Upgrade(StubFx.Residency(StubFx.V1, true), [StubFx.External()]);
+        await StubFx.Commit(g, t =>
+        {
+            t.CreateNode(StubFx.A, StubFx.Team);
+            t.CreateNode(StubFx.Local, StubFx.Ticket);
+            t.SetProperty(StubFx.Local, StubFx.Ref, StubFx.R1);
+        });
+        await StubFx.LinkStub(g, StubFx.A, StubFx.X);
+        await g.dispose();
+        return dir;
+    };
+
+    it('reopen with unchanged bindings writes no commit and keeps stubs and engine data', async () =>
+    {
+        const dir = await Seeded();
+        const g = await GraphStore.OpenLmdb(dir);
+        const last = StubFx.Last(g);
+        const upgrade = await g.Upgrade(StubFx.Residency(StubFx.V1, true), [StubFx.External()]);
+        assert.equal(upgrade.Commit, last);
+        assert.equal(await StubFx.CommitsAfter(g, last), 0);
+        assert.deepEqual(await StubFx.ConceptOwner(g, StubFx.X), [StubFx.Ticket, StubFx.Jira]);
+        assert.deepEqual(await StubFx.OutLinks(g, StubFx.A), [StubFx.X]);
+        assert.equal(await StubFx.RawRef(g, StubFx.Local), StubFx.R1);
+        await g.dispose();
+    });
+
+    it('reopen flipping the binding off External deletes its stubs and their edges', async () =>
+    {
+        const dir = await Seeded();
+        const g = await GraphStore.OpenLmdb(dir);
+        await g.Upgrade(StubFx.Residency(StubFx.V1, false), [StubFx.External()]);
+        assert.equal(await StubFx.Exists(g, StubFx.X), false);
+        assert.deepEqual(await StubFx.OutLinks(g, StubFx.A), []);
+        assert.equal(await StubFx.RawRef(g, StubFx.Local), StubFx.R1);
+        await g.dispose();
+    });
+
+    it('reopen flipping the binding on External strips engine data once', async () =>
+    {
+        const dir = StubFx.Dir();
+        const first = await GraphStore.OpenLmdb(dir);
+        await first.Upgrade(StubFx.Residency(StubFx.V1, false), [StubFx.External()]);
+        await StubFx.Commit(first, t =>
+        {
+            t.CreateNode(StubFx.A, StubFx.Team);
+            t.CreateNode(StubFx.X, StubFx.Ticket, { Owner: StubFx.Jira });
+            t.SetProperty(StubFx.X, StubFx.Ref, StubFx.R1);
+            t.Link(StubFx.A, StubFx.Assigned, StubFx.X);
+        });
+        await first.dispose();
+        const g = await GraphStore.OpenLmdb(dir);
+        const last = StubFx.Last(g);
+        await g.Upgrade(StubFx.Residency(StubFx.V1, true), [StubFx.External()]);
+        assert.equal(await StubFx.CommitsAfter(g, last), 1);
+        assert.equal(await StubFx.RawRef(g, StubFx.X), null);
+        assert.deepEqual(await StubFx.OutLinks(g, StubFx.A), [StubFx.X]);
+        await g.dispose();
+        // Reopening again with the same bindings finds nothing to do.
+        const again = await GraphStore.OpenLmdb(dir);
+        const after = StubFx.Last(again);
+        await again.Upgrade(StubFx.Residency(StubFx.V1, true), [StubFx.External()]);
+        assert.equal(await StubFx.CommitsAfter(again, after), 0);
+        await again.dispose();
+    });
+});
 
 describe('stub link serialization', () =>
 {

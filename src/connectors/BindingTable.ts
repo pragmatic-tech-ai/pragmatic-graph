@@ -29,6 +29,7 @@ export class BindingTable
     private static readonly ErrBinding = 'A binding needs a non-empty Model and Connector: ';
     private static readonly ConceptSeparator = ', concept ';
     private static readonly ModelWide = '';
+    private static readonly FingerprintSeparator = '\u0000';
 
     /** Per model: concept name (ModelWide for the model-wide binding) → connector. */
     private readonly models = new Map<string, Map<string, string>>();
@@ -243,6 +244,24 @@ export class BindingTable
     private static Compare(a: string, b: string): number
     {
         return a < b ? -1 : a > b ? 1 : 0;
+    }
+
+    /**
+     * A canonical text of the table: the DefaultConnector and every (model, concept, connector) binding, sorted. Two
+     * tables have the same fingerprint exactly when SameAs holds.
+     */
+    public Fingerprint(): string
+    {
+        const rows: string[][] = [];
+        for (const [model, byConcept] of this.models)
+        {
+            for (const [concept, connector] of byConcept)
+            {
+                rows.push([model, concept, connector]);
+            }
+        }
+        rows.sort((a, b) => BindingTable.Compare(a.join(BindingTable.FingerprintSeparator), b.join(BindingTable.FingerprintSeparator)));
+        return JSON.stringify([this.DefaultConnector ?? null, rows]);
     }
 
     /** True when `other` holds the same bindings (by model and concept) and the same DefaultConnector. */

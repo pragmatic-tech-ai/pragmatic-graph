@@ -11,7 +11,7 @@ import type { PublicIdIndex } from '../identity/PublicIdIndex.js';
 import type { RowIndex } from '../identity/RowIndex.js';
 import type { IWriteTransaction } from '../kv/KeyValue.js';
 import type { CatalogIndex } from '../txn/CatalogIndex.js';
-import { StubRule } from '../txn/StubRule.js';
+import type { StubRule } from '../txn/StubRule.js';
 import { ConflictKeys } from '../txn/ConflictKeys.js';
 import type { WriteKeySet } from '../txn/WriteKeySet.js';
 import type { CatalogDiff } from './CatalogDiff.js';
@@ -94,6 +94,20 @@ interface IDroppedColumn
 }
 
 /**
+ * Stub-ness from STORED state (final review residual round): a stored node is a stub exactly when its slot has no
+ * node-id cell (a stub is written without one, ruling R102); with one it holds engine data. Used by the purge and the
+ * residency reconciliation, so what a node IS in storage, not the rule some setup applied when it was written, decides
+ * how it is removed or converted.
+ */
+class StoredStub
+{
+    public static async Is(columns: ColumnStore, txn: IWriteTransaction, location: Location): Promise<boolean>
+    {
+        return (await columns.ReadCell(txn, location, CatalogSnapshot.NodeIdMember)) === null;
+    }
+}
+
+/**
  * One purge: first collects everything to remove by reading with the OLD catalog index (no writes while a
  * scan is open; every edge is collected once, by key, whichever rule found it), then removes it. The
  * logical write keys (ruling R23) of everything removed go into `keys` during collection.
@@ -128,7 +142,6 @@ class PurgeRun
         private readonly rows: RowIndex,
         private readonly ids: PublicIdIndex,
         private readonly indexes: IndexStore,
-        private readonly stubs: StubRule,
     )
     {
         this.removedTypes = diff.RemovedTypes.filter(d => !d.IsAspect);
@@ -325,15 +338,12 @@ class PurgeRun
     }
 
     /**
-     * Stubs of surviving concepts that the doomed edges leave without any edge are removed with them, in the same
-     * commit (ruling R102): a stub never outlives its last edge.
+     * Stored stubs (StoredStub: no node-id cell) of surviving concepts that the doomed edges leave without any edge are
+     * removed with them, in the same commit (ruling R102): a stub never outlives its last edge. A node holding engine
+     * data is never treated as a stub here, even when the new setup makes it one: the reconciliation converts it.
      */
     private async CollectOrphanedStubs(): Promise<void>
     {
-        if (!this.stubs.IsActive)
-        {
-            return;
-        }
         const candidates = new Set<bigint>();
         for (const edge of this.doomedEdges.values())
         {
@@ -352,7 +362,7 @@ class PurgeRun
             {
                 continue;
             }
-            if (this.stubs.IsStub(await this.ids.OwnerOf(this.txn, id), concept, this.next.Catalog) && !(await this.HasSurvivingEdge(id, concept)))
+            if ((await StoredStub.Is(this.columns, this.txn, location)) && !(await this.HasSurvivingEdge(id, concept)))
             {
                 this.doomed.set(id, { Id: id, Location: location, Concept: concept, TypeKept: true, Stub: true });
             }
@@ -602,9 +612,10 @@ class PurgeRun
 }
 
 /**
- * One residency reconciliation (final review I2, spec 12): run in an upgrade's write transaction after the purge, it
- * compares the stub rule before the upgrade (old catalog, old setup) with the one after (new catalog, new setup) for
- * every stored node, found through the public-id index (stubs have no node-id cell). Collects first, then writes.
+ * One residency reconciliation (final review I2 and residual round, spec 12): run in an upgrade's write transaction
+ * after the purge, it compares every stored node's STORED state (StoredStub: a stub has no node-id cell) with what the
+ * new stub rule (new setup, new catalog) makes it; nodes are found through the public-id index. Collects first, then
+ * writes. Idempotent: a second run with the same rule finds nothing.
  *
  * - A node that BECOMES a stub (its binding now resolves to an External connector): its index entries (computed from its
  *   values with the new catalog), every property cell and its node-id cell go; its identity, owner, seed marker and
@@ -628,7 +639,6 @@ class ResidencyRun
 
     public constructor(
         private readonly txn: IWriteTransaction,
-        private readonly old: CatalogIndex,
         private readonly next: CatalogIndex,
         private readonly keys: WriteKeySet,
         private readonly columns: ColumnStore,
@@ -636,7 +646,6 @@ class ResidencyRun
         private readonly rows: RowIndex,
         private readonly ids: PublicIdIndex,
         private readonly indexes: IndexStore,
-        private readonly before: StubRule,
         private readonly after: StubRule,
     )
     {
@@ -660,12 +669,13 @@ class ResidencyRun
         {
             (await this.HasSurvivingEdge(node) ? kept : orphans).push(node);
         }
+        const farStubs = await this.OrphanedFarStubs();
         const stale: IIndexEntry[] = [];
         for (const node of this.strip)
         {
             stale.push(...(await this.indexes.EntriesOf(this.txn, this.next.IndexesFor(node.Concept), node.Location, node.Id, node.PublicId)));
         }
-        const modified = await this.ModifiedNodes();
+        const modified = await this.ModifiedNodes(farStubs);
 
         for (const edge of this.doomedEdges.values())
         {
@@ -676,20 +686,24 @@ class ResidencyRun
         {
             await this.Strip(node);
         }
-        for (const node of [...this.remove.values(), ...orphans])
+        for (const node of [...this.remove.values(), ...orphans, ...farStubs])
         {
             await this.Remove(node);
         }
         return {
             NodesStripped: kept.length,
-            NodesRemoved: this.remove.size + orphans.length,
+            NodesRemoved: this.remove.size + orphans.length + farStubs.length,
             ValuesRemoved: this.values,
             EdgesRemoved: this.doomedEdges.size,
             ModifiedNodes: modified,
         };
     }
 
-    /** Every stored node whose stub verdict differs between the old and the new rule (collected before any write). */
+    /**
+     * Every stored node whose stored state (StoredStub) differs from what the new rule makes it (collected before any
+     * write): an engine node the rule makes a stub is stripped, a stored stub the rule does not is removed. Deciding from
+     * storage, not from a previous in-memory setup, makes the reconciliation correct across a reopen and idempotent.
+     */
     private async Classify(): Promise<void>
     {
         for await (const id of this.ids.Scan(this.txn))
@@ -701,8 +715,7 @@ class ResidencyRun
                 continue;
             }
             const owner = await this.ids.OwnerOf(this.txn, id);
-            const previous = this.old.ConceptOf(location.TypeId);
-            const was = previous !== undefined && this.before.IsStub(owner, previous, this.old.Catalog);
+            const was = await StoredStub.Is(this.columns, this.txn, location);
             const is = this.after.IsStub(owner, concept, this.next.Catalog);
             if (was === is)
             {
@@ -745,14 +758,18 @@ class ResidencyRun
         }
     }
 
-    /** True when an incoming edge of the node survives the reconciliation (its outgoing ones all go). */
+    /** True when an edge of the node, in either direction, survives the reconciliation. */
     private async HasSurvivingEdge(node: IResidencyNode): Promise<boolean>
     {
-        for (const rel of this.next.IncomingRelationships(node.Concept))
+        const outgoing = this.next.Catalog.EffectiveMembers(node.Concept).filter(m => m.Kind === MemberKind.Relationship).map(rel => [rel, EdgeDirection.Out] as const);
+        const incoming = this.next.IncomingRelationships(node.Concept).map(rel => [rel, EdgeDirection.In] as const);
+        for (const [rel, direction] of [...outgoing, ...incoming])
         {
-            for await (const edge of this.edges.Adjacent(this.txn, rel, node.Id, EdgeDirection.In))
+            for await (const edge of this.edges.Adjacent(this.txn, rel, node.Id, direction))
             {
-                if (!this.doomedEdges.has(ResidencyRun.EdgeKey(rel, edge.Node, node.Id, edge.Position)))
+                const from = direction === EdgeDirection.Out ? node.Id : edge.Node;
+                const to = direction === EdgeDirection.Out ? edge.Node : node.Id;
+                if (!this.doomedEdges.has(ResidencyRun.EdgeKey(rel, from, to, edge.Position)))
                 {
                     return true;
                 }
@@ -761,10 +778,39 @@ class ResidencyRun
         return false;
     }
 
-    /** Public ids of the touched nodes that stay engine nodes (neither stripped nor removed). */
-    private async ModifiedNodes(): Promise<string[]>
+    /**
+     * The far ends of the dropped edges that are stored stubs staying stubs and are left without any edge: removed too
+     * (ruling R102, final review residual round), e.g. the stub a stripped node's dropped out-edge pointed to.
+     */
+    private async OrphanedFarStubs(): Promise<IResidencyNode[]>
     {
-        const changed = new Set<bigint>([...this.remove.keys(), ...this.strip.map(n => n.Id)]);
+        const handled = new Set<bigint>([...this.remove.keys(), ...this.strip.map(n => n.Id)]);
+        const out: IResidencyNode[] = [];
+        for (const id of this.touched)
+        {
+            if (handled.has(id))
+            {
+                continue;
+            }
+            const location = await this.rows.Locate(this.txn, id);
+            const concept = location === undefined ? undefined : this.next.ConceptOf(location.TypeId);
+            if (location === undefined || concept === undefined || !(await StoredStub.Is(this.columns, this.txn, location)))
+            {
+                continue;
+            }
+            const node: IResidencyNode = { Id: id, PublicId: await this.PublicIdOf(id), Location: location, Concept: concept };
+            if (!(await this.HasSurvivingEdge(node)))
+            {
+                out.push(node);
+            }
+        }
+        return out;
+    }
+
+    /** Public ids of the touched nodes that stay engine nodes (neither stripped nor removed). */
+    private async ModifiedNodes(farStubs: readonly IResidencyNode[]): Promise<string[]>
+    {
+        const changed = new Set<bigint>([...this.remove.keys(), ...this.strip.map(n => n.Id), ...farStubs.map(n => n.Id)]);
         const out: string[] = [];
         for (const id of this.touched)
         {
@@ -861,22 +907,23 @@ export class DataPurger
 
     /**
      * `old` is the catalog the stored data conforms to, `next` the one being installed and `diff` the
-     * plan's diff between them. The logical write keys of everything removed are added to `keys`. `stubs`
-     * says which surviving nodes are stubs: one left without an edge is removed too (ruling R102).
+     * plan's diff between them. The logical write keys of everything removed are added to `keys`. A stored stub
+     * (no node-id cell) left without an edge is removed too (ruling R102).
      */
-    public Purge(txn: IWriteTransaction, old: CatalogIndex, next: CatalogIndex, diff: CatalogDiff, keys: WriteKeySet, stubs: StubRule = new StubRule()): Promise<IPurgeStats>
+    public Purge(txn: IWriteTransaction, old: CatalogIndex, next: CatalogIndex, diff: CatalogDiff, keys: WriteKeySet): Promise<IPurgeStats>
     {
-        return new PurgeRun(txn, old, next, diff, keys, this.columns, this.edges, this.rows, this.ids, this.indexes, stubs).Run();
+        return new PurgeRun(txn, old, next, diff, keys, this.columns, this.edges, this.rows, this.ids, this.indexes).Run();
     }
 
     /**
-     * Reconciles stored data with a change of the stub rule (final review I2): after Purge, in the same upgrade write.
-     * `before` is the rule the stored data was written under (with `old`), `after` the one being installed (with
-     * `next`). See ResidencyRun: nodes whose binding became External are stripped to stubs, stubs whose binding is no
-     * longer External are removed with their edges. The logical write keys of everything removed go into `keys`.
+     * Reconciles stored data with the stub rule `after` (the setup being installed, with `next`; final review I2 and
+     * residual round): after Purge, in the same upgrade write. Each node's current state is read from storage
+     * (StoredStub). See ResidencyRun: engine nodes the rule makes stubs are stripped, stored stubs it does not are removed
+     * with their edges, and stubs left without an edge are removed. The logical write keys of everything removed go
+     * into `keys`.
      */
-    public Reconcile(txn: IWriteTransaction, old: CatalogIndex, next: CatalogIndex, keys: WriteKeySet, before: StubRule, after: StubRule): Promise<IResidencyStats>
+    public Reconcile(txn: IWriteTransaction, next: CatalogIndex, keys: WriteKeySet, after: StubRule): Promise<IResidencyStats>
     {
-        return new ResidencyRun(txn, old, next, keys, this.columns, this.edges, this.rows, this.ids, this.indexes, before, after).Run();
+        return new ResidencyRun(txn, next, keys, this.columns, this.edges, this.rows, this.ids, this.indexes, after).Run();
     }
 }

@@ -124,7 +124,9 @@ export class GraphStore
      * and the connectors they name, for commits that start afterwards. Writes routed to a connector are
      * written through it (ruling R72); `timeoutMs` bounds the connector phase of each such commit (default
      * Committer.DefaultPrepareTimeoutMs). GraphError InvalidArgument for a binding to a connector not
-     * given, duplicate or reserved connector names, or a bad timeout. When the new setup routes differently
+     * given, duplicate or reserved connector names, or a bad timeout; also (ruling P19) for a setup that changes which
+     * nodes are stubs (its StubRule fingerprint differs from the stored Meta("stubRule")): residency changes go through
+     * Upgrade, which reconciles stored nodes. When the new setup routes differently
      * (ruling R77), in-flight work routed with the old setup conflicts: a commit not yet applied, a
      * write-through whose prepare is queued or dry-running, and a prepared one at its Finalize (its
      * connectors are then reverted) all fail with ConflictError (a ConnectorError Finalize wrapping it for
@@ -153,10 +155,12 @@ export class GraphStore
 
     /**
      * The changefeed (seam 7, ruling F4): every commit after `afterCommit`, in commit order, read from the
-     * log in one snapshot taken when iteration starts. Each entry is self-sufficient for replay: batches
-     * carry the catalog version they were applied against and their created internal ids; schema changes
-     * carry the complete resulting catalog; upgrades also carry the schema version (their discard follows
-     * from the previous and the resulting catalog, ruling R51). Ending the iteration early releases the snapshot.
+     * log in one snapshot taken when iteration starts. Batches carry the catalog version they were applied against,
+     * their created internal ids and their ops; schema changes carry the complete resulting catalog; upgrades carry the
+     * resulting catalog and the schema version but NOT their discards (the purge, and the residency reconciliation that
+     * also depends on the connector setup, which is not logged): a consumer treats an Upgrade commit as "re-read the
+     * affected data". The engine never replays the log to rebuild storage. Ending the iteration early releases the
+     * snapshot.
      */
     public async *ReadChanges(afterCommit: bigint): AsyncIterable<ICommitApplied>
     {
