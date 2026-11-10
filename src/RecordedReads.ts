@@ -3,6 +3,7 @@ import type { CatalogSnapshot } from './catalog/CatalogSnapshot.js';
 import type { MemberDef } from './catalog/CatalogTypes.js';
 import { MemberKind } from './catalog/ValueType.js';
 import type { CellValue } from './columns/CellValue.js';
+import type { ConnectorSetup } from './connectors/WriteCoordinator.js';
 import { GraphError, GraphErrorCode } from './errors/GraphError.js';
 import { EdgeDirection } from './format/FormatKeys.js';
 import type { Location } from './identity/Location.js';
@@ -35,8 +36,47 @@ export class RecordedReads
     private static readonly Dot = '.';
     private static readonly None: readonly MemberDef[] = Object.freeze([]);
 
+    /** The bindings and connectors installed when the reader opened (fixed for its life, as its snapshot is). */
+    private readonly connectors: ConnectorSetup | undefined;
+
     public constructor(private readonly context: GraphContext, private readonly snapshot: ReadSnapshot, public readonly Reads: ReadSet | undefined)
     {
+        this.connectors = context.Connectors;
+    }
+
+    /**
+     * True iff the stored node is a stub (ruling D2): its (owner, concept) resolves to an External connector. Records the
+     * node's binding (through Owner) when any External connector is installed; reads nothing otherwise.
+     */
+    public async IsStub(node: IReadNode): Promise<boolean>
+    {
+        const setup = this.connectors;
+        if (setup === undefined || setup.External.size === 0)
+        {
+            return false;
+        }
+        return setup.Bindings.IsStub(await this.Owner(node), node.Concept, this.Catalog, setup.External);
+    }
+
+    /**
+     * The stub stored for the external node `publicId` held by model `owner`: the stored node with that public id when
+     * it is owned by `owner` and is a stub, else undefined. Records the public id's binding (also when missing).
+     */
+    public async StubOf(publicId: string, owner: string): Promise<IReadNode | undefined>
+    {
+        const node = await this.Locate(publicId);
+        if (node === undefined || (await this.Owner(node)) !== owner || !(await this.IsStub(node)))
+        {
+            return undefined;
+        }
+        return node;
+    }
+
+    /** True iff some External binding could hold a node of `concept` (BindingTable.ExternalTargets is not empty). */
+    public ExternallyHeld(concept: string): boolean
+    {
+        const setup = this.connectors;
+        return setup !== undefined && setup.External.size > 0 && setup.Bindings.ExternalTargets(concept, this.Catalog, setup.External).length > 0;
     }
 
     public get Index(): CatalogIndex

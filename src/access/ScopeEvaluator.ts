@@ -2,10 +2,12 @@ import type { MemberDef } from '../catalog/CatalogTypes.js';
 import { MemberKind } from '../catalog/ValueType.js';
 import type { CellValue } from '../columns/CellValue.js';
 import { GraphError, GraphErrorCode } from '../errors/GraphError.js';
+import { EdgeDirection } from '../format/FormatKeys.js';
 import { NodeEvaluator, Truth } from '../predicate/NodeEvaluator.js';
-import { type And, type ConceptIs, type Not, type Or, type OwnerIs, Predicate, PredicateKind, type Reachable, type Related } from '../predicate/Predicate.js';
+import { And, type ConceptIs, type Not, type Or, type OwnerIs, Predicate, PredicateKind, type Reachable, type Related } from '../predicate/Predicate.js';
 import type { IReadNode, RecordedReads } from '../RecordedReads.js';
 import { AccessDefault, type AccessScope, type IReadOnlyMembers, type IWriteRules } from './AccessScope.js';
+import type { FetchedNode } from './FetchedNode.js';
 import type { HypotheticalNode } from './HypotheticalNode.js';
 import { WriteStage } from './WriteStage.js';
 
@@ -59,6 +61,7 @@ export class ScopeEvaluator
     private static readonly MaxDecisions = 10_000;
     private static readonly NoHidden: ReadonlySet<string> = new Set();
     private static readonly NoReadOnly: ReadonlySet<string> = new Set();
+    private static readonly NoLinks: readonly string[] = Object.freeze([]);
 
     private readonly rows = new Map<string, readonly Predicate[]>();
     private readonly writes = new Map<string, readonly IWriteRules[]>();
@@ -129,6 +132,57 @@ export class ScopeEvaluator
             return this.scope.Default === AccessDefault.Allow;
         }
         return rows.every(row => node.Eval(row) === Truth.True);
+    }
+
+    /**
+     * True iff the row fetched from an External connector passes every applicable Rows predicate (ruling R100, design
+     * ruling D5); the scope's Default when none applies. A top-level decision of its own (a fresh Evaluation: cycle
+     * guard, memo and MaxDecisions budget), with the row's stub, when one is attached, counted as being decided, so a
+     * rule that comes back to it through engine edges hits the guard. Values come from the row (absent = null); IdIn,
+     * OwnerIs (the fetch target's model) and ConceptIs (the row's concept) are known; Seeded is False. Related Out walks
+     * the row's Links: an engine-resident target is decided as for engine nodes, an external one (a stub, or no stored
+     * node) is Unknown unless Target is True. Related In is decided through the stub's engine edges when there is a
+     * stub; without one it is False, or Unknown when some External binding could hold a source of the relationship.
+     * Reachable is True when the row's id is in From, else decided by the engine BFS through the stub, else Unknown.
+     * Unknown at the top is not visible. Records the reads it makes; caches nothing about the row.
+     */
+    public async VisibleFetched(node: FetchedNode): Promise<boolean>
+    {
+        const rows = this.ApplicableRows(node.Concept);
+        if (rows.length === 0)
+        {
+            return this.scope.Default === AccessDefault.Allow;
+        }
+        const evaluation = new Evaluation();
+        evaluation.Decisions += 1;
+        const stub = node.StubNode;
+        if (stub !== undefined)
+        {
+            evaluation.Deciding.add(stub.Id);
+        }
+        for (const row of rows)
+        {
+            if ((await this.EvalFetched(row, node, evaluation)) !== Truth.True)
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * The predicate a fetch of `concept` pushes down for the scope (design ruling D4): the applicable Rows predicate,
+     * the And of them when several apply (in scope order), True when none applies and Default allows, False when it
+     * denies. Advisory only: every fetched row is still decided by VisibleFetched.
+     */
+    public RowsPredicate(concept: string): Predicate
+    {
+        const rows = this.ApplicableRows(concept);
+        if (rows.length === 0)
+        {
+            return this.scope.Default === AccessDefault.Allow ? Predicate.True : Predicate.False;
+        }
+        return rows.length === 1 ? rows[0]! : new And(rows);
     }
 
     /** Write rules of every Writes entry applicable to `concept` (keyed by it, an ancestor or a carried aspect). */
@@ -375,24 +429,157 @@ export class ScopeEvaluator
         {
             for await (const id of this.reads.Adjacent(rel, node.Id, p.Direction))
             {
-                const neighbor = await this.reads.NodeById(id);
-                const visible = await this.Decide(neighbor, evaluation);
-                if (visible === Truth.False)
-                {
-                    continue;
-                }
-                const target = await this.Eval(p.Target, new NodeFacts(neighbor), evaluation);
-                if (visible === Truth.True && target === Truth.True)
+                const t = await this.Neighbor(p, await this.reads.NodeById(id), evaluation);
+                if (t === Truth.True)
                 {
                     return Truth.True;
                 }
-                if (target !== Truth.False)
+                if (t === Truth.Unknown)
                 {
                     result = Truth.Unknown;
                 }
             }
         }
         return result;
+    }
+
+    /** One neighbor's part of a Related: (neighbor visible AND Target), Kleene. */
+    private async Neighbor(p: Related, neighbor: IReadNode, evaluation: Evaluation): Promise<Truth>
+    {
+        const visible = await this.Decide(neighbor, evaluation);
+        if (visible === Truth.False)
+        {
+            return Truth.False;
+        }
+        const target = await this.Eval(p.Target, new NodeFacts(neighbor), evaluation);
+        if (target === Truth.False)
+        {
+            return Truth.False;
+        }
+        return visible === Truth.True && target === Truth.True ? Truth.True : Truth.Unknown;
+    }
+
+    /** A Rows predicate on a fetched row under D5 (see VisibleFetched). */
+    private async EvalFetched(p: Predicate, node: FetchedNode, evaluation: Evaluation): Promise<Truth>
+    {
+        if (p.IsNodeLocal)
+        {
+            return NodeEvaluator.Evaluate(p, node.Row.Values, node.PublicId);
+        }
+        switch (p.Kind)
+        {
+            case PredicateKind.And:
+                return this.CombineFetched((p as And).Terms, node, evaluation, Truth.False, Truth.True);
+            case PredicateKind.Or:
+                return this.CombineFetched((p as Or).Terms, node, evaluation, Truth.True, Truth.False);
+            case PredicateKind.Not:
+            {
+                const inner = await this.EvalFetched((p as Not).Term, node, evaluation);
+                return inner === Truth.Unknown ? Truth.Unknown : inner === Truth.True ? Truth.False : Truth.True;
+            }
+            case PredicateKind.Related:
+            {
+                const related = p as Related;
+                return related.Direction === EdgeDirection.Out ? this.FetchedOut(related, node, evaluation) : this.FetchedIn(related, node, evaluation);
+            }
+            case PredicateKind.Reachable:
+                return this.FetchedReachable(p as Reachable, node);
+            case PredicateKind.Seeded:
+                return Truth.False;
+            case PredicateKind.OwnerIs:
+                return (p as OwnerIs).Owners.has(node.Owner) ? Truth.True : Truth.False;
+            case PredicateKind.ConceptIs:
+                return node.Concept === (p as ConceptIs).Concept ? Truth.True : Truth.False;
+            default:
+                throw new GraphError(GraphErrorCode.Internal, ScopeEvaluator.ErrKind + String(p.Kind));
+        }
+    }
+
+    /**
+     * Kleene And (dominant False) or Or (dominant True) over a fetched row: the dominant value wins, else Unknown if
+     * any, else `identity`.
+     */
+    private async CombineFetched(terms: readonly Predicate[], node: FetchedNode, evaluation: Evaluation, dominant: Truth, identity: Truth): Promise<Truth>
+    {
+        let result = identity;
+        for (const term of terms)
+        {
+            const t = await this.EvalFetched(term, node, evaluation);
+            if (t === dominant)
+            {
+                return dominant;
+            }
+            if (t === Truth.Unknown)
+            {
+                result = Truth.Unknown;
+            }
+        }
+        return result;
+    }
+
+    /**
+     * Related Out over the row's Links: an engine-resident target (stored and not a stub) decides as for engine nodes;
+     * an external one is Unknown, or True when Target is True (the link exists).
+     */
+    private async FetchedOut(p: Related, node: FetchedNode, evaluation: Evaluation): Promise<Truth>
+    {
+        if (this.reads.RelationshipsOrNone(node.Concept, p.Relationship, EdgeDirection.Out).length === 0)
+        {
+            return Truth.False;
+        }
+        let result = Truth.False;
+        for (const target of node.Row.Links.get(p.Relationship) ?? ScopeEvaluator.NoLinks)
+        {
+            const stored = await this.reads.Locate(target);
+            const t = stored === undefined || (await this.reads.IsStub(stored))
+                ? (p.Target.Kind === PredicateKind.True ? Truth.True : Truth.Unknown)
+                : await this.Neighbor(p, stored, evaluation);
+            if (t === Truth.True)
+            {
+                return Truth.True;
+            }
+            if (t === Truth.Unknown)
+            {
+                result = Truth.Unknown;
+            }
+        }
+        return result;
+    }
+
+    /**
+     * Related In: through the stub's engine edges when there is a stub; otherwise False, or Unknown when some External
+     * binding could hold a source of a relationship of that name targeting the row's concept.
+     */
+    private async FetchedIn(p: Related, node: FetchedNode, evaluation: Evaluation): Promise<Truth>
+    {
+        const stub = node.StubNode;
+        if (stub !== undefined)
+        {
+            return this.EvalRelated(p, stub, evaluation);
+        }
+        for (const rel of this.reads.RelationshipsOrNone(node.Concept, p.Relationship, EdgeDirection.In))
+        {
+            if (this.reads.ExternallyHeld(rel.DeclaredBy))
+            {
+                return Truth.Unknown;
+            }
+        }
+        return Truth.False;
+    }
+
+    /** Reachable: True when the row's id is in From, else the engine BFS through the stub decides, else Unknown. */
+    private async FetchedReachable(p: Reachable, node: FetchedNode): Promise<Truth>
+    {
+        if (p.From.has(node.PublicId))
+        {
+            return Truth.True;
+        }
+        const stub = node.Stub;
+        if (stub === undefined)
+        {
+            return Truth.Unknown;
+        }
+        return (await this.ReachableSet(p)).has(stub) ? Truth.True : Truth.False;
     }
 
     private ReachableSet(p: Reachable): Promise<ReadonlySet<bigint>>

@@ -224,6 +224,8 @@ export class ConnectorSetup
     private static readonly ErrTimeout = 'Connector timeout must be a finite positive number of milliseconds: ';
 
     public readonly Connectors: ReadonlyMap<string, IGraphConnector>;
+    /** Names of the installed connectors whose Residency is External (ruling R96). */
+    public readonly External: ReadonlySet<string>;
 
     public constructor(public readonly Bindings: BindingTable, connectors: readonly IGraphConnector[], public readonly TimeoutMs: number)
     {
@@ -257,6 +259,7 @@ export class ConnectorSetup
             }
         }
         this.Connectors = byName;
+        this.External = new Set([...byName.values()].filter(c => c.Residency === ConnectorResidency.External).map(c => c.Name));
     }
 
     /** An External connector must implement the fetch contract (ruling R96). */
