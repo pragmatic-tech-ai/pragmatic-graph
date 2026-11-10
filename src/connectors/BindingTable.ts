@@ -247,15 +247,17 @@ export class BindingTable
     }
 
     /**
-     * A canonical text of exactly what decides which nodes resolve to a connector in `external` (the stub rule, final
-     * review): '' when no binding names one. Otherwise, sorted, every binding (model, concept or '' for model-wide,
-     * External or not) of each model that has a binding to an External connector; which connector a binding names
-     * is left out, only whether it is External (a non-External binding of such a model can shadow an External one in
-     * some catalog, so it counts; models without an External binding never resolve External, because the
-     * DefaultConnector is never External, ConnectorSetup). Two tables have the same stub fingerprint exactly when
-     * they assign External or not to the same (model, concept) keys in models binding External, so under every catalog
-     * they make the same nodes stubs; re-pointing a binding between connectors of the same residency, adding an
-     * unbound connector or changing a model without External bindings keeps it.
+     * A canonical text of what decides which nodes resolve to a connector in `external` (the stub rule, final review):
+     * '' when no binding names one. Otherwise, sorted, every binding (model, concept or '' for model-wide, External or
+     * not) of each model that has a binding to an External connector; which connector a binding names is left out,
+     * only whether it is External (a non-External binding of such a model can shadow an External one in some catalog,
+     * so it counts; models without an External binding never resolve External, because the DefaultConnector is never
+     * External, ConnectorSetup). Conservative, not exact: equal stub fingerprints imply the same nodes are stubs under
+     * every catalog; the converse fails only for redundant bindings (e.g. a model-wide non-External binding with the
+     * same effect as the default, or a concept binding duplicating its model's model-wide External binding), where the
+     * cost is a refused SetConnectors and an Upgrade that finds no transition and writes no commit. Re-pointing a
+     * binding between connectors of the same residency, adding an unbound connector or changing a model without
+     * External bindings keeps it.
      */
     public StubFingerprint(external: ReadonlySet<string>): string
     {

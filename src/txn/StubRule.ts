@@ -23,17 +23,18 @@ export class StubRule
 
     /**
      * A canonical text of the rule (BindingTable.StubFingerprint over the installed External connectors): Inactive when
-     * no binding names an External connector. Two rules have equal fingerprints exactly when their binding tables make
-     * the same (model, concept) keys External, so under every catalog they make the same nodes stubs; Mirrored or
-     * engine re-pointing and unused External connectors do not change it. Stored as Meta("stubRule"): the rule the
-     * stored data conforms to (final review residual rounds).
+     * no binding names an External connector. Conservative, not exact: equal fingerprints imply the same nodes are
+     * stubs under every catalog; the converse fails only for redundant bindings, where the cost is a refused
+     * SetConnectors and an Upgrade that finds no transition and writes no commit. Mirrored or engine re-pointing and
+     * unused External connectors do not change it. Stored as Meta("stubRule"): the rule the stored data conforms to
+     * (final review residual rounds).
      */
     public get Fingerprint(): string
     {
         return this.IsActive ? (this.setup as ConnectorSetup).Bindings.StubFingerprint((this.setup as ConnectorSetup).External) : StubRule.Inactive;
     }
 
-    /** True when this rule and `other` make the same nodes stubs under every catalog (equal fingerprints). */
+    /** True when the fingerprints are equal, which implies both rules make the same nodes stubs under every catalog (conservative). */
     public SameAs(other: StubRule): boolean
     {
         return this.Fingerprint === other.Fingerprint;

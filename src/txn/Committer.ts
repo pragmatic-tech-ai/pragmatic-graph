@@ -455,9 +455,10 @@ export class Committer
     }
 
     /**
-     * SetConnectors' install (ruling P19): GraphError InvalidArgument, installing nothing, when the setup's stub rule
-     * differs from the one the stored data conforms to (StubRule.Fingerprint against Meta("stubRule"); either side
-     * having an External connector): a residency change must go through an upgrade, which reconciles stored nodes.
+     * SetConnectors' install (ruling P19): GraphError InvalidArgument, installing nothing, when the setup's stub-rule
+     * fingerprint differs from the stored Meta("stubRule") (StubRule.Fingerprint): every setup that could change which
+     * nodes are stubs is refused, and conservatively some redundant-binding ones that do not; a residency change must
+     * go through an upgrade, which reconciles stored nodes.
      * Otherwise as InstallConnectors.
      */
     public SetConnectors(setup: ConnectorSetup): void
