@@ -149,12 +149,29 @@ export class BindingTable
 
     /**
      * True when some node that is, inherits from or carries `conceptOrAspect` could resolve to a connector in `external`:
-     * ExternalTargets of it is not empty. Owners the table does not name resolve to DefaultConnector, never external
+     * exactly when ExternalTargets of it is not empty, but stopping at the first member (see ExternalTargets) some model
+     * resolves to an external connector. Owners the table does not name resolve to DefaultConnector, never external
      * (ConnectorSetup refuses an External default), so they never count.
      */
     public MayResolveExternal(conceptOrAspect: string, catalog: CatalogSnapshot, external: ReadonlySet<string>): boolean
     {
-        return this.ExternalTargets(conceptOrAspect, catalog, external).length > 0;
+        if (external.size === 0)
+        {
+            return false;
+        }
+        const members = this.Members(conceptOrAspect, catalog);
+        for (const model of this.models.keys())
+        {
+            for (const concept of members)
+            {
+                const connector = this.Resolve(model, concept, catalog);
+                if (connector !== undefined && external.has(connector))
+                {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     /** True when `general` and `specific` differ and a fetch of `general` covers nodes of `specific` (IsA). */

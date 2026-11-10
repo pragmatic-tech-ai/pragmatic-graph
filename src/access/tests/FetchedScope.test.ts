@@ -409,7 +409,9 @@ class FetchedFx
                     const linkIn = new Related(FetchedFx.Link, EdgeDirection.In, TruePredicate.Instance);
                     assert.deepEqual(await FetchedFx.Admitted(g, FetchedFx.ServerScope(linkIn), [FetchedFx.Row(FetchedFx.X)]), [false]);
                     assert.deepEqual(await FetchedFx.Admitted(g, FetchedFx.ServerScope(new Not(linkIn)), [FetchedFx.Row(FetchedFx.X)]), [false]);
-                    // The stub still decides an engine-only source.
+                    // An engine edge into the stub still makes Related In True (t assigns x), which no external source
+                    // can undo; under the model-wide binding assigned's source (Team) may be external too, so only True is
+                    // pinned here, not a False.
                     const assignedIn = new Related(FetchedFx.Assigned, EdgeDirection.In, new IdIn(new Set([FetchedFx.T])));
                     assert.deepEqual(await FetchedFx.Admitted(g, FetchedFx.ServerScope(assignedIn), [FetchedFx.Row(FetchedFx.X)]), [true]);
                     g.dispose();
