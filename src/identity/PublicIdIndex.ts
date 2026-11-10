@@ -38,6 +38,15 @@ export class PublicIdIndex
         return raw === undefined ? undefined : (TupleCodec.Decode(raw)[0] as bigint);
     }
 
+    /** Every bound node's internal id, in id order (a full scan of the Ids keyspace; schema purges only). */
+    public async *Scan(txn: IReadTransaction): AsyncIterable<bigint>
+    {
+        for await (const [key] of txn.Scan(Keyspace.Ids, FormatKeys.InternalToPublicRange()))
+        {
+            yield TupleCodec.Decode(key)[1] as bigint;
+        }
+    }
+
     /** The node's owner: '' when it was created without one. Callers establish that the node exists. */
     public async OwnerOf(txn: IReadTransaction, id: bigint): Promise<string>
     {

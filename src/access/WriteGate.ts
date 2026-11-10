@@ -277,7 +277,12 @@ export class WriteGate
             case WriteOp.Unlink:
             {
                 const concept = await this.CheckWrite(index, op.Op, op.From, op.Relationship, targets.Source, false, op.Op === WriteOp.Unlink && this.IsDetach(index, op.From, op.To));
-                await this.CheckReferenced(index, op.Op, op.From, concept, op.To, targets.Target, WriteGate.ErrInvisibleTarget);
+                // An external target that is not a stored node is a stub to be created (R102): its visibility is
+                // checked against the fetched row. A stored node keeps the ordinary rule (no existence oracle).
+                if (!await this.IsNewStubTarget(op, targets.Target))
+                {
+                    await this.CheckReferenced(index, op.Op, op.From, concept, op.To, targets.Target, WriteGate.ErrInvisibleTarget);
+                }
                 if (op.Op === WriteOp.Link)
                 {
                     // The committer resolves siblings unscoped: an unchecked one would be an existence oracle.
@@ -300,6 +305,12 @@ export class WriteGate
                 // Unreachable through GraphTransaction (ruling R90); a gated batch never re-owns.
                 throw this.Denied(AccessErrorCode.UpdateDenied, index, op.Op, op.PublicId, targets.Source?.Concept, WriteGate.ErrSeedOnly);
         }
+    }
+
+    /** A Link carrying ExternalTarget whose `to` is neither created by the batch nor stored (ruling R102). */
+    private async IsNewStubTarget(op: BatchOp, created: CreatedNode | undefined): Promise<boolean>
+    {
+        return op.Op === WriteOp.Link && op.Options?.ExternalTarget !== undefined && created === undefined && (await this.evaluator.Locate(op.To)) === undefined;
     }
 
     /** A node a Link/Unlink names besides its source must be created by the batch or visible (a recorded read). */

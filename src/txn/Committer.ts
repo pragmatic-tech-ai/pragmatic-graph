@@ -17,6 +17,7 @@ import { DataPurger } from '../schema/DataPurger.js';
 import type { ISchemaDescription, ISeedNode } from '../schema/SchemaDescription.js';
 import { SeedMarkers } from '../schema/SeedMarkers.js';
 import { type ISeedCatalogChange, SeedSynchronizer, TransactionSeedView } from '../schema/SeedSynchronizer.js';
+import { StubRule } from './StubRule.js';
 import { BatchApplier } from './BatchApplier.js';
 import { CatalogIndex } from './CatalogIndex.js';
 import { CommitError } from './CommitError.js';
@@ -826,7 +827,7 @@ export class Committer
             let change: ISeedCatalogChange | undefined;
             if (plan.Changed)
             {
-                const stats = await this.purger.Purge(txn, old, next, plan.Diff, keys);
+                const stats = await this.purger.Purge(txn, old, next, plan.Diff, keys, new StubRule(connectors ?? this.connectors));
                 change = { Modified: new Set(stats.ModifiedNodes) };
             }
             const applied = await this.ApplySeed(txn, next, description.Seed, ids, change);

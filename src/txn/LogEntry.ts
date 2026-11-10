@@ -28,7 +28,7 @@ export interface ICommitApplied
     /** The sealed, immutable batch; empty for a schema change or upgrade. */
     readonly Batch: WriteBatch;
     /**
-     * The internal ids allocated for the batch's CreateNode ops, in op order (empty for a schema change or upgrade).
+     * The internal ids allocated for the batch's CreateNode ops and for its Link ops carrying an ExternalTarget (a stub is created only when the target does not exist, but the id is taken either way), in op order (empty for a schema change or upgrade).
      */
     readonly CreatedIds: readonly bigint[];
     /** SchemaChange and Upgrade: the complete catalog after the change. */

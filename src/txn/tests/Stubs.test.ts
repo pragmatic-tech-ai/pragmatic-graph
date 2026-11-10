@@ -5,7 +5,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { AccessScope } from '../../access/AccessScope.js';
 import { CatalogModel } from '../../catalog/CatalogModel.js';
-import { MemberKind } from '../../catalog/ValueType.js';
+import { MemberKind, ValueType } from '../../catalog/ValueType.js';
+import { AccessDefault, AccessScope as Scope } from '../../access/AccessScope.js';
+import { AccessError, AccessErrorCode } from '../../access/AccessError.js';
+import { FalsePredicate } from '../../predicate/Predicate.js';
+import type { ISchemaDescription } from '../../schema/SchemaDescription.js';
 import { BindingTable } from '../../connectors/BindingTable.js';
 import { ConnectorResidency, type IExternalConnector } from '../../connectors/FetchContract.js';
 import { EdgeDirection } from '../../format/FormatKeys.js';
@@ -30,6 +34,10 @@ class StubFx
     public static readonly Person = 'person';
     public static readonly Assigned = 'assigned';
     public static readonly Jira = 'jira';
+    public static readonly Other = 'other';
+    public static readonly Ref = 'ref';
+    public static readonly ByRef = 'byRef';
+    public static readonly UniqRef = 'uniqRef';
     public static readonly Ext = 'ext';
     public static readonly X = 'x';
     public static readonly Y = 'y';
@@ -82,7 +90,9 @@ class StubFx
 
     public static Define(m: CatalogModel): void
     {
-        m.DefineConcept(StubFx.Ticket, null, [], []);
+        m.DefineConcept(StubFx.Ticket, null, [], [{ Name: StubFx.Ref, Kind: MemberKind.Property, Type: ValueType.String, Nullable: true }]);
+        m.DefineIndex(StubFx.ByRef, StubFx.Ticket, [StubFx.Ref], false);
+        m.DefineIndex(StubFx.UniqRef, StubFx.Ticket, [StubFx.Ref], true);
         m.DefineConcept(StubFx.Person, null, [], []);
         m.DefineConcept(StubFx.Team, null, [], [{ Name: StubFx.Assigned, Kind: MemberKind.Relationship, Targets: [StubFx.Ticket], Many: true }]);
     }
@@ -191,6 +201,56 @@ class StubFx
         }
     }
 
+    /** How many entries the secondary-index keyspace holds. */
+    public static async IndexEntries(g: GraphStore): Promise<number>
+    {
+        const txn = await EngineInternals.Context(g).Store.BeginRead();
+        try
+        {
+            let n = 0;
+            for await (const _ of txn.Scan(Keyspace.Index, { Start: Uint8Array.of(0), End: Uint8Array.of(255, 255, 255, 255) }))
+            {
+                n++;
+            }
+            return n;
+        }
+        finally
+        {
+            txn.dispose();
+        }
+    }
+
+    /** A schema over the same names: ticket (bound to ext under jira), team, and optionally team.assigned. */
+    public static Description(version: string, withTicket: boolean, withAssigned: boolean): ISchemaDescription
+    {
+        const assigned = { Name: StubFx.Assigned, Kind: MemberKind.Relationship as const, Targets: [StubFx.Ticket], Many: true };
+        return {
+            Version: version,
+            Definitions: [
+                ...(withTicket ? [{ Name: StubFx.Ticket, IsAspect: false, Parent: null, Aspects: [], Members: [] }] : []),
+                { Name: StubFx.Team, IsAspect: false, Parent: null, Aspects: [], Members: withAssigned ? [assigned] : [] },
+            ],
+            Indexes: [],
+            Seed: [],
+            Bindings: withTicket ? [{ Model: StubFx.Jira, Concept: StubFx.Ticket, Connector: StubFx.Ext }] : [],
+        };
+    }
+
+    /** A store upgraded to the full description, teams a and b, and stubs x (from a) and y (from b). */
+    public static async Purgeable(open: () => Promise<GraphStore>): Promise<GraphStore>
+    {
+        const g = await open();
+        await g.Upgrade(StubFx.Description('v1', true, true), [StubFx.External()]);
+        await StubFx.Commit(g, t =>
+        {
+            t.CreateNode(StubFx.A, StubFx.Team);
+            t.CreateNode(StubFx.B, StubFx.Team);
+        });
+        await StubFx.LinkStub(g, StubFx.A, StubFx.X);
+        await StubFx.LinkStub(g, StubFx.B, StubFx.Y);
+        return g;
+    }
+
     public static IsCode(e: unknown, code: CommitErrorCode): boolean
     {
         return e instanceof CommitError && e.Code === code;
@@ -209,6 +269,8 @@ class StubFx
                 assert.deepEqual(await StubFx.OutLinks(g, StubFx.A), [StubFx.X]);
                 assert.equal(await StubFx.CellEntries(g), before, 'the stub wrote no cell');
                 assert.deepEqual(await StubFx.Scanned(g, StubFx.Ticket), ['local'], 'a stub is not engine data');
+                await StubFx.Commit(g, t => t.Unlink(StubFx.A, StubFx.Assigned, StubFx.X));
+                assert.equal(await StubFx.CellEntries(g), before, 'deleting the stub wrote no cell either');
                 await g.dispose();
             });
 
@@ -262,6 +324,82 @@ class StubFx
                 assert.equal(await StubFx.Exists(g, StubFx.Y), true, 'b still links y');
                 await StubFx.Commit(g, t => t.DeleteNode(StubFx.B));
                 assert.equal(await StubFx.Exists(g, StubFx.Y), false);
+                await g.dispose();
+            });
+
+            it('stub of an indexed concept has no index entries', async () =>
+            {
+                const g = await StubFx.Ready(open);
+                const before = await StubFx.IndexEntries(g);
+                await StubFx.LinkStub(g, StubFx.A, StubFx.X);
+                await StubFx.LinkStub(g, StubFx.A, StubFx.Y);
+                assert.equal(await StubFx.IndexEntries(g), before, 'no entries for two stubs, and no unique violation');
+                await StubFx.Commit(g, t => t.Unlink(StubFx.A, StubFx.Assigned, StubFx.Y));
+                assert.equal(await StubFx.IndexEntries(g), before);
+                await g.dispose();
+            });
+
+            it('existing engine node or stub of another owner is TargetTypeMismatch', async () =>
+            {
+                const g = await StubFx.Ready(open);
+                const onLocal = await StubFx.Rejection(StubFx.Commit(g, t => t.Link(StubFx.A, StubFx.Assigned, 'local', { ExternalTarget: StubFx.Target })));
+                assert.ok(StubFx.IsCode(onLocal, CommitErrorCode.TargetTypeMismatch), String(onLocal));
+                await StubFx.LinkStub(g, StubFx.A, StubFx.X);
+                const otherOwner = await StubFx.Rejection(StubFx.Commit(g, t => t.Link(StubFx.B, StubFx.Assigned, StubFx.X, { ExternalTarget: { Concept: StubFx.Ticket, Owner: StubFx.Other } })));
+                assert.ok(StubFx.IsCode(otherOwner, CommitErrorCode.TargetTypeMismatch), String(otherOwner));
+                await g.dispose();
+            });
+
+            it('scoped transaction can create a stub link; an invisible stored target is InvisibleNode', async () =>
+            {
+                const g = await StubFx.Ready(open);
+                const scope = Scope.Build({ Default: AccessDefault.Allow, Rows: new Map([[StubFx.Ticket, FalsePredicate.Instance]]) });
+                const link = async (to: string, concept: string): Promise<bigint> =>
+                {
+                    const t = await g.Begin(scope);
+                    try
+                    {
+                        t.Link(StubFx.A, StubFx.Assigned, to, { ExternalTarget: { Concept: concept, Owner: StubFx.Jira } });
+                        return await t.Commit();
+                    }
+                    finally
+                    {
+                        t.dispose();
+                    }
+                };
+                await link(StubFx.X, StubFx.Ticket);
+                assert.equal(await StubFx.Exists(g, StubFx.X), true);
+                const error = await StubFx.Rejection(link(StubFx.X, StubFx.Person));
+                assert.ok(error instanceof AccessError && error.Code === AccessErrorCode.InvisibleNode, String(error));
+                await g.dispose();
+            });
+
+            it('concept removal purges its stubs', async () =>
+            {
+                const g = await StubFx.Purgeable(open);
+                await g.Upgrade(StubFx.Description('v2', false, false), [StubFx.External()]);
+                assert.equal(await StubFx.Exists(g, StubFx.X), false);
+                assert.equal(await StubFx.Exists(g, StubFx.Y), false);
+                const r = await g.BeginRead(AccessScope.System);
+                try
+                {
+                    assert.equal(await r.OwnerOf(StubFx.X), undefined);
+                }
+                finally
+                {
+                    r.dispose();
+                }
+                assert.equal(await StubFx.Exists(g, StubFx.A), true);
+                await g.dispose();
+            });
+
+            it('relationship removal deletes orphaned stubs', async () =>
+            {
+                const g = await StubFx.Purgeable(open);
+                await g.Upgrade(StubFx.Description('v2', true, false), [StubFx.External()]);
+                assert.equal(await StubFx.Exists(g, StubFx.X), false);
+                assert.equal(await StubFx.Exists(g, StubFx.Y), false);
+                assert.equal(await StubFx.Exists(g, StubFx.A), true);
                 await g.dispose();
             });
 

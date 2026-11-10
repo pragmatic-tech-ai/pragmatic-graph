@@ -14,11 +14,11 @@ import type { IIndexEntry, IndexStore } from '../indexes/IndexStore.js';
 import { PublicIdIndex } from '../identity/PublicIdIndex.js';
 import type { RowIndex } from '../identity/RowIndex.js';
 import type { IWriteTransaction } from '../kv/KeyValue.js';
-import { ConnectorResidency } from '../connectors/FetchContract.js';
 import type { ConnectorSetup } from '../connectors/WriteCoordinator.js';
 import { SeedMarkers } from '../schema/SeedMarkers.js';
 import { GraphError, GraphErrorCode } from '../errors/GraphError.js';
 import type { CatalogIndex } from './CatalogIndex.js';
+import { StubRule } from './StubRule.js';
 import { CommitError, CommitErrorCode } from './CommitError.js';
 import { ConflictKeys } from './ConflictKeys.js';
 import type { ReadSet } from './ReadSet.js';
@@ -95,8 +95,8 @@ export class BatchApplier
     private static readonly Colon = ': ';
     private static readonly Arrow = ' -> ';
 
-    /** Names of the installed External connectors: a node bound to one is a stub (ruling R102). */
-    private readonly external: ReadonlySet<string>;
+    /** Which stored nodes are stubs (ruling R102). */
+    private readonly stubs: StubRule;
 
     public constructor(
         private readonly index: CatalogIndex,
@@ -106,10 +106,10 @@ export class BatchApplier
         private readonly ids: PublicIdIndex,
         private readonly indexes: IndexStore,
         private readonly dependencies?: ReadSet,
-        private readonly setup?: ConnectorSetup,
+        setup?: ConnectorSetup,
     )
     {
-        this.external = new Set([...(setup?.Connectors.values() ?? [])].filter(c => c.Residency === ConnectorResidency.External).map(c => c.Name));
+        this.stubs = new StubRule(setup);
     }
 
     /**
@@ -122,7 +122,8 @@ export class BatchApplier
     }
 
     /**
-     * `allocated` holds one fresh internal id per CreateNode op, in op order (see CreateHints). Every node
+     * `allocated` holds one fresh internal id per CreateNode op and per Link op carrying an ExternalTarget, in op
+     * order (see CreateHints; the Link's id is used only when it creates the stub). Every node
      * the batch creates (and does not delete again) must have each non-nullable property set by the
      * end of the batch (ruling R29), else MissingRequired.
      */
@@ -169,7 +170,7 @@ export class BatchApplier
                         {
                             throw new GraphError(GraphErrorCode.Internal, BatchApplier.ErrIdsExhausted);
                         }
-                        await this.EnsureStub(txn, op, id, keys, touched);
+                        await this.EnsureStub(txn, op, id, keys);
                     }
                     await this.Link(txn, op, keys);
                     break;
@@ -289,15 +290,21 @@ export class BatchApplier
     /** Returns the deleted node's internal id. */
     private async DeleteNode(txn: IWriteTransaction, op: IDeleteNodeOp, keys: WriteKeySet, touched: Map<bigint, ITouchedNode>): Promise<bigint>
     {
-        const node = await this.Locate(txn, op.PublicId);
-        if (this.index.IndexesFor(node.Concept).length > 0)
+        return this.DeleteLocated(txn, await this.Locate(txn, op.PublicId), op.Strict === true, keys, touched);
+    }
+
+    /** DeleteNode on a resolved node. A stub is identity only: no index entries, no cells to null (ruling R102). */
+    private async DeleteLocated(txn: IWriteTransaction, node: INode, strict: boolean, keys: WriteKeySet, touched: Map<bigint, ITouchedNode>): Promise<bigint>
+    {
+        const stub = await this.IsStubNode(txn, node);
+        if (!stub && this.index.IndexesFor(node.Concept).length > 0)
         {
             await this.Track(txn, node, touched);
             (touched.get(node.Id) as ITouchedNode).Live = false;
         }
         const members = this.index.Catalog.EffectiveMembers(node.Concept);
         let far: bigint[] = [];
-        if (op.Strict === true)
+        if (strict)
         {
             // One scan: it records the adjacency dependencies and proves there is nothing to unlink.
             await this.RequireNoEdges(txn, node, members);
@@ -307,25 +314,31 @@ export class BatchApplier
             far = await this.UnlinkAll(txn, node, members, keys);
         }
         // Every property cell of the slot is nulled, not just the node id (F9); slots are not reused in v1.
-        for (const m of members.filter(x => x.Kind === MemberKind.Property))
+        if (!stub)
         {
-            await this.columns.WriteCell(txn, node.Location, BatchApplier.Erasable(m), null);
+            for (const m of members.filter(x => x.Kind === MemberKind.Property))
+            {
+                await this.columns.WriteCell(txn, node.Location, BatchApplier.Erasable(m), null);
+            }
+            await this.columns.WriteCell(txn, node.Location, CatalogSnapshot.NodeIdMember, null);
         }
-        await this.columns.WriteCell(txn, node.Location, CatalogSnapshot.NodeIdMember, null);
         await this.rows.Clear(txn, node.Id);
         await this.ids.Unbind(txn, node.PublicId, node.Id);
         // A deleted node is no longer seeded: its marker goes with it (ruling R53).
         SeedMarkers.Delete(txn, node.PublicId);
         keys.Add(ConflictKeys.NodeSpace, ConflictKeys.Node(node.PublicId));
         keys.Add(ConflictKeys.ExtentSpace, ConflictKeys.Extent(node.Location.TypeId));
-        BatchApplier.AddCellKeys(keys, node.Id, node.Location.TypeId, CatalogSnapshot.NodeIdMember.Id);
-        for (const m of members.filter(x => x.Kind === MemberKind.Property))
+        if (!stub)
         {
-            BatchApplier.AddCellKeys(keys, node.Id, node.Location.TypeId, m.Id);
+            BatchApplier.AddCellKeys(keys, node.Id, node.Location.TypeId, CatalogSnapshot.NodeIdMember.Id);
+            for (const m of members.filter(x => x.Kind === MemberKind.Property))
+            {
+                BatchApplier.AddCellKeys(keys, node.Id, node.Location.TypeId, m.Id);
+            }
         }
         for (const id of far)
         {
-            await this.RemoveStubIfOrphaned(txn, id, keys, touched);
+            await this.RemoveStubById(txn, id, keys, touched);
         }
         return node.Id;
     }
@@ -380,7 +393,7 @@ export class BatchApplier
         const to = await this.Locate(txn, op.To);
         await BatchApplier.Edge(from, rel, to, () => this.edges.Unlink(txn, rel, from.Id, to.Id));
         BatchApplier.AddEdgeKeys(keys, rel, from.Id, to.Id);
-        await this.RemoveStubIfOrphaned(txn, to.Id, keys, touched);
+        await this.RemoveStubIfOrphaned(txn, to, keys, touched);
     }
 
     /**
@@ -388,60 +401,66 @@ export class BatchApplier
      * stub's binding must name an External connector (InvalidEdge); an existing node of another concept is
      * TargetTypeMismatch. The stub takes an id from `allocated` whether or not it is created.
      */
-    private async EnsureStub(txn: IWriteTransaction, op: ILinkOp, id: bigint, keys: WriteKeySet, touched: Map<bigint, ITouchedNode>): Promise<void>
+    private async EnsureStub(txn: IWriteTransaction, op: ILinkOp, id: bigint, keys: WriteKeySet): Promise<void>
     {
         const target = op.Options?.ExternalTarget as IExternalTarget;
         BatchApplier.RequirePublicId(op.To);
         this.dependencies?.AddKey(ConflictKeys.NodeSpace, ConflictKeys.Node(op.To));
         if ((await this.ids.Resolve(txn, op.To)) !== undefined)
         {
+            // Anything but a stub of the declared concept and owner is not what ExternalTarget claims.
             const existing = await this.Locate(txn, op.To);
-            if (existing.Concept !== target.Concept)
+            const owner = await this.ids.OwnerOf(txn, existing.Id);
+            if (existing.Concept !== target.Concept || owner !== target.Owner || !this.stubs.IsStub(owner, existing.Concept, this.index.Catalog))
             {
                 throw new CommitError(CommitErrorCode.TargetTypeMismatch, BatchApplier.ErrStubConcept + op.To);
             }
             return;
         }
         BatchApplier.Catalog(() => this.index.Catalog.RequireInstantiable(target.Concept));
-        const bindings = this.setup?.Bindings;
-        if (bindings === undefined || !bindings.IsStub(target.Owner, target.Concept, this.index.Catalog, this.external))
+        if (!this.stubs.IsStub(target.Owner, target.Concept, this.index.Catalog))
         {
             throw new CommitError(CommitErrorCode.InvalidEdge, BatchApplier.ErrStub + op.To + BatchApplier.Colon + target.Concept);
         }
-        const node = await this.CreateNode(txn, { Op: WriteOp.CreateNode, PublicId: op.To, Concept: target.Concept, Owner: target.Owner }, id, keys, true);
-        if (this.index.IndexesFor(node.Concept).length > 0)
+        // Not tracked for index maintenance: a stub has no values, so it has no index entries.
+        await this.CreateNode(txn, { Op: WriteOp.CreateNode, PublicId: op.To, Concept: target.Concept, Owner: target.Owner }, id, keys, true);
+    }
+
+    /** True when the stored node is a stub (ruling R102): its binding resolves to an External connector. */
+    private async IsStubNode(txn: IWriteTransaction, node: INode): Promise<boolean>
+    {
+        return this.stubs.IsActive && this.stubs.IsStub(await this.ids.OwnerOf(txn, node.Id), node.Concept, this.index.Catalog);
+    }
+
+    /** RemoveStubIfOrphaned for a far node known only by internal id (an edge scan of a deleted node). */
+    private async RemoveStubById(txn: IWriteTransaction, id: bigint, keys: WriteKeySet, touched: Map<bigint, ITouchedNode>): Promise<void>
+    {
+        if (!this.stubs.IsActive)
         {
-            touched.set(id, { Node: node, Before: [], Live: true });
+            return;
         }
+        const location = await this.rows.Locate(txn, id);
+        const concept = location === undefined ? undefined : this.index.ConceptOf(location.TypeId);
+        const publicId = concept === undefined ? undefined : await this.ids.PublicIdOf(txn, id);
+        if (location === undefined || concept === undefined || publicId === undefined)
+        {
+            return;
+        }
+        await this.RemoveStubIfOrphaned(txn, { PublicId: publicId, Id: id, Location: location, Concept: concept }, keys, touched);
     }
 
     /**
-     * Ruling R102: deletes node `id` when it is a stub (its binding is External) that no edge touches any more,
+     * Ruling R102: deletes `node` when it is a stub (its binding is External) that no edge touches any more,
      * in the same batch that removed its last edge.
      */
-    private async RemoveStubIfOrphaned(txn: IWriteTransaction, id: bigint, keys: WriteKeySet, touched: Map<bigint, ITouchedNode>): Promise<void>
+    private async RemoveStubIfOrphaned(txn: IWriteTransaction, node: INode, keys: WriteKeySet, touched: Map<bigint, ITouchedNode>): Promise<void>
     {
-        if (this.external.size === 0)
+        if (!this.stubs.IsActive || !(await this.IsStubNode(txn, node)) || (await this.HasEdges(txn, node)))
         {
             return;
         }
-        const publicId = await this.ids.PublicIdOf(txn, id);
-        if (publicId === undefined)
-        {
-            return;
-        }
-        const node = await this.Locate(txn, publicId);
-        const owner = await this.ids.OwnerOf(txn, id);
-        const bindings = this.setup?.Bindings;
-        if (bindings === undefined || !bindings.IsStub(owner, node.Concept, this.index.Catalog, this.external))
-        {
-            return;
-        }
-        if (await this.HasEdges(txn, node))
-        {
-            return;
-        }
-        await this.DeleteNode(txn, { Op: WriteOp.DeleteNode, PublicId: publicId }, keys, touched);
+        this.dependencies?.AddKey(ConflictKeys.NodeSpace, ConflictKeys.Node(node.PublicId));
+        await this.DeleteLocated(txn, node, false, keys, touched);
     }
 
     private async HasEdges(txn: IWriteTransaction, node: INode): Promise<boolean>
