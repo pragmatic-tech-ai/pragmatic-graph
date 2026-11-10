@@ -37,7 +37,7 @@ class FetchFx
     public static readonly V2 = 'f2';
     public static readonly NodeId = 'n1';
     private static readonly Label = 'label';
-    public static readonly ReadOnly = 'read-only';
+    public static readonly BeginRefused = 'read-only connector: Begin refused';
 
     public static Concept(name: string, parent: string | null): IDefinitionDescription
     {
@@ -62,7 +62,7 @@ class FetchFx
             Name: name,
             Residency: ConnectorResidency.External,
             Capabilities: { KeyLookup: false, ReverseLookup: false, PushDown: new Set() },
-            Begin: () => Promise.reject(new Error(FetchFx.ReadOnly)),
+            Begin: () => Promise.reject(new Error(FetchFx.BeginRefused)),
             Fetch: () => Promise.resolve({ Rows: [] }),
         };
     }
@@ -95,7 +95,7 @@ describe('Connector read contract', () =>
 
     it('open rejects external residency without Fetch', async () =>
     {
-        const bad = { Name: FetchFx.Ext, Residency: ConnectorResidency.External, Begin: () => Promise.reject(new Error(FetchFx.ReadOnly)) } as IGraphConnector;
+        const bad = { Name: FetchFx.Ext, Residency: ConnectorResidency.External, Begin: () => Promise.reject(new Error(FetchFx.BeginRefused)) } as IGraphConnector;
         const description = FetchFx.Description([{ Model: FetchFx.M1, Concept: FetchFx.Server, Connector: FetchFx.Ext }]);
         await assert.rejects(FetchFx.Open(description, [bad]), FetchFx.IsInvalidArgument);
     });
@@ -195,7 +195,7 @@ describe('Connector read contract', () =>
         {
             const table = new BindingTable(bindings);
             const targets = table.ExternalTargets(FetchFx.Asset, engine.Catalog, new Set([FetchFx.Ext, FetchFx.Other]));
-            assert.deepEqual(targets.map(t => `${t.Concept}:${t.Connector}`), ['Asset:ext', 'Server:other']);
+            assert.deepEqual(targets.map(t => `${t.Concept}:${t.Connector}`), [`${FetchFx.Asset}:${FetchFx.Ext}`, `${FetchFx.Server}:${FetchFx.Other}`]);
         }
         finally
         {
