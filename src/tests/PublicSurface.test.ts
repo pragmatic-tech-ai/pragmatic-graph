@@ -12,7 +12,7 @@ class Surface
 }
 
 // Compile-time: the type-only contract exports exist.
-type ContractTypes = [IConnectorApplied, IConnectorCapabilities, IExternalConnector, IFetchedRow, IFetchPage, IFetchRequest, IFetchTarget];
+export type ContractTypes = [IConnectorApplied, IConnectorCapabilities, IExternalConnector, IFetchedRow, IFetchPage, IFetchRequest, IFetchTarget];
 
 describe('public surface: external bindings', () =>
 {
@@ -26,8 +26,6 @@ describe('public surface: external bindings', () =>
         assert.equal(ConnectorPhase.Fetch, 'Fetch');
         assert.equal(typeof FetchSession, 'function');
         assert.equal(typeof Cypher.CypherCursor, 'function');
-        const types: ContractTypes | undefined = undefined;
-        assert.equal(types, undefined);
     });
 
     test('the federated read channel stays out of the package entry', () =>
