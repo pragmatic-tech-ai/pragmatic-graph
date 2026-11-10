@@ -25,10 +25,13 @@ export interface IFederatedLink extends ILinkView
  * that report stub far nodes instead of deciding them, the connector setup the reader opened with, and whether a public
  * id names a stored engine node. They are not scoped the way GraphReader's public methods are (a stub is reported
  * whatever the scope makes of it; the caller resolves it through its connector and admits the fetched row), so they
- * are NOT reachable from a GraphReader: every reader creates its channel and registers it here, and only engine code
- * that imports this module (CypherEngine, FederatedSource) can obtain it with Of(reader). This module is not exported
- * from the package entry, and the package's `exports` map exposes nothing else. Every read is recorded as the
- * reader's reads are. Closed with its reader: every call then throws GraphError Disposed.
+ * are not part of GraphReader's API: every reader creates its channel and registers it here, and engine code that
+ * imports this module (CypherEngine, FederatedSource) obtains it with Of(reader). The isolation is at the type and
+ * package-entry level: no exported type, member or symbol gives an unscoped read (this module is not exported from the
+ * package entry and the package's `exports` map exposes nothing else). The engine is an in-process library, not a
+ * sandbox: in-process code that bypasses TypeScript privacy (e.g. reading a TS-private field) is out of the threat
+ * model, as for every other private member. Every read is recorded as the reader's reads are. Closed with its reader:
+ * every call then throws GraphError Disposed.
  */
 export class FederatedReads
 {

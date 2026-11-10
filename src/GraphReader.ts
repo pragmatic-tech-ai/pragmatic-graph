@@ -78,8 +78,8 @@ export class GraphReader implements IGraphDisposable
     private readonly evaluator: ScopeEvaluator | undefined;
     /** Only for a scope that restricts writes but not reads (WriteEvaluator). */
     private writeEvaluator: ScopeEvaluator | undefined;
-    /** The unscoped reads of a federated Cypher read (ruling R101): a hard-private field, reachable only through FederatedReads.Of. */
-    readonly #federated: FederatedReads;
+    /** The unscoped reads of a federated Cypher read (ruling R101); engine code obtains them through FederatedReads.Of. */
+    private readonly federated: FederatedReads;
     private disposed = false;
 
     /** @internal Created by GraphStore.BeginRead and GraphStore.Begin; `reads` only for a transaction. */
@@ -87,7 +87,7 @@ export class GraphReader implements IGraphDisposable
     {
         this.recorded = new RecordedReads(context, snapshot, reads);
         this.evaluator = scope.ReadsUnrestricted ? undefined : new ScopeEvaluator(scope, this.recorded);
-        this.#federated = new FederatedReads(this, this.recorded, this.evaluator, snapshot.Index);
+        this.federated = new FederatedReads(this, this.recorded, this.evaluator, snapshot.Index);
         context.Track(this);
     }
 
@@ -537,7 +537,7 @@ export class GraphReader implements IGraphDisposable
             return;
         }
         this.disposed = true;
-        this.#federated.Close();
+        this.federated.Close();
         this.context.Forget(this);
         this.snapshot.dispose();
     }

@@ -783,10 +783,12 @@ class FederatedSuite
     }
 }
 
-// Compile-time: a scoped reader exposes no unscoped federated read (they live behind FederatedReads.Of).
+// Compile-time: GraphReader's type exposes no unscoped federated read (they live behind FederatedReads.Of). The guarantee
+// is type- and entry-level only: in-process code bypassing TypeScript privacy is out of the threat model (R101).
 class NoUnscopedSurface
 {
-    public static readonly Names = ['FederatedLinks', 'StubIdentity', 'Connectors', 'federated', 'StoredNonStub', 'Setup'];
+    /** Public method names that must not exist on a reader (a TS-private field is not a public member and is not checked). */
+    public static readonly Names = ['FederatedLinks', 'StubIdentity', 'Connectors', 'StoredNonStub', 'Setup'];
 
     public static Check(reader: GraphReader): void
     {
@@ -796,14 +798,14 @@ class NoUnscopedSurface
         void reader.StubIdentity;
         // @ts-expect-error not on GraphReader's public surface
         void reader.Connectors;
-        // @ts-expect-error not on GraphReader's public surface
+        // @ts-expect-error TS-private, not on GraphReader's public type
         void reader.federated;
     }
 }
 
 describe('Federated read channel', () =>
 {
-    it('the package entry exposes no unscoped federated read', async () =>
+    it('no exported type, member or entry name gives an unscoped federated read', async () =>
     {
         assert.equal('FederatedReads' in Root, false);
         assert.equal('FederatedSource' in Root, false);
