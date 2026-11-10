@@ -59,6 +59,10 @@ interface ICreatedNode
  * Semantic violations throw CommitError (ruling R26); any other error means storage trouble or an
  * engine bug and is not attributed to the batch. Partition is always 0 in v1.
  *
+ * Ops on external nodes never reach it (ruling R103): a write-through hands the committer only the engine part of the
+ * batch (WriteCoordinator.Route), so nothing external is written to KV; the stub bookkeeping of engine-source links
+ * (R102) stays here.
+ *
  * Secondary indexes are maintained at the end of the batch, per node, from its post-batch values (like
  * MissingRequired): every node the batch created, deleted, or set an indexed (or `Where`-read) member of
  * gets its entries recomputed; removed entries are deleted before added ones are unique-checked and put.
@@ -277,7 +281,7 @@ export class BatchApplier
         {
             throw new CommitError(CommitErrorCode.NotAProperty, BatchApplier.ErrNotProperty + node.Concept + BatchApplier.Dot + op.Member);
         }
-        BatchApplier.RequireValue(node, member, op.Value);
+        BatchApplier.RequireValue(node.Concept, member, op.Value);
         if (this.index.IndexesFor(node.Concept).some(i => i.Touches(member.Id)))
         {
             await this.Track(txn, node, touched);
@@ -574,13 +578,14 @@ export class BatchApplier
     }
 
     /**
-     * Checks the value against the member before anything is written, so that errors the column store
-     * raises afterwards (corrupt stored deltas, slot or partition range errors) are storage failures and
-     * pass through unmapped rather than being blamed on the batch.
+     * CommitError InvalidValue unless the value fits the member of `concept` (null only when nullable). Checked before
+     * anything is written, so that errors the column store raises afterwards (corrupt stored deltas, slot or partition
+     * range errors) are storage failures and pass through unmapped rather than being blamed on the batch. Also checks
+     * writes to external nodes (ruling R103).
      */
-    private static RequireValue(node: INode, member: MemberDef, value: CellValue): void
+    public static RequireValue(concept: string, member: MemberDef, value: CellValue): void
     {
-        const label = node.Concept + BatchApplier.Dot + member.Name;
+        const label = concept + BatchApplier.Dot + member.Name;
         if (value === null)
         {
             if (!member.Nullable)
@@ -651,7 +656,8 @@ export class BatchApplier
         }
     }
 
-    private static Catalog<T>(lookup: () => T): T
+    /** Runs a catalog lookup, mapping a CatalogError to the CommitError a batch gets for it. */
+    public static Catalog<T>(lookup: () => T): T
     {
         try
         {

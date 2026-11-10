@@ -44,6 +44,7 @@ class StubFx
     public static readonly Y = 'y';
     public static readonly A = 'a';
     public static readonly B = 'b';
+    public static readonly Local = 'local';
     private static readonly NoExternal = 'no external connector';
 
     public static readonly Target = Object.freeze({ Concept: StubFx.Ticket, Owner: StubFx.Jira });
@@ -83,7 +84,7 @@ class StubFx
         {
             t.CreateNode(StubFx.A, StubFx.Team);
             t.CreateNode(StubFx.B, StubFx.Team);
-            t.CreateNode('local', StubFx.Ticket);
+            t.CreateNode(StubFx.Local, StubFx.Ticket);
         });
         g.SetConnectors(new BindingTable([{ Model: StubFx.Jira, Concept: StubFx.Ticket, Connector: StubFx.Ext }]), [StubFx.External()]);
         return g;
@@ -269,7 +270,7 @@ class StubFx
                 assert.deepEqual(await StubFx.ConceptOwner(g, StubFx.X), [StubFx.Ticket, StubFx.Jira]);
                 assert.deepEqual(await StubFx.OutLinks(g, StubFx.A), [StubFx.X]);
                 assert.equal(await StubFx.CellEntries(g), before, 'the stub wrote no cell');
-                assert.deepEqual(await StubFx.Scanned(g, StubFx.Ticket), ['local'], 'a stub is not engine data');
+                assert.deepEqual(await StubFx.Scanned(g, StubFx.Ticket), [StubFx.Local], 'a stub is not engine data');
                 await StubFx.Commit(g, t => t.Unlink(StubFx.A, StubFx.Assigned, StubFx.X));
                 assert.equal(await StubFx.CellEntries(g), before, 'deleting the stub wrote no cell either');
                 await g.dispose();
@@ -343,7 +344,7 @@ class StubFx
             it('existing engine node or stub of another owner is TargetTypeMismatch', async () =>
             {
                 const g = await StubFx.Ready(open);
-                const onLocal = await StubFx.Rejection(StubFx.Commit(g, t => t.Link(StubFx.A, StubFx.Assigned, 'local', { ExternalTarget: StubFx.Target })));
+                const onLocal = await StubFx.Rejection(StubFx.Commit(g, t => t.Link(StubFx.A, StubFx.Assigned, StubFx.Local, { ExternalTarget: StubFx.Target })));
                 assert.ok(StubFx.IsCode(onLocal, CommitErrorCode.TargetTypeMismatch), String(onLocal));
                 await StubFx.LinkStub(g, StubFx.A, StubFx.X);
                 const otherOwner = await StubFx.Rejection(StubFx.Commit(g, t => t.Link(StubFx.B, StubFx.Assigned, StubFx.X, { ExternalTarget: { Concept: StubFx.Ticket, Owner: StubFx.Other } })));
@@ -351,7 +352,7 @@ class StubFx
                 await g.dispose();
             });
 
-            it('scoped transaction can create a stub link; an invisible stored target is InvisibleNode', async () =>
+            it('a scoped stub link to a row the transaction never fetched is InvisibleNode, as an invisible stored target is (R103)', async () =>
             {
                 const g = await StubFx.Ready(open);
                 const scope = Scope.Build({ Default: AccessDefault.Allow, Rows: new Map([[StubFx.Ticket, FalsePredicate.Instance]]) });
@@ -368,10 +369,16 @@ class StubFx
                         t.dispose();
                     }
                 };
-                await link(StubFx.X, StubFx.Ticket);
-                assert.equal(await StubFx.Exists(g, StubFx.X), true);
-                const error = await StubFx.Rejection(link(StubFx.X, StubFx.Person));
-                assert.ok(error instanceof AccessError && error.Code === AccessErrorCode.InvisibleNode, String(error));
+                // The positive case (a fetched, visible row) is pinned in connectors/tests/ExternalWrites.test.ts.
+                const unfetched = await StubFx.Rejection(link(StubFx.X, StubFx.Ticket));
+                assert.ok(unfetched instanceof AccessError && unfetched.Code === AccessErrorCode.InvisibleNode, String(unfetched));
+                assert.equal(await StubFx.Exists(g, StubFx.X), false);
+                await StubFx.LinkStub(g, StubFx.B, StubFx.X);
+                const stub = await StubFx.Rejection(link(StubFx.X, StubFx.Person));
+                assert.ok(stub instanceof AccessError && stub.Code === AccessErrorCode.InvisibleNode, String(stub));
+                const stored = await StubFx.Rejection(link(StubFx.Local, StubFx.Ticket));
+                assert.ok(stored instanceof AccessError && stored.Code === AccessErrorCode.InvisibleNode, String(stored));
+                assert.equal((unfetched as Error).message.replace(StubFx.X, StubFx.Local), (stored as Error).message);
                 await g.dispose();
             });
 

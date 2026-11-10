@@ -7,10 +7,11 @@ import { ChunkCodecError } from '../../columns/ChunkCodecError.js';
 import { ValueCodec } from '../../columns/ValueCodec.js';
 import { ConnectorError } from '../../connectors/ConnectorError.js';
 import { GraphError } from '../../errors/GraphError.js';
+import { FederatedReads } from '../../FederatedReads.js';
 import type { GraphTransaction } from '../../GraphTransaction.js';
 import { CommitError, CommitErrorCode } from '../../txn/CommitError.js';
 import { ConflictError } from '../../txn/ConflictError.js';
-import { WriteBatch, WriteOp, type BatchOp } from '../../txn/WriteBatch.js';
+import { WriteBatch, WriteOp, type BatchOp, type IExternalTarget } from '../../txn/WriteBatch.js';
 import { RelDirection } from '../CypherEnums.js';
 import { CypherWriteError, CypherWriteErrorCode } from '../CypherError.js';
 import { CypherNode } from '../CypherNode.js';
@@ -30,6 +31,10 @@ import { OverlayEdge, PendingOverlay } from './PendingOverlay.js';
  * replays the pending writes in order onto the transaction and commits it, mapping engine failures to
  * CypherWriteError with the GraphError as cause (ConflictError → Conflict, AccessError → Denied, CommitError →
  * Invalid, ConnectorError → ConnectorFailed).
+ *
+ * A relationship created to an external node (one whose owner and concept bind to an External connector: fetched by the
+ * query, or reached through a stub) carries LinkOptions.ExternalTarget, so the commit creates or reuses its stub (ruling
+ * R102).
  */
 export class TransactionSink implements ICypherSink
 {
@@ -162,9 +167,10 @@ export class TransactionSink implements ICypherSink
     public async CreateRelationship(from: string, relationship: string, to: string): Promise<boolean>
     {
         await this.Require(from);
-        await this.Require(to);
+        const target = await this.Require(to);
         if ((await this.Targets(from, relationship)).includes(to)) return false;
-        this.pending.Link(from, relationship, to);
+        const external = this.ExternalTarget(target);
+        this.pending.Link(from, relationship, to, external === undefined ? undefined : { ExternalTarget: external });
         this.overlay.RecordLink(from, relationship, to);
         this.Stats.RelationshipsCreated++;
         return true;
@@ -249,7 +255,7 @@ export class TransactionSink implements ICypherSink
                     t.DeleteNode(op.PublicId, op.Strict === true ? { Strict: true } : undefined);
                     break;
                 case WriteOp.Link:
-                    t.Link(op.From, op.Relationship, op.To);
+                    t.Link(op.From, op.Relationship, op.To, op.Options);
                     break;
                 case WriteOp.Unlink:
                     if (this.detaches.has(i))
@@ -285,6 +291,17 @@ export class TransactionSink implements ICypherSink
         if (error instanceof CommitError) return new CypherWriteError(`${TransactionSink.Invalid}: ${error.message}`, CypherWriteErrorCode.Invalid, error);
         if (error instanceof ConnectorError) return new CypherWriteError(TransactionSink.ConnectorFailed, CypherWriteErrorCode.ConnectorFailed, error);
         return error;
+    }
+
+    /** The node's identity when it is external data (its owner and concept bind to an External connector), else undefined. */
+    private ExternalTarget(node: CypherNode): IExternalTarget | undefined
+    {
+        const setup = FederatedReads.Of(this.transaction).Setup;
+        if (setup === undefined || !setup.Bindings.IsStub(node.Owner, node.Concept, this.catalog, setup.External))
+        {
+            return undefined;
+        }
+        return { Concept: node.Concept, Owner: node.Owner };
     }
 
     /** The node as the query now sees it; CypherWriteError when it is invisible, missing or deleted. */

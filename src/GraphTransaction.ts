@@ -1,11 +1,13 @@
 import type { AccessScope } from './access/AccessScope.js';
 import { AccessError } from './access/AccessError.js';
 import { WriteExemptions } from './access/WriteExemptions.js';
+import type { FetchedNode } from './access/FetchedNode.js';
 import { WriteGate } from './access/WriteGate.js';
 import type { CellValue } from './columns/CellValue.js';
-import { type INodeOrigins, WriteCoordinator } from './connectors/WriteCoordinator.js';
+import { type INodeOrigin, type INodeOrigins, WriteCoordinator } from './connectors/WriteCoordinator.js';
 import type { GraphContext, ReadSnapshot } from './GraphContext.js';
 import { GraphError, GraphErrorCode } from './errors/GraphError.js';
+import { FederatedReads } from './FederatedReads.js';
 import { GraphReader } from './GraphReader.js';
 import { ConflictError } from './txn/ConflictError.js';
 import type { ISnapshotHandle } from './txn/ConflictHistory.js';
@@ -29,6 +31,13 @@ import { type ICreateNodeOptions, type IDeleteNodeOptions, type LinkOptions, Wri
  * is a write-through (ruling R72): the engine prepares, every participating connector begins, applies
  * and commits, then the engine finalizes. Any connector failure, the timeout, or a failed Finalize
  * reverts every connector that began, leaves the engine unchanged and fails with ConnectorError.
+ *
+ * Writes to external nodes (ruling R103): with External connectors installed the transaction has one FetchSession
+ * (design ruling D3), which its write queries read through. A node bound to an External connector (created with such an
+ * owner and concept, a stored stub, or a row the transaction fetched) is written to that connector only, never to engine
+ * storage. The commit decides such writes against the row the transaction fetched: a row it never fetched, or one its
+ * scope does not admit, is AccessError InvisibleNode, as a missing engine node is. Fetched rows carry no conflict
+ * detection (spec §6): only the engine reads are validated.
  */
 export class GraphTransaction extends GraphReader
 {
@@ -132,14 +141,16 @@ export class GraphTransaction extends GraphReader
             const generation = this.context.Committer.BindingGeneration;
             if (setup !== undefined)
             {
-                // Routing reads the snapshot unscoped and records it like any read (rulings R72, R89).
-                const origins: INodeOrigins = { Origin: id => this.NodeOrigin(id), Edges: id => this.NodeEdges(id) };
-                const sets = await WriteCoordinator.Route(this.batch, setup.Bindings, this.snapshot.Index, origins);
-                if (sets.size > 0)
+                // Routing reads the snapshot unscoped and records it like any read (rulings R72, R89); a node that is not
+                // stored routes by the row this transaction fetched (R103).
+                const origins: INodeOrigins = { Origin: id => this.RoutingOrigin(id), Edges: id => this.NodeEdges(id) };
+                const routed = await WriteCoordinator.Route(this.batch, setup.Bindings, this.snapshot.Index, origins, setup.External);
+                if (routed.Sets.size > 0)
                 {
-                    const prepare = () => this.context.Committer.Prepare(this.batch, this.Reads, this.ValidationCommit(), began, setup.TimeoutMs, generation);
-                    return await new WriteCoordinator(setup, this.context.ConnectorRevertFailed).Run(prepare, sets);
+                    const prepare = () => this.context.Committer.Prepare(routed.Engine, this.Reads, this.ValidationCommit(), began, setup.TimeoutMs, generation);
+                    return await new WriteCoordinator(setup, this.context.ConnectorRevertFailed).Run(prepare, routed.Sets);
                 }
+                return await this.context.Committer.Submit(routed.Engine, this.Reads, this.ValidationCommit(), began, generation);
             }
             return await this.context.Committer.Submit(this.batch, this.Reads, this.ValidationCommit(), began, generation);
         }
@@ -180,7 +191,7 @@ export class GraphTransaction extends GraphReader
         }
         try
         {
-            await WriteGate.Check(this.WriteEvaluator(), this.batch, this.snapshot.Index.Catalog, this.exempt);
+            await WriteGate.Check(this.WriteEvaluator(), this.batch, this.snapshot.Index.Catalog, this.exempt, id => this.FetchedRow(id));
         }
         catch (error)
         {
@@ -190,6 +201,25 @@ export class GraphTransaction extends GraphReader
             }
             throw error;
         }
+    }
+
+    /** The row this transaction's FetchSession holds for the id, as a FetchedNode of its model; undefined when none. */
+    private async FetchedRow(publicId: string): Promise<FetchedNode | undefined>
+    {
+        const known = FederatedReads.Of(this).OpenSession?.Known(publicId);
+        return known === undefined ? undefined : this.FetchedNodeOf(known.Row, known.Model);
+    }
+
+    /** The stored node's origin (NodeOrigin), else that of the row this transaction fetched for the id. */
+    private async RoutingOrigin(publicId: string): Promise<INodeOrigin | undefined>
+    {
+        const stored = await this.NodeOrigin(publicId);
+        if (stored !== undefined)
+        {
+            return stored;
+        }
+        const known = FederatedReads.Of(this).OpenSession?.Known(publicId);
+        return known === undefined ? undefined : { Owner: known.Model, Concept: known.Row.Concept, Fetched: true };
     }
 
     /** Always set: the constructor hands the reader a ReadSet. */

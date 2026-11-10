@@ -172,6 +172,29 @@ export class ScopeEvaluator
     }
 
     /**
+     * True iff `p` is True on the fetched row under D5 (as VisibleFetched decides a Rows predicate; Unknown is false): how
+     * the WriteGate decides an Update or Delete rule of an external node (ruling R103). A top-level decision of its own;
+     * records the reads it makes.
+     */
+    public async HoldsFetched(p: Predicate, node: FetchedNode): Promise<boolean>
+    {
+        const evaluation = new Evaluation();
+        evaluation.Decisions += 1;
+        const stub = node.StubNode;
+        if (stub !== undefined)
+        {
+            evaluation.Deciding.add(stub.Id);
+        }
+        return (await this.EvalFetched(p, node, evaluation)) === Truth.True;
+    }
+
+    /** True when the stored node is a stub (ruling R102): its binding resolves to an External connector. Records its binding. */
+    public IsStub(node: IReadNode): Promise<boolean>
+    {
+        return this.reads.IsStub(node);
+    }
+
+    /**
      * The predicate a fetch of `concept` pushes down for the scope (design ruling D4): the applicable Rows predicate,
      * the And of them when several apply (in scope order), True when none applies and Default allows, False when it
      * denies. Advisory only: every fetched row is still decided by VisibleFetched.

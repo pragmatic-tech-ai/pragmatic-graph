@@ -7,6 +7,7 @@ import type { IReadNode } from '../RecordedReads.js';
 import { type BatchOp, type WriteBatch, WriteOp } from '../txn/WriteBatch.js';
 import { AccessError, AccessErrorCode } from './AccessError.js';
 import { AccessDefault, type IWriteRules } from './AccessScope.js';
+import type { FetchedNode } from './FetchedNode.js';
 import type { ScopeEvaluator } from './ScopeEvaluator.js';
 import { WriteExemptions } from './WriteExemptions.js';
 import { WriteStage } from './WriteStage.js';
@@ -142,6 +143,27 @@ class CreateEvaluator
     }
 }
 
+/**
+ * A node the batch did not create, as the gate decides it: a stored engine node, or an external node's row fetched in the
+ * transaction (ruling R103). Exactly one of Engine and External is set.
+ */
+class ExistingNode
+{
+    private constructor(public readonly PublicId: string, public readonly Concept: string, public readonly Engine: IReadNode | undefined, public readonly External: FetchedNode | undefined)
+    {
+    }
+
+    public static OfEngine(node: IReadNode): ExistingNode
+    {
+        return new ExistingNode(node.PublicId, node.Concept, node, undefined);
+    }
+
+    public static OfExternal(node: FetchedNode): ExistingNode
+    {
+        return new ExistingNode(node.PublicId, node.Concept, undefined, node);
+    }
+}
+
 /** Selects one kind of write rule from an entry. */
 enum RuleKind
 {
@@ -169,6 +191,13 @@ enum RuleKind
  *   AfterSibling/BeforeSibling must be visible (or created by the batch and live at that op).
  * - DeleteNode: the node must be visible and every applicable Delete predicate hold on its snapshot
  *   values; deleting a node the batch created is exempt.
+ *
+ * External nodes (ruling R103): a node the batch did not create whose public id names no stored engine node, or names
+ * a stub (R102), is external data. It is decided against the row the transaction fetched for it (`fetched`): visible
+ * under the scope as a read decides it (ScopeEvaluator.VisibleFetched), and its Update and Delete rules evaluated on
+ * that row (HoldsFetched). An external node the transaction never fetched, or whose row the scope does not admit, is
+ * InvisibleNode, exactly as a missing or invisible engine node; this holds for an op's source, a Link/Unlink target
+ * (a Link carrying ExternalTarget included) and a sibling. Create rules are evaluated as for engine nodes.
  *
  * Applicable entries are those keyed by the node's concept, an ancestor or a carried aspect; with no
  * applicable predicate of the op's kind the scope's Default decides. A node that does not exist in the
@@ -198,18 +227,32 @@ export class WriteGate
     private static readonly NotVisible = 'concept not visible';
 
     private readonly targets: OpTargets[] = [];
-    private readonly updates = new Map<bigint, boolean>();
+    /** Per public id, whether the node's Update rules hold (decided once per node). */
+    private readonly updates = new Map<string, boolean>();
     /** Per public id, the index of the batch's last DeleteNode of it. */
     private readonly lastDelete = new Map<string, number>();
 
-    private constructor(private readonly evaluator: ScopeEvaluator, private readonly catalog: CatalogSnapshot, private readonly exempt: WriteExemptions)
+    private constructor(
+        private readonly evaluator: ScopeEvaluator,
+        private readonly catalog: CatalogSnapshot,
+        private readonly exempt: WriteExemptions,
+        private readonly fetched: ((publicId: string) => Promise<FetchedNode | undefined>) | undefined)
     {
     }
 
-    /** Throws AccessError for the first op of `batch` the evaluator's scope does not allow; `exempt` as WriteExemptions. */
-    public static async Check(evaluator: ScopeEvaluator, batch: WriteBatch, catalog: CatalogSnapshot, exempt: WriteExemptions = WriteExemptions.None()): Promise<void>
+    /**
+     * Throws AccessError for the first op of `batch` the evaluator's scope does not allow; `exempt` as WriteExemptions.
+     * `fetched`: the row the transaction fetched for an external public id (its stub attached), undefined when it
+     * fetched none; without it every external node reads as not fetched.
+     */
+    public static async Check(
+        evaluator: ScopeEvaluator,
+        batch: WriteBatch,
+        catalog: CatalogSnapshot,
+        exempt: WriteExemptions = WriteExemptions.None(),
+        fetched?: (publicId: string) => Promise<FetchedNode | undefined>): Promise<void>
     {
-        const gate = new WriteGate(evaluator, catalog, exempt);
+        const gate = new WriteGate(evaluator, catalog, exempt, fetched);
         const ops = batch.Ops();
         gate.Resolve(ops);
         for (let i = 0; i < ops.length; i++)
@@ -277,12 +320,9 @@ export class WriteGate
             case WriteOp.Unlink:
             {
                 const concept = await this.CheckWrite(index, op.Op, op.From, op.Relationship, targets.Source, false, op.Op === WriteOp.Unlink && this.IsDetach(index, op.From, op.To));
-                // An external target that is not a stored node is a stub to be created (R102): its visibility is
-                // checked against the fetched row. A stored node keeps the ordinary rule (no existence oracle).
-                if (!await this.IsNewStubTarget(op, targets.Target))
-                {
-                    await this.CheckReferenced(index, op.Op, op.From, concept, op.To, targets.Target, WriteGate.ErrInvisibleTarget);
-                }
+                // An external target (a stub, or no stored node: an ExternalTarget link creates its stub, R102) is decided
+                // against the row the transaction fetched (R103); a stored engine node keeps the ordinary rule.
+                await this.CheckReferenced(index, op.Op, op.From, concept, op.To, targets.Target, WriteGate.ErrInvisibleTarget);
                 if (op.Op === WriteOp.Link)
                 {
                     // The committer resolves siblings unscoped: an unchecked one would be an existence oracle.
@@ -305,12 +345,6 @@ export class WriteGate
                 // Unreachable through GraphTransaction (ruling R90); a gated batch never re-owns.
                 throw this.Denied(AccessErrorCode.UpdateDenied, index, op.Op, op.PublicId, targets.Source?.Concept, WriteGate.ErrSeedOnly);
         }
-    }
-
-    /** A Link carrying ExternalTarget whose `to` is neither created by the batch nor stored (ruling R102). */
-    private async IsNewStubTarget(op: BatchOp, created: CreatedNode | undefined): Promise<boolean>
-    {
-        return op.Op === WriteOp.Link && op.Options?.ExternalTarget !== undefined && created === undefined && (await this.evaluator.Locate(op.To)) === undefined;
     }
 
     /** A node a Link/Unlink names besides its source must be created by the batch or visible (a recorded read). */
@@ -392,11 +426,11 @@ export class WriteGate
             return node.Concept;
         }
         this.CheckReadOnly(index, op, publicId, node.Concept, member, WriteStage.Update);
-        let allowed = this.updates.get(node.Id);
+        let allowed = this.updates.get(node.PublicId);
         if (allowed === undefined)
         {
             allowed = await this.Allows(node, RuleKind.Update);
-            this.updates.set(node.Id, allowed);
+            this.updates.set(node.PublicId, allowed);
         }
         if (!allowed)
         {
@@ -435,8 +469,11 @@ export class WriteGate
         }
     }
 
-    /** True iff every applicable rule of `kind` holds on the node's snapshot values (none: the Default decides). */
-    private async Allows(node: IReadNode, kind: RuleKind): Promise<boolean>
+    /**
+     * True iff every applicable rule of `kind` holds on the node's snapshot values, or on an external node's fetched row
+     * (none: the Default decides).
+     */
+    private async Allows(node: ExistingNode, kind: RuleKind): Promise<boolean>
     {
         const rules = this.Rules(node.Concept, kind);
         if (rules.length === 0)
@@ -445,7 +482,8 @@ export class WriteGate
         }
         for (const rule of rules)
         {
-            if (!(await this.evaluator.Holds(rule, node)))
+            const holds = node.External !== undefined ? await this.evaluator.HoldsFetched(rule, node.External) : await this.evaluator.Holds(rule, node.Engine as IReadNode);
+            if (!holds)
             {
                 return false;
             }
@@ -453,7 +491,7 @@ export class WriteGate
         return true;
     }
 
-    private async RequireVisible(index: number, op: WriteOp, publicId: string): Promise<IReadNode>
+    private async RequireVisible(index: number, op: WriteOp, publicId: string): Promise<ExistingNode>
     {
         const node = await this.VisibleNode(publicId);
         if (node === undefined)
@@ -463,11 +501,20 @@ export class WriteGate
         return node;
     }
 
-    /** The snapshot node when it exists and is visible; missing and invisible are indistinguishable. */
-    private async VisibleNode(publicId: string): Promise<IReadNode | undefined>
+    /**
+     * The snapshot node when it exists and is visible; for an external node (a stub, or no stored node) the row the
+     * transaction fetched when the scope admits it (ruling R103). Missing, not fetched and invisible are
+     * indistinguishable.
+     */
+    private async VisibleNode(publicId: string): Promise<ExistingNode | undefined>
     {
         const node = await this.evaluator.Locate(publicId);
-        return node !== undefined && (await this.evaluator.IsVisible(node)) ? node : undefined;
+        if (node === undefined || (await this.evaluator.IsStub(node)))
+        {
+            const row = await this.fetched?.(publicId);
+            return row !== undefined && (await this.evaluator.VisibleFetched(row)) ? ExistingNode.OfExternal(row) : undefined;
+        }
+        return (await this.evaluator.IsVisible(node)) ? ExistingNode.OfEngine(node) : undefined;
     }
 
     private Rules(concept: string, kind: RuleKind): readonly Predicate[]

@@ -388,6 +388,43 @@ export class WriteBatch
         this.Push({ Op: WriteOp.Unlink, From: from, Relationship: relationship, To: to });
     }
 
+    /** Records a copy of an op recorded elsewhere (e.g. another batch's), checked as its own record call checks it. */
+    public Append(op: BatchOp): void
+    {
+        switch (op.Op)
+        {
+            case WriteOp.CreateNode:
+            {
+                const options: { -readonly [K in keyof ICreateNodeOptions]: ICreateNodeOptions[K] } = {};
+                if (op.ClusterHint !== undefined)
+                {
+                    options.ClusterHint = op.ClusterHint;
+                }
+                if (op.Owner !== undefined)
+                {
+                    options.Owner = op.Owner;
+                }
+                this.CreateNode(op.PublicId, op.Concept, options);
+                return;
+            }
+            case WriteOp.SetProperty:
+                this.SetProperty(op.PublicId, op.Member, op.Value);
+                return;
+            case WriteOp.DeleteNode:
+                this.DeleteNode(op.PublicId, op.Strict === true ? { Strict: true } : undefined);
+                return;
+            case WriteOp.Link:
+                this.Link(op.From, op.Relationship, op.To, op.Options);
+                return;
+            case WriteOp.Unlink:
+                this.Unlink(op.From, op.Relationship, op.To);
+                return;
+            case WriteOp.SetOwner:
+                this.SetOwner(op.PublicId, op.Owner);
+                return;
+        }
+    }
+
     /** Re-owns the node ('' = no owner). Seed synchronization only (ruling R90); GraphTransaction has no such write. */
     public SetOwner(publicId: string, owner: string): void
     {

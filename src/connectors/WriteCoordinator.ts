@@ -3,10 +3,11 @@ import { GraphError, GraphErrorCode } from '../errors/GraphError.js';
 import type { CatalogIndex } from '../txn/CatalogIndex.js';
 import type { PreparedCommit } from '../txn/PreparedCommit.js';
 import type { Signal } from '../txn/Signal.js';
-import { type BatchOp, type IUnlinkOp, type WriteBatch, WriteOp } from '../txn/WriteBatch.js';
+import { type BatchOp, type IUnlinkOp, WriteBatch, WriteOp } from '../txn/WriteBatch.js';
 import { BindingTable } from './BindingTable.js';
 import { type ConnectorChange, ConnectorChangeSet } from './ConnectorChangeSet.js';
 import { ConnectorError, ConnectorPhase } from './ConnectorError.js';
+import { ExternalWriteCheck } from './ExternalWriteCheck.js';
 import { ConnectorResidency, type IExternalConnector } from './FetchContract.js';
 import type { IConnectorTransaction, IGraphConnector } from './GraphConnector.js';
 
@@ -15,6 +16,17 @@ export interface INodeOrigin
 {
     readonly Owner: string;
     readonly Concept: string;
+    /** True when the node is not stored and the origin is that of the row the transaction fetched for it (R103). */
+    readonly Fetched?: boolean;
+}
+
+/** What WriteCoordinator.Route makes of one batch. */
+export interface IRoutedBatch
+{
+    /** Per participating connector, its change set (in batch op order), keyed in connector-name order. */
+    readonly Sets: ReadonlyMap<string, ConnectorChangeSet>;
+    /** The part of the batch engine storage applies, in batch order: everything but the ops on external nodes (R103). */
+    readonly Engine: WriteBatch;
 }
 
 /** One stored edge, by the public ids of its source and target. */
@@ -25,9 +37,13 @@ export interface IIncidentEdge
     readonly To: string;
 }
 
-/** Where routing looks up nodes the batch does not create: the transaction's snapshot (recorded reads). */
+/**
+ * Where routing looks up nodes the batch does not create: the transaction's snapshot (recorded reads), else the rows the
+ * transaction fetched from External connectors.
+ */
 export interface INodeOrigins
 {
+    /** The stored node's origin, else the fetched row's (Fetched set), else undefined. */
     Origin(publicId: string): Promise<INodeOrigin | undefined>;
     /**
      * Every edge of the live node, unscoped, outgoing (effective relationships in declaration order) then
@@ -160,8 +176,19 @@ class ChangeRouter
     private readonly known = new Map<string, INodeOrigin | undefined>();
     private readonly grouped = new Map<string, ConnectorChange[]>();
 
-    public constructor(private readonly table: BindingTable, private readonly index: CatalogIndex, private readonly origins: INodeOrigins)
+    public constructor(private readonly table: BindingTable, private readonly index: CatalogIndex, private readonly origins: INodeOrigins, private readonly external: ReadonlySet<string>)
     {
+    }
+
+    /** True when the origin binds to an External connector: the node's data lives only there (ruling R103). */
+    public IsExternal(origin: INodeOrigin | undefined): boolean
+    {
+        if (origin === undefined || this.external.size === 0)
+        {
+            return false;
+        }
+        const name = this.table.Resolve(origin.Owner, origin.Concept, this.index.Catalog);
+        return name !== undefined && this.external.has(name);
     }
 
     /** Records the origin a CreateNode gives its id for the batch's later ops. */
@@ -343,6 +370,7 @@ export class WriteCoordinator
     private static readonly TimedOut: unique symbol = Symbol('TimedOut');
     /** The owner of a node created without one (as GraphReader.OwnerOf reports it). */
     private static readonly NoOwner = '';
+    private static readonly NoExternal: ReadonlySet<string> = new Set();
     private static readonly ErrSeedOnly = 'A seed-only SetOwner op cannot be routed to connectors: ';
     private static readonly ErrUnhandled = 'Unhandled batch op kind: ';
 
@@ -359,8 +387,8 @@ export class WriteCoordinator
     }
 
     /**
-     * Per participating connector, its change set (in batch op order), keyed in connector-name order.
-     * CreateNode / SetProperty / DeleteNode route by the node's owner and concept, Link / Unlink by the
+     * Per participating connector, its change set (in batch op order), keyed in connector-name order, and the engine's
+     * part of the batch. CreateNode / SetProperty / DeleteNode route by the node's owner and concept, Link / Unlink by the
      * source node's. An op routes by the latest CreateNode of its id earlier in the batch, else by the
      * node in the snapshot (`origins`, each id looked up once). DeleteNode does not change an id's
      * origin: an op on a deleted, not re-created id routes like the deleted node (the engine rejects it at
@@ -371,11 +399,21 @@ export class WriteCoordinator
      * edge of the node in the snapshot as the batch's earlier ops left it (`origins.Edges`, unscoped, so
      * edges the writer's scope hides as well), each routed by its source node exactly like an explicit
      * Unlink, to whichever connector that binds to. A strict DeleteNode removes no edges and gets none.
+     *
+     * Writes to external nodes (ruling R103, `external` the installed External connectors): an op whose node (a Link /
+     * Unlink: its source) binds to an External connector is that connector's change only and is left out of Engine, so
+     * nothing external is written to KV. Such a node is the CreateNode's (owner, concept), a stored stub, or a row the
+     * transaction fetched (`origins`). Its ops are checked as the engine checks its own (ExternalWriteCheck: CommitError
+     * before any connector begins). A plain DeleteNode of an external node puts one Unlink per engine edge into its stub
+     * (the edges as the batch's earlier ops left them) into Engine, each also routed by its source as R89 routes them;
+     * the last one removes the stub (R102). A strict one fails with NodeHasEdges while any engine edge remains.
      */
-    public static async Route(batch: WriteBatch, table: BindingTable, index: CatalogIndex, origins: INodeOrigins): Promise<ReadonlyMap<string, ConnectorChangeSet>>
+    public static async Route(batch: WriteBatch, table: BindingTable, index: CatalogIndex, origins: INodeOrigins, external: ReadonlySet<string> = WriteCoordinator.NoExternal): Promise<IRoutedBatch>
     {
-        const router = new ChangeRouter(table, index, origins);
+        const router = new ChangeRouter(table, index, origins, external);
         const edges = new BatchEdges(index, origins);
+        const check = new ExternalWriteCheck(index);
+        const engine = new WriteBatch();
         for (const op of batch.Ops())
         {
             switch (op.Op)
@@ -383,6 +421,15 @@ export class WriteCoordinator
                 case WriteOp.CreateNode:
                 {
                     const origin = { Owner: op.Owner ?? WriteCoordinator.NoOwner, Concept: op.Concept };
+                    if (router.IsExternal(origin))
+                    {
+                        const prior = await origins.Origin(op.PublicId);
+                        check.Created(op, prior !== undefined && prior.Fetched !== true && !router.IsExternal(prior));
+                    }
+                    else
+                    {
+                        engine.Append(op);
+                    }
                     router.Created(op.PublicId, origin);
                     edges.Created(op.PublicId);
                     router.Emit(op, origin);
@@ -391,25 +438,81 @@ export class WriteCoordinator
                 case WriteOp.DeleteNode:
                 {
                     const origin = await router.Origin(op.PublicId);
-                    for (const edge of await edges.Deleted(op.PublicId, op.Strict === true ? undefined : origin?.Concept))
+                    const outside = router.IsExternal(origin);
+                    const strict = op.Strict === true;
+                    // An external node's engine edges are removed op by op here; the engine removes an engine node's itself.
+                    const concept = strict && !outside ? undefined : origin?.Concept;
+                    const removed: IUnlinkOp[] = [];
+                    for (const edge of await edges.Deleted(op.PublicId, concept))
                     {
                         const unlink: IUnlinkOp = { Op: WriteOp.Unlink, From: edge.From, Relationship: edge.Relationship, To: edge.To };
-                        router.Emit(unlink, await router.Origin(edge.From));
+                        const source = await router.Origin(edge.From);
+                        if (outside && !router.IsExternal(source))
+                        {
+                            removed.push(unlink);
+                        }
+                        if (!strict)
+                        {
+                            router.Emit(unlink, source);
+                        }
+                    }
+                    if (outside)
+                    {
+                        check.DeletedExternal(op.PublicId, strict, removed.length);
+                        removed.forEach(unlink => engine.Append(unlink));
+                    }
+                    else
+                    {
+                        check.Deleted(op.PublicId);
+                        engine.Append(op);
                     }
                     router.Emit(op, origin);
                     break;
                 }
                 case WriteOp.Link:
+                {
                     edges.Linked(op);
-                    router.Emit(op, await router.Origin(op.From));
+                    const source = await router.Origin(op.From);
+                    if (router.IsExternal(source))
+                    {
+                        check.Link(op, source as INodeOrigin, await router.Origin(op.To));
+                    }
+                    else
+                    {
+                        engine.Append(op);
+                    }
+                    router.Emit(op, source);
                     break;
+                }
                 case WriteOp.Unlink:
+                {
                     edges.Unlinked(op);
-                    router.Emit(op, await router.Origin(op.From));
+                    const source = await router.Origin(op.From);
+                    if (router.IsExternal(source))
+                    {
+                        check.Unlink(op, source as INodeOrigin);
+                    }
+                    else
+                    {
+                        engine.Append(op);
+                    }
+                    router.Emit(op, source);
                     break;
+                }
                 case WriteOp.SetProperty:
-                    router.Emit(op, await router.Origin(op.PublicId));
+                {
+                    const origin = await router.Origin(op.PublicId);
+                    if (router.IsExternal(origin))
+                    {
+                        check.SetProperty(op, origin as INodeOrigin);
+                    }
+                    else
+                    {
+                        engine.Append(op);
+                    }
+                    router.Emit(op, origin);
                     break;
+                }
                 case WriteOp.SetOwner:
                     // Seed synchronization only (ruling R90), and seed sync is never routed.
                     throw new GraphError(GraphErrorCode.Internal, WriteCoordinator.ErrSeedOnly + op.PublicId);
@@ -417,7 +520,8 @@ export class WriteCoordinator
                     return WriteCoordinator.Unhandled(op);
             }
         }
-        return router.Sets();
+        check.Finish();
+        return { Sets: router.Sets(), Engine: engine };
     }
 
     /** Compile-time exhaustiveness: every BatchOp kind has a case in Route. */

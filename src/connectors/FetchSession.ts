@@ -17,6 +17,13 @@ interface IMemoEntry
     readonly Members: ReadonlySet<string>;
 }
 
+/** A row a session fetched and the model it was fetched for (FetchSession.Known). */
+export interface IFetchedEntry
+{
+    readonly Row: IFetchedRow;
+    readonly Model: string;
+}
+
 /**
  * The reader of external connectors for one query (rulings R98, R99). One session serves one Cypher read or one
  * GraphTransaction: key lookups and fetched rows are memoised by public id, so a query sees one value per external
@@ -57,6 +64,17 @@ export class FetchSession
     public get ConnectorNames(): ReadonlySet<string>
     {
         return this.names;
+    }
+
+    /**
+     * The row this session holds for the public id (from any earlier Scan, Lookup or Reverse) and the model it was fetched
+     * for; undefined when it fetched none. Fetches nothing: how a transaction's commit decides writes against what the
+     * transaction itself read (ruling R103). The row is as the connector returned it, before any scope decision.
+     */
+    public Known(publicId: string): IFetchedEntry | undefined
+    {
+        const entry = this.memo.get(publicId);
+        return entry === undefined ? undefined : { Row: entry.Row, Model: entry.Model };
     }
 
     /** Every row of the target matching the predicate, draining resume tokens; ticks the probe per page and per row examined. */

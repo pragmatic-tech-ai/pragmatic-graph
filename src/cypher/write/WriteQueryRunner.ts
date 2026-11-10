@@ -1,3 +1,4 @@
+import { FederatedReads } from '../../FederatedReads.js';
 import type { GraphTransaction } from '../../GraphTransaction.js';
 import { CypherWriteError } from '../CypherError.js';
 import type { CypherQueryModel } from '../CypherQueryModel.js';
@@ -5,6 +6,8 @@ import { NullValue, type CypherValue } from '../CypherValue.js';
 import { CancelProbe, type ICancellation } from '../ExecutionLimits.js';
 import { LogicalPlanner, type PlannerOptions } from '../LogicalPlanner.js';
 import type { Binding } from '../Binding.js';
+import type { ICypherSource } from '../CypherSource.js';
+import { FederatedSource } from '../FederatedSource.js';
 import { BindingRows } from '../operators/BindingRows.js';
 import { ReaderSource } from '../ReaderSource.js';
 import type { CypherWriteStats } from './CypherWriteStats.js';
@@ -34,6 +37,10 @@ export interface IWriteQueryRows
  * has reached the transaction yet, so any error leaves it untouched (the caller disposes it). Commit then hands
  * the pending writes to the transaction and commits it, exactly once (TransactionSink.Commit). Between the two,
  * Source reads the graph as the result sees it (e.g. to load result nodes' links).
+ *
+ * With External connectors installed the snapshot is read through a FederatedSource over the transaction's own
+ * FetchSession (rulings D3, R103), so MATCH ... SET / DELETE reach external nodes and the commit decides those writes
+ * against the very rows the query read.
  */
 export class WriteQueryRunner
 {
@@ -46,7 +53,17 @@ export class WriteQueryRunner
 
     constructor(transaction: GraphTransaction, private readonly options: IWriteQueryOptions = {})
     {
-        this.sink = new TransactionSink(transaction, new ReaderSource(transaction), options.Placement ?? new GuidPlacement());
+        this.sink = new TransactionSink(transaction, WriteQueryRunner.SnapshotSource(transaction), options.Placement ?? new GuidPlacement());
+    }
+
+    /** The transaction's snapshot as the query reads it: federated over its FetchSession when External connectors are installed. */
+    private static SnapshotSource(transaction: GraphTransaction): ICypherSource
+    {
+        const base = new ReaderSource(transaction);
+        const channel = FederatedReads.Of(transaction);
+        const session = channel.Session;
+        const setup = channel.Setup;
+        return session === undefined || setup === undefined ? base : new FederatedSource(base, transaction, session, setup.Bindings);
     }
 
     /** The graph as this query sees it: the snapshot with the query's pending writes. */

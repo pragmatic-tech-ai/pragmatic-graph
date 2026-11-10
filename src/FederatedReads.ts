@@ -1,5 +1,6 @@
 import type { ScopeEvaluator } from './access/ScopeEvaluator.js';
 import { MemberKind } from './catalog/ValueType.js';
+import { FetchSession } from './connectors/FetchSession.js';
 import type { ConnectorSetup } from './connectors/WriteCoordinator.js';
 import { GraphError, GraphErrorCode } from './errors/GraphError.js';
 import { EdgeDirection } from './format/FormatKeys.js';
@@ -42,6 +43,7 @@ export class FederatedReads
     private static readonly Channels = new WeakMap<GraphReader, FederatedReads>();
 
     private open = true;
+    private session: FetchSession | undefined;
 
     /** Created by the GraphReader constructor (with its own recorded reads and evaluator), registered for `reader`. */
     public constructor(reader: GraphReader, private readonly recorded: RecordedReads, private readonly evaluator: ScopeEvaluator | undefined, private readonly index: CatalogIndex)
@@ -69,6 +71,29 @@ export class FederatedReads
     {
         this.RequireOpen();
         return this.recorded.Setup;
+    }
+
+    /**
+     * The reader's own FetchSession (design ruling D3: one per GraphTransaction), created on first use; undefined when
+     * the setup has no External connector. A write query reads through it (FederatedSource) and the transaction's commit
+     * decides its writes against what it fetched (ruling R103), so both see one value per external node.
+     */
+    public get Session(): FetchSession | undefined
+    {
+        this.RequireOpen();
+        const setup = this.recorded.Setup;
+        if (this.session === undefined && setup !== undefined && setup.External.size > 0)
+        {
+            this.session = new FetchSession(setup.ExternalConnectors(), setup.Bindings, this.index.Catalog);
+        }
+        return this.session;
+    }
+
+    /** The reader's FetchSession when one was created (Session), without creating it. */
+    public get OpenSession(): FetchSession | undefined
+    {
+        this.RequireOpen();
+        return this.session;
     }
 
     /** Called by GraphReader.dispose. */
