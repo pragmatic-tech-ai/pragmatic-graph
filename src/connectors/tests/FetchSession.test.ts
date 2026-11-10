@@ -299,6 +299,19 @@ describe('FetchSession', () =>
         assert.equal((await session.Lookup('a', [SessionFx.Target()]))?.PublicId, 'a');
     });
 
+    it('a miss on one candidate does not hide the id from another', async () =>
+    {
+        const ext = new FakeExternalConnector(SessionFx.Ext, [[SessionFx.Row('a')]]);
+        const session = await SessionFx.Session(ext);
+        const other: IFetchTarget = { Model: 'm2', Concept: SessionFx.Asset, Connector: SessionFx.Ext };
+        ext.Override = request => ({ Rows: request.Model === SessionFx.M1 ? [SessionFx.Row('a')] : [] });
+        assert.equal(await session.Lookup('a', [other]), undefined);
+        assert.equal(await session.Lookup('a', [other]), undefined);
+        assert.equal(ext.Requests.length, 1);
+        assert.equal((await session.Lookup('a', [other, SessionFx.Target()]))?.PublicId, 'a');
+        assert.equal(ext.Requests.length, 2);
+    });
+
     it('reverse with capability fetches and memoises', async () =>
     {
         const ext = new FakeExternalConnector(SessionFx.Ext, [[SessionFx.Row('a')]]);

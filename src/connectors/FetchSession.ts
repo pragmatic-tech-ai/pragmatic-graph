@@ -12,7 +12,7 @@ import type { IExternalConnector, IFetchPage, IFetchRequest, IFetchTarget, IFetc
 /** What the session remembers about one public id: the row (undefined for a miss), its model and the members it was fetched with. */
 interface IMemoEntry
 {
-    readonly Row: IFetchedRow | undefined;
+    readonly Row: IFetchedRow;
     readonly Model: string;
     readonly Members: ReadonlySet<string>;
 }
@@ -38,8 +38,10 @@ export class FetchSession
     private static readonly ErrPublicId = 'Fetched row has an invalid public id';
     private static readonly ErrUnknownConnector = 'No connector named ';
     private static readonly Separator = ' / ';
+    private static readonly KeySeparator = '\u0000';
 
     private readonly memo = new Map<string, IMemoEntry>();
+    private readonly misses = new Set<string>();
 
     public constructor(
         private readonly connectors: ReadonlyMap<string, IExternalConnector>,
@@ -56,19 +58,15 @@ export class FetchSession
         yield* this.Drain(target, request, probe, undefined);
     }
 
-    /** The row of `publicId` from the first candidate that has it (hits and misses are memoised). */
+    /** The row of `publicId` from the first candidate that has it (hits, and misses per candidate, are memoised). */
     public async Lookup(publicId: string, candidates: readonly IFetchTarget[]): Promise<IFetchedRow | undefined>
     {
-        const known = this.memo.get(publicId);
-        if (known !== undefined && known.Row === undefined)
-        {
-            return undefined;
-        }
         for (const target of candidates)
         {
             const required = this.PropertyNames(target.Concept);
             const entry = this.memo.get(publicId);
-            if (entry?.Row !== undefined)
+            const missKey = this.MissKey(publicId, target);
+            if (entry !== undefined)
             {
                 if (entry.Model !== target.Model || !this.catalog.IsA(entry.Row.Concept, target.Concept))
                 {
@@ -78,6 +76,10 @@ export class FetchSession
                 {
                     return entry.Row;
                 }
+            }
+            else if (this.misses.has(missKey))
+            {
+                continue;
             }
             const request: IFetchRequest = {
                 Model: target.Model,
@@ -91,10 +93,7 @@ export class FetchSession
                 this.memo.set(publicId, { Row: row, Model: target.Model, Members: new Set(required) });
                 return row;
             }
-        }
-        if (!this.memo.has(publicId))
-        {
-            this.memo.set(publicId, { Row: undefined, Model: '', Members: new Set() });
+            this.misses.add(missKey);
         }
         return undefined;
     }
@@ -153,11 +152,11 @@ export class FetchSession
         while (resume !== undefined);
     }
 
-    /** Records the row unless the session already holds one covering the request's members; returns the row to use. */
+    /** The newer fetch replaces a non-covering entry whole: merging two fetches values would mix moments within one entry (D3). Records the row unless the session already holds one covering the request's members; returns the row to use. */
     private Remember(target: IFetchTarget, request: IFetchRequest, row: IFetchedRow): IFetchedRow
     {
         const entry = this.memo.get(row.PublicId);
-        if (entry?.Row !== undefined && request.Members.every(name => entry.Members.has(name)))
+        if (entry !== undefined && request.Members.every(name => entry.Members.has(name)))
         {
             return entry.Row;
         }
@@ -215,6 +214,11 @@ export class FetchSession
                 throw new GraphError(GraphErrorCode.SchemaViolation, FetchSession.ErrValue + name, cause);
             }
         }
+    }
+
+    private MissKey(publicId: string, target: IFetchTarget): string
+    {
+        return [publicId, target.Model, target.Concept, target.Connector].join(FetchSession.KeySeparator);
     }
 
     private PropertyNames(concept: string): readonly string[]
