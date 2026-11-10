@@ -29,6 +29,11 @@ class FetchFx
     public static readonly Asset = 'Asset';
     public static readonly Server = 'Server';
     public static readonly Laptop = 'Laptop';
+    public static readonly Blade = 'Blade';
+    public static readonly Racked = 'Racked';
+    public static readonly Powered = 'Powered';
+    private static readonly Slot = 'slot';
+    private static readonly Battery = 'battery';
     public static readonly M1 = 'm1';
     public static readonly M2 = 'm2';
     public static readonly M3 = 'm3';
@@ -54,6 +59,51 @@ class FetchFx
             Bindings: bindings,
             ...(defaultConnector === undefined ? {} : { DefaultConnector: defaultConnector }),
         };
+    }
+
+    /**
+     * Aspects Racked { slot } and Powered { battery }; Asset { label } with Server (carries Racked; Blade extends it) and
+     * Laptop (carries Powered).
+     */
+    public static AspectDescription(bindings: readonly IBindingDescription[]): ISchemaDescription
+    {
+        const aspect = (name: string, member: string): IDefinitionDescription =>
+            ({ Name: name, IsAspect: true, Parent: null, Aspects: [], Members: [{ Name: member, Kind: MemberKind.Property, Type: ValueType.String, Nullable: true }] });
+        const sub = (name: string, parent: string, aspects: readonly string[]): IDefinitionDescription =>
+            ({ Name: name, IsAspect: false, Parent: parent, Aspects: aspects, Members: [] });
+        return {
+            Version: FetchFx.V1,
+            Definitions: [
+                aspect(FetchFx.Racked, FetchFx.Slot),
+                aspect(FetchFx.Powered, FetchFx.Battery),
+                FetchFx.Concept(FetchFx.Asset, null),
+                sub(FetchFx.Server, FetchFx.Asset, [FetchFx.Racked]),
+                sub(FetchFx.Blade, FetchFx.Server, []),
+                sub(FetchFx.Laptop, FetchFx.Asset, [FetchFx.Powered]),
+            ],
+            Indexes: [],
+            Seed: [],
+            Bindings: bindings,
+        };
+    }
+
+    /** ExternalTargets of `label` under `bindings` (connector Ext external, Other mirrored). */
+    public static async Targets(bindings: readonly IBindingDescription[], label: string): Promise<readonly object[]>
+    {
+        const engine = await FetchFx.Open(FetchFx.AspectDescription(bindings), [FetchFx.External(FetchFx.Ext), new FakeConnector(FetchFx.Other, [])]);
+        try
+        {
+            return new BindingTable(bindings).ExternalTargets(label, engine.Catalog, new Set([FetchFx.Ext]));
+        }
+        finally
+        {
+            await engine.dispose();
+        }
+    }
+
+    public static Target(model: string, concept: string): object
+    {
+        return { Model: model, Concept: concept, Connector: FetchFx.Ext };
     }
 
     public static External(name: string): IExternalConnector
@@ -163,6 +213,41 @@ describe('Connector read contract', () =>
         {
             await engine.dispose();
         }
+    });
+
+    it('ExternalTargets for an aspect covers carriers bound by another aspect', async () =>
+    {
+        // Laptop carries Powered, not Racked: a Powered binding holds no Racked node. Blade folds into Server.
+        const bindings: IBindingDescription[] = [
+            { Model: FetchFx.M1, Concept: FetchFx.Powered, Connector: FetchFx.Ext },
+            { Model: FetchFx.M2, Concept: FetchFx.Racked, Connector: FetchFx.Ext },
+        ];
+        assert.deepEqual(await FetchFx.Targets(bindings, FetchFx.Racked), [FetchFx.Target(FetchFx.M2, FetchFx.Server)]);
+        assert.deepEqual(await FetchFx.Targets(bindings, FetchFx.Powered), [FetchFx.Target(FetchFx.M1, FetchFx.Laptop)]);
+        // Server carries Racked; an M2 Server binding to the mirrored connector takes Server (not Blade) away.
+        const narrowed: IBindingDescription[] = [
+            { Model: FetchFx.M2, Concept: FetchFx.Racked, Connector: FetchFx.Ext },
+            { Model: FetchFx.M2, Concept: FetchFx.Server, Connector: FetchFx.Other },
+            { Model: FetchFx.M2, Concept: FetchFx.Blade, Connector: FetchFx.Ext },
+        ];
+        assert.deepEqual(await FetchFx.Targets(narrowed, FetchFx.Racked), [FetchFx.Target(FetchFx.M2, FetchFx.Blade)]);
+    });
+
+    it('ExternalTargets for an aspect covers carriers bound via an ancestor of the carrier', async () =>
+    {
+        const bindings: IBindingDescription[] = [{ Model: FetchFx.M1, Concept: FetchFx.Asset, Connector: FetchFx.Ext }];
+        assert.deepEqual(await FetchFx.Targets(bindings, FetchFx.Racked), [FetchFx.Target(FetchFx.M1, FetchFx.Server)]);
+        assert.deepEqual(await FetchFx.Targets(bindings, FetchFx.Asset), [FetchFx.Target(FetchFx.M1, FetchFx.Asset)]);
+    });
+
+    it('ExternalTargets for an aspect covers carriers bound model-wide', async () =>
+    {
+        const bindings: IBindingDescription[] = [
+            { Model: FetchFx.M1, Connector: FetchFx.Ext },
+            { Model: FetchFx.M2, Connector: FetchFx.Other },
+        ];
+        assert.deepEqual(await FetchFx.Targets(bindings, FetchFx.Racked), [FetchFx.Target(FetchFx.M1, FetchFx.Server)]);
+        assert.deepEqual(await FetchFx.Targets(bindings, FetchFx.Powered), [FetchFx.Target(FetchFx.M1, FetchFx.Laptop)]);
     });
 
     it('engine storage as default', async () =>

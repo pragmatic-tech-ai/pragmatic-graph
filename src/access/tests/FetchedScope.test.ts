@@ -37,6 +37,7 @@ class FetchedFx
     public static readonly Secret = 'secret';
     public static readonly Load = 'load';
     public static readonly Linked = 'Linked';
+    public static readonly Asset = 'Asset';
     public static readonly Link = 'link';
     public static readonly Nope = 'Nope';
     public static readonly TeamRel = 'team';
@@ -84,8 +85,9 @@ class FetchedFx
             Definitions: [
                 { Name: FetchedFx.Tagged, IsAspect: true, Parent: null, Aspects: [], Members: [FetchedFx.Prop(FetchedFx.Tag, ValueType.String)] },
                 { Name: FetchedFx.Linked, IsAspect: true, Parent: null, Aspects: [], Members: [FetchedFx.Rel(FetchedFx.Link, FetchedFx.Server, true)] },
+                { Name: FetchedFx.Asset, IsAspect: false, Parent: null, Aspects: [], Members: [] },
                 {
-                    Name: FetchedFx.Server, IsAspect: false, Parent: null, Aspects: [FetchedFx.Tagged, FetchedFx.Linked], Members: [
+                    Name: FetchedFx.Server, IsAspect: false, Parent: FetchedFx.Asset, Aspects: [FetchedFx.Tagged, FetchedFx.Linked], Members: [
                         FetchedFx.Prop(FetchedFx.Cpu, ValueType.Int64),
                         FetchedFx.Prop(FetchedFx.Secret, ValueType.String),
                         FetchedFx.Prop(FetchedFx.Load, ValueType.Float64),
@@ -105,6 +107,10 @@ class FetchedFx
     public static readonly ServerBinding: readonly IBindingDescription[] = [{ Model: FetchedFx.Ext, Concept: FetchedFx.Server, Connector: FetchedFx.ExtC }];
     /** Ext's nodes carrying Tagged bound to ExtC: keyed by an aspect, not by the concept that carries it. */
     public static readonly TaggedBinding: readonly IBindingDescription[] = [{ Model: FetchedFx.Ext, Concept: FetchedFx.Tagged, Connector: FetchedFx.ExtC }];
+    /** Ext's Assets (so its Servers) bound to ExtC: keyed by an ancestor of the carrying concept. */
+    public static readonly AncestorBinding: readonly IBindingDescription[] = [{ Model: FetchedFx.Ext, Concept: FetchedFx.Asset, Connector: FetchedFx.ExtC }];
+    /** Everything Ext holds bound to ExtC, model-wide. */
+    public static readonly ModelWideBinding: readonly IBindingDescription[] = [{ Model: FetchedFx.Ext, Connector: FetchedFx.ExtC }];
 
     public static External(): IExternalConnector
     {
@@ -394,6 +400,21 @@ class FetchedFx
                 assert.deepEqual(await FetchedFx.Admitted(g, FetchedFx.ServerScope(new Not(fromU)), [FetchedFx.Row(FetchedFx.X)]), [false]);
                 g.dispose();
             });
+
+            for (const [label, bindings] of [['an ancestor', FetchedFx.AncestorBinding], ['a model-wide binding', FetchedFx.ModelWideBinding]] as const)
+            {
+                it('Related In over an aspect-declared relationship carried by a concept external via ' + label + ' is Unknown', async () =>
+                {
+                    const g = await FetchedFx.Ready(open, true, bindings);
+                    const linkIn = new Related(FetchedFx.Link, EdgeDirection.In, TruePredicate.Instance);
+                    assert.deepEqual(await FetchedFx.Admitted(g, FetchedFx.ServerScope(linkIn), [FetchedFx.Row(FetchedFx.X)]), [false]);
+                    assert.deepEqual(await FetchedFx.Admitted(g, FetchedFx.ServerScope(new Not(linkIn)), [FetchedFx.Row(FetchedFx.X)]), [false]);
+                    // The stub still decides an engine-only source.
+                    const assignedIn = new Related(FetchedFx.Assigned, EdgeDirection.In, new IdIn(new Set([FetchedFx.T])));
+                    assert.deepEqual(await FetchedFx.Admitted(g, FetchedFx.ServerScope(assignedIn), [FetchedFx.Row(FetchedFx.X)]), [true]);
+                    g.dispose();
+                });
+            }
 
             it('Related in over external source is Unknown', async () =>
             {
