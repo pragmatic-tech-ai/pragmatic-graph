@@ -8,6 +8,7 @@ import {
 import type { ICypherSource } from './CypherSource.js';
 import { ScalarValue, type CypherValue } from './CypherValue.js';
 import type { ICancellation } from './ExecutionLimits.js';
+import { GraphError, GraphErrorCode } from '../errors/GraphError.js';
 import { Comparison, FunctionCall, Literal, PropertyAccess, VariableRef, type Expression } from './Expression.js';
 import { OperatorPrinter } from './OperatorPrinter.js';
 import { OptionalMatchPlan } from './OptionalMatchPlan.js';
@@ -65,6 +66,13 @@ export interface PlannerOptions
     readonly StrictWithScope?: boolean;
 }
 
+/** One column of a paged read's effective sort. */
+export interface IKeyColumn
+{
+    readonly Column: string;
+    readonly Descending: boolean;
+}
+
 /**
  * Compiles a CypherQueryModel into an async operator tree over an ICypherSource. Planning is synchronous and
  * raises every semantic error (scope, labels, relationship types, SKIP/LIMIT) before any row is read: labels are
@@ -79,6 +87,7 @@ export class LogicalPlanner
     private static readonly RelPropsUnsupported = 'relationship properties are not supported';
     private static readonly UnknownRelType = 'unknown relationship type';
     private static readonly UnknownOrderByColumn = 'unknown ORDER BY column';
+    private static readonly KeysetOrderBy = 'keyset paging needs ORDER BY over returned columns';
     private static readonly UnknownWhereColumn = 'unknown WITH ... WHERE column';
     private static readonly UnboundVariable = 'variable not in scope';
     private static readonly NonNumericLimit = 'SKIP/LIMIT must evaluate to a number';
@@ -101,6 +110,8 @@ export class LogicalPlanner
         private readonly ensureOrder: boolean = false,
         // Only write-capable plans (PlanForWrite) supply one; read planning omits it.
         private readonly sink?: ICypherSink,
+        // Keyset paging (After): every explicit ORDER BY item must be a returned column.
+        private readonly keyset: boolean = false,
     )
     {
         this.maxVarLength = options?.MaxVarLength ?? LogicalPlanner.DefaultMaxVarLength;
@@ -126,6 +137,9 @@ export class LogicalPlanner
         const plan = planner.PlanForWrite(model);
         return OperatorPrinter.Print(plan.Projection === undefined ? plan.Mutations : planner.ProjectOver(plan.Mutations, plan.Projection));
     }
+
+    /** With ensureOrder, the final projection's effective sort (explicit ORDER BY, then every column ascending) when each item is a column. */
+    public FinalOrder: readonly IKeyColumn[] | undefined = undefined;
 
     public Plan(model: CypherQueryModel): IOperator
     {
@@ -473,11 +487,19 @@ export class LogicalPlanner
         if (projection.Where !== undefined) op = new Filter(op, this.resolveWithWhere(projection), this.parameters);
         if (projection.OrderBy !== undefined)
         {
-            op = new Sort(op, this.resolveOrderBy(projection), this.parameters, this.cancel);
+            let items = this.resolveOrderBy(projection);
+            if (implicitOrder)
+            {
+                items = [...items, ...this.implicitOrder(projection)];
+                this.recordFinalOrder(projection, items);
+            }
+            op = new Sort(op, items, this.parameters, this.cancel);
         }
         else if (implicitOrder)
         {
-            op = new Sort(op, this.implicitOrder(projection), this.parameters, this.cancel);
+            const items = this.implicitOrder(projection);
+            this.recordFinalOrder(projection, items);
+            op = new Sort(op, items, this.parameters, this.cancel);
         }
         if (projection.Skip !== undefined) op = new Skip(op, this.evalCount(projection.Skip));
         if (projection.Limit !== undefined) op = new Limit(op, this.evalCount(projection.Limit));
@@ -537,6 +559,30 @@ export class LogicalPlanner
             }
             return sort;
         });
+    }
+
+    // The final paged projection's order as column keys; under keyset paging an item that is not a returned column is
+    // refused (the cursor can only compare returned columns).
+    private recordFinalOrder(projection: ProjectionClause, items: readonly SortItem[]): void
+    {
+        const columns = new Set<string>(projection.Items.map((i) => i.ColumnName()));
+        const keys: IKeyColumn[] = [];
+        for (const item of items)
+        {
+            if (item.Expr instanceof VariableRef && columns.has(item.Expr.Variable))
+            {
+                keys.push({ Column: item.Expr.Variable, Descending: item.Descending });
+            }
+            else if (this.keyset)
+            {
+                throw new GraphError(GraphErrorCode.InvalidArgument, LogicalPlanner.KeysetOrderBy);
+            }
+            else
+            {
+                return;
+            }
+        }
+        this.FinalOrder = keys;
     }
 
     // Implicit paging order: ORDER BY all projected columns, ascending, resolved exactly as explicit alias references.
