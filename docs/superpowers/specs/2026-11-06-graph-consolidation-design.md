@@ -275,6 +275,25 @@ Also: update protocol and server `ARCHITECTURE.md` (currently stale).
    on-demand fetch; `data/write`, `connector/*`, environment graph on the engine; runtime
    change push; runtime retirements.
 
+### 11.1 Milestone 2 decisions (owner, 2026-11-10)
+- **The environment graph is the Dataverse.** A runtime environment runs ONE engine whose catalog is
+  the union of every package delivered into it. Both delivery channels feed it: `application/deploy`
+  (packages + UI + policy) and admin promote (`graph/load`, a package set without UI). Neither builds a
+  graph of its own. A re-promote or redeploy is an in-place upgrade per §4.3 (data of removed
+  definitions discarded, seeded nodes re-applied, runtime-created data kept); a package still
+  delivered by another channel stays in the union. The separate promoted `EnvironmentGraph` (its
+  overlay, unfiltered query and `loaded-graph.json`-built instance) and per-app data stores are
+  retired. The only instance data outside the engine is the read-only FrozenGraph bundled into an
+  app built for the bundled target (client-side, never written).
+- **Runtime compiles nothing.** The environment engine opens from compiled package manifests
+  (packages → `Domain` → snapshot → engine); compiler/language services run in development
+  environments only.
+- **Ungoverned app-private concepts keep today's bypass.** A concept the tenant security model does not
+  govern is filtered by the app's policy rules only; governed concepts get policy AND depth.
+- **Shares are graph data.** A system share-grant concept links a record to the principal or team it is
+  shared with; the access scope widens reads (and the write rules it already widens today) through a
+  graph predicate over those grants, and a grant commits in the same transaction as any other write.
+
 ## 12. Invariants to test
 - Repository/engine agreement: for every compiled fixture, `Repository.IsA` /
   `InstancesMatching` equal engine label-scan results, aspects included.
