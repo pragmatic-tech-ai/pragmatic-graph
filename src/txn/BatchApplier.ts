@@ -14,13 +14,15 @@ import type { IIndexEntry, IndexStore } from '../indexes/IndexStore.js';
 import { PublicIdIndex } from '../identity/PublicIdIndex.js';
 import type { RowIndex } from '../identity/RowIndex.js';
 import type { IWriteTransaction } from '../kv/KeyValue.js';
+import { ConnectorResidency } from '../connectors/FetchContract.js';
+import type { ConnectorSetup } from '../connectors/WriteCoordinator.js';
 import { SeedMarkers } from '../schema/SeedMarkers.js';
 import { GraphError, GraphErrorCode } from '../errors/GraphError.js';
 import type { CatalogIndex } from './CatalogIndex.js';
 import { CommitError, CommitErrorCode } from './CommitError.js';
 import { ConflictKeys } from './ConflictKeys.js';
 import type { ReadSet } from './ReadSet.js';
-import { type ICreateNodeOp, type IDeleteNodeOp, type ILinkOp, type ISetOwnerOp, type ISetPropertyOp, type IUnlinkOp, WriteBatch, WriteOp } from './WriteBatch.js';
+import { type ICreateNodeOp, type IDeleteNodeOp, type IExternalTarget, type ILinkOp, type ISetOwnerOp, type ISetPropertyOp, type IUnlinkOp, WriteBatch, WriteOp } from './WriteBatch.js';
 import { WriteKeySet } from './WriteKeySet.js';
 
 /** A live node resolved from its public id inside the applying transaction. */
@@ -87,9 +89,14 @@ export class BatchApplier
     private static readonly Nul = '\u0000';
     private static readonly ErrCorruptRow = 'Node has a public id but no stored row: ';
     private static readonly ErrIdsExhausted = 'Batch has more CreateNode operations than allocated ids';
+    private static readonly ErrStub = 'External target is not bound to an external connector: ';
+    private static readonly ErrStubConcept = 'Target exists as a different concept than the external target declares: ';
     private static readonly Dot = '.';
     private static readonly Colon = ': ';
     private static readonly Arrow = ' -> ';
+
+    /** Names of the installed External connectors: a node bound to one is a stub (ruling R102). */
+    private readonly external: ReadonlySet<string>;
 
     public constructor(
         private readonly index: CatalogIndex,
@@ -99,14 +106,19 @@ export class BatchApplier
         private readonly ids: PublicIdIndex,
         private readonly indexes: IndexStore,
         private readonly dependencies?: ReadSet,
+        private readonly setup?: ConnectorSetup,
     )
     {
+        this.external = new Set([...(setup?.Connectors.values() ?? [])].filter(c => c.Residency === ConnectorResidency.External).map(c => c.Name));
     }
 
-    /** Internal ids a batch needs: one per CreateNode, in op order, with the op's cluster hint. */
+    /**
+     * Internal ids a batch needs, in op order, with the op's cluster hint: one per CreateNode and one per Link that
+     * carries an ExternalTarget (whether or not its stub already exists, so the order stays deterministic for replay).
+     */
     public static CreateHints(batch: WriteBatch): Array<string | undefined>
     {
-        return batch.Ops().filter((op): op is ICreateNodeOp => op.Op === WriteOp.CreateNode).map(op => op.ClusterHint);
+        return batch.Ops().filter(op => WriteBatch.TakesId(op)).map(op => op.Op === WriteOp.CreateNode ? op.ClusterHint : undefined);
     }
 
     /**
@@ -149,10 +161,21 @@ export class BatchApplier
                     created.delete(await this.DeleteNode(txn, op, keys, touched));
                     break;
                 case WriteOp.Link:
+                {
+                    if (op.Options?.ExternalTarget !== undefined)
+                    {
+                        const id = allocated[nextId++];
+                        if (id === undefined)
+                        {
+                            throw new GraphError(GraphErrorCode.Internal, BatchApplier.ErrIdsExhausted);
+                        }
+                        await this.EnsureStub(txn, op, id, keys, touched);
+                    }
                     await this.Link(txn, op, keys);
                     break;
+                }
                 case WriteOp.Unlink:
-                    await this.Unlink(txn, op, keys);
+                    await this.Unlink(txn, op, keys, touched);
                     break;
                 case WriteOp.SetOwner:
                     await this.SetOwner(txn, op, keys);
@@ -217,7 +240,8 @@ export class BatchApplier
         }
     }
 
-    private async CreateNode(txn: IWriteTransaction, op: ICreateNodeOp, id: bigint, keys: WriteKeySet): Promise<INode>
+    /** `stub`: an identity-only node (ruling R102) writes no node-id cell, so no concept scan lists it. */
+    private async CreateNode(txn: IWriteTransaction, op: ICreateNodeOp, id: bigint, keys: WriteKeySet, stub: boolean = false): Promise<INode>
     {
         BatchApplier.RequirePublicId(op.PublicId);
         const typeId = BatchApplier.Catalog(() => this.index.Catalog.RequireInstantiable(op.Concept));
@@ -228,11 +252,17 @@ export class BatchApplier
         const slot = await this.columns.AllocateSlot(txn, BatchApplier.Partition, typeId);
         const location: Location = { Partition: BatchApplier.Partition, TypeId: typeId, Slot: slot };
         await this.rows.Assign(txn, id, location);
-        await this.columns.WriteCell(txn, location, CatalogSnapshot.NodeIdMember, id);
+        if (!stub)
+        {
+            await this.columns.WriteCell(txn, location, CatalogSnapshot.NodeIdMember, id);
+        }
         await this.ids.Bind(txn, op.PublicId, id);
         this.ids.SetOwner(txn, id, op.Owner ?? '');
         keys.Add(ConflictKeys.NodeSpace, ConflictKeys.Node(op.PublicId));
-        BatchApplier.AddCellKeys(keys, id, typeId, CatalogSnapshot.NodeIdMember.Id);
+        if (!stub)
+        {
+            BatchApplier.AddCellKeys(keys, id, typeId, CatalogSnapshot.NodeIdMember.Id);
+        }
         keys.Add(ConflictKeys.ExtentSpace, ConflictKeys.Extent(typeId));
         return { PublicId: op.PublicId, Id: id, Location: location, Concept: op.Concept };
     }
@@ -266,6 +296,7 @@ export class BatchApplier
             (touched.get(node.Id) as ITouchedNode).Live = false;
         }
         const members = this.index.Catalog.EffectiveMembers(node.Concept);
+        let far: bigint[] = [];
         if (op.Strict === true)
         {
             // One scan: it records the adjacency dependencies and proves there is nothing to unlink.
@@ -273,7 +304,7 @@ export class BatchApplier
         }
         else
         {
-            await this.UnlinkAll(txn, node, members, keys);
+            far = await this.UnlinkAll(txn, node, members, keys);
         }
         // Every property cell of the slot is nulled, not just the node id (F9); slots are not reused in v1.
         for (const m of members.filter(x => x.Kind === MemberKind.Property))
@@ -291,6 +322,10 @@ export class BatchApplier
         for (const m of members.filter(x => x.Kind === MemberKind.Property))
         {
             BatchApplier.AddCellKeys(keys, node.Id, node.Location.TypeId, m.Id);
+        }
+        for (const id of far)
+        {
+            await this.RemoveStubIfOrphaned(txn, id, keys, touched);
         }
         return node.Id;
     }
@@ -338,13 +373,90 @@ export class BatchApplier
         }
     }
 
-    private async Unlink(txn: IWriteTransaction, op: IUnlinkOp, keys: WriteKeySet): Promise<void>
+    private async Unlink(txn: IWriteTransaction, op: IUnlinkOp, keys: WriteKeySet, touched: Map<bigint, ITouchedNode>): Promise<void>
     {
         const from = await this.Locate(txn, op.From);
         const rel = this.Relationship(from, op.Relationship);
         const to = await this.Locate(txn, op.To);
         await BatchApplier.Edge(from, rel, to, () => this.edges.Unlink(txn, rel, from.Id, to.Id));
         BatchApplier.AddEdgeKeys(keys, rel, from.Id, to.Id);
+        await this.RemoveStubIfOrphaned(txn, to.Id, keys, touched);
+    }
+
+    /**
+     * Ruling R102: creates the identity-only stub (op.To, ExternalTarget) when no node has that public id. The
+     * stub's binding must name an External connector (InvalidEdge); an existing node of another concept is
+     * TargetTypeMismatch. The stub takes an id from `allocated` whether or not it is created.
+     */
+    private async EnsureStub(txn: IWriteTransaction, op: ILinkOp, id: bigint, keys: WriteKeySet, touched: Map<bigint, ITouchedNode>): Promise<void>
+    {
+        const target = op.Options?.ExternalTarget as IExternalTarget;
+        BatchApplier.RequirePublicId(op.To);
+        this.dependencies?.AddKey(ConflictKeys.NodeSpace, ConflictKeys.Node(op.To));
+        if ((await this.ids.Resolve(txn, op.To)) !== undefined)
+        {
+            const existing = await this.Locate(txn, op.To);
+            if (existing.Concept !== target.Concept)
+            {
+                throw new CommitError(CommitErrorCode.TargetTypeMismatch, BatchApplier.ErrStubConcept + op.To);
+            }
+            return;
+        }
+        BatchApplier.Catalog(() => this.index.Catalog.RequireInstantiable(target.Concept));
+        const bindings = this.setup?.Bindings;
+        if (bindings === undefined || !bindings.IsStub(target.Owner, target.Concept, this.index.Catalog, this.external))
+        {
+            throw new CommitError(CommitErrorCode.InvalidEdge, BatchApplier.ErrStub + op.To + BatchApplier.Colon + target.Concept);
+        }
+        const node = await this.CreateNode(txn, { Op: WriteOp.CreateNode, PublicId: op.To, Concept: target.Concept, Owner: target.Owner }, id, keys, true);
+        if (this.index.IndexesFor(node.Concept).length > 0)
+        {
+            touched.set(id, { Node: node, Before: [], Live: true });
+        }
+    }
+
+    /**
+     * Ruling R102: deletes node `id` when it is a stub (its binding is External) that no edge touches any more,
+     * in the same batch that removed its last edge.
+     */
+    private async RemoveStubIfOrphaned(txn: IWriteTransaction, id: bigint, keys: WriteKeySet, touched: Map<bigint, ITouchedNode>): Promise<void>
+    {
+        if (this.external.size === 0)
+        {
+            return;
+        }
+        const publicId = await this.ids.PublicIdOf(txn, id);
+        if (publicId === undefined)
+        {
+            return;
+        }
+        const node = await this.Locate(txn, publicId);
+        const owner = await this.ids.OwnerOf(txn, id);
+        const bindings = this.setup?.Bindings;
+        if (bindings === undefined || !bindings.IsStub(owner, node.Concept, this.index.Catalog, this.external))
+        {
+            return;
+        }
+        if (await this.HasEdges(txn, node))
+        {
+            return;
+        }
+        await this.DeleteNode(txn, { Op: WriteOp.DeleteNode, PublicId: publicId }, keys, touched);
+    }
+
+    private async HasEdges(txn: IWriteTransaction, node: INode): Promise<boolean>
+    {
+        const outgoing = this.index.Catalog.EffectiveMembers(node.Concept).filter(m => m.Kind === MemberKind.Relationship).map(rel => [rel, EdgeDirection.Out] as const);
+        const incoming = this.index.IncomingRelationships(node.Concept).map(rel => [rel, EdgeDirection.In] as const);
+        for (const [rel, direction] of [...outgoing, ...incoming])
+        {
+            this.DependOn(rel, node.Id, direction);
+            for await (const _ of this.edges.Adjacent(txn, rel, node.Id, direction))
+            {
+                return true;
+            }
+        }
+        return false;
     }
 
     private Relationship(from: INode, name: string): MemberDef
@@ -374,8 +486,9 @@ export class BatchApplier
     }
 
     /** Unlinks every edge of the node being deleted, in both directions (a plain DeleteNode). */
-    private async UnlinkAll(txn: IWriteTransaction, node: INode, members: readonly MemberDef[], keys: WriteKeySet): Promise<void>
+    private async UnlinkAll(txn: IWriteTransaction, node: INode, members: readonly MemberDef[], keys: WriteKeySet): Promise<bigint[]>
     {
+        const far: bigint[] = [];
         // Each edge is unlinked at the position its scan already found: no per-edge lookup (F9).
         for (const rel of members.filter(m => m.Kind === MemberKind.Relationship))
         {
@@ -384,6 +497,7 @@ export class BatchApplier
             {
                 await this.edges.UnlinkAt(txn, rel, node.Id, edge.Node, edge.Position);
                 BatchApplier.AddEdgeKeys(keys, rel, node.Id, edge.Node);
+                far.push(edge.Node);
             }
         }
         for (const rel of this.index.IncomingRelationships(node.Concept))
@@ -393,8 +507,10 @@ export class BatchApplier
             {
                 await this.edges.UnlinkAt(txn, rel, edge.Node, node.Id, edge.Position);
                 BatchApplier.AddEdgeKeys(keys, rel, edge.Node, node.Id);
+                far.push(edge.Node);
             }
         }
+        return far;
     }
 
     /**

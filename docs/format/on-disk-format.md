@@ -263,7 +263,7 @@ op      : kind u8, then the fields of that kind
   1 CreateNode  : publicId str, concept str, flags u8 (bit 0 = hint, bit 1 = owner; other bits rejected), [clusterHint str], [owner str]
   2 SetProperty : publicId str, member str, value
   3 DeleteNode  : publicId str
-  4 Link        : from str, relationship str, to str, flags u8, [afterSibling str], [beforeSibling str], [properties]
+  4 Link        : from str, relationship str, to str, flags u8, [afterSibling str], [beforeSibling str], [properties], [externalTarget]
   5 Unlink      : from str, relationship str, to str
   6 DeleteNode (strict) : publicId str   a DeleteNode with Strict: the commit fails (CommitError NodeHasEdges)
                   while the node has any edge after the batch's earlier ops; a plain DeleteNode keeps kind 3,
@@ -273,9 +273,14 @@ op      : kind u8, then the fields of that kind
 str        : byteLength u32, UTF-8 bytes (well-formed Unicode)
 value      : tag u8; 0 = null (no bytes follow), else the ValueType (1 Boolean .. 7 Duration)
              followed by that type's single value bytes (see Columns, Single value bytes)
-flags      : bit 0 = options present, bit 1 = afterSibling, bit 2 = beforeSibling, bit 3 = properties;
+flags      : bit 0 = options present, bit 1 = afterSibling, bit 2 = beforeSibling, bit 3 = properties, bit 4 = externalTarget;
              0 = no options; any other bit set, or a field bit without bit 0, is corrupt
 properties : count u32, then count x (name str, value); names are distinct
+externalTarget : concept str, owner str   the far end lives in an external system (ruling R102); written after properties
 ```
 
-`afterSibling` / `beforeSibling` are public ids of existing targets of the same `(from, relationship)`; the committer resolves them to those edges' positions. A value's tag is the value's own type (a bigint is Int64, a JS number Float64); the member's declared type is checked when the batch is applied. A reader rejects an unknown version, kind, tag or flag, a truncated entry, invalid UTF-8, and trailing bytes.
+`afterSibling` / `beforeSibling` are public ids of existing targets of the same `(from, relationship)`; the committer resolves them to those edges' positions. A value's tag is the value's own type (a bigint is Int64, a JS number Float64); the member's declared type is checked when the batch is applied. A Link carrying an `externalTarget` also consumes one created id (CreatedIds is one per CreateNode and per such Link, in op order, whether or not the stub already exists). A reader rejects an unknown version, kind, tag or flag, a truncated entry, invalid UTF-8, and trailing bytes.
+
+### Stubs
+
+A stub is an identity-only node (ruling R102): the engine stores one when an engine-resident node links to a node that lives only in an external connector. There is no new key and no marker. A stored node is a stub exactly when it has no cells (no node-id cell either, so concept scans never list it) and `BindingTable.Resolve(owner, concept)` names an External connector. It has a public id, a row, an owner and a concept, and only edges. The commit that removes its last edge (Unlink, or DeleteNode of the last linked node) deletes it in the same batch.

@@ -1079,7 +1079,7 @@ export class Committer
             {
                 await this.RequireCurrent(txn);
                 const dependencies = new ReadSet();
-                const applier = new BatchApplier(index, this.columns, this.edges, this.rows, this.ids, this.indexes, dependencies);
+                const applier = new BatchApplier(index, this.columns, this.edges, this.rows, this.ids, this.indexes, dependencies, this.connectors);
                 const keys = await applier.Apply(txn, p.Batch, p.Ids ?? []);
                 throw new DryRunOutcome(keys, dependencies);
             });
@@ -1215,7 +1215,7 @@ export class Committer
     private async ApplyGroup(txn: IWriteTransaction, index: CatalogIndex, candidates: readonly PendingCommit[]): Promise<IGroupOutcome>
     {
         await this.RequireCurrent(txn);
-        const applier = new BatchApplier(index, this.columns, this.edges, this.rows, this.ids, this.indexes);
+        const applier = new BatchApplier(index, this.columns, this.edges, this.rows, this.ids, this.indexes, undefined, this.connectors);
         const groupKeys = new WriteKeySet();
         const accepted: IAccepted[] = [];
         const conflicts: Array<readonly [PendingCommit, Error]> = [];

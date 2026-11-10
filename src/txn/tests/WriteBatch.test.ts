@@ -26,6 +26,7 @@ class BatchFx
         b.Link('p1', 'friends', 'p3', { AfterSibling: 'p2' });
         b.Link('p1', 'friends', 'p4', { BeforeSibling: 'p3', AfterSibling: 'p2' });
         b.Link('p1', 'rated', 'p2', { Properties: new Map([['weight', 7n], ['note', null]]) });
+        b.Link('p1', 'assigned', 'x1', { ExternalTarget: { Concept: 'ticket', Owner: 'jira' } });
         b.Unlink('p1', 'knows', 'p2');
         b.DeleteNode('p2');
         return b;

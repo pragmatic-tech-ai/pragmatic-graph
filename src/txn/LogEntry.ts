@@ -153,7 +153,7 @@ export class LogEntry
         {
             throw new GraphError(GraphErrorCode.Corrupt, String(error), error);
         }
-        if (batch.Ops().filter(op => op.Op === WriteOp.CreateNode).length !== count)
+        if (batch.Ops().filter(op => WriteBatch.TakesId(op)).length !== count)
         {
             throw LogEntry.Corrupt(LogEntry.ErrIds);
         }
