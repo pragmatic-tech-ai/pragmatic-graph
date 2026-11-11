@@ -322,6 +322,75 @@ class EndpointFx
                 await g.dispose();
             });
 
+            it('creating and deleting an edge node in one batch cannot bypass the endpoint rules or leave a node', async () =>
+            {
+                const g = await ready();
+                const scope = X.Edges(X.OkRules());
+                const createDelete = (t: GraphTransaction): void =>
+                {
+                    create(t);
+                    t.DeleteNode(X.A3);
+                };
+                // The links are gated when issued, so deleting the node afterwards does not launder them.
+                X.Denied(await X.Try(g, scope, createDelete), AccessErrorCode.AppendDenied, 'op 1', X.Alice);
+                await X.Rename(g, X.Alice, X.Ok);
+                X.Denied(await X.Try(g, scope, createDelete), AccessErrorCode.AppendToDenied, 'op 2', X.Shown);
+                await X.Rename(g, X.Shown, X.Ok);
+                X.Allowed(await X.Try(g, scope, createDelete));
+                // Nothing is stored; a bare create+delete (no endpoints, so no half-edge check) leaves no node either.
+                X.Allowed(await X.Try(g, scope, t =>
+                {
+                    t.CreateNode(X.Bob, X.Assignment);
+                    t.DeleteNode(X.Bob);
+                }));
+                for (const id of [X.A3, X.Bob])
+                {
+                    const r = await g.BeginRead(AccessScope.System);
+                    try
+                    {
+                        assert.equal(await r.ConceptOf(id), undefined);
+                    }
+                    finally
+                    {
+                        r.dispose();
+                    }
+                }
+                await g.dispose();
+            });
+
+            it('deleting an endpoint of an edge node created in the same batch is refused or leaves the node invisible', async () =>
+            {
+                const g = await ready();
+                const scope = X.Edges([], [X.Shown, X.Two]);
+                const createThenDetach = (t: GraphTransaction): void =>
+                {
+                    create(t);
+                    t.DetachUnlink(X.A3, X.To, X.Shown);
+                    t.DeleteNode(X.Shown);
+                };
+                // The delete-implied unlink leaves To unset, so the created edge node would be a half-edge: refused.
+                X.Denied(await X.Try(g, scope, createThenDetach), AccessErrorCode.AppendToDenied, 'op 0', X.A3);
+                // Without the detach the engine commits the delete and drops the inbound links, so the created edge node is stored
+                // as a half-edge: invisible under the scope (fail closed), never a visible node with an empty endpoint.
+                const plain = await X.Try(g, scope, t =>
+                {
+                    create(t);
+                    t.DeleteNode(X.Shown);
+                });
+                X.Allowed(plain);
+                const r = await g.BeginRead(scope);
+                try
+                {
+                    assert.equal(await r.ConceptOf(X.A3), undefined);
+                    assert.equal(await r.ConceptOf(X.A1), undefined);
+                }
+                finally
+                {
+                    r.dispose();
+                }
+                await g.dispose();
+            });
+
             it('Endpoints entries are validated at Begin', async () =>
             {
                 const g = await ready();

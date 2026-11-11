@@ -233,8 +233,9 @@ enum RuleKind
  *   To, and SetProperty on one the batch did not create Append on the node at From (snapshot endpoints). An endpoint
  *   the batch created and a delete-implied unlink stay exempt. A batch that creates an edge node (and keeps it) must
  *   leave both its From and its To member linked, else AppendDenied (From) or AppendToDenied (To) on the CreateNode op,
- *   checked after every other op; a stored edge node with an unset member is invisible. An endpoint the gate cannot see (an external stub whose
- *   row the transaction never fetched) is InvisibleNode, as a never-fetched Link target (R103), and is not named.
+ *   checked after every other op; a stored edge node with an unset member is invisible. An endpoint the gate cannot
+ *   see (an external stub whose row the transaction never fetched) is InvisibleNode, as a never-fetched Link target
+ *   (R103), and is not named.
  *
  * External nodes (ruling R103): a node the batch did not create whose public id names no stored engine node, or names
  * a stub (R102), is external data. It is decided against the row the transaction fetched for it (`fetched`): visible
