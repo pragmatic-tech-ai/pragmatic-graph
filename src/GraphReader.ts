@@ -169,7 +169,7 @@ export class GraphReader implements IGraphDisposable
         {
             return row;
         }
-        return { PublicId: row.PublicId, Concept: row.Concept, Values: GraphReader.Without(row.Values, hidden), Links: GraphReader.Without(row.Links, hidden) };
+        return { ...row, Values: GraphReader.Without(row.Values, hidden), Links: GraphReader.Without(row.Links, hidden) };
     }
 
     /**

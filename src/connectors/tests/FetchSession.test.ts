@@ -21,6 +21,7 @@ import {
     type IFetchTarget,
     type IFetchedRow,
     type ISchemaDescription,
+    type RowVersion,
 } from '../../index.js';
 import { FetchSession } from '../FetchSession.js';
 import { FakeExternalConnector } from './FakeExternalConnector.js';
@@ -416,6 +417,36 @@ describe('FetchSession', () =>
         assert.equal(ext.Requests.length, 1);
         assert.equal((await session.Lookup('a', [other, SessionFx.Target()]))?.Row.PublicId, 'a');
         assert.equal(ext.Requests.length, 2);
+    });
+
+    it('fetched row keeps its version', async () =>
+    {
+        const ext = new FakeExternalConnector(SessionFx.Ext, [[{ ...SessionFx.Row('x'), Version: 7n }, { ...SessionFx.Row('n'), Version: null as unknown as RowVersion }]]);
+        const session = await SessionFx.Session(ext);
+        assert.equal((await session.Lookup('x', [SessionFx.Target()]))?.Row.Version, 7n);
+        // A null version reads as absent: the validated row carries no Version key.
+        assert.equal('Version' in (await session.Lookup('n', [SessionFx.Target()]))!.Row, false);
+    });
+
+    it('invalid version fails the fetch', async () =>
+    {
+        for (const version of [NaN, Infinity, true, {}] as unknown as RowVersion[])
+        {
+            const ext = new FakeExternalConnector(SessionFx.Ext, [[{ ...SessionFx.Row('x'), Version: version }]]);
+            const session = await SessionFx.Session(ext);
+            await assert.rejects(session.Lookup('x', [SessionFx.Target()]), SessionFx.IsFetchViolation);
+        }
+    });
+
+    it('first fetched version wins', async () =>
+    {
+        const ext = new FakeExternalConnector(SessionFx.Ext, [[{ ...SessionFx.Row('x'), Version: 'a' }]]);
+        const session = await SessionFx.Session(ext);
+        await SessionFx.Drain(session.Scan(SessionFx.Target(), Predicate.True));
+        ext.Pages = [[{ ...SessionFx.Row('x'), Version: 'b' }]];
+        assert.equal((await session.Lookup('x', [SessionFx.Target()]))?.Row.Version, 'a');
+        assert.equal(session.Known('x')?.Row.Version, 'a');
+        assert.equal(ext.Requests.length, 1);
     });
 
     it('reverse with capability fetches and memoises', async () =>

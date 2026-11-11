@@ -40,6 +40,12 @@ export interface IFetchRequest
     readonly Resume?: string;
 }
 
+/**
+ * A source's version of one row (ruling R119 V1): an opaque token the engine never compares. The connector reads it
+ * from its source and guards a later write with it (ConnectorChange.ExpectedVersion).
+ */
+export type RowVersion = string | number | bigint;
+
 export interface IFetchedRow
 {
     readonly PublicId: string;
@@ -47,6 +53,8 @@ export interface IFetchedRow
     readonly Values: ReadonlyMap<string, CellValue>;
     /** Relationship → target public ids, in declaration order. */
     readonly Links: ReadonlyMap<string, readonly string[]>;
+    /** The source's version of the row, when it has one (R119 V1). The session keeps the first admitted row's (R98). */
+    readonly Version?: RowVersion;
 }
 
 export interface IFetchPage

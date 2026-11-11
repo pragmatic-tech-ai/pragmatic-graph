@@ -143,8 +143,13 @@ export class GraphTransaction extends GraphReader
             if (setup !== undefined)
             {
                 // Routing reads the snapshot unscoped and records it like any read (rulings R72, R89); a node that is not
-                // stored routes by the row this transaction fetched (R103).
-                const origins: INodeOrigins = { Origin: id => this.RoutingOrigin(id), Edges: id => this.NodeEdges(id) };
+                // stored routes by the row this transaction fetched (R103), and a fetched row's version is its changes'
+                // ExpectedVersion (R119 V2).
+                const origins: INodeOrigins = {
+                    Origin: id => this.RoutingOrigin(id),
+                    Edges: id => this.NodeEdges(id),
+                    Version: id => FederatedReads.Of(this).OpenSession?.Known(id)?.Row.Version,
+                };
                 const routed = await WriteCoordinator.Route(this.batch, setup.Bindings, this.snapshot.Index, origins, setup.External);
                 if (routed.Sets.size > 0)
                 {
