@@ -407,14 +407,16 @@ export class InExpression extends Expression
     public Evaluate(ctx: EvalContext): CypherValue
     {
         const v = this.operand.Evaluate(ctx);
-        if (!(v instanceof ScalarValue)) return new ScalarValue(false);
         if (this.source !== undefined)
         {
             const items = this.source.Evaluate(ctx);
             if (items instanceof NullValue) return NullValue.Instance;
             if (!(items instanceof ListValue)) throw new CypherSemanticError(InExpression.NotAList);
+            if (v instanceof NullValue) return items.Items.length === 0 ? new ScalarValue(false) : NullValue.Instance;
+            if (!(v instanceof ScalarValue)) return new ScalarValue(false);
             return new ScalarValue(items.Items.some((x) => x instanceof ScalarValue && ScalarSemantics.Equals(x.Value, v.Value)));
         }
+        if (!(v instanceof ScalarValue)) return new ScalarValue(false);
         const found = this.list.some((e) =>
         {
             const x = e.Evaluate(ctx);

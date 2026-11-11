@@ -240,6 +240,24 @@ for (const kind of [StorageKind.Memory, StorageKind.Lmdb])
             }
         });
 
+        it('IN a parameter is null for null and a type error for a non-list', async () =>
+        {
+            const fx = await IdFx.Open(kind);
+            try
+            {
+                const query = "RETURN 'a' IN $p AS r";
+                const nullResult = await fx.Cypher.Execute(AccessScope.System, query, { Parameters: new Map([['p', null]]) });
+                assert.equal(nullResult.Rows[0]![0]!.constructor.name, 'NullValue');
+                const nullLhs = await fx.Cypher.Execute(AccessScope.System, 'RETURN null IN $p AS r', { Parameters: new Map([['p', 5n]]) }).catch((e: unknown) => e);
+                assert.ok(nullLhs instanceof CypherError);
+                await assert.rejects(fx.Cypher.Execute(AccessScope.System, query, { Parameters: new Map([['p', 5n]]) }), CypherError);
+            }
+            finally
+            {
+                await fx.dispose();
+            }
+        });
+
         it('elementId of a relationship is a type error', async () =>
         {
             const fx = await IdFx.Open(kind);
