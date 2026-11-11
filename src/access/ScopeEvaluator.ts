@@ -63,7 +63,7 @@ export class ScopeEvaluator
     private static readonly MaxDecisions = 10_000;
     private static readonly NoHidden: ReadonlySet<string> = new Set();
     /** The one empty read-only set (no member is read-only). */
-    public static readonly NoReadOnly: ReadonlySet<string> = new Set();
+    private static readonly NoReadOnly: ReadonlySet<string> = new Set();
     private static readonly NoLinks: readonly string[] = Object.freeze([]);
     private static readonly NoEndpoints: ReadonlyMap<string, IEndpointMembers> = new Map();
 
@@ -128,8 +128,9 @@ export class ScopeEvaluator
     /**
      * True iff the hypothetical node (built and checked by HypotheticalNode.Build) passes every applicable Rows
      * predicate (ruling R95); the scope's Default when none applies. Predicates needing stored identity or edges are
-     * Unknown on it, so they never admit, also under Not. It has no relationships, so an Endpoints entry (R130) hides
-     * nothing on it, as on a stored edge node whose endpoints are unset. Reads nothing and records nothing.
+     * Unknown on it, so they never admit, also under Not. It has no relationships yet, so an Endpoints entry (R130) is not
+     * applied to it: the WriteGate requires the batch that creates an edge node to link both its members, and a stored
+     * edge node with an unset member is invisible. Reads nothing and records nothing.
      */
     public Admits(node: HypotheticalNode): boolean
     {
@@ -434,7 +435,8 @@ export class ScopeEvaluator
 
     /**
      * The endpoint conjunct of a reified edge node (R130): the Kleene And of the visibility of the nodes at its From and
-     * To members, each decided under `evaluation` (cycle guard, memo, budget); an unset member is True.
+     * To members, each decided under `evaluation` (cycle guard, memo, budget). An unset member is False: a stored
+     * half-edge (never created linked, or left by a delete of an endpoint) fails closed (spec PR4).
      */
     private async EndpointsVisible(node: IReadNode, endpoints: IEndpointMembers, evaluation: Evaluation): Promise<Truth>
     {
@@ -442,13 +444,14 @@ export class ScopeEvaluator
         for (const member of [endpoints.From, endpoints.To])
         {
             const end = await this.EndpointNode(node, member);
-            if (end !== undefined)
+            if (end === undefined)
             {
-                result = ScopeEvaluator.And(result, await this.Decide(end, evaluation));
-                if (result === Truth.False)
-                {
-                    return result;
-                }
+                return Truth.False;
+            }
+            result = ScopeEvaluator.And(result, await this.Decide(end, evaluation));
+            if (result === Truth.False)
+            {
+                return result;
             }
         }
         return result;

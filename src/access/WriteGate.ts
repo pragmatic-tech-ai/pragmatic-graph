@@ -12,7 +12,11 @@ import type { ScopeEvaluator } from './ScopeEvaluator.js';
 import { WriteExemptions } from './WriteExemptions.js';
 import { WriteStage } from './WriteStage.js';
 
-/** A node the batch creates: its concept, owner ('' for none) and the values the batch sets on it (last wins). */
+/**
+ * A node the batch creates: its CreateNode op index, concept, owner ('' for none), the values the batch sets on it
+ * (last wins) and, per relationship member, the targets it links at the end of the batch (a Link adds, an Unlink
+ * removes, so a link-then-unlink leaves the member unset).
+ */
 class CreatedNode
 {
     public readonly Values = new Map<string, CellValue>();
@@ -20,9 +24,36 @@ class CreatedNode
     /** False for an unknown or aspect concept: the committer rejects the op itself, so the gate skips it. */
     public readonly Known: boolean;
 
-    public constructor(public readonly PublicId: string, public readonly Concept: string, public readonly Owner: string, catalog: CatalogSnapshot)
+    /** True once a later DeleteNode of the batch removes it (nothing of it is stored). */
+    public Deleted = false;
+
+    private readonly linked = new Map<string, Set<string>>();
+
+    public constructor(public readonly Index: number, public readonly PublicId: string, public readonly Concept: string, public readonly Owner: string, catalog: CatalogSnapshot)
     {
         this.Known = catalog.Has(Concept) && !catalog.IsAspect(Concept);
+    }
+
+    public Link(member: string, target: string): void
+    {
+        let targets = this.linked.get(member);
+        if (targets === undefined)
+        {
+            targets = new Set<string>();
+            this.linked.set(member, targets);
+        }
+        targets.add(target);
+    }
+
+    public Unlink(member: string, target: string): void
+    {
+        this.linked.get(member)?.delete(target);
+    }
+
+    /** True iff the batch leaves `member` linked to some target. */
+    public IsLinked(member: string): boolean
+    {
+        return (this.linked.get(member)?.size ?? 0) > 0;
     }
 }
 
@@ -200,7 +231,9 @@ enum RuleKind
  *   rule (AppendToDenied), also when the batch created the edge node; the edge node's own Append rule still governs
  *   it as the source. DeleteNode of an edge node also needs Append on the node at From and AppendTo on the node at
  *   To, and SetProperty on one the batch did not create Append on the node at From (snapshot endpoints). An endpoint
- *   the batch created and a delete-implied unlink stay exempt. An endpoint the gate cannot see (an external stub whose
+ *   the batch created and a delete-implied unlink stay exempt. A batch that creates an edge node (and keeps it) must
+ *   leave both its From and its To member linked, else AppendDenied (From) or AppendToDenied (To) on the CreateNode op,
+ *   checked after every other op; a stored edge node with an unset member is invisible. An endpoint the gate cannot see (an external stub whose
  *   row the transaction never fetched) is InvisibleNode, as a never-fetched Link target (R103), and is not named.
  *
  * External nodes (ruling R103): a node the batch did not create whose public id names no stored engine node, or names
@@ -232,6 +265,8 @@ export class WriteGate
     private static readonly ErrInvisibleTarget = 'the target is not visible under the scope: ';
     private static readonly ErrInvisibleSibling = 'the sibling is not visible under the scope: ';
     private static readonly ErrInvisibleEndpoint = 'an endpoint of the edge node is not visible under the scope';
+    private static readonly ErrUnlinkedFrom = 'the batch creates the edge node without linking its From member';
+    private static readonly ErrUnlinkedTo = 'the batch creates the edge node without linking its To member';
     private static readonly ErrSeedOnly = 'an owner change is recorded by seed synchronization only';
     private static readonly NoOwner = '';
     private static readonly AccessDenied = 'Access denied: op ';
@@ -243,6 +278,8 @@ export class WriteGate
     private static readonly NotVisible = 'concept not visible';
 
     private readonly targets: OpTargets[] = [];
+    /** The nodes the batch creates, in op order. */
+    private readonly created: CreatedNode[] = [];
     /** Per rule kind and public id, whether the node's rules of that kind hold (decided once per node). */
     private readonly decided = new Map<RuleKind, Map<string, boolean>>();
     /** Per public id, the index of the batch's last DeleteNode of it. */
@@ -275,6 +312,7 @@ export class WriteGate
         {
             await gate.CheckOp(i, ops[i] as BatchOp);
         }
+        gate.CheckCreatedEdges();
     }
 
     /** First pass: which ops address nodes the batch creates, and those nodes' end-of-batch values. */
@@ -287,8 +325,9 @@ export class WriteGate
             {
                 case WriteOp.CreateNode:
                 {
-                    const node = new CreatedNode(op.PublicId, op.Concept, op.Owner ?? WriteGate.NoOwner, this.catalog);
+                    const node = new CreatedNode(this.targets.length, op.PublicId, op.Concept, op.Owner ?? WriteGate.NoOwner, this.catalog);
                     live.set(op.PublicId, node);
+                    this.created.push(node);
                     this.targets.push(new OpTargets(node));
                     break;
                 }
@@ -300,18 +339,27 @@ export class WriteGate
                     break;
                 }
                 case WriteOp.DeleteNode:
+                {
+                    const node = live.get(op.PublicId);
                     this.lastDelete.set(op.PublicId, this.targets.length);
-                    this.targets.push(new OpTargets(live.get(op.PublicId)));
+                    this.targets.push(new OpTargets(node));
+                    if (node !== undefined)
+                    {
+                        node.Deleted = true;
+                    }
                     live.delete(op.PublicId);
                     break;
+                }
                 case WriteOp.Link:
                 {
                     const after = op.Options?.AfterSibling;
                     const before = op.Options?.BeforeSibling;
+                    live.get(op.From)?.Link(op.Relationship, op.To);
                     this.targets.push(new OpTargets(live.get(op.From), live.get(op.To), after === undefined ? undefined : live.get(after), before === undefined ? undefined : live.get(before)));
                     break;
                 }
                 case WriteOp.Unlink:
+                    live.get(op.From)?.Unlink(op.Relationship, op.To);
                     this.targets.push(new OpTargets(live.get(op.From), live.get(op.To)));
                     break;
                 case WriteOp.SetOwner:
@@ -374,6 +422,32 @@ export class WriteGate
             case WriteOp.SetOwner:
                 // Unreachable through GraphTransaction (ruling R90); a gated batch never re-owns.
                 throw this.Denied(AccessErrorCode.UpdateDenied, index, op.Op, op.PublicId, targets.Source?.Concept, WriteGate.ErrSeedOnly);
+        }
+    }
+
+    /**
+     * After every op passed: a reified edge node the batch creates (and does not delete) must leave the batch linked at
+     * both its From and its To member (R130), else AppendDenied (From) or AppendToDenied (To) on its CreateNode op. A
+     * stored edge node with an unset member is invisible, so the create is the only point a half-edge could be written
+     * on purpose; a delete-implied unlink in the batch also leaves the member unset.
+     */
+    private CheckCreatedEdges(): void
+    {
+        for (const node of this.created)
+        {
+            const endpoints = node.Known && !node.Deleted ? this.evaluator.EndpointsOf(node.Concept) : undefined;
+            if (endpoints === undefined)
+            {
+                continue;
+            }
+            if (!node.IsLinked(endpoints.From))
+            {
+                throw this.Denied(AccessErrorCode.AppendDenied, node.Index, WriteOp.CreateNode, node.PublicId, node.Concept, WriteGate.ErrUnlinkedFrom);
+            }
+            if (!node.IsLinked(endpoints.To))
+            {
+                throw this.Denied(AccessErrorCode.AppendToDenied, node.Index, WriteOp.CreateNode, node.PublicId, node.Concept, WriteGate.ErrUnlinkedTo);
+            }
         }
     }
 
@@ -446,17 +520,14 @@ export class WriteGate
 
     /**
      * The snapshot node at `member` of the visible reified edge node `edge` must satisfy its `kind` rules (Append on
-     * From, AppendTo on To; R130). Unset: nothing to check. An edge node is never external (ScopeValidator), so it has
-     * engine edges; an external one would have none here and checks nothing.
+     * From, AppendTo on To; R130). An edge node is never external (ScopeValidator), and a visible one has both members
+     * set (a stored half-edge is invisible, so RequireVisible already refused it); an unset member here fails closed as
+     * InvisibleNode all the same.
      */
     private async CheckEndpoint(index: number, op: WriteOp, edge: ExistingNode, member: string, kind: RuleKind): Promise<void>
     {
         const stored = edge.Engine === undefined ? undefined : await this.evaluator.EndpointNode(edge.Engine, member);
-        if (stored === undefined)
-        {
-            return;
-        }
-        const end = await this.VisibleNode(stored.PublicId);
+        const end = stored === undefined ? undefined : await this.VisibleNode(stored.PublicId);
         if (end === undefined)
         {
             // A stub endpoint whose concept has no applicable Rows leaves the edge node visible, but the transaction may

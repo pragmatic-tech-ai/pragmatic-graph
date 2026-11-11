@@ -9,9 +9,11 @@ import { GraphError, GraphErrorCode } from '../errors/GraphError.js';
 export class ConnectorContext
 {
     private static readonly ErrKey = 'A connector context key must be a non-empty string';
+    /** The key of the anonymous context. */
+    private static readonly AnonymousKey = '';
 
     /** No caller identity: connectors with dedicated credentials accept it; connectors acting as the caller should refuse it. */
-    public static readonly Anonymous: ConnectorContext = new ConnectorContext('');
+    public static readonly Anonymous: ConnectorContext = new ConnectorContext(ConnectorContext.AnonymousKey);
 
     private constructor(public readonly Key: string)
     {
@@ -21,7 +23,7 @@ export class ConnectorContext
     /** GraphError InvalidArgument for a non-string or empty key. */
     public static For(key: string): ConnectorContext
     {
-        if (typeof key !== 'string' || key === '')
+        if (typeof key !== 'string' || key === ConnectorContext.AnonymousKey)
         {
             throw new GraphError(GraphErrorCode.InvalidArgument, ConnectorContext.ErrKey);
         }
@@ -30,6 +32,6 @@ export class ConnectorContext
 
     public get IsAnonymous(): boolean
     {
-        return this.Key === '';
+        return this.Key === ConnectorContext.AnonymousKey;
     }
 }

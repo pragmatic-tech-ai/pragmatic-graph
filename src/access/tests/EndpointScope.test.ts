@@ -10,6 +10,7 @@ import { GraphStore } from '../../GraphStore.js';
 import type { GraphTransaction } from '../../GraphTransaction.js';
 import { Compare, CompareOp, FalsePredicate, IdIn, type Predicate, TruePredicate } from '../../predicate/Predicate.js';
 import type { ISchemaDescription } from '../../schema/SchemaDescription.js';
+import { ConflictError } from '../../txn/ConflictError.js';
 import { AccessError, AccessErrorCode } from '../AccessError.js';
 import { AccessDefault, AccessScope, type IEndpointMembers, type IWriteRules } from '../AccessScope.js';
 
@@ -218,6 +219,80 @@ class EndpointFx
                 await X.Rename(g, X.Alice, X.Ok);
                 // p-shown fails AppendTo: the To node is not consulted.
                 X.Allowed(await X.Try(g, scope, update));
+                await g.dispose();
+            });
+
+            it('a half-edge fails closed: invisible when stored, refused when created', async () =>
+            {
+                const g = await ready();
+                const scope = X.Edges();
+                // a3 stored with From only (System writes ungated); p-shown DETACH DELETEd under System leaves a1 a half-edge.
+                X.Allowed(await X.Try(g, AccessScope.System, t =>
+                {
+                    t.CreateNode(X.A3, X.Assignment);
+                    t.Link(X.A3, X.From, X.Alice);
+                }));
+                X.Allowed(await X.Try(g, AccessScope.System, t =>
+                {
+                    t.DetachUnlink(X.A1, X.To, X.Shown);
+                    t.DeleteNode(X.Shown);
+                }));
+                const r = await g.BeginRead(scope);
+                try
+                {
+                    assert.equal(await r.ConceptOf(X.A3), undefined);
+                    assert.equal(await r.ConceptOf(X.A1), undefined);
+                    const seen: string[] = [];
+                    for await (const id of r.ScanNodes(X.Assignment))
+                    {
+                        seen.push(id);
+                    }
+                    assert.deepEqual(seen, []);
+                }
+                finally
+                {
+                    r.dispose();
+                }
+                X.Denied(await X.Try(g, scope, t => t.SetProperty(X.A3, X.Role, X.Lead)), AccessErrorCode.InvisibleNode, X.A3);
+                X.Denied(await X.Try(g, scope, t => t.DeleteNode(X.A1)), AccessErrorCode.InvisibleNode, X.A1);
+                X.Allowed(await X.Try(g, AccessScope.System, t => t.SetProperty(X.A3, X.Role, X.Lead)));
+                X.Allowed(await X.Try(g, AccessScope.System, t => t.DeleteNode(X.A1)));
+                const bob = (t: GraphTransaction): void => t.CreateNode(X.Bob, X.Assignment);
+                const two = X.Edges([], [X.Two]);
+                X.Denied(await X.Try(g, two, t =>
+                {
+                    bob(t);
+                    t.Link(X.Bob, X.From, X.Alice);
+                }), AccessErrorCode.AppendToDenied, 'op 0', X.Bob);
+                X.Denied(await X.Try(g, two, t =>
+                {
+                    bob(t);
+                    t.Link(X.Bob, X.To, X.Two);
+                }), AccessErrorCode.AppendDenied, 'op 0', X.Bob);
+                // A link-then-unlink of To in the batch leaves it unset.
+                X.Denied(await X.Try(g, two, t =>
+                {
+                    bob(t);
+                    t.Link(X.Bob, X.From, X.Alice);
+                    t.Link(X.Bob, X.To, X.Two);
+                    t.Unlink(X.Bob, X.To, X.Two);
+                }), AccessErrorCode.AppendToDenied, 'op 0', X.Bob);
+                await g.dispose();
+            });
+
+            it('an endpoint relink by a concurrent commit conflicts (stale endpoint read)', async () =>
+            {
+                const g = await ready();
+                await X.Rename(g, X.Alice, X.Ok);
+                X.Allowed(await X.Try(g, AccessScope.System, t => t.CreateNode(X.Bob, X.Person)));
+                const t1 = await g.Begin(X.Edges(X.OkRules()));
+                t1.SetProperty(X.A1, X.Role, X.Lead);
+                X.Allowed(await X.Try(g, AccessScope.System, t =>
+                {
+                    t.Unlink(X.A1, X.From, X.Alice);
+                    t.Link(X.A1, X.From, X.Bob);
+                }));
+                await assert.rejects(t1.Commit(), (e: unknown) => e instanceof ConflictError);
                 await g.dispose();
             });
 

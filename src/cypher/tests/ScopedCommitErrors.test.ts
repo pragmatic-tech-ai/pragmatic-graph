@@ -1,7 +1,6 @@
 import { after, before, describe, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { AccessDefault, AccessScope, CommitError, CommitErrorCode, EdgeError, EdgeErrorCode, IdIn, MemberKind, type MemberInput } from '../../index.js';
-import { ConnectorError, ConnectorPhase } from '../../index.js';
+import { AccessDefault, AccessScope, BindingTable, CommitError, CommitErrorCode, ConnectorError, ConnectorPhase, EdgeError, EdgeErrorCode, IdIn, MemberKind, type MemberInput } from '../../index.js';
 import { CommitErrorRedactor } from '../../txn/CommitErrorRedactor.js';
 import { CypherWriteError, CypherWriteErrorCode } from '../CypherError.js';
 import { CypherFixture as F } from './CypherFixture.js';
@@ -145,12 +144,12 @@ describe('CommitErrorRedactor.RedactAny', () =>
 {
     test('redacts a CommitError behind a ConnectorError and inside an AggregateError', () =>
     {
-        const leaky = (): CommitError => new CommitError(CommitErrorCode.DuplicatePublicId, 'Public id already exists: proj-hidden');
-        const wrapped = CommitErrorRedactor.RedactAny(new ConnectorError('engine', ConnectorPhase.Finalize, leaky()));
+        const leaky = (): CommitError => new CommitError(CommitErrorCode.DuplicatePublicId, ScopedCommitFx.Redacted + ': ' + ScopedCommitFx.Hidden);
+        const wrapped = CommitErrorRedactor.RedactAny(new ConnectorError(BindingTable.EngineStorage, ConnectorPhase.Finalize, leaky()));
         assert.ok(wrapped instanceof ConnectorError);
         assert.equal(wrapped.Phase, ConnectorPhase.Finalize);
         assert.equal((wrapped.cause as CommitError).message, ScopedCommitFx.Redacted);
-        const reverted = CommitErrorRedactor.RedactAny(new ConnectorError('engine', ConnectorPhase.Finalize, new AggregateError([leaky(), new Error('x')], 'reverts')));
+        const reverted = CommitErrorRedactor.RedactAny(new ConnectorError(BindingTable.EngineStorage, ConnectorPhase.Finalize, new AggregateError([leaky(), new Error('x')], 'reverts')));
         const members = ((reverted as ConnectorError).cause as AggregateError).errors;
         assert.equal((members[0] as CommitError).message, ScopedCommitFx.Redacted);
         assert.equal((members[1] as Error).message, 'x');
