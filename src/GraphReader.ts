@@ -68,6 +68,7 @@ export class GraphReader implements IGraphDisposable
     private static readonly ErrNotProperty = 'Member is not a property: ';
     private static readonly ErrDirection = 'Unknown edge direction: ';
     private static readonly ErrUnknownIndex = 'Unknown index: ';
+    private static readonly ErrEstimateScoped = 'EstimateCount needs a scope that restricts no read';
     private static readonly Dot = '.';
     private static readonly Partition = 0;
     private static readonly NoHidden: ReadonlySet<string> = new Set();
@@ -466,11 +467,16 @@ export class GraphReader implements IGraphDisposable
     /**
      * An upper bound of the live nodes matching `conceptOrAspect`: the sum of the matching concepts' slot
      * counts, which still include deleted slots. Unscoped (it counts invisible nodes too) and records
-     * nothing: the figure is advisory.
+     * nothing: the figure is advisory, so it is available only to scopes that restrict no read
+     * (GraphError InvalidArgument otherwise).
      */
     public async EstimateCount(conceptOrAspect: string): Promise<number>
     {
         this.RequireOpen();
+        if (!this.Scope.ReadsUnrestricted)
+        {
+            throw new GraphError(GraphErrorCode.InvalidArgument, GraphReader.ErrEstimateScoped);
+        }
         let total = 0;
         for (const typeId of this.snapshot.Index.Catalog.ConceptsMatching(conceptOrAspect))
         {

@@ -220,7 +220,19 @@ class ScopeFx
                 {
                     assert.deepEqual(await ScopeFx.Visible(r, ['p1', 'm1', 't1', ScopeFx.SeedTeam]), ['p1', 'm1'], 'an entry on an ancestor applies');
                     assert.deepEqual(await ScopeFx.Ids(r, ScopeFx.Ticket), []);
-                    assert.equal(await r.EstimateCount(ScopeFx.Ticket), 1, 'EstimateCount stays an unscoped upper bound');
+                    await assert.rejects(r.EstimateCount(ScopeFx.Ticket), e => e instanceof GraphError && e.GraphCode === GraphErrorCode.InvalidArgument);
+                });
+                await g.dispose();
+            });
+
+            it('EstimateCount answers under a read-unrestricted scope', async () =>
+            {
+                const g = await ScopeFx.Ready(open);
+                await ScopeFx.Commit(g, t => t.CreateNode('t1', ScopeFx.Ticket));
+                const scope = AccessScope.Build({ Default: AccessDefault.Allow, Writes: new Map([[ScopeFx.Ticket, {}]]) });
+                await ScopeFx.Read(g, scope, async r =>
+                {
+                    assert.equal(await r.EstimateCount(ScopeFx.Ticket), 1);
                 });
                 await g.dispose();
             });
