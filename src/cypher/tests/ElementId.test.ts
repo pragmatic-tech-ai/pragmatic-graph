@@ -7,13 +7,15 @@ import { AccessDefault, AccessScope } from '../../access/AccessScope.js';
 import { Compare, CompareOp, type Predicate } from '../../predicate/Predicate.js';
 import type { CellValue } from '../../columns/CellValue.js';
 import type { ConnectorChange } from '../../connectors/ConnectorChangeSet.js';
-import type { ConnectorContext } from '../../connectors/ConnectorContext.js';
+import { ConnectorContext } from '../../connectors/ConnectorContext.js';
+import { ConnectorError, ConnectorPhase } from '../../connectors/ConnectorError.js';
 import { PredicateKind } from '../../predicate/Predicate.js';
 import { NodeEvaluator } from '../../predicate/NodeEvaluator.js';
 import type { IFetchPage, IFetchRequest, IFetchedRow } from '../../connectors/FetchContract.js';
 import type { IConnectorTransaction } from '../../connectors/GraphConnector.js';
 import { FakeConnector } from '../../connectors/tests/FakeConnector.js';
 import { FakeExternalConnector } from '../../connectors/tests/FakeExternalConnector.js';
+import { GraphError, GraphErrorCode } from '../../errors/GraphError.js';
 import { GraphEngine, StorageKind } from '../../GraphEngine.js';
 import { CypherEngine } from '../CypherEngine.js';
 import { CypherError } from '../CypherError.js';
@@ -73,6 +75,10 @@ class IdFx
     public static readonly Seek = 'IdSeek(';
     public static readonly Scan = 'LabelScan(';
     public static readonly Hidden = 'c3';
+    public static readonly Invalid = 'bad';
+    public static readonly Caller = 'alice';
+    public static readonly SanitizedText = 'A fetched row failed validation';
+    public static readonly ReadNames = 'MATCH (c:Customer) WHERE elementId(c) IN $ids RETURN c.name';
     public static readonly Rename = "MATCH (c:Customer) WHERE elementId(c) IN $ids SET c.name = 'x' RETURN elementId(c)";
     public static readonly HideEngine = AccessScope.Build({
         Default: AccessDefault.Allow,
@@ -127,6 +133,12 @@ class IdFx
     public Run(text: string, scope: AccessScope = AccessScope.System, ids?: string[]): Promise<CypherResult>
     {
         return this.Cypher.Execute(scope, text, ids === undefined ? {} : { Parameters: new Map([[IdFx.Ids, ids]]) });
+    }
+
+    /** A Customer row that fails validation: a value for the relationship friend. */
+    public static InvalidRow(): IFetchedRow
+    {
+        return { PublicId: IdFx.Invalid, Concept: IdFx.Customer, Values: new Map<string, CellValue>([['friend', 'x']]), Links: new Map() };
     }
 
     public static Col(result: CypherResult): unknown[]
@@ -252,6 +264,29 @@ for (const kind of [StorageKind.Memory, StorageKind.Lmdb])
                 const nullLhs = await fx.Cypher.Execute(AccessScope.System, 'RETURN null IN $p AS r', { Parameters: new Map([['p', 5n]]) }).catch((e: unknown) => e);
                 assert.ok(nullLhs instanceof CypherError);
                 await assert.rejects(fx.Cypher.Execute(AccessScope.System, query, { Parameters: new Map([['p', 5n]]) }), CypherError);
+            }
+            finally
+            {
+                await fx.dispose();
+            }
+        });
+
+        it('by-id seek fetches with the caller context and fails without naming the row (R133)', async () =>
+        {
+            const fx = await IdFx.Open(kind);
+            try
+            {
+                const context = ConnectorContext.For(IdFx.Caller);
+                const run = (ids: string[]) => fx.Cypher.Execute(IdFx.OpenOnly, IdFx.ReadNames, { Parameters: new Map([[IdFx.Ids, ids]]), Connector: context });
+                const before = fx.Connector.Requests.length;
+                assert.deepEqual(IdFx.Col(await run(['c1', IdFx.Hidden])), ['one']);
+                assert.ok(fx.Connector.Requests.slice(before).every(r => r.Context === context));
+                fx.Connector.Pages = [[...fx.Connector.Pages.flat(), IdFx.InvalidRow()]];
+                const error = await run([IdFx.Invalid]).catch((e: unknown) => e);
+                assert.ok(error instanceof ConnectorError && error.Phase === ConnectorPhase.Fetch, String(error));
+                assert.ok(error.cause instanceof GraphError && error.cause.GraphCode === GraphErrorCode.SchemaViolation);
+                assert.equal(error.cause.message, IdFx.SanitizedText);
+                assert.equal(error.cause.cause, undefined);
             }
             finally
             {

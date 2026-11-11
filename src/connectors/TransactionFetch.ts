@@ -2,8 +2,8 @@ import { GraphError, GraphErrorCode } from '../errors/GraphError.js';
 import type { FederatedReads, IStubIdentity } from '../FederatedReads.js';
 import type { GraphTransaction, IFetchKey, IFetchedView } from '../GraphTransaction.js';
 import type { Predicate } from '../predicate/Predicate.js';
-import { ConnectorError, ConnectorPhase } from './ConnectorError.js';
 import type { IFetchTarget, IFetchedRow } from './FetchContract.js';
+import { FetchFailure } from './FetchFailure.js';
 import type { IFetchScope } from './FetchSession.js';
 
 /** The ids of one Fetch that share a candidate list, fetched by one FetchSession.LookupMany. */
@@ -32,16 +32,13 @@ class FetchGroup
  * in the session memo, which is never exposed, so the commit still decides writes against them (ruling R103).
  *
  * A fetched row that fails schema validation fails the Fetch, whatever the scope would make of it, as ConnectorError
- * Fetch whose cause is a GraphError SchemaViolation naming neither the id nor the row: the failure must not reveal what
- * the connector holds for an id the scope may not admit.
+ * Fetch whose cause is a GraphError SchemaViolation naming neither the id nor the row (FetchFailure): the failure must
+ * not reveal what the connector holds for an id the scope may not admit.
  */
 export class TransactionFetch implements IFetchScope
 {
     private static readonly Separator = '\u0000';
-    /** The connector a sanitized failure names when none is known: none. */
-    private static readonly NoConnector = '';
     private static readonly ErrCollision = 'Fetch was given two different keys for one public id';
-    private static readonly ErrInvalidRow = 'A fetched row failed validation';
 
     public constructor(private readonly reader: GraphTransaction, private readonly channel: FederatedReads)
     {
@@ -91,11 +88,11 @@ export class TransactionFetch implements IFetchScope
             for (const group of groups.values())
             {
                 // The session wraps every invalid row as a ConnectorError Fetch naming the connector that returned it.
-                const entries = await TransactionFetch.Guarded(TransactionFetch.NoConnector, () => session.LookupMany(group.Ids, group.Candidates, undefined, this));
+                const entries = await FetchFailure.Sanitized(FetchFailure.NoConnector, () => session.LookupMany(group.Ids, group.Candidates, undefined, this));
                 for (const [publicId, entry] of entries)
                 {
                     // The session keeps a row only from the connector its (model, concept) resolves to: the one that returned it.
-                    const connector = this.channel.Setup?.Bindings.Resolve(entry.Model, entry.Row.Concept, this.reader.Catalog) ?? TransactionFetch.NoConnector;
+                    const connector = this.channel.Setup?.Bindings.Resolve(entry.Model, entry.Row.Concept, this.reader.Catalog) ?? FetchFailure.NoConnector;
                     const view = await this.View(entry.Row, entry.Model, connector);
                     if (view !== undefined)
                     {
@@ -135,34 +132,10 @@ export class TransactionFetch implements IFetchScope
         return [...byId.values()];
     }
 
-    /**
-     * Runs a step that validates fetched rows, replacing a schema-validation failure (a GraphError SchemaViolation, bare
-     * or as a ConnectorError Fetch's cause) by a ConnectorError Fetch that names neither the id nor the row. Every other
-     * failure passes unchanged. The replacement names the wrapped error's connector, else `connector` (the one that
-     * returned the row, or NoConnector).
-     */
-    private static async Guarded<T>(connector: string, step: () => Promise<T>): Promise<T>
-    {
-        try
-        {
-            return await step();
-        }
-        catch (error)
-        {
-            const fetch = error instanceof ConnectorError && error.Phase === ConnectorPhase.Fetch;
-            const cause: unknown = fetch ? error.cause : error;
-            if (cause instanceof GraphError && cause.GraphCode === GraphErrorCode.SchemaViolation)
-            {
-                throw new ConnectorError(fetch ? error.Connector : connector, ConnectorPhase.Fetch, new GraphError(GraphErrorCode.SchemaViolation, TransactionFetch.ErrInvalidRow));
-            }
-            throw error;
-        }
-    }
-
     /** The admitted row as a view (see the class comment); undefined when the scope does not admit it. */
     private async View(row: IFetchedRow, model: string, connector: string): Promise<IFetchedView | undefined>
     {
-        const admitted = await TransactionFetch.Guarded(connector, () => this.reader.AdmitFetched(row, model));
+        const admitted = await FetchFailure.Sanitized(connector, () => this.reader.AdmitFetched(row, model));
         if (admitted === undefined)
         {
             return undefined;

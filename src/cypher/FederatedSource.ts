@@ -3,6 +3,7 @@ import { MemberKind } from '../catalog/ValueType.js';
 import type { CellValue } from '../columns/CellValue.js';
 import type { BindingTable } from '../connectors/BindingTable.js';
 import type { IFetchTarget, IFetchedRow } from '../connectors/FetchContract.js';
+import { FetchFailure } from '../connectors/FetchFailure.js';
 import type { FetchSession, IFetchScope } from '../connectors/FetchSession.js';
 import { EdgeDirection } from '../format/FormatKeys.js';
 import { FederatedReads, type IFederatedLink } from '../FederatedReads.js';
@@ -94,8 +95,9 @@ export class FederatedSource extends CatalogSource implements IFetchScope
     /**
      * Per id, in the ids' order: an engine node, a stub resolved through its owner, or a row this query already fetched;
      * the ids left over are looked up in one go (FetchSession.LookupMany: one keyed request per External target of the
-     * label) and admitted under the scope, so an id the scope hides yields nothing, as in a label scan. Without a label
-     * nothing is fetched. Nodes that are not the label are dropped.
+     * label) and admitted under the scope, so an id the scope hides yields nothing, as in a label scan. A fetched row that
+     * fails validation fails the seek as GraphTransaction.Fetch fails (FetchFailure: naming neither the id nor the row).
+     * Without a label nothing is fetched. Nodes that are not the label are dropped.
      */
     public async *NodesById(ids: readonly string[], label: string | undefined, probe?: IReadProbe): AsyncIterable<CypherNode>
     {
@@ -119,10 +121,13 @@ export class FederatedSource extends CatalogSource implements IFetchScope
         }
         if (name !== undefined && pending.length > 0)
         {
-            const entries = await this.session.LookupMany(pending, this.FetchTargets(name), probe, this);
+            // A row that fails validation fails the seek without naming the id or the row (R121 F1 as for Fetch, R133).
+            const session = this.session;
+            const entries = await FetchFailure.Sanitized(FetchFailure.NoConnector, () => session.LookupMany(pending, this.FetchTargets(name), probe, this));
             for (const [id, entry] of entries)
             {
-                const admitted = await this.Admit(entry.Row, entry.Model);
+                const connector = this.bindings.Resolve(entry.Model, entry.Row.Concept, this.catalog) ?? FetchFailure.NoConnector;
+                const admitted = await FetchFailure.Sanitized(connector, () => this.Admit(entry.Row, entry.Model));
                 if (admitted !== undefined)
                 {
                     found.set(id, admitted);
