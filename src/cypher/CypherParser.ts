@@ -456,7 +456,7 @@ export class CypherParser
             this.expectKeyword(CypherParser.KwNull);
             return new IsNullExpression(left, negated);
         }
-        if (this.acceptKeyword(CypherParser.KwIn)) return new InExpression(left, this.parseLiteralList());
+        if (this.acceptKeyword(CypherParser.KwIn)) return this.peek().Kind === TokenKind.Dollar ? new InExpression(left, [], this.parsePrimary()) : new InExpression(left, this.parseLiteralList());
         return left;
     }
 

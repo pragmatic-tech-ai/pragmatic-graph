@@ -5,6 +5,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { AccessDefault, AccessScope } from '../../access/AccessScope.js';
 import { AccessError, AccessErrorCode } from '../../access/AccessError.js';
+import { CatalogModel } from '../../catalog/CatalogModel.js';
+import { MemberKind } from '../../catalog/ValueType.js';
 import type { CellValue } from '../../columns/CellValue.js';
 import { CypherWriteError, CypherWriteErrorCode } from '../../cypher/CypherError.js';
 import { CypherEngine } from '../../cypher/CypherEngine.js';
@@ -21,15 +23,17 @@ import { EngineInternals } from '../../tests/EngineInternals.js';
 import { ConflictError } from '../../txn/ConflictError.js';
 import type { GraphTransaction } from '../../GraphTransaction.js';
 import { Compare, CompareOp, type Predicate } from '../../predicate/Predicate.js';
+import { CatalogIndex } from '../../txn/CatalogIndex.js';
 import { CommitError, CommitErrorCode } from '../../txn/CommitError.js';
 import type { ICommitApplied } from '../../txn/LogEntry.js';
-import { type BatchOp, WriteOp } from '../../txn/WriteBatch.js';
+import { type BatchOp, WriteBatch, WriteOp } from '../../txn/WriteBatch.js';
 import type { ConnectorChange } from '../ConnectorChangeSet.js';
 import { BindingTable } from '../BindingTable.js';
 import type { IConnectorApplied } from '../ConnectorApplied.js';
 import { ConnectorError, ConnectorPhase } from '../ConnectorError.js';
-import type { IFetchedRow } from '../FetchContract.js';
+import type { IFetchedRow, RowVersion } from '../FetchContract.js';
 import type { IConnectorTransaction } from '../GraphConnector.js';
+import { type INodeOrigins, WriteCoordinator } from '../WriteCoordinator.js';
 import { FakeConnector, FakeStep } from './FakeConnector.js';
 import { FakeExternalConnector } from './FakeExternalConnector.js';
 
@@ -112,6 +116,9 @@ class ExtFx
     public static readonly ExtRevert = 'ext.Revert';
     public static readonly Boom = 'subscriber failure';
     public static readonly NoOwner = '';
+    /** x's row version at the connector (R119 V1). */
+    public static readonly V1 = 'v1';
+    public static readonly ExpectedVersionKey = 'ExpectedVersion';
     public static readonly Target = Object.freeze({ Concept: ExtFx.Ticket, Owner: ExtFx.Jira });
     private static readonly Space = ' ';
     private static readonly Dot = '.';
@@ -140,15 +147,16 @@ class ExtFx
         }
     }
 
-    public static Row(id: string, state: string, links: Readonly<Record<string, readonly string[]>> = {}): IFetchedRow
+    public static Row(id: string, state: string, links: Readonly<Record<string, readonly string[]>> = {}, version?: RowVersion): IFetchedRow
     {
-        return { PublicId: id, Concept: ExtFx.Ticket, Values: new Map<string, CellValue>([[ExtFx.Id, id], [ExtFx.State, state]]), Links: new Map(Object.entries(links)) };
+        const row = { PublicId: id, Concept: ExtFx.Ticket, Values: new Map<string, CellValue>([[ExtFx.Id, id], [ExtFx.State, state]]), Links: new Map(Object.entries(links)) };
+        return version === undefined ? row : { ...row, Version: version };
     }
 
     public static async Open(storage: IEngineStorage): Promise<ExtFx>
     {
         const connector = new TicketSystem(ExtFx.Ext, [
-            ExtFx.Row(ExtFx.X, ExtFx.OpenState, { team: [ExtFx.A] }),
+            ExtFx.Row(ExtFx.X, ExtFx.OpenState, { team: [ExtFx.A] }, ExtFx.V1),
             ExtFx.Row(ExtFx.Locked, ExtFx.LockedState),
             ExtFx.Row(ExtFx.Closed, ExtFx.ClosedState),
         ]);
@@ -414,6 +422,62 @@ class ExternalWritesSuite
                     assert.equal((changes[0] as ConnectorChange & { Value: CellValue }).Value, ExtFx.DoneState);
                     assert.equal(changes[0]!.Owner, ExtFx.Jira);
                     assert.equal(await fx.StoredOwner(ExtFx.X), undefined);
+                }
+                finally
+                {
+                    await fx.dispose();
+                }
+            });
+
+            it('set on a fetched row carries its version', async () =>
+            {
+                const fx = await ExtFx.Open(storage());
+                try
+                {
+                    await fx.Run('MATCH (t:Ticket {id: \'x\'}) SET t.state = \'done\'');
+                    assert.deepEqual(fx.Connector.Changes().map(c => c.ExpectedVersion), [ExtFx.V1]);
+                }
+                finally
+                {
+                    await fx.dispose();
+                }
+            });
+
+            it('create carries no version', async () =>
+            {
+                const fx = await ExtFx.Open(storage());
+                try
+                {
+                    // A delete before the re-create carries the fetched version; the CreateNode and every change after it none.
+                    await fx.Commit(AccessScope.System, async t =>
+                    {
+                        await ExtFx.Fetch(t, ExtFx.X);
+                        t.DeleteNode(ExtFx.X);
+                        t.CreateNode(ExtFx.X, ExtFx.Ticket, { Owner: ExtFx.Jira });
+                        t.SetProperty(ExtFx.X, ExtFx.State, ExtFx.NewState);
+                    });
+                    const changes = fx.Connector.Changes();
+                    assert.deepEqual(changes.map(c => ExtFx.Shape(c)), ['DeleteNode x', 'CreateNode x', 'SetProperty x.state']);
+                    assert.equal(changes[0]!.ExpectedVersion, ExtFx.V1);
+                    assert.deepEqual(changes.slice(1).map(c => ExtFx.ExpectedVersionKey in c), [false, false]);
+                }
+                finally
+                {
+                    await fx.dispose();
+                }
+            });
+
+            it('unfetched system write carries no version', async () =>
+            {
+                const fx = await ExtFx.Open(storage());
+                try
+                {
+                    await fx.LinkStub(ExtFx.A, ExtFx.X);
+                    // Routed by the stored stub (R103): nothing was read, so nothing can be stale (R119 V3).
+                    await fx.Commit(AccessScope.System, async t => t.SetProperty(ExtFx.X, ExtFx.State, ExtFx.DoneState));
+                    const changes = fx.Connector.Changes();
+                    assert.deepEqual(changes.map(c => ExtFx.Shape(c)), ['SetProperty x.state']);
+                    assert.equal(ExtFx.ExpectedVersionKey in changes[0]!, false);
                 }
                 finally
                 {
@@ -894,6 +958,57 @@ class ExternalWritesSuite
         });
     }
 }
+
+/**
+ * WriteCoordinator.Route stamps ExpectedVersion (ruling R119 V2) from INodeOrigins.Version. Schema: item { next -> item
+ * (many) }; model crm binds to connector ext (External when listed as such, else Mirrored). x and y are fetched rows
+ * (versions 'vx' and 3), and y links to x.
+ */
+class RouteFx
+{
+    public static readonly Item = 'item';
+    public static readonly Next = 'next';
+    public static readonly Crm = 'crm';
+    public static readonly Ext = 'ext';
+    public static readonly X = 'x';
+    public static readonly Y = 'y';
+    public static readonly VersionX = 'vx';
+    public static readonly VersionY = 3;
+
+    /** The ext change set of a plain DeleteNode of x; `external` routes ext as External, else as Mirrored. */
+    public static async DeleteX(external: boolean): Promise<readonly ConnectorChange[]>
+    {
+        const m = new CatalogModel();
+        m.DefineConcept(RouteFx.Item, null, [], [{ Name: RouteFx.Next, Kind: MemberKind.Relationship, Targets: [RouteFx.Item], Many: true }]);
+        const versions = new Map<string, RowVersion>([[RouteFx.X, RouteFx.VersionX], [RouteFx.Y, RouteFx.VersionY]]);
+        const origins: INodeOrigins = {
+            Origin: async () => ({ Owner: RouteFx.Crm, Concept: RouteFx.Item, Fetched: true }),
+            Edges: async id => id === RouteFx.X ? [{ From: RouteFx.Y, Relationship: RouteFx.Next, To: RouteFx.X }] : [],
+            Version: id => versions.get(id),
+        };
+        const batch = new WriteBatch();
+        batch.DeleteNode(RouteFx.X);
+        const table = new BindingTable([{ Model: RouteFx.Crm, Connector: RouteFx.Ext }]);
+        const routed = await WriteCoordinator.Route(batch, table, new CatalogIndex(m.Seal()), origins, new Set(external ? [RouteFx.Ext] : []));
+        return routed.Sets.get(RouteFx.Ext)!.Changes;
+    }
+}
+
+describe('WriteCoordinator.Route expected versions', () =>
+{
+    it('delete and its unlinks carry the version', async () =>
+    {
+        const changes = await RouteFx.DeleteX(true);
+        assert.deepEqual(changes.map(c => [ExtFx.Shape(c), c.ExpectedVersion]), [['Unlink y next x', RouteFx.VersionY], ['DeleteNode x', RouteFx.VersionX]]);
+    });
+
+    it('mirrored changes carry no version', async () =>
+    {
+        const changes = await RouteFx.DeleteX(false);
+        assert.deepEqual(changes.map(c => ExtFx.Shape(c)), ['Unlink y next x', 'DeleteNode x']);
+        assert.ok(changes.every(c => !(ExtFx.ExpectedVersionKey in c)));
+    });
+});
 
 after(() => ExtFx.RemoveDirs());
 ExternalWritesSuite.Register('Memory', () => ({ Kind: StorageKind.Memory }));

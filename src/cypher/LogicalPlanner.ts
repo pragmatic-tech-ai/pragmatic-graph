@@ -15,6 +15,7 @@ import { FetchHint } from './FetchHint.js';
 import { OperatorPrinter } from './OperatorPrinter.js';
 import { OptionalMatchPlan } from './OptionalMatchPlan.js';
 import { CypherParser } from './CypherParser.js';
+import { IdSeekTerm } from './IdSeekTerm.js';
 import { SeekEquality } from './SeekEquality.js';
 import type { NodePattern, PatternPath } from './PatternPath.js';
 import { Aggregate, type AggregateItem } from './operators/Aggregate.js';
@@ -25,6 +26,7 @@ import { Distinct } from './operators/Distinct.js';
 import { Expand } from './operators/Expand.js';
 import { ExpandInto } from './operators/ExpandInto.js';
 import { Filter } from './operators/Filter.js';
+import { IdSeek } from './operators/IdSeek.js';
 import { IndexSeek } from './operators/IndexSeek.js';
 import type { IOperator } from './operators/IOperator.js';
 import { LabelFilter } from './operators/LabelFilter.js';
@@ -341,11 +343,12 @@ export class LogicalPlanner
         }
         const conjuncts = match.Where === undefined ? [] : SeekEquality.Conjuncts(match.Where.Predicate);
         const seeks = conjuncts.map(c => SeekEquality.TryParse(c)).filter((e): e is SeekEquality => e !== undefined);
+        const idSeeks = conjuncts.map(c => IdSeekTerm.TryParse(c)).filter((e): e is IdSeekTerm => e !== undefined);
         const consumed = new Set<Expression>();
         let op = input;
         for (const path of match.Paths)
         {
-            op = this.compilePath(op, path, bound, seeks, consumed, conjuncts);
+            op = this.compilePath(op, path, bound, seeks, idSeeks, consumed, conjuncts);
         }
         if (op === undefined) op = new SingleRow();
         if (match.Where !== undefined)
@@ -369,7 +372,7 @@ export class LogicalPlanner
         return new OptionalApply(source, plan, optionalVars);
     }
 
-    private compilePath(input: IOperator | undefined, path: PatternPath, bound: Set<string>, seeks: readonly SeekEquality[], consumed: Set<Expression>, conjuncts: readonly Expression[]): IOperator
+    private compilePath(input: IOperator | undefined, path: PatternPath, bound: Set<string>, seeks: readonly SeekEquality[], idSeeks: readonly IdSeekTerm[], consumed: Set<Expression>, conjuncts: readonly Expression[]): IOperator
     {
         this.validateRels(path);
         const names = path.Nodes.map((n, i) => n.Variable ?? `${LogicalPlanner.AnonPrefix}${i}`);
@@ -384,7 +387,7 @@ export class LogicalPlanner
         else
         {
             const hint = FetchHint.For(anchor, conjuncts, this.parameters);
-            const seek = this.trySeek(anchor, names[0]!, seeks, hint);
+            const seek = this.tryIdSeek(anchor, names[0]!, idSeeks) ?? this.trySeek(anchor, names[0]!, seeks, hint);
             const scan = seek?.Op ?? this.anchor(anchor, names[0]!, hint);
             if (seek?.Source !== undefined) consumed.add(seek.Source);
             op = input === undefined ? scan : new CartesianProduct(input, scan, this.cancel);
@@ -617,6 +620,16 @@ export class LogicalPlanner
     {
         const label = this.resolve(node.Label);
         return label === undefined ? new AllNodesScan(this.source, name, this.cancel) : new LabelScan(this.source, name, label, this.cancel, hint);
+    }
+
+    // A by-id seek for a freshly bound anchor with an `elementId(v) = x` / `IN xs` conjunct (ruling R121 F2); the
+    // consumed conjunct is not filtered again, the label (when given) is checked by the source.
+    private tryIdSeek(node: NodePattern, name: string, idSeeks: readonly IdSeekTerm[]): ISeekChoice | undefined
+    {
+        if (node.Variable === undefined) return undefined;
+        const term = idSeeks.find(t => t.Variable === node.Variable);
+        if (term === undefined) return undefined;
+        return { Op: new IdSeek(this.source, name, this.resolve(node.Label), term, this.parameters, this.cancel), InlineKey: undefined, Source: term.Source };
     }
 
     // An index seek for a freshly bound labelled anchor: an inline property first, then a top-level WHERE equality on

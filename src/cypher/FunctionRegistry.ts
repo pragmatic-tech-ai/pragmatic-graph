@@ -1,4 +1,4 @@
-import { CypherValue, ScalarValue, NullValue, type CypherScalar } from './CypherValue.js';
+import { CypherValue, NodeValue, ScalarValue, NullValue, type CypherScalar } from './CypherValue.js';
 import { ListValue, MapValue, PathValue } from './StructuredValues.js';
 import { CypherSemanticError } from './CypherError.js';
 import { ScalarSemantics } from './ScalarSemantics.js';
@@ -236,6 +236,20 @@ class ReplaceFunction extends FunctionBase
     }
 }
 
+// The node's public id (Neo4j 5 elementId); null for null, a Cypher type error for anything but a node.
+class ElementIdFunction extends FunctionBase
+{
+    private static readonly NotANode = 'elementId() takes a node';
+
+    public Invoke(args: readonly CypherValue[]): CypherValue
+    {
+        const a = args[0];
+        if (a instanceof NullValue) return NullValue.Instance;
+        if (!(a instanceof NodeValue)) throw new CypherSemanticError(ElementIdFunction.NotANode);
+        return new ScalarValue(a.Node.PublicId);
+    }
+}
+
 class PathLengthFunction extends FunctionBase
 {
     public Invoke(args: readonly CypherValue[]): CypherValue
@@ -281,6 +295,7 @@ export class FunctionRegistry
     private static readonly TrimName = 'trim';
     private static readonly SubstringName = 'substring';
     private static readonly ReplaceName = 'replace';
+    public static readonly ElementIdName = 'elementid';
     private static readonly LengthName = 'length';
     private static readonly NodesName = 'nodes';
     private static readonly RelationshipsName = 'relationships';
@@ -310,6 +325,7 @@ export class FunctionRegistry
         [FunctionRegistry.TrimName, new TrimFunction()],
         [FunctionRegistry.SubstringName, new SubstringFunction()],
         [FunctionRegistry.ReplaceName, new ReplaceFunction()],
+        [FunctionRegistry.ElementIdName, new ElementIdFunction()],
         [FunctionRegistry.LengthName, new PathLengthFunction()],
         [FunctionRegistry.NodesName, new PathNodesFunction()],
         [FunctionRegistry.RelationshipsName, new PathRelationshipsFunction()],

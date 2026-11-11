@@ -91,6 +91,54 @@ export class FederatedSource extends CatalogSource implements IFetchScope
         }
     }
 
+    /**
+     * Per id, in the ids' order: an engine node, a stub resolved through its owner, or a row this query already fetched;
+     * the ids left over are looked up in one go (FetchSession.LookupMany: one keyed request per External target of the
+     * label) and admitted under the scope, so an id the scope hides yields nothing, as in a label scan. Without a label
+     * nothing is fetched. Nodes that are not the label are dropped.
+     */
+    public async *NodesById(ids: readonly string[], label: string | undefined, probe?: IReadProbe): AsyncIterable<CypherNode>
+    {
+        const name = label === undefined ? undefined : this.labels.Resolve(label);
+        const order = [...new Set(ids)];
+        const found = new Map<string, CypherNode>();
+        const pending: string[] = [];
+        for (const id of order)
+        {
+            probe?.Tick();
+            const located = await this.Locate(id, probe);
+            if (located.Node !== undefined)
+            {
+                found.set(id, located.Node);
+            }
+            else if (located.Unresolved && !await this.reads.StoredNonStub(id))
+            {
+                // An id no node answers for: only now may a connector be asked. An engine node, visible or not, owns its id (D2).
+                pending.push(id);
+            }
+        }
+        if (name !== undefined && pending.length > 0)
+        {
+            const entries = await this.session.LookupMany(pending, this.FetchTargets(name), probe, this);
+            for (const [id, entry] of entries)
+            {
+                const admitted = await this.Admit(entry.Row, entry.Model);
+                if (admitted !== undefined)
+                {
+                    found.set(id, admitted);
+                }
+            }
+        }
+        for (const id of order)
+        {
+            const node = found.get(id);
+            if (node !== undefined && (name === undefined || this.catalog.IsA(node.Concept, name)))
+            {
+                yield node;
+            }
+        }
+    }
+
     public Node(publicId: string): Promise<CypherNode | undefined>
     {
         return this.NodeOf(publicId, undefined);
@@ -99,18 +147,28 @@ export class FederatedSource extends CatalogSource implements IFetchScope
     /** Node, with the probe a lookup it needs ticks (per page and per row). */
     private async NodeOf(publicId: string, probe: IReadProbe | undefined): Promise<CypherNode | undefined>
     {
+        return (await this.Locate(publicId, probe)).Node;
+    }
+
+    /**
+     * What is known of the id without asking a connector for it: an engine node, a stub resolved through its owner, or a
+     * row this query fetched. Unresolved: none of these answered (the id may be a hidden engine node or an unfetched row).
+     */
+    private async Locate(publicId: string, probe: IReadProbe | undefined): Promise<{ readonly Node?: CypherNode; readonly Unresolved: boolean }>
+    {
         const node = await this.base.Node(publicId);
         if (node !== undefined && !this.IsStub(node.Owner, node.Concept))
         {
-            return node;
+            return { Node: node, Unresolved: false };
         }
         const stub = node !== undefined ? { Concept: node.Concept, Owner: node.Owner } : await this.reads.StubIdentity(publicId);
         if (stub !== undefined)
         {
-            return this.Resolve(publicId, stub.Concept, stub.Owner, probe);
+            const resolved = await this.Resolve(publicId, stub.Concept, stub.Owner, probe);
+            return resolved === undefined ? { Unresolved: false } : { Node: resolved, Unresolved: false };
         }
         const known = this.fetched.get(publicId);
-        return known === undefined ? undefined : this.ToNode(known);
+        return known === undefined ? { Unresolved: true } : { Node: this.ToNode(known), Unresolved: false };
     }
 
     /** Outgoing, Incoming, or both with each (relationship, far node) pair once, as ReaderSource.Expand. */

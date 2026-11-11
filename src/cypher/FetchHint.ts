@@ -3,6 +3,7 @@ import { ComparisonOp } from './CypherEnums.js';
 import { ScalarValue, type CypherScalar, type CypherValue } from './CypherValue.js';
 import { Comparison, InExpression, IsNullExpression, Literal, Parameter, PropertyAccess, type Expression } from './Expression.js';
 import type { NodePattern } from './PatternPath.js';
+import { ListValue } from './StructuredValues.js';
 
 /**
  * The push-down hint of a freshly bound scan anchor (ruling R101, design ruling D4): a node-local engine Predicate that
@@ -75,6 +76,10 @@ export class FetchHint
             {
                 return undefined;
             }
+            if (conjunct.Source !== undefined)
+            {
+                return FetchHint.SourceTerm(member, conjunct.Source, parameters);
+            }
             const values: CypherScalar[] = [];
             for (const item of conjunct.List)
             {
@@ -92,6 +97,28 @@ export class FetchHint
             return new In(member, values);
         }
         return undefined;
+    }
+
+    /**
+     * `member IN $param`: In over the parameter list's non-null scalar items (the others equal nothing). Nothing when the
+     * source is not a supplied list parameter, so the hint never narrows more than the filter does.
+     */
+    private static SourceTerm(member: string, source: Expression, parameters: ReadonlyMap<string, CypherValue>): Predicate | undefined
+    {
+        const list = source instanceof Parameter ? parameters.get(source.Name) : undefined;
+        if (!(list instanceof ListValue))
+        {
+            return undefined;
+        }
+        const values: CypherScalar[] = [];
+        for (const item of list.Items)
+        {
+            if (item instanceof ScalarValue)
+            {
+                values.push(item.Value);
+            }
+        }
+        return new In(member, values);
     }
 
     /** The property name when the expression is `variable.property`. */

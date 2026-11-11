@@ -10,7 +10,7 @@ import type { IConnectorApplied } from './ConnectorApplied.js';
 import { type ConnectorChange, ConnectorChangeSet } from './ConnectorChangeSet.js';
 import { ConnectorError, ConnectorPhase } from './ConnectorError.js';
 import { ExternalWriteCheck } from './ExternalWriteCheck.js';
-import { ConnectorResidency, type IExternalConnector } from './FetchContract.js';
+import { ConnectorResidency, type IExternalConnector, type RowVersion } from './FetchContract.js';
 import type { IConnectorTransaction, IGraphConnector } from './GraphConnector.js';
 
 /** The owner (model, '' for none) and concept a write routes by. */
@@ -47,6 +47,8 @@ export interface INodeOrigins
 {
     /** The stored node's origin, else the fetched row's (Fetched set), else undefined. */
     Origin(publicId: string): Promise<INodeOrigin | undefined>;
+    /** The version of the row the transaction fetched for the id (R119 V1), else undefined. */
+    Version(publicId: string): RowVersion | undefined;
     /**
      * Every edge of the live node, unscoped, outgoing (effective relationships in declaration order) then
      * incoming (IncomingRelationships order), each in stored edge order; none when there is no such node.
@@ -177,6 +179,8 @@ class ChangeRouter
 {
     private readonly known = new Map<string, INodeOrigin | undefined>();
     private readonly grouped = new Map<string, ConnectorChange[]>();
+    /** The ids a CreateNode of this batch created so far: their later changes carry no ExpectedVersion (R119 V2). */
+    private readonly createdHere = new Set<string>();
 
     public constructor(private readonly table: BindingTable, private readonly index: CatalogIndex, private readonly origins: INodeOrigins, private readonly external: ReadonlySet<string>)
     {
@@ -192,6 +196,7 @@ class ChangeRouter
     public Created(publicId: string, origin: INodeOrigin): void
     {
         this.known.set(publicId, origin);
+        this.createdHere.add(publicId);
     }
 
     /** The id's latest origin: its CreateNode earlier in the batch, else the snapshot's node (looked up once). */
@@ -204,8 +209,13 @@ class ChangeRouter
         return this.known.get(publicId);
     }
 
-    /** Adds the op to the change set of the connector its origin binds to; none when engine-only or found nowhere. */
-    public Emit(op: BatchOp, origin: INodeOrigin | undefined): void
+    /**
+     * Adds the op to the change set of the connector its origin binds to; none when engine-only or found nowhere. On an
+     * External connector the change carries the fetched version of `routingId` (the written node, or a Link / Unlink's
+     * source) as ExpectedVersion, unless the batch created that id earlier (ruling R119 V2); the key is never added
+     * without a version, and Mirrored connectors never get one.
+     */
+    public Emit(op: BatchOp, origin: INodeOrigin | undefined, routingId: string): void
     {
         if (origin === undefined)
         {
@@ -222,7 +232,10 @@ class ChangeRouter
             changes = [];
             this.grouped.set(name as string, changes);
         }
-        changes.push({ ...op, Owner: origin.Owner, Concept: origin.Concept } as ConnectorChange);
+        const version = this.external.has(name as string) && !this.createdHere.has(routingId) ? this.origins.Version(routingId) : undefined;
+        changes.push((version === undefined
+            ? { ...op, Owner: origin.Owner, Concept: origin.Concept }
+            : { ...op, Owner: origin.Owner, Concept: origin.Concept, ExpectedVersion: version }) as ConnectorChange);
     }
 
     /** The change sets, keyed in connector-name order. */
@@ -440,7 +453,7 @@ export class WriteCoordinator
                     }
                     router.Created(op.PublicId, origin);
                     edges.Created(op.PublicId);
-                    router.Emit(op, origin);
+                    router.Emit(op, origin, op.PublicId);
                     break;
                 }
                 case WriteOp.DeleteNode:
@@ -461,7 +474,7 @@ export class WriteCoordinator
                         }
                         if (!strict)
                         {
-                            router.Emit(unlink, source);
+                            router.Emit(unlink, source, edge.From);
                         }
                     }
                     if (outside)
@@ -474,7 +487,7 @@ export class WriteCoordinator
                         check.Deleted(op.PublicId);
                         engine.Append(op);
                     }
-                    router.Emit(op, origin);
+                    router.Emit(op, origin, op.PublicId);
                     break;
                 }
                 case WriteOp.Link:
@@ -494,7 +507,7 @@ export class WriteCoordinator
                         }
                         engine.Append(op);
                     }
-                    router.Emit(op, source);
+                    router.Emit(op, source, op.From);
                     break;
                 }
                 case WriteOp.Unlink:
@@ -509,7 +522,7 @@ export class WriteCoordinator
                     {
                         engine.Append(op);
                     }
-                    router.Emit(op, source);
+                    router.Emit(op, source, op.From);
                     break;
                 }
                 case WriteOp.SetProperty:
@@ -523,7 +536,7 @@ export class WriteCoordinator
                     {
                         engine.Append(op);
                     }
-                    router.Emit(op, origin);
+                    router.Emit(op, origin, op.PublicId);
                     break;
                 }
                 case WriteOp.SetOwner:

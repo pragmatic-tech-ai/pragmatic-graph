@@ -104,38 +104,66 @@ export class FetchSession
      * The row of `publicId` from the first candidate that has it, with the candidate's model (hits, and misses per
      * candidate, are memoised); ticks the probe per page and per row returned, as Scan. A memo entry another candidate
      * does not satisfy (see the class comment) makes Lookup skip that candidate. `scope` gives the predicate a fallback
-     * scan pushes down for a connector without KeyLookup.
+     * scan pushes down for a connector without KeyLookup. LookupMany of the one id.
      */
     public async Lookup(publicId: string, candidates: readonly IFetchTarget[], probe?: IReadProbe, scope: IFetchScope = FetchSession.Unscoped): Promise<IFetchedEntry | undefined>
     {
-        for (const target of candidates)
+        return (await this.LookupMany([publicId], candidates, probe, scope)).get(publicId);
+    }
+
+    /**
+     * Lookup of every id at once (ruling R121 F1): per candidate, in order, one request for the ids no earlier candidate
+     * answered and none has a memoised miss of: a keyed request (Keys, in the ids' order) when the connector declares
+     * KeyLookup, else one scan with And(scope, IdIn{ids}). Rows of other ids are ignored outright. Hits and misses are
+     * memoised as Lookup memoises them, and an id with a memo entry is answered from it alone (the first candidate the
+     * entry serves), never fetched. The result holds the ids found, absent ones are missing.
+     */
+    public async LookupMany(publicIds: readonly string[], candidates: readonly IFetchTarget[], probe?: IReadProbe, scope: IFetchScope = FetchSession.Unscoped): Promise<ReadonlyMap<string, IFetchedEntry>>
+    {
+        const found = new Map<string, IFetchedEntry>();
+        const unknown: string[] = [];
+        for (const publicId of new Set(publicIds))
         {
             const entry = this.memo.get(publicId);
-            if (entry !== undefined)
+            if (entry === undefined)
             {
-                if (this.Serves(entry, target))
-                {
-                    return entry;
-                }
-                continue;
+                unknown.push(publicId);
             }
-            const missKey = this.MissKey(publicId, target);
-            if (this.misses.has(missKey))
+            else if (candidates.some(target => this.Serves(entry, target)))
             {
-                continue;
+                found.set(publicId, entry);
             }
-            const request = this.Connector(target).Capabilities.KeyLookup
-                ? { ...this.Request(target, Predicate.True), Keys: [publicId] }
-                : this.Request(target, new And([scope.RowPredicate(target.Concept), new IdIn(new Set([publicId]))]));
-            for await (const row of this.Drain(target, request, probe, publicId))
-            {
-                const found = { Row: row, Model: target.Model };
-                this.memo.set(publicId, found);
-                return found;
-            }
-            this.misses.add(missKey);
         }
-        return undefined;
+        for (const target of candidates)
+        {
+            const pending = new Set(unknown.filter(id => !found.has(id) && !this.misses.has(this.MissKey(id, target))));
+            if (pending.size === 0)
+            {
+                continue;
+            }
+            const ids = [...pending];
+            const request = this.Connector(target).Capabilities.KeyLookup
+                ? { ...this.Request(target, Predicate.True), Keys: ids }
+                : this.Request(target, new And([scope.RowPredicate(target.Concept), new IdIn(new Set(ids))]));
+            for await (const row of this.Drain(target, request, probe, pending))
+            {
+                if (pending.delete(row.PublicId))
+                {
+                    const hit = { Row: row, Model: target.Model };
+                    this.memo.set(row.PublicId, hit);
+                    found.set(row.PublicId, hit);
+                    if (pending.size === 0)
+                    {
+                        break;
+                    }
+                }
+            }
+            for (const id of pending)
+            {
+                this.misses.add(this.MissKey(id, target));
+            }
+        }
+        return found;
     }
 
     /**
@@ -166,10 +194,10 @@ export class FetchSession
     }
 
     /**
-     * Pages through the fetch. With `onlyId` (a key lookup) rows of other ids are ignored outright and nothing is
+     * Pages through the fetch. With `onlyIds` (a key lookup) rows of other ids are ignored outright and nothing is
      * memoised here; otherwise each admitted row goes through Remember and the session's row is yielded.
      */
-    private async *Drain(target: IFetchTarget, request: IFetchRequest, probe: IReadProbe | undefined, onlyId: string | undefined): AsyncGenerator<IFetchedRow>
+    private async *Drain(target: IFetchTarget, request: IFetchRequest, probe: IReadProbe | undefined, onlyIds: ReadonlySet<string> | undefined): AsyncGenerator<IFetchedRow>
     {
         const connector = this.Connector(target);
         let resume: string | undefined;
@@ -188,7 +216,7 @@ export class FetchSession
             for (const fetched of page.Rows)
             {
                 probe?.Tick();
-                if (onlyId !== undefined && fetched.PublicId !== onlyId)
+                if (onlyIds !== undefined && !onlyIds.has(fetched.PublicId))
                 {
                     continue;
                 }
@@ -197,7 +225,7 @@ export class FetchSession
                 {
                     continue;
                 }
-                yield onlyId === undefined ? this.Remember(target, row) : row;
+                yield onlyIds === undefined ? this.Remember(target, row) : row;
             }
             resume = page.Resume;
         }
