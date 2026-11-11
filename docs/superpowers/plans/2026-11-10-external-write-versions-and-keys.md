@@ -118,7 +118,7 @@ TODL and the host consume the engine (and the host consumes TODL) through `node_
   - `ExternalWriteCheck.Finish` runs per step, over the creates of that step: R29 is judged per create step.
   - The write gate runs per step, incrementally: `WriteGate.Check(evaluator, batch, catalog, exempt, fetched, from)` checks ops from index `from`, with the earlier ops as context. A denial fails the step before any connector call.
   - Connector calls in a step run one connector at a time in name order. Each is raced against the setup's timeout as today, from the step's start. They are awaited inside the statement: Cypher operators are async iterators, and `ICypherSink.CreateNode` becomes async.
-  - A connector is `Begin`-ed at its first step and kept for the transaction's life.
+  - A connector is `Begin`-ed at its first step and kept for the transaction's life. It is begun with the transaction's `ConnectorContext` (`Begin(context)`, security S2, ruling E11).
 - **E3 Connector contract (R124).**
   ```ts
   interface IConnectorTransaction
@@ -158,7 +158,7 @@ TODL and the host consume the engine (and the host consumes TODL) through `node_
 - **E4 Source-assigned keys (R124).** Signature: `GraphTransaction.CreateAssigned(requests: readonly IAssignedCreate[]): Promise<readonly IFetchedView[]>` (index-aligned), with `IAssignedLink { Relationship: string; To: string }` as the element type of `IAssignedCreate.Links`.
   - Steps:
     1. Flush pending ops.
-    2. Check every request: R29, and the gate's Create rules, judged hypothetically as for any create. `ExternalWriteCheck` runs on the properties and links. A failed check fails before any connector call.
+    2. Check every request: R29; the gate's Create rules, judged hypothetically as for any create; the scope's Hidden and ReadOnly.Create members over its Properties and Links (placement defaults exempt); and the AppendTo rule of every link target that exists in the snapshot (security S2). `ExternalWriteCheck` runs on the properties and links. A failed check fails before any connector call.
     3. Group the requests by binding connector, and call `Create` once per connector, in name order, as one step each.
     4. Validate each returned row with `FetchedNode.Validated`.
     5. Map outcome `i` back to request `i`. The mapping is by position, so the outcome count must equal the request count, else the call is `ConnectorError(connector, Write, GraphError Internal)`.
@@ -186,7 +186,7 @@ TODL and the host consume the engine (and the host consumes TODL) through `node_
 
     Compensation is bounded by the setup's timeout from the failure. Late outcomes are reported on `ConnectorRevertFailed`, as today.
   - **What the caller sees:**
-    - The failure itself is the error. A failed step is `ConnectorError(connector, Write, cause)`. An engine rejection (ConflictError, CommitError, AccessError) is rethrown as-is when every compensation succeeded.
+    - The failure itself is the error. A failed step is `ConnectorError(connector, Write, cause)`. An engine rejection (ConflictError, CommitError, AccessError) is rethrown as the transaction surfaces it when every compensation succeeded; a CommitError under a read-restricting scope is first redacted by `CommitErrorRedactor` (security S2), and the redacted error is also what goes into the AggregateError below.
     - **When a compensation fails:**
       - the caller gets `ConnectorError(<failing connector or EngineStorage>, <phase>, AggregateError([failure, ...compensationErrors]))`, so an engine rejection is then wrapped, with the failure first;
       - every failed compensation is raised on `ConnectorRevertFailed` at once, not only late ones;
@@ -262,6 +262,11 @@ TODL and the host consume the engine (and the host consumes TODL) through `node_
   - **Pattern stages.** A batched CREATE executes in stages. Stage 0 is the new nodes no other new external node in the same pattern points at, then a stage per topological level of new-external → new-external links. Each stage is one step per connector: `CreateAssigned` for KeyAssigned places, or Apply for client-keyed ones, carrying every row's nodes of that stage. A link-cycle among new external nodes of one pattern puts the closing link into a final Link step after all stages.
   - **Mapping back to rows.** The batched operator keeps `rows[i] → requests[j]`. Outcome j (index-aligned, E3/E4) gives row i its node. Apply results map back by public id (`Versions`). Rows are then yielded in input order, holding the real nodes.
   - **Failure inside a batch.** The step fails as a whole. The connector has applied some rows and failed others: SQL Sequential continues past a failed op; Transactional applies nothing. Under R113 accounting only the applied rows are logged, so the step's `Undo` compensates exactly those. The transaction then compensates its earlier steps in reverse and ends (E6). The query rejects with the step's `ConnectorError Write`. The cause is an `ExternalWriteError` listing the failed rows' keys or Refs, or `IsConflict` for a version conflict.
+- **E11 One caller per transaction (security S2; platform security spec §6).** Connector work is never pooled, cached, batched or compensated across callers. The engine's unit of caller is the GraphTransaction and its `ConnectorContext`:
+  - Every connector call a GraphTransaction makes runs on the `IConnectorTransaction` begun with that transaction's context. That covers `Fetch`, `Begin`, `Apply`, `Create`, `Undo`, `Commit`, `Revert`, and the compensation of an abort, a failed commit or a dropped transaction (`GraphStore.dispose()`'s Drop included). Fetches carry `IFetchRequest.Context`.
+  - Write steps, batched clauses (E10), `CreateAssigned` groups, the step log, the version ledger (E5) and the fetch memo belong to one GraphTransaction. Nothing merges, reorders, replays or reuses them across two transactions, even when their contexts or scopes are equal. E10's cross-row batching is across the rows of one statement in one transaction only.
+  - A version one transaction learned never guards another transaction's write.
+  - Drop and store shutdown compensate each transaction separately, each on its own connector transactions and in its own reverse step order.
 
 ## Global Constraints
 
@@ -284,6 +289,7 @@ TODL and the host consume the engine (and the host consumes TODL) through `node_
   - TODL: `npm test` and `npx tsc --noEmit -p .`;
   - host: `npm test` and `npm run build`.
 - Fix every review finding, minors included. Commit only in the task's own repo, and record rulings in the engine's `docs/decisions.md` as a separate engine commit. No push and no publish without the owner's go-ahead.
+- **One caller per transaction (E11).** No connector state, step, batch or compensation crosses GraphTransactions; every connector call carries the transaction's `ConnectorContext`.
 
 ## Review Focus
 
@@ -310,6 +316,7 @@ TODL and the host consume the engine (and the host consumes TODL) through `node_
 9. **Wave 2: a dropped transaction is silent.** → Task 2.2 tests:
    - `DisposeAsync of a dropped transaction compensates then rejects`: `TransactionDroppedError`, with `Outcome === Compensated`, `TransactionId === txn.Id`, and `TransactionDropped` raised once;
    - `sync dispose of a dropped transaction throws at once`: `Outcome === undefined`, and the `Compensation` promise resolves to `Compensated`.
+10. **Wave 2: two callers' batched writes stay apart.** → Task 2.4b test `concurrent batched creates keep their contexts`. Two transactions with contexts alice and bob each run a batched external CREATE at the same time. The fake connector sees two `Begin` calls with distinct contexts, each step carries only its own transaction's rows, and failing bob's step compensates only bob's (alice commits).
 
 ---
 
@@ -611,6 +618,7 @@ TODL and the host consume the engine (and the host consumes TODL) through `node_
   - `store dispose drops open transactions without throwing`: `GraphStore.dispose()` with an open transaction that has one step compensates it, raises `TransactionDropped`, and returns normally.
   - `successful commit reports Committed once`: one `ConnectorApplied` with `Outcome === Committed` and `Commit` set. An all-external commit gives `Commit === undefined` and `Committed`.
   - `no participation raises nothing`.
+  - `drop compensates each transaction on its own connector transactions`: two open transactions with different contexts each execute a step on one connector. Dropping one compensates only its own connector transaction, in its own reverse order, and the other commits untouched.
 - [ ] **Step 2: Run** `npx tsx --test src/connectors/tests/Compensation.test.ts`. Expected: FAIL.
 - [ ] **Step 3: Implement** E6 and the ConnectorApplied part of E7.
 - [ ] **Step 4: Run** the tests, `npm test`, `npm run typecheck`. Expected: PASS.
@@ -732,6 +740,7 @@ TODL and the host consume the engine (and the host consumes TODL) through `node_
   - **Stages and failures:**
     - `pattern stages batch targets first`: `UNWIND [1,2] AS i CREATE (o:Order {total: i})-[:customer]->(c:Customer {name: 'n'})` makes two `Create` calls: Customers (2 requests), then Orders (2 requests), each order's FK being its own row's customer key.
     - `partial batch failure compensates exactly the applied rows`: the fake applies requests 0 and 2 and reports request 1 as an Error outcome. The query rejects `CypherWriteError ConnectorFailed`, the fake's Undo deletes exactly keys of requests 0 and 2, request 1 never applied, and earlier steps of the query are undone too.
+    - `concurrent batched creates keep their contexts`: the Review Focus item 10 scenario (alice and bob, batched CREATE at once). Each `Begin` carries its own context, each step holds only its own rows, and bob's failure compensates only bob's rows.
 - [ ] **Step 2: Run** `npx tsx --test src/cypher/tests/WriteBatching.test.ts`. Expected: FAIL.
 - [ ] **Step 3: Implement** E10.
 - [ ] **Step 4: Run** the tests, `npm test`, `npm run typecheck`, `npm run build`. Expected: PASS.
