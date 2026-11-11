@@ -458,4 +458,36 @@ describe('FetchSession', () =>
         await session.Lookup('a', [SessionFx.Target()]);
         assert.equal(ext.Requests.length, 1);
     });
+
+    it('LookupMany memoises hits and misses', async () =>
+    {
+        const ext = new FakeExternalConnector(SessionFx.Ext, [[SessionFx.Row('a'), SessionFx.Row('b')]]);
+        const session = await SessionFx.Session(ext);
+        const first = await session.LookupMany(['a', 'nope', 'b'], [SessionFx.Target()]);
+        assert.deepEqual([...first.keys()].sort(), ['a', 'b']);
+        assert.equal(ext.Requests.length, 1);
+        assert.deepEqual(ext.Requests[0]!.Keys, ['a', 'nope', 'b']);
+        const again = await session.LookupMany(['b', 'nope', 'a'], [SessionFx.Target()]);
+        assert.equal(again.get('a'), first.get('a'));
+        assert.equal(again.size, 2);
+        assert.equal(ext.Requests.length, 1);
+        assert.equal(session.Known('b'), first.get('b'));
+    });
+
+    it('LookupMany falls back to one scan without KeyLookup', async () =>
+    {
+        const ext = new FakeExternalConnector(SessionFx.Ext, [], { KeyLookup: false, ReverseLookup: false, PushDown: new Set() });
+        ext.Override = () => ({ Rows: [SessionFx.Row('other'), SessionFx.Row('y'), SessionFx.Row('z')] });
+        const session = await SessionFx.Session(ext);
+        const scope = { RowPredicate: (concept: string) => new Compare(SessionFx.Label, CompareOp.Eq, concept) };
+        const found = await session.LookupMany(['y', 'z'], [SessionFx.Target()], undefined, scope);
+        assert.deepEqual([...found.keys()], ['y', 'z']);
+        assert.equal(ext.Requests.length, 1);
+        const request = ext.Requests[0]!;
+        assert.equal(request.Keys, undefined);
+        const [scoped, ids] = (request.Predicate as And).Terms;
+        assert.ok(scoped instanceof Compare && scoped.Value === SessionFx.Asset);
+        assert.ok(ids instanceof IdIn && [...ids.Ids].join() === 'y,z');
+        assert.equal(session.Known('other'), undefined);
+    });
 });

@@ -4,15 +4,39 @@ import { WriteExemptions } from './access/WriteExemptions.js';
 import type { FetchedNode } from './access/FetchedNode.js';
 import { WriteGate } from './access/WriteGate.js';
 import type { CellValue } from './columns/CellValue.js';
+import type { RowVersion } from './connectors/FetchContract.js';
+import { TransactionFetch } from './connectors/TransactionFetch.js';
 import { type INodeOrigin, type INodeOrigins, WriteCoordinator } from './connectors/WriteCoordinator.js';
 import type { GraphContext, ReadSnapshot } from './GraphContext.js';
 import { GraphError, GraphErrorCode } from './errors/GraphError.js';
 import { FederatedReads } from './FederatedReads.js';
-import { GraphReader } from './GraphReader.js';
+import { GraphReader, type INodeView } from './GraphReader.js';
 import { ConflictError } from './txn/ConflictError.js';
 import type { ISnapshotHandle } from './txn/ConflictHistory.js';
 import { ReadSet } from './txn/ReadSet.js';
 import { type ICreateNodeOptions, type IDeleteNodeOptions, type LinkOptions, WriteBatch } from './txn/WriteBatch.js';
+
+/**
+ * A key of GraphTransaction.Fetch (ruling R121 F1): the public id, and for an id the engine stores no node of, the concept
+ * (and optionally the owner model) to fetch it as. TODL ids are opaque to the engine: without Concept such an id is absent.
+ */
+export interface IFetchKey
+{
+    readonly PublicId: string;
+    readonly Concept?: string;
+    readonly Owner?: string;
+}
+
+/**
+ * A node as GraphTransaction.Fetch returns it: the scoped view (hidden members removed, null for an unset property).
+ * External is true for a row fetched from an External connector, whose Version is the source's version of the row the
+ * transaction's session holds (R119 V1); an engine node has none.
+ */
+export interface IFetchedView extends INodeView
+{
+    readonly External: boolean;
+    readonly Version?: RowVersion;
+}
 
 /**
  * An optimistic, serializable read-write transaction. Reads are snapshot reads at Begin and are
@@ -117,6 +141,22 @@ export class GraphTransaction extends GraphReader
         const index = this.batch.Count;
         this.batch.Unlink(from, relationship, to);
         this.exempt.Detaches.add(index);
+    }
+
+    /**
+     * The nodes of the keys as this transaction may see them (ruling R121 F1), keyed by public id; a key it may not see,
+     * or cannot resolve, is absent. A string key is an IFetchKey without Concept. A stored engine node is read as ReadNode
+     * reads it (External false). A stub, or an id with no stored node whose key names a Concept (and optionally an Owner),
+     * is fetched from its External connector through the transaction's FetchSession, under the scope and memoised for the
+     * transaction: the sanctioned fetch-before-write path, so a later write to a returned external node is decided
+     * against that row (R103) and carries its Version as ExpectedVersion (R119 V2). An id the scope does not admit stays
+     * unwritable (AccessError InvisibleNode). ReadNode still serves no stub data (P15).
+     */
+    public async Fetch(keys: readonly (string | IFetchKey)[]): Promise<ReadonlyMap<string, IFetchedView>>
+    {
+        this.RequireActive();
+        const normalized = keys.map(key => typeof key === 'string' ? { PublicId: key } : key);
+        return new TransactionFetch(this, FederatedReads.Of(this)).Resolve(normalized);
     }
 
     /**

@@ -9,7 +9,7 @@ export { GraphStore } from './GraphStore.js';
 export type { ILmdbOptions } from './kv/lmdb/LmdbStore.js';
 export { GraphReader, type ILinkView, type INodeView, type IReadProbe, type IScanRow } from './GraphReader.js';
 export type { IIndexBound, IIndexRange } from './indexes/IndexKey.js';
-export { GraphTransaction } from './GraphTransaction.js';
+export { GraphTransaction, type IFetchKey, type IFetchedView } from './GraphTransaction.js';
 export { AccessDefault, AccessScope, type IAccessScopeOptions, type IReadOnlyMembers, type IWriteRules } from './access/AccessScope.js';
 
 // Schema definition.
