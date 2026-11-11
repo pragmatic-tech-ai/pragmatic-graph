@@ -76,6 +76,12 @@ class IdFx
     public static readonly Scan = 'LabelScan(';
     public static readonly Hidden = 'c3';
     public static readonly Invalid = 'bad';
+    public static readonly InvalidStub = 'bad-stub';
+    public static readonly Model = 'crm';
+    public static readonly Friend = 'friend';
+    public static readonly Engine = 'e2';
+    /** A link target id over 400 UTF-8 bytes: invalid, and must not leak into the error. */
+    public static readonly LongTarget = 'z'.repeat(401);
     public static readonly Caller = 'alice';
     public static readonly SanitizedText = 'A fetched row failed validation';
     public static readonly ReadNames = 'MATCH (c:Customer) WHERE elementId(c) IN $ids RETURN c.name';
@@ -139,6 +145,29 @@ class IdFx
     public static InvalidRow(): IFetchedRow
     {
         return { PublicId: IdFx.Invalid, Concept: IdFx.Customer, Values: new Map<string, CellValue>([['friend', 'x']]), Links: new Map() };
+    }
+
+    /** A Customer row whose friend link targets an invalid (over-long) public id. */
+    public static InvalidStubRow(): IFetchedRow
+    {
+        return { PublicId: IdFx.InvalidStub, Concept: IdFx.Customer, Values: new Map(), Links: new Map([[IdFx.Friend, [IdFx.LongTarget]]]) };
+    }
+
+    /** Stores a stub of the external Customer `id` (e2 friend -> id, written under System). */
+    public async StoreStub(id: string): Promise<void>
+    {
+        const t = await this.Engine.Begin(AccessScope.System);
+        t.Link(IdFx.Engine, IdFx.Friend, id, { ExternalTarget: { Concept: IdFx.Customer, Owner: IdFx.Model } });
+        await t.Commit();
+    }
+
+    /** Asserts the error is the sanitized fetch failure (R121 F1, R133): no id, member or row text. */
+    public static AssertSanitized(error: unknown): void
+    {
+        assert.ok(error instanceof ConnectorError && error.Phase === ConnectorPhase.Fetch, String(error));
+        assert.ok(error.cause instanceof GraphError && error.cause.GraphCode === GraphErrorCode.SchemaViolation);
+        assert.equal(error.cause.message, IdFx.SanitizedText);
+        assert.equal(error.cause.cause, undefined);
     }
 
     public static Col(result: CypherResult): unknown[]
@@ -271,7 +300,7 @@ for (const kind of [StorageKind.Memory, StorageKind.Lmdb])
             }
         });
 
-        it('by-id seek fetches with the caller context and fails without naming the row (R133)', async () =>
+        it('by-id seek fetches with the caller context and fails without naming the row, stub or not (R133)', async () =>
         {
             const fx = await IdFx.Open(kind);
             try
@@ -280,13 +309,13 @@ for (const kind of [StorageKind.Memory, StorageKind.Lmdb])
                 const run = (ids: string[]) => fx.Cypher.Execute(IdFx.OpenOnly, IdFx.ReadNames, { Parameters: new Map([[IdFx.Ids, ids]]), Connector: context });
                 const before = fx.Connector.Requests.length;
                 assert.deepEqual(IdFx.Col(await run(['c1', IdFx.Hidden])), ['one']);
-                assert.ok(fx.Connector.Requests.slice(before).every(r => r.Context === context));
-                fx.Connector.Pages = [[...fx.Connector.Pages.flat(), IdFx.InvalidRow()]];
-                const error = await run([IdFx.Invalid]).catch((e: unknown) => e);
-                assert.ok(error instanceof ConnectorError && error.Phase === ConnectorPhase.Fetch, String(error));
-                assert.ok(error.cause instanceof GraphError && error.cause.GraphCode === GraphErrorCode.SchemaViolation);
-                assert.equal(error.cause.message, IdFx.SanitizedText);
-                assert.equal(error.cause.cause, undefined);
+                const requests = fx.Connector.Requests.slice(before);
+                assert.ok(requests.length > 0);
+                assert.ok(requests.every(r => r.Context === context));
+                await fx.StoreStub(IdFx.InvalidStub);
+                fx.Connector.Pages = [[...fx.Connector.Pages.flat(), IdFx.InvalidRow(), IdFx.InvalidStubRow()]];
+                IdFx.AssertSanitized(await run([IdFx.Invalid]).catch((e: unknown) => e));
+                IdFx.AssertSanitized(await run([IdFx.InvalidStub]).catch((e: unknown) => e));
             }
             finally
             {

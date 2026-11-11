@@ -4,7 +4,7 @@ import type { CellValue } from '../columns/CellValue.js';
 import type { BindingTable } from '../connectors/BindingTable.js';
 import type { IFetchTarget, IFetchedRow } from '../connectors/FetchContract.js';
 import { FetchFailure } from '../connectors/FetchFailure.js';
-import type { FetchSession, IFetchScope } from '../connectors/FetchSession.js';
+import type { FetchSession, IFetchScope, IFetchedEntry } from '../connectors/FetchSession.js';
 import { EdgeDirection } from '../format/FormatKeys.js';
 import { FederatedReads, type IFederatedLink } from '../FederatedReads.js';
 import type { GraphReader, ILinkView, IReadProbe } from '../GraphReader.js';
@@ -96,7 +96,8 @@ export class FederatedSource extends CatalogSource implements IFetchScope
      * Per id, in the ids' order: an engine node, a stub resolved through its owner, or a row this query already fetched;
      * the ids left over are looked up in one go (FetchSession.LookupMany: one keyed request per External target of the
      * label) and admitted under the scope, so an id the scope hides yields nothing, as in a label scan. A fetched row that
-     * fails validation fails the seek as GraphTransaction.Fetch fails (FetchFailure: naming neither the id nor the row).
+     * fails validation, for a stub or an unstored id, fails the seek as GraphTransaction.Fetch fails (FetchFailure: naming
+     * neither the id nor the row).
      * Without a label nothing is fetched. Nodes that are not the label are dropped.
      */
     public async *NodesById(ids: readonly string[], label: string | undefined, probe?: IReadProbe): AsyncIterable<CypherNode>
@@ -108,7 +109,7 @@ export class FederatedSource extends CatalogSource implements IFetchScope
         for (const id of order)
         {
             probe?.Tick();
-            const located = await this.Locate(id, probe);
+            const located = await this.Locate(id, probe, true);
             if (located.Node !== undefined)
             {
                 found.set(id, located.Node);
@@ -126,8 +127,7 @@ export class FederatedSource extends CatalogSource implements IFetchScope
             const entries = await FetchFailure.Sanitized(FetchFailure.NoConnector, () => session.LookupMany(pending, this.FetchTargets(name), probe, this));
             for (const [id, entry] of entries)
             {
-                const connector = this.bindings.Resolve(entry.Model, entry.Row.Concept, this.catalog) ?? FetchFailure.NoConnector;
-                const admitted = await FetchFailure.Sanitized(connector, () => this.Admit(entry.Row, entry.Model));
+                const admitted = await FetchFailure.Sanitized(this.ConnectorOf(entry), () => this.Admit(entry.Row, entry.Model));
                 if (admitted !== undefined)
                 {
                     found.set(id, admitted);
@@ -158,8 +158,9 @@ export class FederatedSource extends CatalogSource implements IFetchScope
     /**
      * What is known of the id without asking a connector for it: an engine node, a stub resolved through its owner, or a
      * row this query fetched. Unresolved: none of these answered (the id may be a hidden engine node or an unfetched row).
+     * `sanitized` (the by-id seek): a stub's row that fails validation fails as FetchFailure.Sanitized makes it fail.
      */
-    private async Locate(publicId: string, probe: IReadProbe | undefined): Promise<{ readonly Node?: CypherNode; readonly Unresolved: boolean }>
+    private async Locate(publicId: string, probe: IReadProbe | undefined, sanitized = false): Promise<{ readonly Node?: CypherNode; readonly Unresolved: boolean }>
     {
         const node = await this.base.Node(publicId);
         if (node !== undefined && !this.IsStub(node.Owner, node.Concept))
@@ -169,7 +170,7 @@ export class FederatedSource extends CatalogSource implements IFetchScope
         const stub = node !== undefined ? { Concept: node.Concept, Owner: node.Owner } : await this.reads.StubIdentity(publicId);
         if (stub !== undefined)
         {
-            const resolved = await this.Resolve(publicId, stub.Concept, stub.Owner, probe);
+            const resolved = await this.Resolve(publicId, stub.Concept, stub.Owner, probe, sanitized);
             return resolved === undefined ? { Unresolved: false } : { Node: resolved, Unresolved: false };
         }
         const known = this.fetched.get(publicId);
@@ -277,7 +278,7 @@ export class FederatedSource extends CatalogSource implements IFetchScope
     }
 
     /** The external node behind a stub (or a link target) of `owner`: memoised per query, undefined when dangling or not visible. */
-    private async Resolve(publicId: string, concept: string, owner: string, probe: IReadProbe | undefined): Promise<CypherNode | undefined>
+    private async Resolve(publicId: string, concept: string, owner: string, probe: IReadProbe | undefined, sanitized = false): Promise<CypherNode | undefined>
     {
         const known = this.fetched.get(publicId);
         if (known !== undefined && known.Owner === owner)
@@ -285,18 +286,34 @@ export class FederatedSource extends CatalogSource implements IFetchScope
             return this.ToNode(known);
         }
         const candidates = this.catalog.Has(concept) ? this.FetchTargets(concept).filter(t => t.Model === owner) : [];
-        return this.LookUp(publicId, candidates, probe);
+        return this.LookUp(publicId, candidates, probe, sanitized);
     }
 
-    /** The first candidate's row of the id (FetchSession.Lookup), admitted as a node of the model it was fetched for. */
-    private async LookUp(publicId: string, candidates: readonly IFetchTarget[], probe: IReadProbe | undefined): Promise<CypherNode | undefined>
+    /**
+     * The first candidate's row of the id (FetchSession.Lookup), admitted as a node of the model it was fetched for. With
+     * `sanitized` (the by-id seek, R133) a row that fails validation fails as FetchFailure.Sanitized makes it fail; Node and
+     * Expand keep the detailed failure (R98).
+     */
+    private async LookUp(publicId: string, candidates: readonly IFetchTarget[], probe: IReadProbe | undefined, sanitized = false): Promise<CypherNode | undefined>
     {
         if (candidates.length === 0)
         {
             return undefined;
         }
-        const entry = await this.session.Lookup(publicId, candidates, probe, this);
-        return entry === undefined ? undefined : this.Admit(entry.Row, entry.Model);
+        const lookup = () => this.session.Lookup(publicId, candidates, probe, this);
+        const entry = sanitized ? await FetchFailure.Sanitized(FetchFailure.NoConnector, lookup) : await lookup();
+        if (entry === undefined)
+        {
+            return undefined;
+        }
+        const admit = () => this.Admit(entry.Row, entry.Model);
+        return sanitized ? FetchFailure.Sanitized(this.ConnectorOf(entry), admit) : admit();
+    }
+
+    /** The connector that returned the session's entry: the one its (model, concept) resolves to; NoConnector when none. */
+    private ConnectorOf(entry: IFetchedEntry): string
+    {
+        return this.bindings.Resolve(entry.Model, entry.Row.Concept, this.catalog) ?? FetchFailure.NoConnector;
     }
 
     /** IFetchScope: the scope's row predicate for a fetch of the concept (ScopePredicate), what fallback scans push down. */

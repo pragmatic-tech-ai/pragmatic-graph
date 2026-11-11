@@ -49,6 +49,10 @@ Scope entries apply to a concept's subconcepts and to every concept carrying an 
 
 Licensed under Apache-2.0. See NOTICE for attribution.
 
+## Upgrading from 0.3.0
+
+0.4.0 enforces the security S2 rules and is breaking (ruling R134). `IGraphConnector.Begin(context)` now receives the caller's `ConnectorContext`, and every `IFetchRequest` carries one in `Context`. Link and Unlink are judged by the source's `Append` and the target's `AppendTo` rules, not by `Update`, so a scope that restricted links through `Update` must state `Append` and `AppendTo`. `EstimateCount` refuses under a read-restricting scope (Default Deny, or any `Rows`, hidden members or `Endpoints` entry). Under such a scope, commit errors are redacted and say only that something conflicts.
+
 ## External bindings
 
 A binding can name a connector that is the source of truth for a concept instead of mirroring the engine's data. A connector's `Residency` is `Mirrored` (the default: the engine stores the data and writes through to the connector) or `External` (`IExternalConnector`: the engine stores no property data and reads the connector on demand). An External connector provides `Capabilities` and `Fetch(IFetchRequest): Promise<IFetchPage>`; it cannot be the `DefaultConnector`. Failures surface as `ConnectorError` with `ConnectorPhase.Fetch`.
