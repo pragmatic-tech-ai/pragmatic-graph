@@ -25,7 +25,7 @@ export class FakeExternalConnector implements IExternalConnector
     {
     }
 
-    public Begin(): Promise<IConnectorTransaction>
+    public Begin(_context?: unknown): Promise<IConnectorTransaction>
     {
         return Promise.reject(new Error(FakeExternalConnector.ReadOnly));
     }

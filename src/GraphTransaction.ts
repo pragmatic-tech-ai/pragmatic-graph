@@ -16,6 +16,7 @@ import { ConflictError } from './txn/ConflictError.js';
 import type { ISnapshotHandle } from './txn/ConflictHistory.js';
 import { ReadSet } from './txn/ReadSet.js';
 import { type ICreateNodeOptions, type IDeleteNodeOptions, type LinkOptions, WriteBatch } from './txn/WriteBatch.js';
+import type { ConnectorContext } from './connectors/ConnectorContext.js';
 
 /**
  * An optimistic, serializable read-write transaction. Reads are snapshot reads at Begin and are
@@ -55,9 +56,9 @@ export class GraphTransaction extends GraphReader
     private committing = false;
 
     /** @internal Created by GraphStore.Begin. */
-    public constructor(context: GraphContext, snapshot: ReadSnapshot, scope: AccessScope)
+    public constructor(context: GraphContext, snapshot: ReadSnapshot, scope: AccessScope, connector: ConnectorContext)
     {
-        super(context, snapshot, scope, new ReadSet());
+        super(context, snapshot, scope, connector, new ReadSet());
     }
 
     public CreateNode(publicId: string, concept: string, options?: ICreateNodeOptions): void
@@ -164,7 +165,7 @@ export class GraphTransaction extends GraphReader
                     const prepare = () => this.context.Committer.Prepare(routed.Engine, this.Reads, this.ValidationCommit(), began, setup.TimeoutMs, generation);
                     // An all-external write makes no engine commit (controller ruling P13): it answers like an empty batch.
                     const unchanged = routed.Engine.Count === 0 ? this.SnapshotCommit : undefined;
-                    return await new WriteCoordinator(setup, this.context.ConnectorRevertFailed, this.context.ConnectorApplied).Run(prepare, routed.Sets, unchanged);
+                    return await new WriteCoordinator(setup, this.context.ConnectorRevertFailed, this.context.ConnectorApplied, this.Connector).Run(prepare, routed.Sets, unchanged);
                 }
                 return await this.context.Committer.Submit(routed.Engine, this.Reads, this.ValidationCommit(), began, generation);
             }

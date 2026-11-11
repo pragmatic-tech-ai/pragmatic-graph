@@ -266,7 +266,7 @@ class FedFx
         try
         {
             const setup = FederatedReads.Of(reader).Setup!;
-            const session = new FetchSession(setup.ExternalConnectors(), setup.Bindings, reader.Catalog);
+            const session = new FetchSession(setup.ExternalConnectors(), setup.Bindings, reader.Catalog, reader.Connector);
             return await work(new FederatedSource(new ReaderSource(reader), reader, session, setup.Bindings));
         }
         finally

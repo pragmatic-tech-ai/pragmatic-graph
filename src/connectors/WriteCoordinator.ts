@@ -11,6 +11,7 @@ import { type ConnectorChange, ConnectorChangeSet } from './ConnectorChangeSet.j
 import { ConnectorError, ConnectorPhase } from './ConnectorError.js';
 import { ExternalWriteCheck } from './ExternalWriteCheck.js';
 import { ConnectorResidency, type IExternalConnector } from './FetchContract.js';
+import type { ConnectorContext } from './ConnectorContext.js';
 import type { IConnectorTransaction, IGraphConnector } from './GraphConnector.js';
 
 /** The owner (model, '' for none) and concept a write routes by. */
@@ -388,7 +389,7 @@ export class WriteCoordinator
     /** The connector call last started, for wrapping a non-connector error should one ever escape. */
     private current: { readonly Connector: string; readonly Phase: ConnectorPhase } = { Connector: BindingTable.EngineStorage, Phase: ConnectorPhase.Prepare };
 
-    public constructor(private readonly setup: ConnectorSetup, private readonly lateFailures: Signal<ConnectorError>, private readonly applied: Signal<IConnectorApplied>)
+    public constructor(private readonly setup: ConnectorSetup, private readonly lateFailures: Signal<ConnectorError>, private readonly applied: Signal<IConnectorApplied>, private readonly context: ConnectorContext)
     {
     }
 
@@ -600,7 +601,7 @@ export class WriteCoordinator
             const participants = [...sets.keys()].map(name => this.setup.Connectors.get(name)!);
             for (const connector of participants)
             {
-                const txn = await this.Call(connector, ConnectorPhase.Begin, undefined, () => connector.Begin());
+                const txn = await this.Call(connector, ConnectorPhase.Begin, undefined, () => connector.Begin(this.context));
                 this.began.push({ Connector: connector, Txn: txn });
             }
             for (const { Connector, Txn } of this.began)

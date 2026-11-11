@@ -9,6 +9,7 @@ import { EdgeDirection } from './format/FormatKeys.js';
 import type { GraphReader, ILinkView, IReadProbe } from './GraphReader.js';
 import type { RecordedReads } from './RecordedReads.js';
 import type { CatalogIndex } from './txn/CatalogIndex.js';
+import type { ConnectorContext } from './connectors/ConnectorContext.js';
 
 /** A stub's identity: the concept and owner model it was created with (ruling R102). */
 export interface IStubIdentity
@@ -48,7 +49,7 @@ export class FederatedReads
     private session: FetchSession | undefined;
 
     /** Created by the GraphReader constructor (with its own recorded reads and evaluator), registered for `reader`. */
-    public constructor(reader: GraphReader, private readonly recorded: RecordedReads, private readonly evaluator: ScopeEvaluator | undefined, private readonly index: CatalogIndex)
+    public constructor(reader: GraphReader, private readonly recorded: RecordedReads, private readonly evaluator: ScopeEvaluator | undefined, private readonly index: CatalogIndex, private readonly connector: ConnectorContext)
     {
         if (FederatedReads.Channels.has(reader))
         {
@@ -86,7 +87,7 @@ export class FederatedReads
         const setup = this.recorded.Setup;
         if (this.session === undefined && setup !== undefined && setup.External.size > 0)
         {
-            this.session = new FetchSession(setup.ExternalConnectors(), setup.Bindings, this.index.Catalog);
+            this.session = new FetchSession(setup.ExternalConnectors(), setup.Bindings, this.index.Catalog, this.connector);
         }
         return this.session;
     }

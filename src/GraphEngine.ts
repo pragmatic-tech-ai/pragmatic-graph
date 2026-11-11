@@ -9,7 +9,7 @@ import { ConnectorSetup } from './connectors/WriteCoordinator.js';
 import { GraphError, GraphErrorCode } from './errors/GraphError.js';
 import { GraphContext } from './GraphContext.js';
 import type { GraphReader } from './GraphReader.js';
-import { GraphStore } from './GraphStore.js';
+import { GraphStore, type IBeginOptions } from './GraphStore.js';
 import type { GraphTransaction } from './GraphTransaction.js';
 import type { ILmdbOptions } from './kv/lmdb/LmdbStore.js';
 import type { ISchemaDescription } from './schema/SchemaDescription.js';
@@ -189,23 +189,23 @@ export class GraphEngine
     }
 
     /** A read-only snapshot of the latest commit under `scope` (GraphStore.BeginRead). */
-    public BeginRead(scope: AccessScope): Promise<GraphReader>
+    public BeginRead(scope: AccessScope, options?: IBeginOptions): Promise<GraphReader>
     {
         if (this.disposing !== undefined)
         {
             return Promise.reject(GraphEngine.Disposed());
         }
-        return this.store.BeginRead(scope);
+        return this.store.BeginRead(scope, options);
     }
 
     /** A read-write transaction under `scope` (GraphStore.Begin); writes are gated by the scope's write rules. */
-    public Begin(scope: AccessScope): Promise<GraphTransaction>
+    public Begin(scope: AccessScope, options?: IBeginOptions): Promise<GraphTransaction>
     {
         if (this.disposing !== undefined)
         {
             return Promise.reject(GraphEngine.Disposed());
         }
-        return this.store.Begin(scope);
+        return this.store.Begin(scope, options);
     }
 
     /**

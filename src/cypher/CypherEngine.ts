@@ -25,6 +25,8 @@ import { ReaderSource } from './ReaderSource.js';
 import { ListValue, MapValue, PathValue } from './StructuredValues.js';
 import type { INodePlacement } from './write/NodePlacement.js';
 import { WriteQueryRunner } from './write/WriteQueryRunner.js';
+import type { ConnectorContext } from '../connectors/ConnectorContext.js';
+import type { IBeginOptions } from '../GraphStore.js';
 
 interface IPageOutcome
 {
@@ -39,6 +41,8 @@ export interface ICypherRunOptions
     readonly Limits?: ExecutionLimits;
     /** Ids and owners of nodes a write query creates; GuidPlacement when absent. */
     readonly Placement?: INodePlacement;
+    /** On whose behalf the query's connector calls run (its reader's or transaction's ConnectorContext); Anonymous when absent. */
+    readonly Connector?: ConnectorContext;
 }
 
 /**
@@ -74,7 +78,7 @@ export class CypherEngine
         const limits = options.Limits;
         const paging = limits?.Skip !== undefined || limits?.After !== undefined;
         if (paging) CypherEngine.ValidatePaging(limits!);
-        const reader = await this.engine.BeginRead(scope);
+        const reader = await this.engine.BeginRead(scope, CypherEngine.BeginOptions(options));
         try
         {
             const view = CypherEngine.ReadSource(reader);
@@ -115,6 +119,11 @@ export class CypherEngine
      * when the reader's connector setup has External connectors, else the plain ReaderSource. A ConnectorError from any
      * fetch rejects the read; no partial result is returned.
      */
+    private static BeginOptions(options: ICypherRunOptions): IBeginOptions
+    {
+        return options.Connector === undefined ? {} : { Connector: options.Connector };
+    }
+
     private static ReadSource(reader: GraphReader): ICypherSource
     {
         const base = new ReaderSource(reader);
@@ -123,7 +132,7 @@ export class CypherEngine
         {
             return base;
         }
-        return new FederatedSource(base, reader, new FetchSession(setup.ExternalConnectors(), setup.Bindings, reader.Catalog), setup.Bindings);
+        return new FederatedSource(base, reader, new FetchSession(setup.ExternalConnectors(), setup.Bindings, reader.Catalog, reader.Connector), setup.Bindings);
     }
 
     public static ToDto(result: CypherResult): CypherResultDto
@@ -152,7 +161,7 @@ export class CypherEngine
     // Writes are never paged: limits.Skip / RowCap are ignored (the whole mutation pipeline drains); Cancel applies.
     private async ExecuteWrite(scope: AccessScope, model: CypherQueryModel, parameters: ReadonlyMap<string, CypherValue>, options: ICypherRunOptions): Promise<CypherResult>
     {
-        const transaction = await this.engine.Begin(scope);
+        const transaction = await this.engine.Begin(scope, CypherEngine.BeginOptions(options));
         try
         {
             const runOptions: { Placement?: INodePlacement; Planner?: PlannerOptions } = {};

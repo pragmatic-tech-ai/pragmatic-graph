@@ -1,5 +1,6 @@
 import type { CellValue } from '../columns/CellValue.js';
 import type { Predicate, PredicateKind } from '../predicate/Predicate.js';
+import type { ConnectorContext } from './ConnectorContext.js';
 import type { IGraphConnector } from './GraphConnector.js';
 
 /**
@@ -38,6 +39,8 @@ export interface IFetchRequest
     readonly Reverse?: { readonly Relationship: string; readonly Target: string };
     readonly Limit?: number;
     readonly Resume?: string;
+    /** On whose behalf this fetch runs: its reader's or transaction's context, on every request including continuations. */
+    readonly Context: ConnectorContext;
 }
 
 export interface IFetchedRow
@@ -59,6 +62,11 @@ export interface IExternalConnector extends IGraphConnector
 {
     readonly Residency: ConnectorResidency.External;
     readonly Capabilities: IConnectorCapabilities;
+    /**
+     * One page of rows. `request.Context` is the context of the one reader or transaction asking (spec section 6): serve the
+     * fetch with that caller's connection or token only. The engine never caches, pools or batches fetches across
+     * contexts, and never reuses one caller's rows for another; the connector must not either.
+     */
     Fetch(request: IFetchRequest): Promise<IFetchPage>;
 }
 

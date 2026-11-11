@@ -1,3 +1,4 @@
+import type { ConnectorContext } from '../ConnectorContext.js';
 import { after, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -45,9 +46,9 @@ class TicketSystem extends FakeExternalConnector
         this.Writes = new FakeConnector(name, this.Log);
     }
 
-    public override Begin(): Promise<IConnectorTransaction>
+    public override Begin(context: ConnectorContext): Promise<IConnectorTransaction>
     {
-        return this.Writes.Begin();
+        return this.Writes.Begin(context);
     }
 
     /** Every change the connector was asked to apply, flattened. */

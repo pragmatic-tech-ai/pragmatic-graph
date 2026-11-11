@@ -1,3 +1,4 @@
+import type { ConnectorContext } from './ConnectorContext.js';
 import type { ConnectorChangeSet } from './ConnectorChangeSet.js';
 import type { ConnectorResidency } from './FetchContract.js';
 
@@ -9,6 +10,12 @@ import type { ConnectorResidency } from './FetchContract.js';
  * Changes are the batch ops as recorded (ConnectorChange), including DeleteNode's `Strict` flag, plus
  * one Unlink before a plain DeleteNode for every edge the delete removes whose source binds to the
  * connector (ruling R89).
+ *
+ * Context (spec section 6): Begin receives the ConnectorContext of the one transaction whose commit is writing through, and
+ * every call on the returned connector transaction belongs to that context. A connector transaction and its WriteCoordinator
+ * serve exactly one GraphTransaction; the engine never caches, pools, batches or compensates connector work across readers
+ * or transactions, and group commit merges engine batches only. A connector that acts as the caller uses this context's
+ * connection or token, never another's.
  */
 export interface IGraphConnector
 {
@@ -16,7 +23,7 @@ export interface IGraphConnector
     readonly Name: string;
     /** Absent means Mirrored (ruling R96); External connectors implement IExternalConnector. */
     readonly Residency?: ConnectorResidency;
-    Begin(): Promise<IConnectorTransaction>;
+    Begin(context: ConnectorContext): Promise<IConnectorTransaction>;
 }
 
 export interface IConnectorTransaction
