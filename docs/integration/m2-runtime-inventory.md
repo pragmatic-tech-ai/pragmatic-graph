@@ -124,3 +124,37 @@ TODL: `graph-api/tests/*`, `model-data/tests/*` (~45), `cypher/tests/*` (~45), `
 `codegen/tests/{read-client,model-package}.test.ts`, `application/tests/*`,
 `engine-bridge/tests/{PolicyScopeCompiler,EngineCellMapper,DevLoop}.test.ts`.
 todl-connectors-host: per-adapter tests, `connectors-e2e`, `resolution-audit-e2e`, `adapter-conformance.ts`.
+
+## After M2.2 (TODL 0.54.0, branch feat/m2.2-runtime-on-engine)
+New parallel APIs, all exported from `@pragmatic-tech-ai/todl/engine` unless noted (nothing was deleted):
+- `DataSourceConnector` (engine `IExternalConnector` over `IDataSourceAdapter`s; does not own its adapter), `DataSourceTransaction`,
+  `ChangeBatcher`, `FetchTranslator`, `ResumeToken`, `ExternalIdentity`, `ExternalWriteError` (`Failures` carry kinds).
+- `EnvironmentCatalogComposer` -> `IEnvironmentCatalog` from `IPackageDelivery[]` (`DeliveryChannel`), with `PackageVersionUnifier`,
+  `UnifiedPackageSource`, `EnvironmentCatalogError` (`IncompatibleVersions`, `ConflictingDefinition`, `UnknownConnector`, ...),
+  and `EnvironmentNodePlacement` (external creates at the unique external binding; `AmbiguousExternalBinding`; `NoHomeModel`).
+- `SystemPackage` (`todl.system@1.0.0`, always added), `SystemNames`, `ShareGrants`, `ShareGrantScope` (`Widening`, `GrantRows`, `SubjectMatch`),
+  `ShareRight`, `ShareSubject`.
+- `PolicyScopeCompiler.FromRules(Iterable<IPolicyRuleSource>, description)` (typed value semantics).
+- Root entry: `CypherWire` (engine-free `CypherCellCodec`, DTOs); `Cypher.*` still re-exports the same classes.
+- `EngineFixture` is a test-only helper (not public).
+
+Notes for M2.3: `IDescribeOptions.EmitExternalBindings` defaults false (T14). `FromRules` `MalformedPolicy` must be treated as fatal for the app (T13).
+Share-grant scopes must admit `GrantRows(subjects)` on `todl.system.ShareGrant` or `Widening` cannot see the principal's grants (R114).
+The engine requires an external node be fetched in the same transaction before it is written.
+Optimistic concurrency guards only the commit window (Q1); sources that assign their own keys cannot be created through the engine (Q3).
+
+### Retirement handoff to M2.3 (each item: the server importer must go first)
+- TODL `src/cypher/**` and root `export * as Cypher`: server importers are the cypher handler (parser, `ReferencedLabels`, `OverQuery`/`ToDto`, `Deadline`, errors),
+  pragmatic-server (`CypherPushDown`, `GraphQuerySchema`, `ParameterValue`), `cypher-result-mapper`, the param converter, `execute-result-mapper`,
+  `graph-data-digest` (`GraphQueryAdapter`). Afterwards the server uses the engine `Cypher` and `CypherWire`. Grep Plexus (`apps/plexus`, `plexus-core`)
+  for TODL `Cypher.` first; if offline Plexus uses it over `GraphQuery`, keep `src/cypher` for it. Includes `ICypherWriter`, `WriteOverlay`, `push-down.ts`, `GraphQueryAdapter`.
+- `src/graph-api/connector-runtime-graph-query.ts` + index export (importers: environment-graph, pragmatic-server).
+- `src/model-data/connector-prefetch.ts`, then `connector-mirror-mapper.ts` and `conjunctive-query-filter-provider.ts` once unused (importers: environment-graph, pragmatic-server).
+- `src/model-data/connector-working-copy.ts`, `federated-model-data-connector.ts` (importer: server connector-service `WriteBack`, replaced by an engine transaction).
+- `src/connectors/connector-runtime.ts` (importers: server connector-service, page reader, keyed write target, `Connectors()`).
+- `IDescribeOptions.EmitExternalBindings`: flip on for dev once the dev host installs `DataSourceConnector`s, then remove the option (T14).
+- Kept: `GraphQuery`/`IGraphQuery`, `ModelDataSource`, typed read clients on `IModelDataConnector`, the `IDataSourceAdapter` family, `DataSourceAdapterCatalog`, host adapters.
+  The server-side `ConnectorRuntime` -> `ModelDataSource` bridge dies with `ConnectorRuntime`.
+- Server replacements: `AppConnectorPlan`/`RuntimeAppGraph` -> `EnvironmentCatalogComposer`; `ShareStore`/`ShareGrantIndex`/`ShareWidening*` -> `todl.system.ShareGrant`
+  nodes + `ShareGrantScope` (delete a record's grants in the same transaction); `AccessPolicySetting.Load` -> `IdentityEnforcement` -> `PolicyScopeCompiler.FromRules`;
+  `ExternalIdentity.ReadOnly()` -> scope write predicate False, seeded nodes write predicate `Not(Seeded)`; `ExternalWriteError.Failures` kinds -> `AppWriteResultDto` statuses (T9).
