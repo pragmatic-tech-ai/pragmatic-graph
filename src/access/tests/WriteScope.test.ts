@@ -443,6 +443,16 @@ class WriteFx
                 WriteFx.Denied(await WriteFx.Try(g, scope, t => t.Link('t', WriteFx.About, 'p')), AccessErrorCode.AppendToDenied, 'op 0', 't');
                 WriteFx.Allowed(await WriteFx.Try(g, scope, t => t.Link('t', WriteFx.About, 'good')));
                 WriteFx.Denied(await WriteFx.Try(g, scope, t => t.Unlink('linked', WriteFx.About, 'p')), AccessErrorCode.AppendToDenied, 'linked');
+                // Visibility is reported first: an invisible sibling beats a target failing AppendTo.
+                await WriteFx.Setup(g, t =>
+                {
+                    t.SetProperty('p', WriteFx.Name, 'x');
+                    t.CreateNode('hidden', WriteFx.Person);
+                    t.SetProperty('hidden', WriteFx.Name, WriteFx.Secretive);
+                    t.CreateNode('team', WriteFx.Team);
+                });
+                const hiding = WriteFx.HideSecret(new Map([[WriteFx.Person, { AppendTo: new Compare(WriteFx.Name, CompareOp.Eq, WriteFx.Ok) }]]));
+                WriteFx.Denied(await WriteFx.Try(g, hiding, t => t.Link('team', WriteFx.Member, 'p', { AfterSibling: 'hidden' })), AccessErrorCode.InvisibleNode, 'hidden');
                 await g.dispose();
             });
 

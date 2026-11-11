@@ -189,8 +189,10 @@ enum RuleKind
  *   (ruling R92): the entries' ReadOnly.Create sets on a node the batch created, their ReadOnly.Update sets on an existing
  *   node, plus the same stage of the own concept's entry's ReadOnlyExact (R94). A host-placed
  *   default on a node the batch created (GraphTransaction.SetDefault, R91) is exempt from both; an unlink a
- *   DETACH DELETE implies (GraphTransaction.DetachUnlink) is exempt from ReadOnly, from the source's Append rule and from the target's AppendTo rule when the batch later deletes one of its ends (ruling F-a: only the Delete rule governs it). A Link/Unlink target and a Link's
- *   AfterSibling/BeforeSibling must be visible (or created by the batch and live at that op).
+ *   DETACH DELETE implies (GraphTransaction.DetachUnlink) is exempt from ReadOnly, from the source's Append rule and
+ *   from the target's AppendTo rule when the batch later deletes one of its ends (ruling F-a: only the Delete rule
+ *   governs it). A Link/Unlink target and a Link's AfterSibling/BeforeSibling must be visible (or created by the
+ *   batch and live at that op); AppendTo is checked after all of those, so InvisibleNode is reported first.
  * - DeleteNode: the node must be visible and every applicable Delete predicate hold on its snapshot
  *   values; deleting a node the batch created is exempt.
  *
@@ -327,8 +329,7 @@ export class WriteGate
                 const concept = await this.CheckWrite(index, op.Op, op.From, op.Relationship, targets.Source, false, detach, RuleKind.Append);
                 // An external target (a stub, or no stored node: an ExternalTarget link creates its stub, R102) is decided
                 // against the row the transaction fetched (R103); a stored engine node keeps the ordinary rule.
-                await this.CheckReferenced(index, op.Op, op.From, concept, op.To, targets.Target, WriteGate.ErrInvisibleTarget);
-                await this.CheckAppendTo(index, op.Op, op.From, concept, op.To, targets.Target, detach);
+                const target = await this.CheckReferenced(index, op.Op, op.From, concept, op.To, targets.Target, WriteGate.ErrInvisibleTarget);
                 if (op.Op === WriteOp.Link)
                 {
                     // The committer resolves siblings unscoped: an unchecked one would be an existence oracle.
@@ -342,6 +343,11 @@ export class WriteGate
                         await this.CheckReferenced(index, op.Op, op.From, concept, options.BeforeSibling, targets.Before, WriteGate.ErrInvisibleSibling);
                     }
                 }
+                // Last, so every visibility check (target, siblings) reports InvisibleNode first.
+                if (target !== undefined && !detach)
+                {
+                    await this.CheckAppendTo(index, op.Op, op.From, concept, op.To, target);
+                }
                 break;
             }
             case WriteOp.DeleteNode:
@@ -353,13 +359,22 @@ export class WriteGate
         }
     }
 
-    /** A node a Link/Unlink names besides its source must be created by the batch or visible (a recorded read). */
-    private async CheckReferenced(index: number, op: WriteOp, from: string, concept: string, publicId: string, created: CreatedNode | undefined, reason: string): Promise<void>
+    /**
+     * A node a Link/Unlink names besides its source must be created by the batch or visible (a recorded read);
+     * resolves with the visible snapshot node, undefined when the batch created it.
+     */
+    private async CheckReferenced(index: number, op: WriteOp, from: string, concept: string, publicId: string, created: CreatedNode | undefined, reason: string): Promise<ExistingNode | undefined>
     {
-        if (created === undefined && (await this.VisibleNode(publicId)) === undefined)
+        if (created !== undefined)
+        {
+            return undefined;
+        }
+        const node = await this.VisibleNode(publicId);
+        if (node === undefined)
         {
             throw this.Denied(AccessErrorCode.InvisibleNode, index, op, from, concept, reason + publicId);
         }
+        return node;
     }
 
     private CheckCreate(index: number, publicId: string, node: CreatedNode): void
@@ -392,17 +407,13 @@ export class WriteGate
         }
     }
 
-    /** The target of a Link/Unlink must satisfy its AppendTo rules (R129); a created target and a delete-implied unlink are exempt. */
-    private async CheckAppendTo(index: number, op: WriteOp, from: string, concept: string, to: string, created: CreatedNode | undefined, detach: boolean): Promise<void>
+    /** The (visible, snapshot) target of a Link/Unlink must satisfy its AppendTo rules (R129); the caller skips created targets and delete-implied unlinks. */
+    private async CheckAppendTo(index: number, op: WriteOp, from: string, concept: string, to: string, target: ExistingNode): Promise<void>
     {
-        if (created !== undefined || detach)
+        if (!(await this.Decide(target, RuleKind.AppendTo)))
         {
-            return;
-        }
-        const node = await this.VisibleNode(to);
-        if (node !== undefined && !(await this.Decide(node, RuleKind.AppendTo)))
-        {
-            throw this.Denied(AccessErrorCode.AppendToDenied, index, op, from, concept, WriteGate.ErrAppendTo + to);
+            const reason = this.Rules(target.Concept, RuleKind.AppendTo).length === 0 ? WriteGate.ErrDefault : WriteGate.ErrAppendTo + to;
+            throw this.Denied(AccessErrorCode.AppendToDenied, index, op, from, concept, reason);
         }
     }
 
@@ -412,7 +423,7 @@ export class WriteGate
         return targets.Source !== undefined && this.exempt.Defaults.has(index);
     }
 
-    /** A DetachUnlink op one of whose ends the batch deletes later: exempt from ReadOnly and Update (R92, F-a). */
+    /** A DetachUnlink op one of whose ends the batch deletes later: exempt from ReadOnly, Append and AppendTo (R92, F-a, R129). */
     private IsDetach(index: number, from: string, to: string): boolean
     {
         return this.exempt.Detaches.has(index) && ((this.lastDelete.get(from) ?? -1) > index || (this.lastDelete.get(to) ?? -1) > index);
@@ -443,7 +454,7 @@ export class WriteGate
         if (detach)
         {
             // Ruling F-a (R92): a delete-implied unlink is governed only by the Delete rule of the node the batch
-            // deletes, never by the source's ReadOnly or Update rules, whether the source is visible or hidden.
+            // deletes, never by the source's ReadOnly or Append rules or the target's AppendTo rule, whether the source is visible or hidden.
             return node.Concept;
         }
         this.CheckReadOnly(index, op, publicId, node.Concept, member, WriteStage.Update);
