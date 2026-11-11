@@ -483,6 +483,43 @@ class ThroughFx
                 await g.dispose();
             });
 
+            it('connector conflict is flagged', async () =>
+            {
+                const g = await ThroughFx.Ready(open);
+                const fx = ThroughFx.Install(g, ThroughFx.TwoModels);
+                fx.B.FailAt = FakeStep.Commit;
+                fx.B.Failure = new ConflictError('stale');
+                const e = await ThroughFx.Rejection(ThroughFx.Commit(g, t => ThroughFx.WriteBoth(t)));
+                assert.ok(ThroughFx.IsConnectorError(e, ThroughFx.B, ConnectorPhase.Commit));
+                assert.equal(e.IsConflict, true);
+                await g.dispose();
+            });
+
+            it('connector failure is not a conflict', async () =>
+            {
+                const g = await ThroughFx.Ready(open);
+                const fx = ThroughFx.Install(g, ThroughFx.TwoModels);
+                fx.B.FailAt = FakeStep.Commit;
+                const e = await ThroughFx.Rejection(ThroughFx.Commit(g, t => ThroughFx.WriteBoth(t)));
+                assert.ok(ThroughFx.IsConnectorError(e, ThroughFx.B, ConnectorPhase.Commit));
+                assert.equal(e.IsConflict, false);
+                await g.dispose();
+            });
+
+            it('conflict with failed revert is still a conflict', async () =>
+            {
+                const g = await ThroughFx.Ready(open);
+                const fx = ThroughFx.Install(g, ThroughFx.TwoModels);
+                fx.B.FailAt = FakeStep.Commit;
+                fx.B.Failure = new ConflictError('stale');
+                fx.A.FailAt = FakeStep.Revert;
+                const e = await ThroughFx.Rejection(ThroughFx.Commit(g, t => ThroughFx.WriteBoth(t)));
+                assert.ok(ThroughFx.IsConnectorError(e, ThroughFx.B, ConnectorPhase.Commit));
+                assert.ok(e.cause instanceof AggregateError);
+                assert.equal(e.IsConflict, true);
+                await g.dispose();
+            });
+
             it('engine conflict at prepare: no connector began', async () =>
             {
                 const g = await ThroughFx.Ready(open);

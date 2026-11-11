@@ -221,6 +221,14 @@ describe('write overlay: read-your-writes within one query', () =>
             (e: unknown) => e instanceof CypherWriteError && e.WriteCode === CypherWriteErrorCode.ConnectorFailed && e.cause instanceof ConnectorError);
     });
 
+    test('stale version maps to Cypher Conflict', async () =>
+    {
+        o.Connector.FailAt = FakeStep.Apply;
+        o.Connector.Failure = new ConflictError('stale');
+        await assert.rejects(W.Write(fx, "MATCH (n:Server {name: 'a'}) SET n.port = 1"),
+            (e: unknown) => e instanceof CypherWriteError && e.WriteCode === CypherWriteErrorCode.Conflict && e.cause instanceof ConnectorError && e.cause.IsConflict);
+    });
+
     test('merge does not duplicate edge', async () =>
     {
         const r = await W.Write(fx, "MATCH (a:Server {name: 'a'}), (b:Server {name: 'b'}) MERGE (a)-[:peer]->(b)");
