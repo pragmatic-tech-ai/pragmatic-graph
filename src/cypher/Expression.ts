@@ -380,6 +380,7 @@ export class IsNullExpression extends Expression
 
 export class InExpression extends Expression
 {
+    public static readonly NotAList = 'IN expects a list on its right side';
     private static readonly Label = 'in';
 
     /** `source`: a list-valued expression (a parameter) the operand is looked up in, instead of the literal `list`. */
@@ -410,7 +411,9 @@ export class InExpression extends Expression
         if (this.source !== undefined)
         {
             const items = this.source.Evaluate(ctx);
-            return new ScalarValue(items instanceof ListValue && items.Items.some((x) => x instanceof ScalarValue && ScalarSemantics.Equals(x.Value, v.Value)));
+            if (items instanceof NullValue) return NullValue.Instance;
+            if (!(items instanceof ListValue)) throw new CypherSemanticError(InExpression.NotAList);
+            return new ScalarValue(items.Items.some((x) => x instanceof ScalarValue && ScalarSemantics.Equals(x.Value, v.Value)));
         }
         const found = this.list.some((e) =>
         {

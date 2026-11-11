@@ -1,9 +1,9 @@
-import { And, Compare, CompareOp, IdIn, In, IsNull, Not, type Predicate } from '../predicate/Predicate.js';
+import { And, Compare, CompareOp, In, IsNull, Not, type Predicate } from '../predicate/Predicate.js';
 import { ComparisonOp } from './CypherEnums.js';
 import { ScalarValue, type CypherScalar, type CypherValue } from './CypherValue.js';
 import { Comparison, InExpression, IsNullExpression, Literal, Parameter, PropertyAccess, type Expression } from './Expression.js';
-import { IdSeekTerm } from './IdSeekTerm.js';
 import type { NodePattern } from './PatternPath.js';
+import { ListValue } from './StructuredValues.js';
 
 /**
  * The push-down hint of a freshly bound scan anchor (ruling R101, design ruling D4): a node-local engine Predicate that
@@ -43,11 +43,6 @@ export class FetchHint
 
     private static Term(conjunct: Expression, variable: string, parameters: ReadonlyMap<string, CypherValue>): Predicate | undefined
     {
-        const id = IdSeekTerm.TryParse(conjunct);
-        if (id !== undefined)
-        {
-            return id.Variable === variable ? FetchHint.IdTerm(id, parameters) : undefined;
-        }
         if (conjunct instanceof Comparison)
         {
             const op = FetchHint.Op(conjunct.Op);
@@ -81,6 +76,10 @@ export class FetchHint
             {
                 return undefined;
             }
+            if (conjunct.Source !== undefined)
+            {
+                return FetchHint.SourceTerm(member, conjunct.Source, parameters);
+            }
             const values: CypherScalar[] = [];
             for (const item of conjunct.List)
             {
@@ -100,17 +99,26 @@ export class FetchHint
         return undefined;
     }
 
-    /** IdIn of the ids an `elementId(v)` conjunct admits (ruling R121 F2); nothing when its operand cannot be evaluated. */
-    private static IdTerm(term: IdSeekTerm, parameters: ReadonlyMap<string, CypherValue>): Predicate | undefined
+    /**
+     * `member IN $param`: In over the parameter list's non-null scalar items (the others equal nothing). Nothing when the
+     * source is not a supplied list parameter, so the hint never narrows more than the filter does.
+     */
+    private static SourceTerm(member: string, source: Expression, parameters: ReadonlyMap<string, CypherValue>): Predicate | undefined
     {
-        try
-        {
-            return new IdIn(new Set(term.Ids(parameters)));
-        }
-        catch
+        const list = source instanceof Parameter ? parameters.get(source.Name) : undefined;
+        if (!(list instanceof ListValue))
         {
             return undefined;
         }
+        const values: CypherScalar[] = [];
+        for (const item of list.Items)
+        {
+            if (item instanceof ScalarValue)
+            {
+                values.push(item.Value);
+            }
+        }
+        return new In(member, values);
     }
 
     /** The property name when the expression is `variable.property`. */

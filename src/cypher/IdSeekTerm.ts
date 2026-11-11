@@ -2,7 +2,8 @@ import { Binding, EvalContext } from './Binding.js';
 import { ComparisonOp } from './CypherEnums.js';
 import { Comparison, FunctionCall, InExpression, ListLiteral, VariableRef, type Expression } from './Expression.js';
 import { FunctionRegistry } from './FunctionRegistry.js';
-import { ScalarValue, type CypherValue } from './CypherValue.js';
+import { CypherSemanticError } from './CypherError.js';
+import { NullValue, ScalarValue, type CypherValue } from './CypherValue.js';
 import { ListValue } from './StructuredValues.js';
 
 /**
@@ -29,6 +30,10 @@ export class IdSeekTerm
     public Ids(parameters: ReadonlyMap<string, CypherValue>): readonly string[]
     {
         const value = this.Operand.Evaluate(new EvalContext(new Binding(), parameters));
+        if (!this.Single && !(value instanceof ListValue) && !(value instanceof NullValue))
+        {
+            throw new CypherSemanticError(InExpression.NotAList);
+        }
         const candidates = this.Single ? [value] : value instanceof ListValue ? value.Items : [];
         const ids = new Set<string>();
         for (const c of candidates)

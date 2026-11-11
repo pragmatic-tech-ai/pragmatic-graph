@@ -106,27 +106,14 @@ export class FederatedSource extends CatalogSource implements IFetchScope
         for (const id of order)
         {
             probe?.Tick();
-            const node = await this.base.Node(id);
-            const stub = node !== undefined && !this.IsStub(node.Owner, node.Concept) ? undefined : node !== undefined ? { Concept: node.Concept, Owner: node.Owner } : await this.reads.StubIdentity(id);
-            const known = this.fetched.get(id);
-            if (node !== undefined && stub === undefined)
+            const located = await this.Locate(id, probe);
+            if (located.Node !== undefined)
             {
-                found.set(id, node);
+                found.set(id, located.Node);
             }
-            else if (stub !== undefined)
+            else if (located.Unresolved && !await this.reads.StoredNonStub(id))
             {
-                const resolved = await this.Resolve(id, stub.Concept, stub.Owner, probe);
-                if (resolved !== undefined)
-                {
-                    found.set(id, resolved);
-                }
-            }
-            else if (known !== undefined)
-            {
-                found.set(id, this.ToNode(known));
-            }
-            else
-            {
+                // An id no node answers for: only now may a connector be asked. An engine node, visible or not, owns its id (D2).
                 pending.push(id);
             }
         }
@@ -160,18 +147,28 @@ export class FederatedSource extends CatalogSource implements IFetchScope
     /** Node, with the probe a lookup it needs ticks (per page and per row). */
     private async NodeOf(publicId: string, probe: IReadProbe | undefined): Promise<CypherNode | undefined>
     {
+        return (await this.Locate(publicId, probe)).Node;
+    }
+
+    /**
+     * What is known of the id without asking a connector for it: an engine node, a stub resolved through its owner, or a
+     * row this query fetched. Unresolved: none of these answered (the id may be a hidden engine node or an unfetched row).
+     */
+    private async Locate(publicId: string, probe: IReadProbe | undefined): Promise<{ readonly Node?: CypherNode; readonly Unresolved: boolean }>
+    {
         const node = await this.base.Node(publicId);
         if (node !== undefined && !this.IsStub(node.Owner, node.Concept))
         {
-            return node;
+            return { Node: node, Unresolved: false };
         }
         const stub = node !== undefined ? { Concept: node.Concept, Owner: node.Owner } : await this.reads.StubIdentity(publicId);
         if (stub !== undefined)
         {
-            return this.Resolve(publicId, stub.Concept, stub.Owner, probe);
+            const resolved = await this.Resolve(publicId, stub.Concept, stub.Owner, probe);
+            return resolved === undefined ? { Unresolved: false } : { Node: resolved, Unresolved: false };
         }
         const known = this.fetched.get(publicId);
-        return known === undefined ? undefined : this.ToNode(known);
+        return known === undefined ? { Unresolved: true } : { Node: this.ToNode(known), Unresolved: false };
     }
 
     /** Outgoing, Incoming, or both with each (relationship, far node) pair once, as ReaderSource.Expand. */

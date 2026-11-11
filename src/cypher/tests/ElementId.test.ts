@@ -7,7 +7,9 @@ import { AccessDefault, AccessScope } from '../../access/AccessScope.js';
 import { Compare, CompareOp, type Predicate } from '../../predicate/Predicate.js';
 import type { CellValue } from '../../columns/CellValue.js';
 import type { ConnectorChange } from '../../connectors/ConnectorChangeSet.js';
-import type { IFetchedRow } from '../../connectors/FetchContract.js';
+import { PredicateKind } from '../../predicate/Predicate.js';
+import { NodeEvaluator } from '../../predicate/NodeEvaluator.js';
+import type { IFetchPage, IFetchRequest, IFetchedRow } from '../../connectors/FetchContract.js';
 import type { IConnectorTransaction } from '../../connectors/GraphConnector.js';
 import { FakeConnector } from '../../connectors/tests/FakeConnector.js';
 import { FakeExternalConnector } from '../../connectors/tests/FakeExternalConnector.js';
@@ -24,10 +26,23 @@ class TicketSystem extends FakeExternalConnector
     public readonly Log: string[] = [];
     public readonly Writes: FakeConnector;
 
+    /** True: scans apply the pushed node-local predicate, as a push-down connector would. */
+    public Honour = false;
+
     public constructor(name: string, rows: readonly IFetchedRow[])
     {
-        super(name, [rows]);
+        super(name, [rows], { KeyLookup: true, ReverseLookup: true, PushDown: new Set([PredicateKind.Compare, PredicateKind.In, PredicateKind.And]) });
         this.Writes = new FakeConnector(name, this.Log);
+    }
+
+    public override async Fetch(request: IFetchRequest): Promise<IFetchPage>
+    {
+        const page = await super.Fetch(request);
+        if (!this.Honour || request.Keys !== undefined || !request.Predicate.IsNodeLocal)
+        {
+            return page;
+        }
+        return { ...page, Rows: page.Rows.filter(r => NodeEvaluator.Matches(request.Predicate, r.Values, r.PublicId)) };
     }
 
     public override Begin(): Promise<IConnectorTransaction>
@@ -58,6 +73,10 @@ class IdFx
     public static readonly Scan = 'LabelScan(';
     public static readonly Hidden = 'c3';
     public static readonly Rename = "MATCH (c:Customer) WHERE elementId(c) IN $ids SET c.name = 'x' RETURN elementId(c)";
+    public static readonly HideEngine = AccessScope.Build({
+        Default: AccessDefault.Allow,
+        Rows: new Map<string, Predicate>([[IdFx.Customer, new Compare('name', CompareOp.Ne, 'engine')]]),
+    });
     public static readonly OpenOnly = AccessScope.Build({
         Default: AccessDefault.Allow,
         Rows: new Map<string, Predicate>([[IdFx.Customer, new Compare('name', CompareOp.Ne, 'locked')]]),
@@ -182,6 +201,38 @@ for (const kind of [StorageKind.Memory, StorageKind.Lmdb])
                 const result = await fx.Run(IdFx.Rename, IdFx.OpenOnly, ['c1', IdFx.Hidden]);
                 assert.deepEqual(IdFx.Col(result), ['c1']);
                 assert.deepEqual(fx.Connector.ChangedIds(), ['c1']);
+            }
+            finally
+            {
+                await fx.dispose();
+            }
+        });
+
+        it('by-id match never sends an engine id to a connector', async () =>
+        {
+            const fx = await IdFx.Open(kind);
+            try
+            {
+                const result = await fx.Run(IdFx.Rename, IdFx.HideEngine, ['e1', 'c1']);
+                assert.deepEqual(IdFx.Col(result), ['c1']);
+                assert.ok(fx.Connector.Requests.every(r => !(r.Keys ?? []).includes('e1')));
+            }
+            finally
+            {
+                await fx.dispose();
+            }
+        });
+
+        it('property IN a parameter list survives a pushed filter', async () =>
+        {
+            const fx = await IdFx.Open(kind);
+            try
+            {
+                fx.Connector.Honour = true;
+                const query = "MATCH (c:Customer) WHERE c.name IN $ids SET c.name = 'x' RETURN elementId(c)";
+                const result = await fx.Run(query, AccessScope.System, ['one', 'two']);
+                assert.deepEqual(IdFx.Col(result).sort(), ['c1', 'c2']);
+                assert.deepEqual(fx.Connector.ChangedIds(), ['c1', 'c2']);
             }
             finally
             {
