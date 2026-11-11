@@ -75,6 +75,22 @@ export class OverlaySource implements ICypherSource
         }
     }
 
+    /** The base's nodes as the query now sees them, then the created nodes with these ids that are the label. */
+    public async *NodesById(ids: readonly string[], label: string | undefined, probe?: IReadProbe): AsyncIterable<CypherNode>
+    {
+        for await (const node of this.base.NodesById(ids, label, probe))
+        {
+            const current = this.Current(node);
+            if (current !== undefined) yield current;
+        }
+        const wanted = new Set(ids);
+        for (const node of this.overlay.CreatedNodes())
+        {
+            probe?.Tick();
+            if (wanted.has(node.PublicId) && (label === undefined || this.base.IsA(node, label))) yield node;
+        }
+    }
+
     public async Node(publicId: string): Promise<CypherNode | undefined>
     {
         if (this.overlay.IsTouched(publicId)) return this.overlay.Touched(publicId);

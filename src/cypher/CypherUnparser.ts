@@ -307,6 +307,10 @@ export class CypherUnparser
 
     private InText(e: InExpression): string
     {
+        if (e.Source !== undefined)
+        {
+            return `${this.Expr(e.Operand, Prec.Additive)} ${CypherUnparser.KwIn} ${this.Expr(e.Source, Prec.Additive)}`;
+        }
         const items = e.List.map((i) =>
         {
             if (!(i instanceof Literal) || i.Value === null) throw new CypherSemanticError(CypherUnparser.UnsupportedInItem);

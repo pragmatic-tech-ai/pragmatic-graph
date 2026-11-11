@@ -44,6 +44,21 @@ export class ReaderSource extends CatalogSource
         }
     }
 
+    /** The engine's visible nodes with these ids that are the label, in the ids' order. */
+    public async *NodesById(ids: readonly string[], label: string | undefined, probe?: IReadProbe): AsyncIterable<CypherNode>
+    {
+        const name = label === undefined ? undefined : this.labels.Resolve(label);
+        for (const id of new Set(ids))
+        {
+            probe?.Tick();
+            const node = await this.Node(id);
+            if (node !== undefined && (name === undefined || this.catalog.IsA(node.Concept, name)))
+            {
+                yield node;
+            }
+        }
+    }
+
     public async Node(publicId: string): Promise<CypherNode | undefined>
     {
         const view = await this.reader.ReadNode(publicId);

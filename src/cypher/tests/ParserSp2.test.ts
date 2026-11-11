@@ -132,9 +132,9 @@ describe('cypher parser SP2 (expression edge cases)', () =>
         assert.equal(agg.Parts[0]!.Projection!.Items[0]!.Alias, 'x');
     });
 
-    test('IN with a non-literal right side is a clear syntax error', () =>
+    test('IN with a right side that is neither a list nor a parameter is a clear syntax error', () =>
     {
-        assert.throws(() => new CypherParser('RETURN 1 IN $xs AS x').Parse(), (e: unknown) => e instanceof CypherSyntaxError && /expected/i.test(e.message) && /line 1/.test(e.message));
+        assert.throws(() => new CypherParser('RETURN 1 IN xs AS x').Parse(), (e: unknown) => e instanceof CypherSyntaxError && /expected/i.test(e.message) && /line 1/.test(e.message));
     });
 
     test('a relationship variable on a variable-length pattern parses with its hop bounds', () =>

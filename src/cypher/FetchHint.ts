@@ -1,7 +1,8 @@
-import { And, Compare, CompareOp, In, IsNull, Not, type Predicate } from '../predicate/Predicate.js';
+import { And, Compare, CompareOp, IdIn, In, IsNull, Not, type Predicate } from '../predicate/Predicate.js';
 import { ComparisonOp } from './CypherEnums.js';
 import { ScalarValue, type CypherScalar, type CypherValue } from './CypherValue.js';
 import { Comparison, InExpression, IsNullExpression, Literal, Parameter, PropertyAccess, type Expression } from './Expression.js';
+import { IdSeekTerm } from './IdSeekTerm.js';
 import type { NodePattern } from './PatternPath.js';
 
 /**
@@ -42,6 +43,11 @@ export class FetchHint
 
     private static Term(conjunct: Expression, variable: string, parameters: ReadonlyMap<string, CypherValue>): Predicate | undefined
     {
+        const id = IdSeekTerm.TryParse(conjunct);
+        if (id !== undefined)
+        {
+            return id.Variable === variable ? FetchHint.IdTerm(id, parameters) : undefined;
+        }
         if (conjunct instanceof Comparison)
         {
             const op = FetchHint.Op(conjunct.Op);
@@ -92,6 +98,19 @@ export class FetchHint
             return new In(member, values);
         }
         return undefined;
+    }
+
+    /** IdIn of the ids an `elementId(v)` conjunct admits (ruling R121 F2); nothing when its operand cannot be evaluated. */
+    private static IdTerm(term: IdSeekTerm, parameters: ReadonlyMap<string, CypherValue>): Predicate | undefined
+    {
+        try
+        {
+            return new IdIn(new Set(term.Ids(parameters)));
+        }
+        catch
+        {
+            return undefined;
+        }
     }
 
     /** The property name when the expression is `variable.property`. */

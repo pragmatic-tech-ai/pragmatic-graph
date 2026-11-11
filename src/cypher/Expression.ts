@@ -382,7 +382,8 @@ export class InExpression extends Expression
 {
     private static readonly Label = 'in';
 
-    constructor(private readonly operand: Expression, private readonly list: readonly Expression[])
+    /** `source`: a list-valued expression (a parameter) the operand is looked up in, instead of the literal `list`. */
+    constructor(private readonly operand: Expression, private readonly list: readonly Expression[], private readonly source?: Expression)
     {
         super();
     }
@@ -397,10 +398,20 @@ export class InExpression extends Expression
         return this.list;
     }
 
+    public get Source(): Expression | undefined
+    {
+        return this.source;
+    }
+
     public Evaluate(ctx: EvalContext): CypherValue
     {
         const v = this.operand.Evaluate(ctx);
         if (!(v instanceof ScalarValue)) return new ScalarValue(false);
+        if (this.source !== undefined)
+        {
+            const items = this.source.Evaluate(ctx);
+            return new ScalarValue(items instanceof ListValue && items.Items.some((x) => x instanceof ScalarValue && ScalarSemantics.Equals(x.Value, v.Value)));
+        }
         const found = this.list.some((e) =>
         {
             const x = e.Evaluate(ctx);
@@ -411,12 +422,12 @@ export class InExpression extends Expression
 
     public StructuralKey(): string
     {
-        return `in:(${this.operand.StructuralKey()},[${this.list.map((e) => e.StructuralKey()).join(',')}])`;
+        return `in:(${this.operand.StructuralKey()},[${this.list.map((e) => e.StructuralKey()).join(',')}]${this.source === undefined ? '' : `,${this.source.StructuralKey()}`})`;
     }
 
     public Rewrite(replacer: (e: Expression) => Expression | undefined): Expression
     {
-        return replacer(this) ?? new InExpression(this.operand.Rewrite(replacer), this.list.map((e) => e.Rewrite(replacer)));
+        return replacer(this) ?? new InExpression(this.operand.Rewrite(replacer), this.list.map((e) => e.Rewrite(replacer)), this.source?.Rewrite(replacer));
     }
 
     public DefaultName(): string
@@ -428,11 +439,12 @@ export class InExpression extends Expression
     {
         this.operand.CollectVariables(into);
         for (const e of this.list) e.CollectVariables(into);
+        this.source?.CollectVariables(into);
     }
 
     public override ContainsAggregate(): boolean
     {
-        return this.operand.ContainsAggregate() || this.list.some((e) => e.ContainsAggregate());
+        return this.operand.ContainsAggregate() || this.list.some((e) => e.ContainsAggregate()) || (this.source?.ContainsAggregate() ?? false);
     }
 }
 

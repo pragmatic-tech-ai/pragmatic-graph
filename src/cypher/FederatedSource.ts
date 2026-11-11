@@ -91,6 +91,67 @@ export class FederatedSource extends CatalogSource implements IFetchScope
         }
     }
 
+    /**
+     * Per id, in the ids' order: an engine node, a stub resolved through its owner, or a row this query already fetched;
+     * the ids left over are looked up in one go (FetchSession.LookupMany: one keyed request per External target of the
+     * label) and admitted under the scope, so an id the scope hides yields nothing, as in a label scan. Without a label
+     * nothing is fetched. Nodes that are not the label are dropped.
+     */
+    public async *NodesById(ids: readonly string[], label: string | undefined, probe?: IReadProbe): AsyncIterable<CypherNode>
+    {
+        const name = label === undefined ? undefined : this.labels.Resolve(label);
+        const order = [...new Set(ids)];
+        const found = new Map<string, CypherNode>();
+        const pending: string[] = [];
+        for (const id of order)
+        {
+            probe?.Tick();
+            const node = await this.base.Node(id);
+            const stub = node !== undefined && !this.IsStub(node.Owner, node.Concept) ? undefined : node !== undefined ? { Concept: node.Concept, Owner: node.Owner } : await this.reads.StubIdentity(id);
+            const known = this.fetched.get(id);
+            if (node !== undefined && stub === undefined)
+            {
+                found.set(id, node);
+            }
+            else if (stub !== undefined)
+            {
+                const resolved = await this.Resolve(id, stub.Concept, stub.Owner, probe);
+                if (resolved !== undefined)
+                {
+                    found.set(id, resolved);
+                }
+            }
+            else if (known !== undefined)
+            {
+                found.set(id, this.ToNode(known));
+            }
+            else
+            {
+                pending.push(id);
+            }
+        }
+        if (name !== undefined && pending.length > 0)
+        {
+            const entries = await this.session.LookupMany(pending, this.FetchTargets(name), probe, this);
+            for (const [id, entry] of entries)
+            {
+                const admitted = await this.Admit(entry.Row, entry.Model);
+                if (admitted !== undefined)
+                {
+                    found.set(id, admitted);
+                }
+            }
+        }
+        for (const id of order)
+        {
+            const node = found.get(id);
+            if (node !== undefined && (name === undefined || this.catalog.IsA(node.Concept, name)))
+            {
+                yield node;
+            }
+        }
+    }
+
     public Node(publicId: string): Promise<CypherNode | undefined>
     {
         return this.NodeOf(publicId, undefined);
