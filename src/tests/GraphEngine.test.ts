@@ -27,6 +27,7 @@ import {
     type IConnectorTransaction,
     type ICreateNodeOptions,
     type IDefinitionDescription,
+    type IEndpointMembers,
     type IEngineStorage,
     type IGraphConnector,
     type IGraphEngineOptions,
@@ -501,7 +502,7 @@ describe('Public export surface', () =>
     /** Compile-time: every public type of Tasks 1–11 is importable from the package root. */
     type PublicTypes = [
         IGraphEngineOptions, IEngineStorage, IUpgradeCommit, ICreateNodeOptions, IndexDef, IIndexRange, IIndexBound,
-        IAccessScopeOptions, IWriteRules, IGraphConnector, IConnectorTransaction, ConnectorChange,
+        IAccessScopeOptions, IWriteRules, IEndpointMembers, IGraphConnector, IConnectorTransaction, ConnectorChange,
         ISchemaDescription, IDefinitionDescription, IIndexDescription, ISeedNode, ISeedLink, IBindingDescription,
     ];
 

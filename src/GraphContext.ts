@@ -80,8 +80,11 @@ export class GraphContext
     public readonly ConnectorApplied = new Signal<IConnectorApplied>();
 
     private readonly open = new Set<IGraphDisposable>();
-    /** Per scope, the catalog version it was last validated against (ruling R63). */
-    private readonly validated = new WeakMap<AccessScope, number>();
+    /**
+     * Per scope, the catalog version and connector setup it was last validated against (ruling R63; the setup since
+     * Endpoints keys may not be externally held, R130).
+     */
+    private readonly validated = new WeakMap<AccessScope, { readonly Version: number; readonly Setup: ConnectorSetup | undefined }>();
 
     public constructor(public readonly Store: IKeyValueStore, public readonly Committer: Committer)
     {
@@ -159,15 +162,17 @@ export class GraphContext
         }
     }
 
-    /** Validates the scope's names against `index` once per (scope, catalog version); see ScopeValidator. */
+    /** Validates the scope's names against `index` once per (scope, catalog version, connector setup); see ScopeValidator. */
     public ValidateScope(scope: AccessScope, index: CatalogIndex): void
     {
-        if (this.validated.get(scope) === index.Catalog.Version)
+        const setup = this.Connectors;
+        const last = this.validated.get(scope);
+        if (last !== undefined && last.Version === index.Catalog.Version && last.Setup === setup)
         {
             return;
         }
-        ScopeValidator.Validate(scope, index);
-        this.validated.set(scope, index.Catalog.Version);
+        ScopeValidator.Validate(scope, index, setup);
+        this.validated.set(scope, { Version: index.Catalog.Version, Setup: setup });
     }
 
     public Track(reader: IGraphDisposable): void
