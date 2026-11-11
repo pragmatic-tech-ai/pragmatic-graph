@@ -10,11 +10,12 @@ import { CypherFixture } from '../../cypher/tests/CypherFixture.js';
 import { GraphError, GraphErrorCode } from '../../errors/GraphError.js';
 import { GraphEngine, type IEngineStorage, StorageKind } from '../../GraphEngine.js';
 import type { GraphTransaction } from '../../GraphTransaction.js';
-import { Compare, CompareOp, type Predicate } from '../../predicate/Predicate.js';
+import { And, Compare, CompareOp, IdIn, type Predicate } from '../../predicate/Predicate.js';
 import type { ISchemaDescription } from '../../schema/SchemaDescription.js';
 import { WriteOp } from '../../txn/WriteBatch.js';
 import type { ConnectorChange } from '../ConnectorChangeSet.js';
-import type { IFetchedRow, RowVersion } from '../FetchContract.js';
+import { ConnectorError, ConnectorPhase } from '../ConnectorError.js';
+import type { IConnectorCapabilities, IFetchedRow, RowVersion } from '../FetchContract.js';
 import type { IConnectorTransaction } from '../GraphConnector.js';
 import { FakeConnector, FakeStep } from './FakeConnector.js';
 import { FakeExternalConnector } from './FakeExternalConnector.js';
@@ -26,9 +27,9 @@ class CrmSystem extends FakeExternalConnector
     public readonly Log: string[] = [];
     public readonly Writes: FakeConnector;
 
-    public constructor(name: string, rows: readonly IFetchedRow[])
+    public constructor(name: string, rows: readonly IFetchedRow[], capabilities: IConnectorCapabilities)
     {
-        super(name, [rows]);
+        super(name, [rows], capabilities);
         this.Writes = new FakeConnector(name, this.Log);
     }
 
@@ -79,6 +80,8 @@ class FetchFx
     public static readonly C5 = 'c5';
     public static readonly E1 = 'e1';
     public static readonly E2 = 'e2';
+    public static readonly Bad = 'bad-row-id';
+    public static readonly Nobody = 'nobody';
     public static readonly V7 = 'v7';
     public static readonly V8 = 'v8';
 
@@ -114,8 +117,9 @@ class FetchFx
         return version === undefined ? row : { ...row, Version: version };
     }
 
-    public static async Open(storage: IEngineStorage): Promise<FetchFx>
+    public static async Open(storage: IEngineStorage, keyLookup: boolean): Promise<FetchFx>
     {
+        const capabilities = { KeyLookup: keyLookup, ReverseLookup: true, PushDown: new Set<never>() };
         const connector = new CrmSystem(FetchFx.Ext, [
             FetchFx.Row(FetchFx.C1, FetchFx.Eu, FetchFx.V7),
             FetchFx.Row(FetchFx.C2, FetchFx.Us),
@@ -123,7 +127,8 @@ class FetchFx
             FetchFx.Row(FetchFx.C4, FetchFx.Eu),
             FetchFx.Row(FetchFx.C5, FetchFx.Eu),
             FetchFx.Row(FetchFx.E1, FetchFx.Eu, undefined, FetchFx.Remote),
-        ]);
+            { ...FetchFx.Row(FetchFx.Bad, FetchFx.Eu), Values: new Map<string, CellValue>([[FetchFx.Region, 5]]) },
+        ], capabilities);
         const engine = await GraphEngine.Open({ Description: FetchFx.Description(), Storage: storage, Connectors: [connector] });
         return new FetchFx(engine, connector);
     }
@@ -185,9 +190,9 @@ class TransactionFetchSuite
     {
         describe(`GraphTransaction.Fetch (${name})`, () =>
         {
-            const run = (work: (fx: FetchFx) => Promise<void>) => async () =>
+            const run = (work: (fx: FetchFx) => Promise<void>, keyLookup: boolean = true) => async () =>
             {
-                const fx = await FetchFx.Open(storage());
+                const fx = await FetchFx.Open(storage(), keyLookup);
                 try
                 {
                     await work(fx);
@@ -290,6 +295,38 @@ class TransactionFetchSuite
                 assert.equal(e1.Properties.get(FetchFx.Name), FetchFx.Local);
                 assert.equal(e1.Properties.has(FetchFx.Secret), false);
                 assert.equal(fx.Connector.Requests.length, 0);
+            }));
+
+            it('without KeyLookup the scope is pushed down and an Owner filters the candidates', run(async fx =>
+            {
+                const fetched = await fx.With(t => t.Fetch([{ ...FetchFx.Key(FetchFx.C1), Owner: FetchFx.Crm }, { ...FetchFx.Key(FetchFx.C3), Owner: FetchFx.Nobody }]));
+                assert.deepEqual([...fetched.keys()], [FetchFx.C1]);
+                assert.equal(fx.Connector.Requests.length, 1);
+                const request = fx.Connector.Requests[0]!;
+                assert.equal(request.Keys, undefined);
+                const [scoped, ids] = (request.Predicate as And).Terms;
+                assert.ok(scoped instanceof Compare && scoped.Member === FetchFx.Region && scoped.Value === FetchFx.Eu);
+                assert.ok(ids instanceof IdIn && [...ids.Ids].join() === FetchFx.C1);
+            }, false));
+
+            it('identical keys collapse and different keys for one id are refused', run(async fx =>
+            {
+                await fx.With(async t =>
+                {
+                    assert.equal((await t.Fetch([FetchFx.Key(FetchFx.C1), FetchFx.Key(FetchFx.C1)])).size, 1);
+                    assert.deepEqual(fx.Connector.Requests.map(r => r.Keys), [[FetchFx.C1]]);
+                    await assert.rejects(t.Fetch([FetchFx.C1, FetchFx.Key(FetchFx.C1)]), (e: unknown) => e instanceof GraphError && e.GraphCode === GraphErrorCode.InvalidArgument);
+                });
+            }));
+
+            it('an invalid fetched row fails the fetch without naming the id', run(async fx =>
+            {
+                const error = await fx.With(t => t.Fetch([FetchFx.Key(FetchFx.Bad)])).then(() => undefined, (e: unknown) => e);
+                assert.ok(error instanceof ConnectorError && error.Phase === ConnectorPhase.Fetch, String(error));
+                const cause = error.cause;
+                assert.ok(cause instanceof GraphError && cause.GraphCode === GraphErrorCode.SchemaViolation && cause.cause === undefined);
+                const text = error.message + cause.message;
+                assert.ok(!text.includes(FetchFx.Bad) && !text.includes(FetchFx.Customer) && !text.includes(FetchFx.Region), text);
             }));
 
             it('fetch after commit is disposed', run(async fx =>
