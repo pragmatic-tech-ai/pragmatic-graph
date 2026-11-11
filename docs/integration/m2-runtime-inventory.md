@@ -160,3 +160,16 @@ Final-review fixes: `DataSourceConnector(plan, adapter, identity)` and `Open(pla
 - Server replacements: `AppConnectorPlan`/`RuntimeAppGraph` -> `EnvironmentCatalogComposer`; `ShareStore`/`ShareGrantIndex`/`ShareWidening*` -> `todl.system.ShareGrant`
   nodes + `ShareGrantScope` (delete a record's grants in the same transaction); `AccessPolicySetting.Load` -> `IdentityEnforcement` -> `PolicyScopeCompiler.FromRules`;
   `ExternalIdentity.ReadOnly()` -> scope write predicate False, seeded nodes write predicate `Not(Seeded)`; `ExternalWriteError.Failures` kinds -> `AppWriteResultDto` statuses (T9).
+
+## After M2.3 (TODL 0.57.0, commit bde2ec11 on feat/m2.3-todl)
+- Step 0 guard: offline Plexus (`apps/plexus`, `plexus-core`, excluding `*.generated.ts`) has no TODL `Cypher.` use, so `src/cypher` went in full; it is no longer a server path.
+- Deleted from TODL: `src/cypher/**` and the root `export * as Cypher` (incl. `ICypherWriter`, `WriteOverlay`, `push-down.ts`, `GraphQueryAdapter`);
+  `graph-api/connector-runtime-graph-query.ts` (`ConnectorRuntimeGraphQuery`); `model-data/connector-prefetch.ts`, `connector-mirror-mapper.ts`,
+  `conjunctive-query-filter-provider.ts`; `IDescribeOptions.EmitExternalBindings` (`SnapshotDescriber` always emits every plan binding, R118). Tests of those went with them.
+- `connectors/connector-runtime.ts` (`ConnectorRuntime`) was never a TODL file: it was the server's, already gone with Task 14.
+- Kept, against the handoff list: `FederatedModelDataConnector` + `ConnectorWorkingCopy` (+ `IConnectorQueryFilterProvider`, `FlushOutcome`), because
+  TODL `codegen/model-package.ts` (`ModelPackageGenerator`) still emits `new FederatedModelDataConnector(plan, shard)` for connector-backed typed packages,
+  and todl-connectors-host's e2e tests use it. Retiring it needs a codegen decision first.
+- Remains: `GraphQuery`/`IGraphQuery` (`./graph-api`), `ModelDataSource`, typed read clients on `IModelDataConnector`, the `IDataSourceAdapter` family,
+  `DataSourceAdapterCatalog`, host adapters, `CypherWire` (cell codec + wire DTOs). Cypher runs only on the engine (`Cypher` from `@pragmatic-tech-ai/graph`).
+- Server follow-up found here: `environments/seed/compile.ts` (outside `src`) still ran TODL `Cypher` over `GraphQuery`; it now counts via `GraphQuery.AllInstances()`.
