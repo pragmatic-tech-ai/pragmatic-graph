@@ -38,6 +38,8 @@ class FetchGroup
 export class TransactionFetch implements IFetchScope
 {
     private static readonly Separator = '\u0000';
+    /** The connector a sanitized failure names when none is known: none. */
+    private static readonly NoConnector = '';
     private static readonly ErrCollision = 'Fetch was given two different keys for one public id';
     private static readonly ErrInvalidRow = 'A fetched row failed validation';
 
@@ -88,11 +90,12 @@ export class TransactionFetch implements IFetchScope
         {
             for (const group of groups.values())
             {
-                const first = group.Candidates[0]!.Connector;
-                const entries = await TransactionFetch.Guarded(first, () => session.LookupMany(group.Ids, group.Candidates, undefined, this));
+                // The session wraps every invalid row as a ConnectorError Fetch naming the connector that returned it.
+                const entries = await TransactionFetch.Guarded(TransactionFetch.NoConnector, () => session.LookupMany(group.Ids, group.Candidates, undefined, this));
                 for (const [publicId, entry] of entries)
                 {
-                    const connector = group.Candidates.find(t => t.Model === entry.Model)?.Connector ?? first;
+                    // The session keeps a row only from the connector its (model, concept) resolves to: the one that returned it.
+                    const connector = this.channel.Setup?.Bindings.Resolve(entry.Model, entry.Row.Concept, this.reader.Catalog) ?? TransactionFetch.NoConnector;
                     const view = await this.View(entry.Row, entry.Model, connector);
                     if (view !== undefined)
                     {
@@ -133,9 +136,10 @@ export class TransactionFetch implements IFetchScope
     }
 
     /**
-     * Runs a step that validates fetched rows from `connector`, replacing a schema-validation failure (a GraphError SchemaViolation, bare
+     * Runs a step that validates fetched rows, replacing a schema-validation failure (a GraphError SchemaViolation, bare
      * or as a ConnectorError Fetch's cause) by a ConnectorError Fetch that names neither the id nor the row. Every other
-     * failure passes unchanged.
+     * failure passes unchanged. The replacement names the wrapped error's connector, else `connector` (the one that
+     * returned the row, or NoConnector).
      */
     private static async Guarded<T>(connector: string, step: () => Promise<T>): Promise<T>
     {
