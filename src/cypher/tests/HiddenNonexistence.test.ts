@@ -15,7 +15,30 @@ class HiddenFx
     public static readonly Task = 'Task';
     public static readonly Salary = 'salary';
     public static readonly About = 'about';
-    public static readonly Links = 'links';
+    public static readonly Name = 'name';
+    public static readonly NationalId = 'nationalId';
+    public static readonly SalaryIndex = 'EmployeeSalary';
+    public static readonly NameA = 'a';
+    public static readonly NameB = 'b';
+    public static readonly NameC = 'c';
+    public static readonly NameD = 'd';
+    public static readonly E1 = 'e1';
+    public static readonly E2 = 'e2';
+    public static readonly E3 = 'e3';
+    public static readonly C1 = 'c1';
+    public static readonly P1 = 'p1';
+    public static readonly T3 = 't3';
+    public static readonly X = 'x';
+    public static readonly C = 'c';
+    public static readonly T = 't';
+    public static readonly P = 'p';
+
+    public static readonly AboveSixty = 'MATCH (n:Employee) WHERE n.salary > 60000 RETURN n.name AS x ORDER BY x';
+    public static readonly IncomingCount = 'MATCH (p:Project)<-[r]-(t) RETURN count(r) AS c';
+    public static readonly EitherCount = 'MATCH (p:Project)-[r]-(t) RETURN count(t) AS c';
+    public static readonly VarLength = 'MATCH (p:Project)<-[:about*1..2]-(x) RETURN x';
+    public static readonly AllTasks = 'MATCH (t:Task) RETURN t';
+    public static readonly TaskProjects = 'MATCH (t:Task)-[:about]->(p) RETURN p';
 
     public static readonly Queries: readonly string[] = [
         'MATCH (n:Employee) WHERE n.salary > 100000 RETURN n.name AS x ORDER BY x',
@@ -35,23 +58,27 @@ class HiddenFx
     {
         const F = CypherFixture;
         const X = HiddenFx;
-        const pay = (n: bigint): Record<string, bigint> => (withSalary ? { salary: n } : {});
         return F.Open(
             [
-                F.Concept(X.Employee, [F.Text('name'), F.Int(X.Salary), F.Text('nationalId')]),
+                F.Concept(X.Employee, [F.Text(X.Name), F.Int(X.Salary), F.Text(X.NationalId)]),
                 F.Concept(X.Contractor, [], X.Employee),
-                F.Concept(X.Project, [F.Text('name')]),
-                F.Concept(X.Task, [F.Text('name'), F.Rel(X.About, [X.Project])]),
+                F.Concept(X.Project, [F.Text(X.Name)]),
+                F.Concept(X.Task, [F.Text(X.Name), F.Rel(X.About, [X.Project])]),
             ],
             [
-                F.Node('e1', X.Employee, { name: 'a', ...pay(200000n) }),
-                F.Node('e2', X.Employee, { name: 'b' }),
-                F.Node('e3', X.Employee, { name: 'c', ...pay(50000n) }),
-                F.Node('c1', X.Contractor, { name: 'd', ...pay(70000n) }),
-                F.Node('p1', X.Project),
-                F.Node('t3', X.Task, {}, [[X.About, 'p1']]),
+                F.Node(X.E1, X.Employee, { name: X.NameA, ...X.Pay(withSalary, 200000n) }),
+                F.Node(X.E2, X.Employee, { name: X.NameB }),
+                F.Node(X.E3, X.Employee, { name: X.NameC, ...X.Pay(withSalary, 50000n) }),
+                F.Node(X.C1, X.Contractor, { name: X.NameD, ...X.Pay(withSalary, 70000n) }),
+                F.Node(X.P1, X.Project),
+                F.Node(X.T3, X.Task, {}, [[X.About, X.P1]]),
             ],
-            [{ Name: 'EmployeeSalary', On: X.Employee, Members: [X.Salary] }]);
+            [{ Name: X.SalaryIndex, On: X.Employee, Members: [X.Salary] }]);
+    }
+
+    private static Pay(withSalary: boolean, amount: bigint): Record<string, bigint>
+    {
+        return withSalary ? { [HiddenFx.Salary]: amount } : {};
     }
 
     public static Hiding(exact: boolean): AccessScope
@@ -93,21 +120,22 @@ describe('hidden members and records read as absent in Cypher', () =>
 
     test('HiddenExact hides on the exact concept only', async () =>
     {
-        const q = 'MATCH (n:Employee) WHERE n.salary > 60000 RETURN n.name AS x ORDER BY x';
-        assert.deepEqual(await a.Column(q, 'x', HiddenFx.Hiding(true)), ['a']);
-        assert.deepEqual(await a.Column(q, 'x'), ['a', 'd']);
+        const X = HiddenFx;
+        assert.deepEqual(await a.Column(X.AboveSixty, X.X, X.Hiding(true)), [X.NameA]);
+        assert.deepEqual(await a.Column(X.AboveSixty, X.X), [X.NameA, X.NameD]);
     });
 
     test('an incoming edge from an invisible source is neither walked nor counted', async () =>
     {
-        const noTasks = HiddenFx.Without(HiddenFx.Task);
-        assert.deepEqual(await a.Column('MATCH (p:Project)<-[r]-(t) RETURN count(r) AS c', 'c', noTasks), [0n]);
-        assert.deepEqual(await a.Column('MATCH (p:Project)-[r]-(t) RETURN count(t) AS c', 'c', noTasks), [0n]);
-        assert.deepEqual(await a.Column('MATCH (p:Project)<-[:about*1..2]-(x) RETURN x', 'x', noTasks), []);
+        const X = HiddenFx;
+        const noTasks = X.Without(X.Task);
+        assert.deepEqual(await a.Column(X.IncomingCount, X.C, noTasks), [0n]);
+        assert.deepEqual(await a.Column(X.EitherCount, X.C, noTasks), [0n]);
+        assert.deepEqual(await a.Column(X.VarLength, X.X, noTasks), []);
 
-        const noProjects = HiddenFx.Without(HiddenFx.Project);
-        assert.deepEqual(await a.Column('MATCH (t:Task) RETURN t', 't', noProjects), ['t3']);
-        assert.deepEqual(await a.Read(source => source.OutLinks('t3'), noProjects), []);
-        assert.deepEqual(await a.Column('MATCH (t:Task)-[:about]->(p) RETURN p', 'p', noProjects), []);
+        const noProjects = X.Without(X.Project);
+        assert.deepEqual(await a.Column(X.AllTasks, X.T, noProjects), [X.T3]);
+        assert.deepEqual(await a.Read(source => source.OutLinks(X.T3), noProjects), []);
+        assert.deepEqual(await a.Column(X.TaskProjects, X.P, noProjects), []);
     });
 });
