@@ -1,6 +1,6 @@
 import { AccessError } from '../../access/AccessError.js';
-import type { MemberDef } from '../../catalog/CatalogTypes.js';
 import { WriteStage } from '../../access/WriteStage.js';
+import type { MemberDef } from '../../catalog/CatalogTypes.js';
 import type { CatalogSnapshot } from '../../catalog/CatalogSnapshot.js';
 import { MemberKind, ValueType } from '../../catalog/ValueType.js';
 import type { CellValue } from '../../columns/CellValue.js';

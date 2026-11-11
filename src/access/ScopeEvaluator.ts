@@ -62,7 +62,8 @@ export class ScopeEvaluator
     /** Node decisions one top-level decision may make; beyond it the rest is Unknown (fail closed, R66). */
     private static readonly MaxDecisions = 10_000;
     private static readonly NoHidden: ReadonlySet<string> = new Set();
-    private static readonly NoReadOnly: ReadonlySet<string> = new Set();
+    /** The one empty read-only set (no member is read-only). */
+    public static readonly NoReadOnly: ReadonlySet<string> = new Set();
     private static readonly NoLinks: readonly string[] = Object.freeze([]);
     private static readonly NoEndpoints: ReadonlyMap<string, IEndpointMembers> = new Map();
 

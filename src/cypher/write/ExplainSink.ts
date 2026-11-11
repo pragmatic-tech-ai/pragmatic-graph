@@ -1,3 +1,4 @@
+import { ScopeEvaluator } from '../../access/ScopeEvaluator.js';
 import { CypherError } from '../CypherError.js';
 import type { CypherNode } from '../CypherNode.js';
 import type { ICypherSource } from '../CypherSource.js';
@@ -13,8 +14,6 @@ export class ExplainSink implements ICypherSink
 {
     private static readonly NoWrites = 'an explained plan writes nothing';
 
-    private static readonly NoReadOnly: ReadonlySet<string> = new Set();
-
     public readonly View: OverlaySource;
 
     constructor(source: ICypherSource)
@@ -24,7 +23,7 @@ export class ExplainSink implements ICypherSink
 
     public ReadOnlyMembers(): ReadonlySet<string>
     {
-        return ExplainSink.NoReadOnly;
+        return ScopeEvaluator.NoReadOnly;
     }
 
     public CreateNode(): CypherNode

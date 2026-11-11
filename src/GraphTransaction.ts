@@ -2,6 +2,7 @@ import type { AccessScope } from './access/AccessScope.js';
 import { AccessError } from './access/AccessError.js';
 import { WriteExemptions } from './access/WriteExemptions.js';
 import type { FetchedNode } from './access/FetchedNode.js';
+import { ScopeEvaluator } from './access/ScopeEvaluator.js';
 import { WriteGate } from './access/WriteGate.js';
 import type { WriteStage } from './access/WriteStage.js';
 import type { CellValue } from './columns/CellValue.js';
@@ -43,8 +44,6 @@ import { type ICreateNodeOptions, type IDeleteNodeOptions, type LinkOptions, Wri
  */
 export class GraphTransaction extends GraphReader
 {
-    private static readonly NoReadOnly: ReadonlySet<string> = new Set();
-
     private static readonly ErrFinished = 'Transaction has already committed or been disposed';
     private static readonly ErrSchema = 'The schema changed after the transaction began: catalog version ';
     private static readonly ErrSchemaNow = ', now ';
@@ -103,7 +102,7 @@ export class GraphTransaction extends GraphReader
      */
     public ReadOnlyMembers(concept: string, stage: WriteStage): ReadonlySet<string>
     {
-        return this.Scope.WritesUnrestricted ? GraphTransaction.NoReadOnly : this.WriteEvaluator().ReadOnlyMembers(concept, stage);
+        return this.Scope.WritesUnrestricted ? ScopeEvaluator.NoReadOnly : this.WriteEvaluator().ReadOnlyMembers(concept, stage);
     }
 
     public Link(from: string, relationship: string, to: string, options?: LinkOptions): void
