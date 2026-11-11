@@ -1,6 +1,8 @@
 import { after, before, describe, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { AccessDefault, AccessScope, CommitError, CommitErrorCode, EdgeError, EdgeErrorCode, IdIn, MemberKind, type MemberInput } from '../../index.js';
+import { ConnectorError, ConnectorPhase } from '../../index.js';
+import { CommitErrorRedactor } from '../../txn/CommitErrorRedactor.js';
 import { CypherWriteError, CypherWriteErrorCode } from '../CypherError.js';
 import { CypherFixture as F } from './CypherFixture.js';
 import { WriteFixture as W } from './WriteFixture.js';
@@ -14,6 +16,11 @@ class ScopedCommitFx
     public static readonly Project = 'Project';
     public static readonly Person = 'Person';
     public static readonly Code = 'code';
+    public static readonly Name = 'name';
+    public static readonly Manager = 'manager';
+    public static readonly NameA = 'a';
+    public static readonly NameB = 'b';
+    public static readonly NameHidden = 'h';
     public static readonly Shown = 'proj-shown';
     public static readonly Hidden = 'proj-hidden';
     public static readonly Fresh = 'proj-new';
@@ -23,19 +30,19 @@ class ScopedCommitFx
     public static readonly PersonHidden = 'person-hidden';
     public static readonly Redacted = 'Public id already exists';
     public static readonly Cardinality = 'the relationship allows one outgoing edge per node';
-    public static readonly Reassign = "MATCH (x:Person {name: 'a'}), (y:Person {name: 'b'}) SET x.manager = y";
+    public static readonly Reassign = `MATCH (x:Person {name: '${ScopedCommitFx.NameA}'}), (y:Person {name: '${ScopedCommitFx.NameB}'}) SET x.manager = y`;
 
     public static Open(): Promise<F>
     {
-        const manager: MemberInput = { Name: 'manager', Kind: MemberKind.Relationship, Targets: [ScopedCommitFx.Person], Many: false, Ordered: false };
+        const manager: MemberInput = { Name: ScopedCommitFx.Manager, Kind: MemberKind.Relationship, Targets: [ScopedCommitFx.Person], Many: false, Ordered: false };
         return F.Open(
-            [F.Concept(ScopedCommitFx.Project, [F.Text(ScopedCommitFx.Code), F.Text('name')]), F.Concept(ScopedCommitFx.Person, [F.Text('name'), manager])],
+            [F.Concept(ScopedCommitFx.Project, [F.Text(ScopedCommitFx.Code), F.Text(ScopedCommitFx.Name)]), F.Concept(ScopedCommitFx.Person, [F.Text(ScopedCommitFx.Name), manager])],
             [
                 F.Node(ScopedCommitFx.Shown, ScopedCommitFx.Project, { code: 'A' }),
                 F.Node(ScopedCommitFx.Hidden, ScopedCommitFx.Project, { code: ScopedCommitFx.HiddenValue }),
-                F.Node(ScopedCommitFx.PersonA, ScopedCommitFx.Person, { name: 'a' }, [['manager', ScopedCommitFx.PersonHidden]]),
-                F.Node(ScopedCommitFx.PersonB, ScopedCommitFx.Person, { name: 'b' }),
-                F.Node(ScopedCommitFx.PersonHidden, ScopedCommitFx.Person, { name: 'h' }),
+                F.Node(ScopedCommitFx.PersonA, ScopedCommitFx.Person, { name: ScopedCommitFx.NameA }, [[ScopedCommitFx.Manager, ScopedCommitFx.PersonHidden]]),
+                F.Node(ScopedCommitFx.PersonB, ScopedCommitFx.Person, { name: ScopedCommitFx.NameB }),
+                F.Node(ScopedCommitFx.PersonHidden, ScopedCommitFx.Person, { name: ScopedCommitFx.NameHidden }),
             ],
             [{ Name: 'ProjectCode', On: ScopedCommitFx.Project, Members: [ScopedCommitFx.Code], Unique: true }]);
     }
@@ -131,5 +138,21 @@ describe('commit errors under a read-restricting scope', () =>
         const error = await X.CommitFailure(fx, AccessScope.System, t => t.CreateNode(X.Hidden, X.Project));
         assert.ok(error instanceof CommitError);
         assert.ok(error.message.includes(X.Hidden), error.message);
+    });
+});
+
+describe('CommitErrorRedactor.RedactAny', () =>
+{
+    test('redacts a CommitError behind a ConnectorError and inside an AggregateError', () =>
+    {
+        const leaky = (): CommitError => new CommitError(CommitErrorCode.DuplicatePublicId, 'Public id already exists: proj-hidden');
+        const wrapped = CommitErrorRedactor.RedactAny(new ConnectorError('engine', ConnectorPhase.Finalize, leaky()));
+        assert.ok(wrapped instanceof ConnectorError);
+        assert.equal(wrapped.Phase, ConnectorPhase.Finalize);
+        assert.equal((wrapped.cause as CommitError).message, ScopedCommitFx.Redacted);
+        const reverted = CommitErrorRedactor.RedactAny(new ConnectorError('engine', ConnectorPhase.Finalize, new AggregateError([leaky(), new Error('x')], 'reverts')));
+        const members = ((reverted as ConnectorError).cause as AggregateError).errors;
+        assert.equal((members[0] as CommitError).message, ScopedCommitFx.Redacted);
+        assert.equal((members[1] as Error).message, 'x');
     });
 });

@@ -1,3 +1,4 @@
+import { ConnectorError } from '../connectors/ConnectorError.js';
 import { EdgeError, EdgeErrorCode } from '../edges/EdgeError.js';
 import { CommitError, CommitErrorCode } from './CommitError.js';
 
@@ -14,6 +15,29 @@ export class CommitErrorRedactor
     private static readonly CardinalityText = 'the relationship allows one outgoing edge per node';
     private static readonly DuplicateEdgeText = 'the edge already exists';
     private static readonly RuleText = 'the edge breaks a graph rule';
+
+    /**
+     * Redacts a commit failure of any shape: a CommitError, a ConnectorError whose cause is one (a failed Finalize,
+     * R71), or an AggregateError of them (a failed Revert). Other errors are returned unchanged.
+     */
+    public static RedactAny(error: unknown): unknown
+    {
+        if (error instanceof CommitError)
+        {
+            return CommitErrorRedactor.Redact(error);
+        }
+        if (error instanceof ConnectorError)
+        {
+            const cause = CommitErrorRedactor.RedactAny(error.cause);
+            return cause === error.cause ? error : new ConnectorError(error.Connector, error.Phase, cause);
+        }
+        if (error instanceof AggregateError)
+        {
+            const members = error.errors.map(member => CommitErrorRedactor.RedactAny(member));
+            return members.every((member, i) => member === error.errors[i]) ? error : new AggregateError(members, error.message);
+        }
+        return error;
+    }
 
     public static Redact(error: CommitError): CommitError
     {

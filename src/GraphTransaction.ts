@@ -11,7 +11,6 @@ import type { GraphContext, ReadSnapshot } from './GraphContext.js';
 import { GraphError, GraphErrorCode } from './errors/GraphError.js';
 import { FederatedReads } from './FederatedReads.js';
 import { GraphReader } from './GraphReader.js';
-import { CommitError } from './txn/CommitError.js';
 import { CommitErrorRedactor } from './txn/CommitErrorRedactor.js';
 import { ConflictError } from './txn/ConflictError.js';
 import type { ISnapshotHandle } from './txn/ConflictHistory.js';
@@ -173,8 +172,8 @@ export class GraphTransaction extends GraphReader
         }
         catch (error)
         {
-            // A conflict with a record the scope cannot read says only that something conflicts (security S2, R131).
-            throw error instanceof CommitError && !this.Scope.ReadsUnrestricted ? CommitErrorRedactor.Redact(error) : error;
+            // Under a read-restricting scope commit errors are reduced to "something conflicts" (security S2, R131).
+            throw this.Scope.ReadsUnrestricted ? error : CommitErrorRedactor.RedactAny(error);
         }
         finally
         {
