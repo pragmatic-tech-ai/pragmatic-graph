@@ -1,12 +1,13 @@
 import { CatalogError } from '../catalog/CatalogError.js';
 import type { MemberDef } from '../catalog/CatalogTypes.js';
 import { MemberKind } from '../catalog/ValueType.js';
+import type { ConnectorSetup } from '../connectors/WriteCoordinator.js';
 import { GraphError, GraphErrorCode } from '../errors/GraphError.js';
 import { EdgeDirection } from '../format/FormatKeys.js';
 import type { And, Compare, ConceptIs, In, IsNull, Not, Or, Predicate, Reachable, Related } from '../predicate/Predicate.js';
 import { PredicateKind } from '../predicate/Predicate.js';
 import type { CatalogIndex } from '../txn/CatalogIndex.js';
-import type { AccessScope } from './AccessScope.js';
+import type { AccessScope, IEndpointMembers } from './AccessScope.js';
 
 /**
  * Where a scope predicate is evaluated: on the scope entry's key (top level), or on the concepts a
@@ -27,7 +28,9 @@ class Place
  * members members of that key (R94); every ConceptIs name a concept (R93); every property a Rows or
  * Writes predicate reads an effective property of its key (Related Targets: of a concept the step
  * reaches), and every relationship a Related or Reachable step follows an effective relationship
- * (parity with index Where, R61). Violations are GraphError InvalidArgument naming the key and name.
+ * (parity with index Where, R61). Every Endpoints key is a concept (never an aspect) that no External connector may
+ * hold, its From and To distinct single-valued relationships of it, and two entries one node can match (one key an
+ * ancestor of the other) name the same members (R130). Violations are GraphError InvalidArgument naming the key and name.
  */
 export class ScopeValidator
 {
@@ -40,10 +43,16 @@ export class ScopeValidator
     private static readonly ErrReadOnlyExactKey = 'AccessScope Writes ReadOnlyExact key is not a concept: ';
     private static readonly ErrConceptIs = 'AccessScope predicate tests for a name that is not a concept: ';
     private static readonly ErrNoConcept = 'AccessScope predicate follows a relationship that reaches no concept: ';
+    private static readonly ErrEndpointKey = 'AccessScope Endpoints key is not a concept: ';
+    private static readonly ErrEndpointMember = 'AccessScope Endpoints member is not a single-valued relationship of its key: ';
+    private static readonly ErrEndpointSame = 'AccessScope Endpoints From and To name the same member: ';
+    private static readonly ErrEndpointExternal = 'AccessScope Endpoints key may be held by an External connector: ';
+    private static readonly ErrEndpointConflict = 'AccessScope Endpoints entries applying to one concept name different members: ';
     private static readonly Dot = '.';
     private static readonly Colon = ': ';
 
-    public static Validate(scope: AccessScope, index: CatalogIndex): void
+    /** `setup`: the installed connectors (none: no concept is externally held). */
+    public static Validate(scope: AccessScope, index: CatalogIndex, setup?: ConnectorSetup): void
     {
         const catalog = index.Catalog;
         for (const keys of [scope.Rows.keys(), scope.Hidden.keys(), scope.Writes.keys()])
@@ -79,11 +88,45 @@ export class ScopeValidator
                 ScopeValidator.RequireMembers(index, key, rules.ReadOnlyExact.Create ?? [], ScopeValidator.ErrUnknownReadOnly);
                 ScopeValidator.RequireMembers(index, key, rules.ReadOnlyExact.Update ?? [], ScopeValidator.ErrUnknownReadOnly);
             }
-            for (const predicate of [rules.Create, rules.Update, rules.Delete])
+            for (const predicate of [rules.Create, rules.Update, rules.Delete, rules.Append, rules.AppendTo])
             {
                 if (predicate !== undefined)
                 {
                     ScopeValidator.Walk(index, predicate, new Place(key, key, []));
+                }
+            }
+        }
+        ScopeValidator.ValidateEndpoints(scope.Endpoints, index, setup);
+    }
+
+    private static ValidateEndpoints(endpoints: ReadonlyMap<string, IEndpointMembers>, index: CatalogIndex, setup: ConnectorSetup | undefined): void
+    {
+        const catalog = index.Catalog;
+        for (const [key, members] of endpoints)
+        {
+            ScopeValidator.RequireConcept(index, key, ScopeValidator.ErrEndpointKey);
+            if (members.From === members.To)
+            {
+                throw new GraphError(GraphErrorCode.InvalidArgument, ScopeValidator.ErrEndpointSame + key + ScopeValidator.Dot + members.To);
+            }
+            for (const member of [members.From, members.To])
+            {
+                const def = ScopeValidator.MemberOf(index, key, member);
+                if (def?.Kind !== MemberKind.Relationship || def.Many)
+                {
+                    throw new GraphError(GraphErrorCode.InvalidArgument, ScopeValidator.ErrEndpointMember + key + ScopeValidator.Dot + member);
+                }
+            }
+            if (setup !== undefined && setup.Bindings.MayResolveExternal(key, catalog, setup.External))
+            {
+                throw new GraphError(GraphErrorCode.InvalidArgument, ScopeValidator.ErrEndpointExternal + key);
+            }
+            for (const [other, theirs] of endpoints)
+            {
+                if (other !== key && catalog.IsA(key, other) && (theirs.From !== members.From || theirs.To !== members.To))
+                {
+                    const member = theirs.From !== members.From ? members.From : members.To;
+                    throw new GraphError(GraphErrorCode.InvalidArgument, ScopeValidator.ErrEndpointConflict + key + ScopeValidator.Dot + member);
                 }
             }
         }

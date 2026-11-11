@@ -1,4 +1,5 @@
 import { ConnectorResidency, type IConnectorCapabilities, type IExternalConnector, type IFetchPage, type IFetchRequest, type IFetchedRow } from '../FetchContract.js';
+import type { ConnectorContext } from '../ConnectorContext.js';
 import type { IConnectorTransaction } from '../GraphConnector.js';
 
 /**
@@ -25,7 +26,7 @@ export class FakeExternalConnector implements IExternalConnector
     {
     }
 
-    public Begin(): Promise<IConnectorTransaction>
+    public Begin(_context: ConnectorContext): Promise<IConnectorTransaction>
     {
         return Promise.reject(new Error(FakeExternalConnector.ReadOnly));
     }

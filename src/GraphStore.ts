@@ -4,6 +4,7 @@ import type { CatalogSnapshot } from './catalog/CatalogSnapshot.js';
 import { CatalogStore } from './catalog/CatalogStore.js';
 import type { IConnectorApplied } from './connectors/ConnectorApplied.js';
 import { BindingTable } from './connectors/BindingTable.js';
+import { ConnectorContext } from './connectors/ConnectorContext.js';
 import type { ConnectorError } from './connectors/ConnectorError.js';
 import type { IGraphConnector } from './connectors/GraphConnector.js';
 import { ConnectorSetup } from './connectors/WriteCoordinator.js';
@@ -20,6 +21,13 @@ import { CommitLog } from './txn/CommitLog.js';
 import { Committer, type ICommitApplied, type IUpgradeCommit } from './txn/Committer.js';
 import type { ISchemaDescription } from './schema/SchemaDescription.js';
 import { type ISignal, SignalView } from './txn/Signal.js';
+
+/** Options of GraphStore.BeginRead and Begin. */
+export interface IBeginOptions
+{
+    /** On whose behalf the reader's or transaction's connector calls run (spec section 6); absent means ConnectorContext.Anonymous. */
+    readonly Connector?: ConnectorContext;
+}
 
 /**
  * The low-level store of the graph engine: one graph over one durable (LMDB) or in-memory store. Hosts
@@ -184,10 +192,10 @@ export class GraphStore
      * A read-only snapshot of the latest commit, read under `scope`. GraphError InvalidArgument when the
      * scope names a concept, aspect or hidden member the snapshot's catalog does not have (ruling R63).
      */
-    public async BeginRead(scope: AccessScope): Promise<GraphReader>
+    public async BeginRead(scope: AccessScope, options?: IBeginOptions): Promise<GraphReader>
     {
         this.RequireLive();
-        const reader = new GraphReader(this.context, this.Scoped(await this.context.OpenSnapshot(false), scope), scope);
+        const reader = new GraphReader(this.context, this.Scoped(await this.context.OpenSnapshot(false), scope), scope, options?.Connector ?? ConnectorContext.Anonymous);
         return this.Handed(reader);
     }
 
@@ -195,10 +203,10 @@ export class GraphStore
      * A read-write transaction over a snapshot of the latest commit, reading under `scope` (validated as
      * for BeginRead); Commit checks every write against the scope first (the write gate, ruling R68).
      */
-    public async Begin(scope: AccessScope): Promise<GraphTransaction>
+    public async Begin(scope: AccessScope, options?: IBeginOptions): Promise<GraphTransaction>
     {
         this.RequireLive();
-        const txn = new GraphTransaction(this.context, this.Scoped(await this.context.OpenSnapshot(true), scope), scope);
+        const txn = new GraphTransaction(this.context, this.Scoped(await this.context.OpenSnapshot(true), scope), scope, options?.Connector ?? ConnectorContext.Anonymous);
         return this.Handed(txn);
     }
 

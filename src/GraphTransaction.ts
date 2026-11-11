@@ -3,7 +3,9 @@ import { AccessError } from './access/AccessError.js';
 import { WriteExemptions } from './access/WriteExemptions.js';
 import type { FetchedNode } from './access/FetchedNode.js';
 import { WriteGate } from './access/WriteGate.js';
+import type { WriteStage } from './access/WriteStage.js';
 import type { CellValue } from './columns/CellValue.js';
+import type { ConnectorContext } from './connectors/ConnectorContext.js';
 import type { RowVersion } from './connectors/FetchContract.js';
 import { TransactionFetch } from './connectors/TransactionFetch.js';
 import { type INodeOrigin, type INodeOrigins, WriteCoordinator } from './connectors/WriteCoordinator.js';
@@ -11,6 +13,7 @@ import type { GraphContext, ReadSnapshot } from './GraphContext.js';
 import { GraphError, GraphErrorCode } from './errors/GraphError.js';
 import { FederatedReads } from './FederatedReads.js';
 import { GraphReader, type INodeView } from './GraphReader.js';
+import { CommitErrorRedactor } from './txn/CommitErrorRedactor.js';
 import { ConflictError } from './txn/ConflictError.js';
 import type { ISnapshotHandle } from './txn/ConflictHistory.js';
 import { ReadSet } from './txn/ReadSet.js';
@@ -69,6 +72,8 @@ export class GraphTransaction extends GraphReader
     private static readonly ErrFinished = 'Transaction has already committed or been disposed';
     private static readonly ErrSchema = 'The schema changed after the transaction began: catalog version ';
     private static readonly ErrSchemaNow = ', now ';
+    /** The empty read-only set (no member is read-only). */
+    private static readonly NoReadOnly: ReadonlySet<string> = new Set();
 
     private readonly batch = new WriteBatch();
     /** The batch ops SetDefault and DetachUnlink recorded. */
@@ -76,9 +81,9 @@ export class GraphTransaction extends GraphReader
     private committing = false;
 
     /** @internal Created by GraphStore.Begin. */
-    public constructor(context: GraphContext, snapshot: ReadSnapshot, scope: AccessScope)
+    public constructor(context: GraphContext, snapshot: ReadSnapshot, scope: AccessScope, connector: ConnectorContext)
     {
-        super(context, snapshot, scope, new ReadSet());
+        super(context, snapshot, scope, connector, new ReadSet());
     }
 
     public CreateNode(publicId: string, concept: string, options?: ICreateNodeOptions): void
@@ -115,6 +120,16 @@ export class GraphTransaction extends GraphReader
     {
         this.RequireActive();
         this.batch.DeleteNode(publicId, options);
+    }
+
+    /**
+     * The members the scope's write gate refuses to write on a node of `concept` at `stage` (ReadOnly for the stage
+     * plus ReadOnlyExact; ruling R92); empty when the scope's writes are unrestricted. Scope metadata only:
+     * nothing is read or recorded.
+     */
+    public ReadOnlyMembers(concept: string, stage: WriteStage): ReadonlySet<string>
+    {
+        return this.Scope.WritesUnrestricted ? GraphTransaction.NoReadOnly : this.WriteEvaluator().ReadOnlyMembers(concept, stage);
     }
 
     public Link(from: string, relationship: string, to: string, options?: LinkOptions): void
@@ -196,11 +211,16 @@ export class GraphTransaction extends GraphReader
                     const prepare = () => this.context.Committer.Prepare(routed.Engine, this.Reads, this.ValidationCommit(), began, setup.TimeoutMs, generation);
                     // An all-external write makes no engine commit (controller ruling P13): it answers like an empty batch.
                     const unchanged = routed.Engine.Count === 0 ? this.SnapshotCommit : undefined;
-                    return await new WriteCoordinator(setup, this.context.ConnectorRevertFailed, this.context.ConnectorApplied).Run(prepare, routed.Sets, unchanged);
+                    return await new WriteCoordinator(setup, this.context.ConnectorRevertFailed, this.context.ConnectorApplied, this.Connector).Run(prepare, routed.Sets, unchanged);
                 }
                 return await this.context.Committer.Submit(routed.Engine, this.Reads, this.ValidationCommit(), began, generation);
             }
             return await this.context.Committer.Submit(this.batch, this.Reads, this.ValidationCommit(), began, generation);
+        }
+        catch (error)
+        {
+            // Under a read-restricting scope commit errors are reduced to "something conflicts" (security S2, R131).
+            throw this.Scope.ReadsUnrestricted ? error : CommitErrorRedactor.RedactAny(error);
         }
         finally
         {

@@ -16,6 +16,13 @@ export interface IWriteRules
     readonly Update?: Predicate;
     readonly Delete?: Predicate;
     /**
+     * Link and Unlink: holds on the edge's SOURCE node (pre-batch values), instead of Update, which now governs
+     * SetProperty only (spec section 5, ruling R129). A node the batch created and a delete-implied unlink are exempt.
+     */
+    readonly Append?: Predicate;
+    /** Link and Unlink: holds on the edge's TARGET node (pre-batch values); the same exemptions as Append. */
+    readonly AppendTo?: Predicate;
+    /**
      * Members (properties and relationships) the writer may not set, remove, link or unlink on the instances,
      * per operation (AccessError MemberReadOnly, ruling R92). They stay readable. Values a host places as
      * defaults on a node the batch creates (GraphTransaction.SetDefault) are exempt.
@@ -38,6 +45,13 @@ export interface IReadOnlyMembers
     readonly Update?: ReadonlySet<string>;
 }
 
+/** The two relationship members of a reified edge concept (spec section 5, PR4). */
+export interface IEndpointMembers
+{
+    readonly From: string;
+    readonly To: string;
+}
+
 export interface IAccessScopeOptions
 {
     /** For nodes with no applicable Rows entry. */
@@ -54,6 +68,13 @@ export interface IAccessScopeOptions
     readonly HiddenExact?: ReadonlyMap<string, ReadonlySet<string>>;
     /** Key: a concept or aspect name. */
     readonly Writes?: ReadonlyMap<string, IWriteRules>;
+    /**
+     * Key: a reified edge concept (never an aspect); value: its single-valued From and To relationship members (spec
+     * section 5, ruling R130). An entry applies to nodes of the concept and of its subconcepts. Such a node is visible
+     * iff its own Rows/Default decision allows it and the nodes at From and To are visible; Link/Unlink of From needs
+     * the From node's Append rule, of To the To node's AppendTo rule; DeleteNode needs both, SetProperty the Append rule.
+     */
+    readonly Endpoints?: ReadonlyMap<string, IEndpointMembers>;
 }
 
 /**
@@ -76,26 +97,31 @@ export class AccessScope
     private static readonly NoRows: ReadonlyMap<string, Predicate> = new Map();
     private static readonly NoHidden: ReadonlyMap<string, ReadonlySet<string>> = new Map();
     private static readonly NoWrites: ReadonlyMap<string, IWriteRules> = new Map();
+    private static readonly NoEndpoints: ReadonlyMap<string, IEndpointMembers> = new Map();
 
     /** Everything visible, nothing hidden, every write allowed; reads under it do no evaluator work. */
-    public static readonly System: AccessScope = new AccessScope(AccessDefault.Allow, AccessScope.NoRows, AccessScope.NoHidden, AccessScope.NoHidden, AccessScope.NoWrites);
+    public static readonly System: AccessScope = new AccessScope(AccessDefault.Allow, AccessScope.NoRows, AccessScope.NoHidden, AccessScope.NoHidden, AccessScope.NoWrites,
+        AccessScope.NoEndpoints);
 
     public readonly Default: AccessDefault;
     public readonly Rows: ReadonlyMap<string, Predicate>;
     public readonly Hidden: ReadonlyMap<string, ReadonlySet<string>>;
     public readonly HiddenExact: ReadonlyMap<string, ReadonlySet<string>>;
     public readonly Writes: ReadonlyMap<string, IWriteRules>;
+    /** Per reified edge concept, its endpoint members (see IAccessScopeOptions.Endpoints). */
+    public readonly Endpoints: ReadonlyMap<string, IEndpointMembers>;
     /** Every member name some Hidden or HiddenExact entry hides, on any concept (see HiddenNames). */
     private readonly hiddenNames: FrozenNameSet;
 
     private constructor(fallback: AccessDefault, rows: ReadonlyMap<string, Predicate>, hidden: ReadonlyMap<string, ReadonlySet<string>>,
-        hiddenExact: ReadonlyMap<string, ReadonlySet<string>>, writes: ReadonlyMap<string, IWriteRules>)
+        hiddenExact: ReadonlyMap<string, ReadonlySet<string>>, writes: ReadonlyMap<string, IWriteRules>, endpoints: ReadonlyMap<string, IEndpointMembers>)
     {
         this.Default = fallback;
         this.Rows = rows;
         this.Hidden = hidden;
         this.HiddenExact = hiddenExact;
         this.Writes = writes;
+        this.Endpoints = endpoints;
         const names = new Set<string>();
         for (const map of [hidden, hiddenExact])
         {
@@ -146,7 +172,18 @@ export class AccessScope
             writes.set(name, Object.freeze(copy));
         }
         return new AccessScope(options.Default, new Map(options.Rows ?? AccessScope.NoRows), AccessScope.CopyMembers(options.Hidden),
-            AccessScope.CopyMembers(options.HiddenExact), writes);
+            AccessScope.CopyMembers(options.HiddenExact), writes, AccessScope.CopyEndpoints(options.Endpoints));
+    }
+
+    /** A copy of an Endpoints map, each entry a frozen { From, To }. */
+    private static CopyEndpoints(source: ReadonlyMap<string, IEndpointMembers> | undefined): ReadonlyMap<string, IEndpointMembers>
+    {
+        const out = new Map<string, IEndpointMembers>();
+        for (const [name, members] of source ?? AccessScope.NoEndpoints)
+        {
+            out.set(name, Object.freeze({ From: members.From, To: members.To }));
+        }
+        return out;
     }
 
     /** A copy of a Hidden or HiddenExact map, each member set copied. */
@@ -192,12 +229,13 @@ export class AccessScope
     }
 
     /**
-     * @internal True iff reads need no evaluation: Default Allow, no Rows, no Hidden and no HiddenExact entries
+     * @internal True iff reads need no evaluation: Default Allow, no Rows, Hidden, HiddenExact or Endpoints entries
      * (System, or any scope built that way). Readers then skip the evaluator entirely.
      */
     public get ReadsUnrestricted(): boolean
     {
-        return this.Default === AccessDefault.Allow && this.Rows.size === 0 && this.Hidden.size === 0 && this.HiddenExact.size === 0;
+        return this.Default === AccessDefault.Allow && this.Rows.size === 0 && this.Hidden.size === 0 && this.HiddenExact.size === 0
+            && this.Endpoints.size === 0;
     }
 
     /**

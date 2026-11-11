@@ -18,4 +18,6 @@ export interface ICypherSink
     /** False when the edge does not exist in the view. */
     DeleteRelationship(from: string, relationship: string, to: string): Promise<boolean>;
     DeleteNode(publicId: string, detach: boolean): Promise<void>;
+    /** The members the scope's write gate refuses on this node (its stage: created in this query, or existing); scope metadata, nothing is read. */
+    ReadOnlyMembers(publicId: string, concept: string): ReadonlySet<string>;
 }

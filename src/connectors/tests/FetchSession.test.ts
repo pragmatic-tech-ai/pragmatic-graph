@@ -23,6 +23,7 @@ import {
     type ISchemaDescription,
     type RowVersion,
 } from '../../index.js';
+import { ConnectorContext } from '../ConnectorContext.js';
 import { FetchSession } from '../FetchSession.js';
 import { FakeExternalConnector } from './FakeExternalConnector.js';
 
@@ -115,7 +116,7 @@ class SessionFx
     {
         const catalog = await SessionFx.Catalog();
         const table = new BindingTable(SessionFx.Description().Bindings ?? []);
-        return new FetchSession(new Map([[connector.Name, connector]]), table, catalog);
+        return new FetchSession(new Map([[connector.Name, connector]]), table, catalog, ConnectorContext.Anonymous);
     }
 
     public static async Drain(rows: AsyncIterable<IFetchedRow>): Promise<string[]>

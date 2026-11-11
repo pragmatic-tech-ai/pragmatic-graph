@@ -7,12 +7,15 @@ import { AccessDefault, AccessScope } from '../../access/AccessScope.js';
 import { Compare, CompareOp, type Predicate } from '../../predicate/Predicate.js';
 import type { CellValue } from '../../columns/CellValue.js';
 import type { ConnectorChange } from '../../connectors/ConnectorChangeSet.js';
+import { ConnectorContext } from '../../connectors/ConnectorContext.js';
+import { ConnectorError, ConnectorPhase } from '../../connectors/ConnectorError.js';
 import { PredicateKind } from '../../predicate/Predicate.js';
 import { NodeEvaluator } from '../../predicate/NodeEvaluator.js';
 import type { IFetchPage, IFetchRequest, IFetchedRow } from '../../connectors/FetchContract.js';
 import type { IConnectorTransaction } from '../../connectors/GraphConnector.js';
 import { FakeConnector } from '../../connectors/tests/FakeConnector.js';
 import { FakeExternalConnector } from '../../connectors/tests/FakeExternalConnector.js';
+import { GraphError, GraphErrorCode } from '../../errors/GraphError.js';
 import { GraphEngine, StorageKind } from '../../GraphEngine.js';
 import { CypherEngine } from '../CypherEngine.js';
 import { CypherError } from '../CypherError.js';
@@ -45,9 +48,9 @@ class TicketSystem extends FakeExternalConnector
         return { ...page, Rows: page.Rows.filter(r => NodeEvaluator.Matches(request.Predicate, r.Values, r.PublicId)) };
     }
 
-    public override Begin(): Promise<IConnectorTransaction>
+    public override Begin(context: ConnectorContext): Promise<IConnectorTransaction>
     {
-        return this.Writes.Begin();
+        return this.Writes.Begin(context);
     }
 
     public Changes(): readonly ConnectorChange[]
@@ -72,6 +75,18 @@ class IdFx
     public static readonly Seek = 'IdSeek(';
     public static readonly Scan = 'LabelScan(';
     public static readonly Hidden = 'c3';
+    public static readonly Invalid = 'bad';
+    public static readonly InvalidStub = 'bad-stub';
+    /** A connector row (named two) that the tests store as a stub. */
+    public static readonly ValidStub = 'c2';
+    public static readonly Model = 'crm';
+    public static readonly Friend = 'friend';
+    public static readonly Engine = 'e2';
+    /** A link target id over 400 UTF-8 bytes: invalid, and must not leak into the error. */
+    public static readonly LongTarget = 'z'.repeat(401);
+    public static readonly Caller = 'alice';
+    public static readonly SanitizedText = 'A fetched row failed validation';
+    public static readonly ReadNames = 'MATCH (c:Customer) WHERE elementId(c) IN $ids RETURN c.name';
     public static readonly Rename = "MATCH (c:Customer) WHERE elementId(c) IN $ids SET c.name = 'x' RETURN elementId(c)";
     public static readonly HideEngine = AccessScope.Build({
         Default: AccessDefault.Allow,
@@ -126,6 +141,35 @@ class IdFx
     public Run(text: string, scope: AccessScope = AccessScope.System, ids?: string[]): Promise<CypherResult>
     {
         return this.Cypher.Execute(scope, text, ids === undefined ? {} : { Parameters: new Map([[IdFx.Ids, ids]]) });
+    }
+
+    /** A Customer row that fails validation: a value for the relationship friend. */
+    public static InvalidRow(): IFetchedRow
+    {
+        return { PublicId: IdFx.Invalid, Concept: IdFx.Customer, Values: new Map<string, CellValue>([['friend', 'x']]), Links: new Map() };
+    }
+
+    /** A Customer row whose friend link targets an invalid (over-long) public id. */
+    public static InvalidStubRow(): IFetchedRow
+    {
+        return { PublicId: IdFx.InvalidStub, Concept: IdFx.Customer, Values: new Map(), Links: new Map([[IdFx.Friend, [IdFx.LongTarget]]]) };
+    }
+
+    /** Stores a stub of the external Customer `id` (e2 friend -> id, written under System). */
+    public async StoreStub(id: string): Promise<void>
+    {
+        const t = await this.Engine.Begin(AccessScope.System);
+        t.Link(IdFx.Engine, IdFx.Friend, id, { ExternalTarget: { Concept: IdFx.Customer, Owner: IdFx.Model } });
+        await t.Commit();
+    }
+
+    /** Asserts the error is the sanitized fetch failure (R121 F1, R133): no id, member or row text. */
+    public static AssertSanitized(error: unknown): void
+    {
+        assert.ok(error instanceof ConnectorError && error.Phase === ConnectorPhase.Fetch, String(error));
+        assert.ok(error.cause instanceof GraphError && error.cause.GraphCode === GraphErrorCode.SchemaViolation);
+        assert.equal(error.cause.message, IdFx.SanitizedText);
+        assert.equal(error.cause.cause, undefined);
     }
 
     public static Col(result: CypherResult): unknown[]
@@ -251,6 +295,31 @@ for (const kind of [StorageKind.Memory, StorageKind.Lmdb])
                 const nullLhs = await fx.Cypher.Execute(AccessScope.System, 'RETURN null IN $p AS r', { Parameters: new Map([['p', 5n]]) }).catch((e: unknown) => e);
                 assert.ok(nullLhs instanceof CypherError);
                 await assert.rejects(fx.Cypher.Execute(AccessScope.System, query, { Parameters: new Map([['p', 5n]]) }), CypherError);
+            }
+            finally
+            {
+                await fx.dispose();
+            }
+        });
+
+        it('by-id seek fetches with the caller context and fails without naming the row, stub or not (R133)', async () =>
+        {
+            const fx = await IdFx.Open(kind);
+            try
+            {
+                const context = ConnectorContext.For(IdFx.Caller);
+                const run = (ids: string[]) => fx.Cypher.Execute(IdFx.OpenOnly, IdFx.ReadNames, { Parameters: new Map([[IdFx.Ids, ids]]), Connector: context });
+                const before = fx.Connector.Requests.length;
+                assert.deepEqual(IdFx.Col(await run(['c1', IdFx.Hidden])), ['one']);
+                const requests = fx.Connector.Requests.slice(before);
+                assert.ok(requests.length > 0);
+                assert.ok(requests.every(r => r.Context === context));
+                await fx.StoreStub(IdFx.ValidStub);
+                assert.deepEqual(IdFx.Col(await run([IdFx.ValidStub])), ['two']);
+                await fx.StoreStub(IdFx.InvalidStub);
+                fx.Connector.Pages = [[...fx.Connector.Pages.flat(), IdFx.InvalidRow(), IdFx.InvalidStubRow()]];
+                IdFx.AssertSanitized(await run([IdFx.Invalid]).catch((e: unknown) => e));
+                IdFx.AssertSanitized(await run([IdFx.InvalidStub]).catch((e: unknown) => e));
             }
             finally
             {

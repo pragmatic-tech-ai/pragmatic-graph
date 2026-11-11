@@ -14,6 +14,7 @@ import { And, Compare, CompareOp, IdIn, type Predicate } from '../../predicate/P
 import type { ISchemaDescription } from '../../schema/SchemaDescription.js';
 import { WriteOp } from '../../txn/WriteBatch.js';
 import type { ConnectorChange } from '../ConnectorChangeSet.js';
+import type { ConnectorContext } from '../ConnectorContext.js';
 import { ConnectorError, ConnectorPhase } from '../ConnectorError.js';
 import type { IConnectorCapabilities, IFetchedRow, RowVersion } from '../FetchContract.js';
 import type { IConnectorTransaction } from '../GraphConnector.js';
@@ -33,9 +34,9 @@ class CrmSystem extends FakeExternalConnector
         this.Writes = new FakeConnector(name, this.Log);
     }
 
-    public override Begin(): Promise<IConnectorTransaction>
+    public override Begin(context: ConnectorContext): Promise<IConnectorTransaction>
     {
-        return this.Writes.Begin();
+        return this.Writes.Begin(context);
     }
 
     public get BeginCount(): number

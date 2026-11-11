@@ -8,6 +8,7 @@ import { AccessError, AccessErrorCode } from '../../access/AccessError.js';
 import { CatalogModel } from '../../catalog/CatalogModel.js';
 import { MemberKind } from '../../catalog/ValueType.js';
 import type { CellValue } from '../../columns/CellValue.js';
+import type { ConnectorContext } from '../ConnectorContext.js';
 import { CypherWriteError, CypherWriteErrorCode } from '../../cypher/CypherError.js';
 import { CypherEngine } from '../../cypher/CypherEngine.js';
 import type { CypherResult } from '../../cypher/CypherResult.js';
@@ -49,9 +50,9 @@ class TicketSystem extends FakeExternalConnector
         this.Writes = new FakeConnector(name, this.Log);
     }
 
-    public override Begin(): Promise<IConnectorTransaction>
+    public override Begin(context: ConnectorContext): Promise<IConnectorTransaction>
     {
-        return this.Writes.Begin();
+        return this.Writes.Begin(context);
     }
 
     /** Every change the connector was asked to apply, flattened. */

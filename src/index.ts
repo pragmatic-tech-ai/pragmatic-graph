@@ -5,12 +5,14 @@
 export { GraphEngine, StorageKind, type IEngineStorage, type IGraphEngineOptions } from './GraphEngine.js';
 
 // The low-level store underneath the facade.
-export { GraphStore } from './GraphStore.js';
+export { GraphStore, type IBeginOptions } from './GraphStore.js';
+export { ConnectorContext } from './connectors/ConnectorContext.js';
 export type { ILmdbOptions } from './kv/lmdb/LmdbStore.js';
 export { GraphReader, type ILinkView, type INodeView, type IReadProbe, type IScanRow } from './GraphReader.js';
 export type { IIndexBound, IIndexRange } from './indexes/IndexKey.js';
 export { GraphTransaction, type IFetchKey, type IFetchedView } from './GraphTransaction.js';
-export { AccessDefault, AccessScope, type IAccessScopeOptions, type IReadOnlyMembers, type IWriteRules } from './access/AccessScope.js';
+export { WriteStage } from './access/WriteStage.js';
+export { AccessDefault, AccessScope, type IAccessScopeOptions, type IEndpointMembers, type IReadOnlyMembers, type IWriteRules } from './access/AccessScope.js';
 
 // Schema definition.
 export { CatalogModel, type IConceptOptions, type IndexDef, type MemberDef, type MemberInput, type TypeDefinition } from './catalog/CatalogModel.js';

@@ -15,6 +15,10 @@ export enum AccessErrorCode
     InvisibleNode = 5,
     /** The write sets, removes, links or unlinks a member the scope marks read-only on the node's concept (ruling R92). */
     MemberReadOnly = 6,
+    /** A Link or Unlink whose source an applicable Append predicate does not hold on (pre-batch values; security S2). */
+    AppendDenied = 7,
+    /** A Link or Unlink whose target an applicable AppendTo predicate does not hold on (pre-batch values; security S2). */
+    AppendToDenied = 8,
 }
 
 /**

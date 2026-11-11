@@ -6,7 +6,7 @@ import { EdgeDirection } from '../format/FormatKeys.js';
 import { NodeEvaluator, Truth } from '../predicate/NodeEvaluator.js';
 import { And, type ConceptIs, type Not, type Or, type OwnerIs, Predicate, PredicateKind, type Reachable, type Related } from '../predicate/Predicate.js';
 import type { IReadNode, RecordedReads } from '../RecordedReads.js';
-import { AccessDefault, type AccessScope, type IReadOnlyMembers, type IWriteRules } from './AccessScope.js';
+import { AccessDefault, type AccessScope, type IEndpointMembers, type IReadOnlyMembers, type IWriteRules } from './AccessScope.js';
 import type { FetchedNode } from './FetchedNode.js';
 import type { HypotheticalNode } from './HypotheticalNode.js';
 import { WriteStage } from './WriteStage.js';
@@ -39,7 +39,9 @@ class Evaluation
  * Internal: decides, for one reader or transaction, which nodes its AccessScope lets it see and which
  * members it hides. Applicable entries for a node are those keyed by its concept, an ancestor or a
  * carried aspect (CatalogSnapshot.IsA); the node is visible iff every applicable Rows predicate is True
- * (Kleene logic, Unknown collapsed to not visible at the top), and Default decides when none applies.
+ * (Kleene logic, Unknown collapsed to not visible at the top), and Default decides when none applies. A node with an
+ * applicable Endpoints entry (a reified edge, ruling R130) is visible iff, besides that, the nodes at its From and To
+ * members are visible, each decided under the same Evaluation (Kleene And; an unset member hides nothing).
  *
  * Every read goes through the reader's RecordedReads (unscoped, recorded): visibility is a read and
  * lands in a transaction's ReadSet. Related is the Kleene Or, over the neighbors, of (neighbor visible
@@ -60,11 +62,15 @@ export class ScopeEvaluator
     /** Node decisions one top-level decision may make; beyond it the rest is Unknown (fail closed, R66). */
     private static readonly MaxDecisions = 10_000;
     private static readonly NoHidden: ReadonlySet<string> = new Set();
+    /** The one empty read-only set (no member is read-only). */
     private static readonly NoReadOnly: ReadonlySet<string> = new Set();
     private static readonly NoLinks: readonly string[] = Object.freeze([]);
+    private static readonly NoEndpoints: ReadonlyMap<string, IEndpointMembers> = new Map();
 
     private readonly rows = new Map<string, readonly Predicate[]>();
     private readonly writes = new Map<string, readonly IWriteRules[]>();
+    /** Per concept, its applicable Endpoints entry (null: none applies). */
+    private readonly endpoints = new Map<string, IEndpointMembers | null>();
     private readonly hidden = new Map<string, ReadonlySet<string>>();
     private readonly readOnlyCreate = new Map<string, ReadonlySet<string>>();
     private readonly readOnlyUpdate = new Map<string, ReadonlySet<string>>();
@@ -122,7 +128,9 @@ export class ScopeEvaluator
     /**
      * True iff the hypothetical node (built and checked by HypotheticalNode.Build) passes every applicable Rows
      * predicate (ruling R95); the scope's Default when none applies. Predicates needing stored identity or edges are
-     * Unknown on it, so they never admit, also under Not. Reads nothing and records nothing.
+     * Unknown on it, so they never admit, also under Not. It has no relationships yet, so an Endpoints entry (R130) is not
+     * applied to it: the WriteGate requires the batch that creates an edge node to link both its members, and a stored
+     * edge node with an unset member is invisible. Reads nothing and records nothing.
      */
     public Admits(node: HypotheticalNode): boolean
     {
@@ -230,6 +238,48 @@ export class ScopeEvaluator
     }
 
     /**
+     * The Endpoints entry applicable to `concept` (keyed by it or an ancestor; ScopeValidator guarantees every
+     * applicable entry names the same members), undefined when none applies, and for a name that is not a concept of
+     * the catalog (a batch op naming one is rejected by the committer).
+     */
+    public EndpointsOf(concept: string): IEndpointMembers | undefined
+    {
+        let out = this.endpoints.get(concept);
+        if (out === undefined)
+        {
+            out = null;
+            const catalog = this.reads.Catalog;
+            const known = this.scope.Endpoints.size > 0 && catalog.Has(concept) && !catalog.IsAspect(concept);
+            for (const [name, members] of known ? this.scope.Endpoints : ScopeEvaluator.NoEndpoints)
+            {
+                if (this.Applies(concept, name))
+                {
+                    out = members;
+                    break;
+                }
+            }
+            this.endpoints.set(concept, out);
+        }
+        return out ?? undefined;
+    }
+
+    /**
+     * The snapshot node at the single-valued relationship `member` of `node` (undefined when unset), visible or not.
+     * Records the adjacency read, so a later commit that relinks it conflicts.
+     */
+    public async EndpointNode(node: IReadNode, member: string): Promise<IReadNode | undefined>
+    {
+        for (const rel of this.reads.RelationshipsOrNone(node.Concept, member, EdgeDirection.Out))
+        {
+            for await (const id of this.reads.Adjacent(rel, node.Id, EdgeDirection.Out))
+            {
+                return this.reads.NodeById(id);
+            }
+        }
+        return undefined;
+    }
+
+    /**
      * Members hidden on nodes whose own concept is `concept`: the union of every applicable Hidden entry and the
      * HiddenExact entry keyed by `concept` itself (ruling R94). The single source every Hidden consumer reads.
      */
@@ -321,7 +371,8 @@ export class ScopeEvaluator
     private async Decide(node: IReadNode, evaluation: Evaluation): Promise<Truth>
     {
         const rows = this.ApplicableRows(node.Concept);
-        if (rows.length === 0)
+        const endpoints = this.EndpointsOf(node.Concept);
+        if (rows.length === 0 && (endpoints === undefined || this.scope.Default !== AccessDefault.Allow))
         {
             return this.scope.Default === AccessDefault.Allow ? Truth.True : Truth.False;
         }
@@ -362,6 +413,10 @@ export class ScopeEvaluator
                     result = Truth.Unknown;
                 }
             }
+            if (result !== Truth.False && endpoints !== undefined)
+            {
+                result = ScopeEvaluator.And(result, await this.EndpointsVisible(node, endpoints, evaluation));
+            }
         }
         finally
         {
@@ -376,6 +431,40 @@ export class ScopeEvaluator
         const visible = result === Truth.True;
         this.visible.set(node.Id, visible);
         return visible ? Truth.True : Truth.False;
+    }
+
+    /**
+     * The endpoint conjunct of a reified edge node (R130): the Kleene And of the visibility of the nodes at its From and
+     * To members, each decided under `evaluation` (cycle guard, memo, budget). An unset member is False: a stored
+     * half-edge (never created linked, or left by a delete of an endpoint) fails closed (spec PR4).
+     */
+    private async EndpointsVisible(node: IReadNode, endpoints: IEndpointMembers, evaluation: Evaluation): Promise<Truth>
+    {
+        let result = Truth.True;
+        for (const member of [endpoints.From, endpoints.To])
+        {
+            const end = await this.EndpointNode(node, member);
+            if (end === undefined)
+            {
+                return Truth.False;
+            }
+            result = ScopeEvaluator.And(result, await this.Decide(end, evaluation));
+            if (result === Truth.False)
+            {
+                return result;
+            }
+        }
+        return result;
+    }
+
+    /** Kleene And of two truths. */
+    private static And(a: Truth, b: Truth): Truth
+    {
+        if (a === Truth.False || b === Truth.False)
+        {
+            return Truth.False;
+        }
+        return a === Truth.Unknown || b === Truth.Unknown ? Truth.Unknown : Truth.True;
     }
 
     private async Eval(p: Predicate, facts: NodeFacts, evaluation: Evaluation): Promise<Truth>

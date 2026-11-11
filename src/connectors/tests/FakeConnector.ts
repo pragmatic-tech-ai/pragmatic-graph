@@ -1,4 +1,5 @@
 import type { ConnectorChangeSet } from '../ConnectorChangeSet.js';
+import type { ConnectorContext } from '../ConnectorContext.js';
 import type { IConnectorTransaction, IGraphConnector } from '../GraphConnector.js';
 
 /** The calls a FakeConnector can be told to fail or hang in. */
@@ -23,6 +24,8 @@ export class FakeConnector implements IGraphConnector
     private static readonly FailurePrefix = 'fake failure: ';
 
     public readonly Applied: ConnectorChangeSet[] = [];
+    /** The context of every Begin, in call order. */
+    public readonly Contexts: ConnectorContext[] = [];
     public FailAt: FakeStep | undefined;
     public HangAt: FakeStep | undefined;
     public OnCommit: (() => Promise<void>) | undefined;
@@ -45,8 +48,9 @@ export class FakeConnector implements IGraphConnector
         this.release();
     }
 
-    public async Begin(): Promise<IConnectorTransaction>
+    public async Begin(context: ConnectorContext): Promise<IConnectorTransaction>
     {
+        this.Contexts.push(context);
         await this.Step(FakeStep.Begin);
         return new FakeConnectorTransaction(this);
     }

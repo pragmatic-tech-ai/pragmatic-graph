@@ -6,6 +6,7 @@ import type { MemberDef } from './catalog/CatalogTypes.js';
 import { CatalogSnapshot } from './catalog/CatalogSnapshot.js';
 import { MemberKind } from './catalog/ValueType.js';
 import type { CellValue } from './columns/CellValue.js';
+import type { ConnectorContext } from './connectors/ConnectorContext.js';
 import type { IFetchedRow } from './connectors/FetchContract.js';
 import { GraphError, GraphErrorCode } from './errors/GraphError.js';
 import { EdgeDirection } from './format/FormatKeys.js';
@@ -59,8 +60,8 @@ export interface IReadProbe
  * Every reader carries an AccessScope (spec section 7). A node the scope does not let it see behaves
  * exactly as a missing node in every read; a member the scope hides (Hidden or HiddenExact) reads as
  * null in GetProperty and yields no rows in ScanConcept (and an index over a hidden member skips the
- * node in SeekIndex). The visibility reads are recorded like any other read. EstimateCount stays an
- * unscoped upper bound.
+ * node in SeekIndex). The visibility reads are recorded like any other read. EstimateCount is an
+ * unscoped upper bound and so refuses (InvalidArgument) under a scope that restricts any read.
  */
 export class GraphReader implements IGraphDisposable
 {
@@ -68,6 +69,7 @@ export class GraphReader implements IGraphDisposable
     private static readonly ErrNotProperty = 'Member is not a property: ';
     private static readonly ErrDirection = 'Unknown edge direction: ';
     private static readonly ErrUnknownIndex = 'Unknown index: ';
+    private static readonly ErrEstimateScoped = 'EstimateCount needs a scope that restricts no read';
     private static readonly Dot = '.';
     private static readonly Partition = 0;
     private static readonly NoHidden: ReadonlySet<string> = new Set();
@@ -82,11 +84,11 @@ export class GraphReader implements IGraphDisposable
     private disposed = false;
 
     /** @internal Created by GraphStore.BeginRead and GraphStore.Begin; `reads` only for a transaction. */
-    public constructor(protected readonly context: GraphContext, protected readonly snapshot: ReadSnapshot, private readonly scope: AccessScope, reads?: ReadSet)
+    public constructor(protected readonly context: GraphContext, protected readonly snapshot: ReadSnapshot, private readonly scope: AccessScope, private readonly connector: ConnectorContext, reads?: ReadSet)
     {
         this.recorded = new RecordedReads(context, snapshot, reads);
         this.evaluator = scope.ReadsUnrestricted ? undefined : new ScopeEvaluator(scope, this.recorded);
-        this.federated = new FederatedReads(this, this.recorded, this.evaluator, snapshot.Index);
+        this.federated = new FederatedReads(this, this.recorded, this.evaluator, snapshot.Index, connector);
         context.Track(this);
     }
 
@@ -100,6 +102,12 @@ export class GraphReader implements IGraphDisposable
     public get Catalog(): CatalogSnapshot
     {
         return this.snapshot.Index.Catalog;
+    }
+
+    /** The context every connector call of this reader (or transaction) runs under; Anonymous when the caller gave none. */
+    public get Connector(): ConnectorContext
+    {
+        return this.connector;
     }
 
     /** The access scope every read of this reader is enforced under. */
@@ -494,11 +502,16 @@ export class GraphReader implements IGraphDisposable
     /**
      * An upper bound of the live nodes matching `conceptOrAspect`: the sum of the matching concepts' slot
      * counts, which still include deleted slots. Unscoped (it counts invisible nodes too) and records
-     * nothing: the figure is advisory.
+     * nothing: the figure is advisory, so it is available only to scopes that restrict no read
+     * (GraphError InvalidArgument otherwise).
      */
     public async EstimateCount(conceptOrAspect: string): Promise<number>
     {
         this.RequireOpen();
+        if (!this.Scope.ReadsUnrestricted)
+        {
+            throw new GraphError(GraphErrorCode.InvalidArgument, GraphReader.ErrEstimateScoped);
+        }
         let total = 0;
         for (const typeId of this.snapshot.Index.Catalog.ConceptsMatching(conceptOrAspect))
         {

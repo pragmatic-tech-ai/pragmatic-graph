@@ -1,5 +1,6 @@
 import type { CatalogSnapshot } from '../catalog/CatalogSnapshot.js';
 import { MemberKind } from '../catalog/ValueType.js';
+import type { ConnectorContext } from './ConnectorContext.js';
 import { GraphError, GraphErrorCode } from '../errors/GraphError.js';
 import type { CatalogIndex } from '../txn/CatalogIndex.js';
 import type { PreparedCommit } from '../txn/PreparedCommit.js';
@@ -401,7 +402,7 @@ export class WriteCoordinator
     /** The connector call last started, for wrapping a non-connector error should one ever escape. */
     private current: { readonly Connector: string; readonly Phase: ConnectorPhase } = { Connector: BindingTable.EngineStorage, Phase: ConnectorPhase.Prepare };
 
-    public constructor(private readonly setup: ConnectorSetup, private readonly lateFailures: Signal<ConnectorError>, private readonly applied: Signal<IConnectorApplied>)
+    public constructor(private readonly setup: ConnectorSetup, private readonly lateFailures: Signal<ConnectorError>, private readonly applied: Signal<IConnectorApplied>, private readonly context: ConnectorContext)
     {
     }
 
@@ -613,7 +614,7 @@ export class WriteCoordinator
             const participants = [...sets.keys()].map(name => this.setup.Connectors.get(name)!);
             for (const connector of participants)
             {
-                const txn = await this.Call(connector, ConnectorPhase.Begin, undefined, () => connector.Begin());
+                const txn = await this.Call(connector, ConnectorPhase.Begin, undefined, () => connector.Begin(this.context));
                 this.began.push({ Connector: connector, Txn: txn });
             }
             for (const { Connector, Txn } of this.began)

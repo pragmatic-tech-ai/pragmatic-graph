@@ -1,4 +1,5 @@
 import { AccessError } from '../../access/AccessError.js';
+import { WriteStage } from '../../access/WriteStage.js';
 import type { MemberDef } from '../../catalog/CatalogTypes.js';
 import type { CatalogSnapshot } from '../../catalog/CatalogSnapshot.js';
 import { MemberKind, ValueType } from '../../catalog/ValueType.js';
@@ -368,6 +369,11 @@ export class TransactionSink implements ICypherSink
             throw error;
         }
         return cell;
+    }
+
+    public ReadOnlyMembers(publicId: string, concept: string): ReadonlySet<string>
+    {
+        return this.transaction.ReadOnlyMembers(concept, this.overlay.IsCreated(publicId) ? WriteStage.Create : WriteStage.Update);
     }
 
     /** A created node's properties as a reader under the transaction's scope would show them (null for unset). */
