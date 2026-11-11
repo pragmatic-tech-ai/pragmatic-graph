@@ -77,6 +77,8 @@ class IdFx
     public static readonly Hidden = 'c3';
     public static readonly Invalid = 'bad';
     public static readonly InvalidStub = 'bad-stub';
+    /** A connector row (named two) that the tests store as a stub. */
+    public static readonly ValidStub = 'c2';
     public static readonly Model = 'crm';
     public static readonly Friend = 'friend';
     public static readonly Engine = 'e2';
@@ -312,6 +314,8 @@ for (const kind of [StorageKind.Memory, StorageKind.Lmdb])
                 const requests = fx.Connector.Requests.slice(before);
                 assert.ok(requests.length > 0);
                 assert.ok(requests.every(r => r.Context === context));
+                await fx.StoreStub(IdFx.ValidStub);
+                assert.deepEqual(IdFx.Col(await run([IdFx.ValidStub])), ['two']);
                 await fx.StoreStub(IdFx.InvalidStub);
                 fx.Connector.Pages = [[...fx.Connector.Pages.flat(), IdFx.InvalidRow(), IdFx.InvalidStubRow()]];
                 IdFx.AssertSanitized(await run([IdFx.Invalid]).catch((e: unknown) => e));
