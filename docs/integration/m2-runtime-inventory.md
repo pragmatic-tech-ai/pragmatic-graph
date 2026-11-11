@@ -142,6 +142,8 @@ Notes for M2.3: `IDescribeOptions.EmitExternalBindings` defaults false (T14). `F
 Share-grant scopes must admit `GrantRows(subjects)` on `todl.system.ShareGrant` or `Widening` cannot see the principal's grants (R114).
 The engine requires an external node be fetched in the same transaction before it is written.
 Optimistic concurrency guards only the commit window (Q1); sources that assign their own keys cannot be created through the engine (Q3).
+Superseded: spec §11.2 (engine 0.3.0 / 0.4.0 plans) replaces Q1 (commit-window-only optimistic concurrency), Q3 (no source-assigned keys), the deferred-to-commit external writes and Q5 (NeverMatches) with read-time optimistic locking, immediate external writes that take source-assigned ids, and policy membership by member kind. The two lines above describe M2.2 as shipped, not the target design.
+Final-review fixes: `DataSourceConnector(plan, adapter, identity)` and `Open(plan, adapters, services, identity)` no longer take a description, and a plan binding the identity does not hold throws `EngineBridgeErrorCode.UnknownExternalBinding`. `Compose` rejects one concept bound twice differently in one package (`EnvironmentCatalogErrorCode.DuplicateBinding`) and an undescribable binding (`InvalidBinding`); both codes are appended, so M2.3's error mapping must know them.
 
 ### Retirement handoff to M2.3 (each item: the server importer must go first)
 - TODL `src/cypher/**` and root `export * as Cypher`: server importers are the cypher handler (parser, `ReferencedLabels`, `OverQuery`/`ToDto`, `Deadline`, errors),
