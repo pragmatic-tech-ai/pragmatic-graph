@@ -1,4 +1,5 @@
 import { GraphError, GraphErrorCode } from '../errors/GraphError.js';
+import { ConflictError } from '../txn/ConflictError.js';
 
 /** The step of a write-through that failed. */
 export enum ConnectorPhase
@@ -42,5 +43,19 @@ export class ConnectorError extends GraphError
     {
         super(GraphErrorCode.ConnectorFailed, ConnectorError.MessageStart + Connector + ConnectorError.MessageMiddle + Phase, cause);
         this.name = ConnectorError.ErrorName;
+    }
+
+    /**
+     * True when the connector reported a stale expected version: the cause is a ConflictError, or an
+     * AggregateError (the failure plus failed reverts) whose first error is one.
+     */
+    public get IsConflict(): boolean
+    {
+        const cause = this.cause;
+        if (cause instanceof AggregateError)
+        {
+            return cause.errors[0] instanceof ConflictError;
+        }
+        return cause instanceof ConflictError;
     }
 }

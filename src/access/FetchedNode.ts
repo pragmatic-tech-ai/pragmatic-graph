@@ -2,7 +2,7 @@ import type { CatalogSnapshot } from '../catalog/CatalogSnapshot.js';
 import type { MemberDef } from '../catalog/CatalogTypes.js';
 import { MemberKind } from '../catalog/ValueType.js';
 import type { CellValue } from '../columns/CellValue.js';
-import type { IFetchedRow } from '../connectors/FetchContract.js';
+import type { IFetchedRow, RowVersion } from '../connectors/FetchContract.js';
 import { GraphError, GraphErrorCode } from '../errors/GraphError.js';
 import type { IReadNode } from '../RecordedReads.js';
 import { BatchApplier } from '../txn/BatchApplier.js';
@@ -21,6 +21,7 @@ export class FetchedNode
     private static readonly ErrLink = 'Fetched row carries links for a member that is not a relationship: ';
     private static readonly ErrPublicId = 'Fetched row has an invalid public id';
     private static readonly ErrTargetId = 'Fetched row links to an invalid public id: ';
+    private static readonly ErrVersion = 'Fetched row has an invalid version';
     private static readonly Dot = '.';
 
     private stub: IReadNode | undefined;
@@ -37,7 +38,9 @@ export class FetchedNode
      * every Links key an effective relationship of it. Every failure is GraphError SchemaViolation (FetchSession wraps it
      * as ConnectorError Fetch). A null or undefined value reads as absent and is dropped; any other value must fit its
      * member as a write would (HypotheticalNode.Checked: an Int64 widens into a Float64 member when exact), else
-     * SchemaViolation naming `Concept.member`. Returns a new row (link lists copied); the caller's is never changed.
+     * SchemaViolation naming `Concept.member`. A Version (R119 V1) is copied: null or undefined reads as absent (the
+     * returned row has no Version key); a string, bigint or finite number is kept; anything else is SchemaViolation.
+     * Returns a new row (link lists copied); the caller's is never changed.
      */
     public static Validated(catalog: CatalogSnapshot, row: IFetchedRow): IFetchedRow
     {
@@ -77,7 +80,24 @@ export class FetchedNode
             }
             links.set(name, Object.freeze([...targets]));
         }
-        return { PublicId: row.PublicId, Concept: row.Concept, Values: values, Links: links };
+        const version = FetchedNode.CheckedVersion(row.Version);
+        return version === undefined
+            ? { PublicId: row.PublicId, Concept: row.Concept, Values: values, Links: links }
+            : { PublicId: row.PublicId, Concept: row.Concept, Values: values, Links: links, Version: version };
+    }
+
+    /** The row's version, undefined when absent (null or undefined); GraphError SchemaViolation when not a RowVersion. */
+    private static CheckedVersion(version: unknown): RowVersion | undefined
+    {
+        if (version === undefined || version === null)
+        {
+            return undefined;
+        }
+        if (typeof version === 'string' || typeof version === 'bigint' || (typeof version === 'number' && Number.isFinite(version)))
+        {
+            return version;
+        }
+        throw new GraphError(GraphErrorCode.SchemaViolation, FetchedNode.ErrVersion);
     }
 
     /** GraphError SchemaViolation (cause the CommitError InvalidPublicId) unless `publicId` is a valid public id. */

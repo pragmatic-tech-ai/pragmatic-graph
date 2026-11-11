@@ -177,7 +177,7 @@ export class GraphReader implements IGraphDisposable
         {
             return row;
         }
-        return { PublicId: row.PublicId, Concept: row.Concept, Values: GraphReader.Without(row.Values, hidden), Links: GraphReader.Without(row.Links, hidden) };
+        return { ...row, Values: GraphReader.Without(row.Values, hidden), Links: GraphReader.Without(row.Links, hidden) };
     }
 
     /**
@@ -242,19 +242,47 @@ export class GraphReader implements IGraphDisposable
     {
         this.RequireOpen();
         const node = await this.EngineNode(publicId);
-        if (node === undefined)
+        return node === undefined ? undefined : this.NodeView(node);
+    }
+
+    /**
+     * @internal ReadNode of a stored engine node (not a stub) the caller located unscoped (FederatedReads.StoredNode):
+     * undefined when the scope does not let the reader see it, else the view ReadNode returns, its reads recorded alike.
+     */
+    public async ReadLocated(node: IReadNode): Promise<INodeView | undefined>
+    {
+        this.RequireOpen();
+        if (this.evaluator !== undefined && !(await this.evaluator.IsVisible(node)))
         {
             return undefined;
         }
-        const hidden = this.evaluator?.HiddenMembers(node.Concept);
+        return this.NodeView(node);
+    }
+
+    /**
+     * @internal The one shape of a node's properties as a view reports them (ReadNode, GraphTransaction.Fetch): every
+     * effective property of `concept` the scope does not hide, in effective member order, with `value`'s value (null
+     * when unset).
+     */
+    public async ScopedProperties(concept: string, value: (def: MemberDef) => CellValue | undefined | Promise<CellValue | undefined>): Promise<ReadonlyMap<string, CellValue>>
+    {
+        this.RequireOpen();
+        const hidden = this.evaluator?.HiddenMembers(concept);
         const properties = new Map<string, CellValue>();
-        for (const def of this.snapshot.Index.Catalog.EffectiveMembers(node.Concept))
+        for (const def of this.snapshot.Index.Catalog.EffectiveMembers(concept))
         {
             if (def.Kind === MemberKind.Property && hidden?.has(def.Name) !== true)
             {
-                properties.set(def.Name, await this.recorded.Cell(node, def));
+                properties.set(def.Name, (await value(def)) ?? null);
             }
         }
+        return properties;
+    }
+
+    /** The view of a visible engine node: one Cell key recorded per returned property, as GetProperty does. */
+    private async NodeView(node: IReadNode): Promise<INodeView>
+    {
+        const properties = await this.ScopedProperties(node.Concept, def => this.recorded.Cell(node, def));
         return { PublicId: node.PublicId, Concept: node.Concept, Owner: await this.recorded.Owner(node), Properties: properties };
     }
 

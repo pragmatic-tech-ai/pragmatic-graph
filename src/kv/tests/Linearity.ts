@@ -9,6 +9,8 @@ export class Linearity
 {
     public static readonly Factor = 10;
     public static readonly MaxRatio = 25;
+    /** For disk-backed work: the 10n run is I/O-bound (commit flush, page cache) so concurrent test processes inflate it more than the n run; still far below the quadratic ~100. */
+    public static readonly DiskMaxRatio = 40;
     public static readonly CeilingMs = 20000;
     /** Small-run times below this are floored, so timer granularity cannot inflate the ratio. */
     public static readonly FloorMs = 5;
@@ -24,16 +26,16 @@ export class Linearity
      * Runs work(small) then work(small * Factor), each `repeats` times keeping the fastest (so a GC pause
      * or a busy machine in one run cannot fake superlinearity); `work` must tolerate repeating. Returns
      * both durations in ms after asserting the bounds. `ceilingMs` overrides the absolute ceiling for work
-     * whose measured per-op cost needs more (ruling R79).
+     * whose measured per-op cost needs more (ruling R79); `maxRatio` likewise overrides the ratio bound.
      */
-    public static async Check(label: string, small: number, work: (n: number) => Promise<void> | void, repeats = 1, ceilingMs = Linearity.CeilingMs): Promise<[number, number]>
+    public static async Check(label: string, small: number, work: (n: number) => Promise<void> | void, repeats = 1, ceilingMs = Linearity.CeilingMs, maxRatio = Linearity.MaxRatio): Promise<[number, number]>
     {
         const smallMs = await Linearity.Fastest(() => work(small), repeats);
         const largeMs = await Linearity.Fastest(() => work(small * Linearity.Factor), repeats);
         const ratio = largeMs / Math.max(smallMs, Linearity.FloorMs);
         const detail = label + ': ' + smallMs.toFixed(1) + Linearity.AtSmall + small + ', ' + largeMs.toFixed(1) + Linearity.AtLarge + Linearity.Factor + Linearity.RatioText + ratio.toFixed(1);
         console.log(Linearity.Prefix + detail);
-        assert.ok(ratio < Linearity.MaxRatio, Linearity.Superlinear + detail);
+        assert.ok(ratio < maxRatio, Linearity.Superlinear + detail);
         assert.ok(largeMs < ceilingMs, Linearity.TooSlow + detail + Linearity.Ms);
         return [smallMs, largeMs];
     }

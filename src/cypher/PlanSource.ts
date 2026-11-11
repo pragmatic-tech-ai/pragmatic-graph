@@ -45,6 +45,11 @@ export class PlanSource extends CatalogSource
         return PlanSource.Refuse();
     }
 
+    public NodesById(): AsyncIterable<CypherNode>
+    {
+        return PlanSource.Refuse();
+    }
+
     public OutLinks(): Promise<readonly ILinkView[]>
     {
         return Promise.reject(new CypherError(PlanSource.NoReads));

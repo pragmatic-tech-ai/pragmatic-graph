@@ -45,6 +45,13 @@ export interface ICypherSource
     ScanAll(probe?: IReadProbe): AsyncIterable<CypherNode>;
     /** The node, or undefined when no visible node has the public id. */
     Node(publicId: string): Promise<CypherNode | undefined>;
+    /**
+     * The visible nodes with these public ids that are the label (any node when undefined), in the ids' order, each once
+     * (ruling R121 F2). An id no visible node has is skipped, exactly as a label scan would not surface it. A federated
+     * source answers an id the engine does not store with one keyed fetch of the label's External targets; with no label
+     * it finds only engine nodes, stubs and rows already fetched in the query.
+     */
+    NodesById(ids: readonly string[], label: string | undefined, probe?: IReadProbe): AsyncIterable<CypherNode>;
     /** The node's edges in `direction`, of `relationship` or of every relationship when undefined. */
     Expand(publicId: string, relationship: string | undefined, direction: RelDirection, probe?: IReadProbe): AsyncIterable<IExpandRow>;
     /**

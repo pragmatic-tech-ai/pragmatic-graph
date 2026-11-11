@@ -10,7 +10,7 @@ export { ConnectorContext } from './connectors/ConnectorContext.js';
 export type { ILmdbOptions } from './kv/lmdb/LmdbStore.js';
 export { GraphReader, type ILinkView, type INodeView, type IReadProbe, type IScanRow } from './GraphReader.js';
 export type { IIndexBound, IIndexRange } from './indexes/IndexKey.js';
-export { GraphTransaction } from './GraphTransaction.js';
+export { GraphTransaction, type IFetchKey, type IFetchedView } from './GraphTransaction.js';
 export { WriteStage } from './access/WriteStage.js';
 export { AccessDefault, AccessScope, type IAccessScopeOptions, type IEndpointMembers, type IReadOnlyMembers, type IWriteRules } from './access/AccessScope.js';
 
@@ -42,7 +42,7 @@ export { FormatVersionMismatchError } from './format/FormatMeta.js';
 // Connectors: bindings and the write-through contract (spec §5, ruling R72).
 export type { IConnectorTransaction, IGraphConnector } from './connectors/GraphConnector.js';
 export { ConnectorChangeSet, type ConnectorChange } from './connectors/ConnectorChangeSet.js';
-export { ConnectorResidency, type IConnectorCapabilities, type IExternalConnector, type IFetchPage, type IFetchRequest, type IFetchTarget, type IFetchedRow } from './connectors/FetchContract.js';
+export { ConnectorResidency, type IConnectorCapabilities, type IExternalConnector, type IFetchPage, type IFetchRequest, type IFetchTarget, type IFetchedRow, type RowVersion } from './connectors/FetchContract.js';
 export { BindingTable } from './connectors/BindingTable.js';
 export { ConnectorError, ConnectorPhase } from './connectors/ConnectorError.js';
 export type { IConnectorApplied } from './connectors/ConnectorApplied.js';

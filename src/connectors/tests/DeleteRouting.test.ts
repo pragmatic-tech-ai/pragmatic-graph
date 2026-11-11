@@ -318,7 +318,7 @@ describe('WriteCoordinator.Route', () =>
         DeleteFx.Define(m);
         const batch = new WriteBatch();
         batch.SetOwner(DeleteFx.X, DeleteFx.Crm);
-        const origins: INodeOrigins = { Origin: async () => ({ Owner: DeleteFx.Crm, Concept: DeleteFx.Item }), Edges: async () => [] };
+        const origins: INodeOrigins = { Origin: async () => ({ Owner: DeleteFx.Crm, Concept: DeleteFx.Item }), Edges: async () => [], Version: () => undefined };
         const table = new BindingTable([{ Model: DeleteFx.Crm, Connector: DeleteFx.A }]);
         await assert.rejects(WriteCoordinator.Route(batch, table, new CatalogIndex(m.Seal()), origins), (e: unknown) => e instanceof GraphError && e.GraphCode === GraphErrorCode.Internal);
     });

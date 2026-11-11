@@ -8,7 +8,7 @@ import type { ConnectorSetup } from './connectors/WriteCoordinator.js';
 import { GraphError, GraphErrorCode } from './errors/GraphError.js';
 import { EdgeDirection } from './format/FormatKeys.js';
 import type { GraphReader, ILinkView, IReadProbe } from './GraphReader.js';
-import type { RecordedReads } from './RecordedReads.js';
+import type { IReadNode, RecordedReads } from './RecordedReads.js';
 import type { CatalogIndex } from './txn/CatalogIndex.js';
 
 /** A stub's identity: the concept and owner model it was created with (ruling R102). */
@@ -16,6 +16,13 @@ export interface IStubIdentity
 {
     readonly Concept: string;
     readonly Owner: string;
+}
+
+/** A stored node as StoredNode locates it: Stub is set when it is a stub, else it is an engine node (its data is engine data). */
+export interface IStoredNode
+{
+    readonly Node: IReadNode;
+    readonly Stub?: IStubIdentity;
 }
 
 /** One edge as a federated read sees it: Stub is set when the far node is a stub (FederatedReads.Links). */
@@ -118,6 +125,25 @@ export class FederatedReads
             return undefined;
         }
         return { Concept: node.Concept, Owner: await this.recorded.Owner(node) };
+    }
+
+    /**
+     * The stored node with this public id, decided by nothing, with its stub identity when it is a stub; undefined when no
+     * node is stored. One locate answers both StoredNonStub and StubIdentity, recording what they record.
+     */
+    public async StoredNode(publicId: string): Promise<IStoredNode | undefined>
+    {
+        this.RequireOpen();
+        const node = await this.recorded.Locate(publicId);
+        if (node === undefined)
+        {
+            return undefined;
+        }
+        if (!(await this.recorded.IsStub(node)))
+        {
+            return { Node: node };
+        }
+        return { Node: node, Stub: { Concept: node.Concept, Owner: await this.recorded.Owner(node) } };
     }
 
     /**

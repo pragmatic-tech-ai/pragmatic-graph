@@ -96,6 +96,7 @@ export abstract class CatalogSource implements ICypherSource
     public abstract ScanAll(probe?: IReadProbe): AsyncIterable<CypherNode>;
     public abstract Node(publicId: string): Promise<CypherNode | undefined>;
     public abstract Expand(publicId: string, relationship: string | undefined, direction: RelDirection, probe?: IReadProbe): AsyncIterable<IExpandRow>;
+    public abstract NodesById(ids: readonly string[], label: string | undefined, probe?: IReadProbe): AsyncIterable<CypherNode>;
     public abstract OutLinks(publicId: string): Promise<readonly ILinkView[]>;
     public abstract SeekEqual(label: string, member: string, value: CellValue, probe?: IReadProbe, hint?: Predicate): AsyncIterable<CypherNode> | undefined;
 

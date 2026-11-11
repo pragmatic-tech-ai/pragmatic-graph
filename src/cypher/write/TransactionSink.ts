@@ -290,6 +290,7 @@ export class TransactionSink implements ICypherSink
             return new CypherWriteError(TransactionSink.NodeHasRelationships, CypherWriteErrorCode.NodeHasRelationships, error);
         }
         if (error instanceof CommitError) return new CypherWriteError(`${TransactionSink.Invalid}: ${error.message}`, CypherWriteErrorCode.Invalid, error);
+        if (error instanceof ConnectorError && error.IsConflict) return new CypherWriteError(TransactionSink.Conflict, CypherWriteErrorCode.Conflict, error);
         if (error instanceof ConnectorError) return new CypherWriteError(TransactionSink.ConnectorFailed, CypherWriteErrorCode.ConnectorFailed, error);
         return error;
     }
