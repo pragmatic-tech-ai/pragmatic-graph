@@ -40,6 +40,9 @@ class EndpointFx
     public static readonly A1 = 'a1';
     public static readonly A2 = 'a2';
     public static readonly A3 = 'a3';
+    public static readonly Bob = 'bob';
+    public static readonly NoSuch = 'nosuch';
+    public static readonly EndpointsLabel = 'Endpoints';
     public static readonly Members: IEndpointMembers = { From: EndpointFx.From, To: EndpointFx.To };
 
     public static Dir(): string
@@ -222,12 +225,11 @@ class EndpointFx
             {
                 const g = await ready();
                 await X.Rename(g, X.Shown, X.Ok);
-                const bob = 'bob';
                 X.Allowed(await X.Try(g, X.Edges([[X.Person, { Append: FalsePredicate.Instance }], [X.Project, { AppendTo: new Compare(X.Name, CompareOp.Eq, X.Ok) }]]), t =>
                 {
-                    t.CreateNode(bob, X.Person);
+                    t.CreateNode(X.Bob, X.Person);
                     t.CreateNode(X.A3, X.Assignment);
-                    t.Link(X.A3, X.From, bob);
+                    t.Link(X.A3, X.From, X.Bob);
                     t.Link(X.A3, X.To, X.Shown);
                 }));
                 await g.dispose();
@@ -248,9 +250,9 @@ class EndpointFx
             it('Endpoints entries are validated at Begin', async () =>
             {
                 const g = await ready();
-                const invalid = (e: unknown): boolean => e instanceof GraphError && e.GraphCode === GraphErrorCode.InvalidArgument && e.message.includes('Endpoints');
+                const invalid = (e: unknown): boolean => e instanceof GraphError && e.GraphCode === GraphErrorCode.InvalidArgument && e.message.includes(X.EndpointsLabel);
                 const bad: ReadonlyArray<ReadonlyArray<readonly [string, IEndpointMembers]>> = [
-                    [[X.Assignment, { From: 'nosuch', To: X.To }]],
+                    [[X.Assignment, { From: X.NoSuch, To: X.To }]],
                     [[X.Assignment, { From: X.To, To: X.To }]],
                     [[X.Assignment, { From: X.Cc, To: X.To }]],
                     [[X.Assignment, X.Members], [X.Contract, { From: X.To, To: X.From }]],

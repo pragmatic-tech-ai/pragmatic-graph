@@ -200,7 +200,8 @@ enum RuleKind
  *   rule (AppendToDenied), also when the batch created the edge node; the edge node's own Append rule still governs
  *   it as the source. DeleteNode of an edge node also needs Append on the node at From and AppendTo on the node at
  *   To, and SetProperty on one the batch did not create Append on the node at From (snapshot endpoints). An endpoint
- *   the batch created and a delete-implied unlink stay exempt.
+ *   the batch created and a delete-implied unlink stay exempt. An endpoint the gate cannot see (an external stub whose
+ *   row the transaction never fetched) is InvisibleNode, as a never-fetched Link target (R103), and is not named.
  *
  * External nodes (ruling R103): a node the batch did not create whose public id names no stored engine node, or names
  * a stub (R102), is external data. It is decided against the row the transaction fetched for it (`fetched`): visible
@@ -230,6 +231,7 @@ export class WriteGate
     private static readonly ErrInvisible = 'the node is not visible under the scope';
     private static readonly ErrInvisibleTarget = 'the target is not visible under the scope: ';
     private static readonly ErrInvisibleSibling = 'the sibling is not visible under the scope: ';
+    private static readonly ErrInvisibleEndpoint = 'an endpoint of the edge node is not visible under the scope';
     private static readonly ErrSeedOnly = 'an owner change is recorded by seed synchronization only';
     private static readonly NoOwner = '';
     private static readonly AccessDenied = 'Access denied: op ';
@@ -330,11 +332,11 @@ export class WriteGate
             case WriteOp.SetProperty:
             {
                 const placed = this.IsPlacedDefault(index, targets);
-                const concept = await this.CheckWrite(index, op.Op, op.PublicId, op.Member, targets.Source, placed, false, RuleKind.Update);
-                const endpoints = this.evaluator.EndpointsOf(concept);
-                if (targets.Source === undefined && endpoints !== undefined)
+                const node = await this.CheckWrite(index, op.Op, op.PublicId, op.Member, targets.Source, placed, false, RuleKind.Update);
+                const endpoints = node instanceof ExistingNode ? this.evaluator.EndpointsOf(node.Concept) : undefined;
+                if (node instanceof ExistingNode && endpoints !== undefined)
                 {
-                    await this.CheckEndpoint(index, op.Op, op.PublicId, concept, endpoints.From, RuleKind.Append);
+                    await this.CheckEndpoint(index, op.Op, node, endpoints.From, RuleKind.Append);
                 }
                 break;
             }
@@ -342,7 +344,7 @@ export class WriteGate
             case WriteOp.Unlink:
             {
                 const detach = op.Op === WriteOp.Unlink && this.IsDetach(index, op.From, op.To);
-                const concept = await this.CheckWrite(index, op.Op, op.From, op.Relationship, targets.Source, false, detach, RuleKind.Append);
+                const concept = (await this.CheckWrite(index, op.Op, op.From, op.Relationship, targets.Source, false, detach, RuleKind.Append)).Concept;
                 // An external target (a stub, or no stored node: an ExternalTarget link creates its stub, R102) is decided
                 // against the row the transaction fetched (R103); a stored engine node keeps the ordinary rule.
                 const target = await this.CheckReferenced(index, op.Op, op.From, concept, op.To, targets.Target, WriteGate.ErrInvisibleTarget);
@@ -443,13 +445,13 @@ export class WriteGate
     }
 
     /**
-     * The snapshot node at `member` of the visible reified edge node `publicId` must satisfy its `kind` rules (Append
-     * on From, AppendTo on To; R130). Unset: nothing to check.
+     * The snapshot node at `member` of the visible reified edge node `edge` must satisfy its `kind` rules (Append on
+     * From, AppendTo on To; R130). Unset: nothing to check. An edge node is never external (ScopeValidator), so it has
+     * engine edges; an external one would have none here and checks nothing.
      */
-    private async CheckEndpoint(index: number, op: WriteOp, publicId: string, concept: string, member: string, kind: RuleKind): Promise<void>
+    private async CheckEndpoint(index: number, op: WriteOp, edge: ExistingNode, member: string, kind: RuleKind): Promise<void>
     {
-        const edge = await this.evaluator.Locate(publicId);
-        const stored = edge === undefined ? undefined : await this.evaluator.EndpointNode(edge, member);
+        const stored = edge.Engine === undefined ? undefined : await this.evaluator.EndpointNode(edge.Engine, member);
         if (stored === undefined)
         {
             return;
@@ -457,10 +459,12 @@ export class WriteGate
         const end = await this.VisibleNode(stored.PublicId);
         if (end === undefined)
         {
-            // Unreachable for a visible edge node (its endpoints are visible); fail closed without naming the node.
-            throw this.Denied(WriteGate.EndpointCode(kind), index, op, publicId, concept, WriteGate.EndpointReason(kind));
+            // A stub endpoint whose concept has no applicable Rows leaves the edge node visible, but the transaction may
+            // never have fetched its row: InvisibleNode, as for a never-fetched external Link target (R103). The
+            // endpoint is not named.
+            throw this.Denied(AccessErrorCode.InvisibleNode, index, op, edge.PublicId, edge.Concept, WriteGate.ErrInvisibleEndpoint);
         }
-        await this.CheckEndpointNode(index, op, publicId, concept, end, kind);
+        await this.CheckEndpointNode(index, op, edge.PublicId, edge.Concept, end, kind);
     }
 
     /** `end`, an endpoint of the edge node `publicId`, must satisfy its `kind` (Append or AppendTo) rules (R130). */
@@ -498,12 +502,13 @@ export class WriteGate
     }
 
     /**
-     * SetProperty, Link or Unlink of `member` on the node `publicId` (an edge's source); resolves with its concept.
+     * SetProperty, Link or Unlink of `member` on the node `publicId` (an edge's source); resolves with the node (the
+     * created one, or the visible snapshot node).
      * `placed`: a default the host placed on a node the batch created, exempt from Hidden and ReadOnly.
      * `detach`: an unlink a later delete in the batch implies, exempt from ReadOnly and the Update/Append rule (F-a).
      * `kind`: Update for SetProperty, Append for Link/Unlink (R129).
      */
-    private async CheckWrite(index: number, op: WriteOp, publicId: string, member: string, created: CreatedNode | undefined, placed: boolean, detach: boolean, kind: RuleKind): Promise<string>
+    private async CheckWrite(index: number, op: WriteOp, publicId: string, member: string, created: CreatedNode | undefined, placed: boolean, detach: boolean, kind: RuleKind): Promise<CreatedNode | ExistingNode>
     {
         if (created !== undefined)
         {
@@ -515,7 +520,7 @@ export class WriteGate
                     this.CheckReadOnly(index, op, publicId, created.Concept, member, WriteStage.Create);
                 }
             }
-            return created.Concept;
+            return created;
         }
         const node = await this.RequireVisible(index, op, publicId);
         this.CheckHidden(index, op, publicId, node.Concept, member);
@@ -523,7 +528,7 @@ export class WriteGate
         {
             // Ruling F-a (R92): a delete-implied unlink is governed only by the Delete rule of the node the batch
             // deletes, never by the source's ReadOnly or Append rules or the target's AppendTo rule.
-            return node.Concept;
+            return node;
         }
         this.CheckReadOnly(index, op, publicId, node.Concept, member, WriteStage.Update);
         if (!(await this.Decide(node, kind)))
@@ -532,7 +537,7 @@ export class WriteGate
             throw this.Denied(append ? AccessErrorCode.AppendDenied : AccessErrorCode.UpdateDenied, index, op, publicId, node.Concept,
                 this.Reason(node.Concept, kind, append ? WriteGate.ErrAppend : WriteGate.ErrUpdate));
         }
-        return node.Concept;
+        return node;
     }
 
     /** `Allows`, decided once per node and kind within the batch. */
@@ -569,8 +574,8 @@ export class WriteGate
         if (endpoints !== undefined)
         {
             // Removing the edge node removes the edge: Append on its From node, AppendTo on its To node (R130).
-            await this.CheckEndpoint(index, op, publicId, node.Concept, endpoints.From, RuleKind.Append);
-            await this.CheckEndpoint(index, op, publicId, node.Concept, endpoints.To, RuleKind.AppendTo);
+            await this.CheckEndpoint(index, op, node, endpoints.From, RuleKind.Append);
+            await this.CheckEndpoint(index, op, node, endpoints.To, RuleKind.AppendTo);
         }
     }
 

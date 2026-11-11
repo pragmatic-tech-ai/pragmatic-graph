@@ -119,13 +119,14 @@ export class ScopeValidator
             }
             if (setup !== undefined && setup.Bindings.MayResolveExternal(key, catalog, setup.External))
             {
-                throw new GraphError(GraphErrorCode.InvalidArgument, ScopeValidator.ErrEndpointExternal + key + ScopeValidator.Dot + members.From);
+                throw new GraphError(GraphErrorCode.InvalidArgument, ScopeValidator.ErrEndpointExternal + key);
             }
             for (const [other, theirs] of endpoints)
             {
                 if (other !== key && catalog.IsA(key, other) && (theirs.From !== members.From || theirs.To !== members.To))
                 {
-                    throw new GraphError(GraphErrorCode.InvalidArgument, ScopeValidator.ErrEndpointConflict + key + ScopeValidator.Dot + members.From);
+                    const member = theirs.From !== members.From ? members.From : members.To;
+                    throw new GraphError(GraphErrorCode.InvalidArgument, ScopeValidator.ErrEndpointConflict + key + ScopeValidator.Dot + member);
                 }
             }
         }
