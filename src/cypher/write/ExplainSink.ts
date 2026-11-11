@@ -13,11 +13,18 @@ export class ExplainSink implements ICypherSink
 {
     private static readonly NoWrites = 'an explained plan writes nothing';
 
+    private static readonly NoReadOnly: ReadonlySet<string> = new Set();
+
     public readonly View: OverlaySource;
 
     constructor(source: ICypherSource)
     {
         this.View = new OverlaySource(source, new PendingOverlay());
+    }
+
+    public ReadOnlyMembers(): ReadonlySet<string>
+    {
+        return ExplainSink.NoReadOnly;
     }
 
     public CreateNode(): CypherNode

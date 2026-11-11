@@ -50,6 +50,7 @@ class RoFx
     public static readonly U1 = 'u1';
     public static readonly U2 = 'u2';
     public static readonly X = 'x';
+    public static readonly Y = 'y';
     public static readonly Tagged = 'Tagged';
     public static readonly Tag = 'tag';
     public static readonly FirstPlaced = 'c0';
@@ -382,5 +383,32 @@ describe('read-only write members (R92)', () =>
         // Not read-only on update: an existing node's owner may change.
         await W.Write(fx, "MATCH (k:Ticket {title: 'x'}) SET k.owner = 'u2'", { Scope: scope });
         assert.equal(await RoFx.Read(fx, AccessScope.System, RoFx.K, RoFx.Owner), RoFx.U2);
+    });
+
+    test('SET n = {map} leaves read-only members untouched', async () =>
+    {
+        await W.Write(fx, "MATCH (k:Ticket {title: 'x'}) SET k = {title: 'y'}", { Scope: RoFx.Scope() });
+        assert.equal(await RoFx.Read(fx, AccessScope.System, RoFx.K, RoFx.Owner), RoFx.U1);
+        assert.equal(await RoFx.Read(fx, AccessScope.System, RoFx.K, RoFx.Title), RoFx.Y);
+    });
+
+    test('SET n = {map} on a created node keeps its placed read-only default', async () =>
+    {
+        const scope = RoFx.StageScope([RoFx.Owner], []);
+        await W.Write(fx, "CREATE (n:Ticket {title: 'a'}) SET n = {title: 'b'}", { Scope: scope, Placement: new OwnerPlacement(RoFx.U2) });
+        assert.equal(await RoFx.Read(fx, AccessScope.System, RoFx.FirstPlaced, RoFx.Owner), RoFx.U2);
+        assert.equal(await RoFx.Read(fx, AccessScope.System, RoFx.FirstPlaced, RoFx.Title), 'b');
+    });
+
+    test('SET n = {map} naming a read-only member is refused', async () =>
+    {
+        await RoFx.DeniedQuery(fx, "MATCH (k:Ticket {title: 'x'}) SET k = {title: 'y', owner: 'u2'}", RoFx.Owner);
+    });
+
+    test('SET n = {map} still nulls writable unlisted members', async () =>
+    {
+        await W.Write(fx, "MATCH (k:Ticket {title: 'x'}) SET k = {owner: 'u1'}", { Scope: RoFx.Scope([RoFx.Assignee]) });
+        assert.equal(await RoFx.Read(fx, AccessScope.System, RoFx.K, RoFx.Title), null);
+        assert.equal(await RoFx.Read(fx, AccessScope.System, RoFx.K, RoFx.Owner), RoFx.U1);
     });
 });

@@ -3,6 +3,7 @@ import { AccessError } from './access/AccessError.js';
 import { WriteExemptions } from './access/WriteExemptions.js';
 import type { FetchedNode } from './access/FetchedNode.js';
 import { WriteGate } from './access/WriteGate.js';
+import type { WriteStage } from './access/WriteStage.js';
 import type { CellValue } from './columns/CellValue.js';
 import { type INodeOrigin, type INodeOrigins, WriteCoordinator } from './connectors/WriteCoordinator.js';
 import type { GraphContext, ReadSnapshot } from './GraphContext.js';
@@ -42,6 +43,8 @@ import { type ICreateNodeOptions, type IDeleteNodeOptions, type LinkOptions, Wri
  */
 export class GraphTransaction extends GraphReader
 {
+    private static readonly NoReadOnly: ReadonlySet<string> = new Set();
+
     private static readonly ErrFinished = 'Transaction has already committed or been disposed';
     private static readonly ErrSchema = 'The schema changed after the transaction began: catalog version ';
     private static readonly ErrSchemaNow = ', now ';
@@ -91,6 +94,16 @@ export class GraphTransaction extends GraphReader
     {
         this.RequireActive();
         this.batch.DeleteNode(publicId, options);
+    }
+
+    /**
+     * The members the scope's write gate refuses to write on a node of `concept` at `stage` (ReadOnly for the stage
+     * plus ReadOnlyExact; ruling R92); empty when the scope's writes are unrestricted. Scope metadata only:
+     * nothing is read or recorded.
+     */
+    public ReadOnlyMembers(concept: string, stage: WriteStage): ReadonlySet<string>
+    {
+        return this.Scope.WritesUnrestricted ? GraphTransaction.NoReadOnly : this.WriteEvaluator().ReadOnlyMembers(concept, stage);
     }
 
     public Link(from: string, relationship: string, to: string, options?: LinkOptions): void

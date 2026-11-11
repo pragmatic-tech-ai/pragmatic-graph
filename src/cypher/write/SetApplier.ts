@@ -40,15 +40,17 @@ export class SetApplier
 
     /**
      * SET n = {map}: every property of the node (as the query now sees it, so also a node created earlier in
-     * the query) that is set and not in the map is set to null. Relationships are untouched.
+     * the query) that is set, not in the map and not read-only under the scope is set to null. Relationships are
+     * untouched. Read-only members are skipped, not nulled; one the map names is still assigned (and refused by the gate).
      */
     private async RemoveUnlisted(id: string, map: MapValue): Promise<void>
     {
         const node = await this.sink.View.Node(id);
         if (node === undefined) return;
+        const readOnly = this.sink.ReadOnlyMembers(id, node.Concept);
         for (const [name, value] of node.Properties)
         {
-            if (value !== null && !map.Entries.has(name)) await this.sink.RemoveProperty(id, name);
+            if (value !== null && !map.Entries.has(name) && !readOnly.has(name)) await this.sink.RemoveProperty(id, name);
         }
     }
 

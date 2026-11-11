@@ -10,6 +10,7 @@ export type { ILmdbOptions } from './kv/lmdb/LmdbStore.js';
 export { GraphReader, type ILinkView, type INodeView, type IReadProbe, type IScanRow } from './GraphReader.js';
 export type { IIndexBound, IIndexRange } from './indexes/IndexKey.js';
 export { GraphTransaction } from './GraphTransaction.js';
+export { WriteStage } from './access/WriteStage.js';
 export { AccessDefault, AccessScope, type IAccessScopeOptions, type IEndpointMembers, type IReadOnlyMembers, type IWriteRules } from './access/AccessScope.js';
 
 // Schema definition.
