@@ -294,6 +294,28 @@ Also: update protocol and server `ARCHITECTURE.md` (currently stale).
   shared with; the access scope widens reads (and the write rules it already widens today) through a
   graph predicate over those grants, and a grant commits in the same transaction as any other write.
 
+### 11.2 External-write and policy decisions (owner, 2026-11-10, after M2.2)
+- **Optimistic locking is read-time.** A connector's fetched row carries the version the source holds
+  (`IFetchedRow.Version`). The engine remembers it per node for the life of the fetch session and sends
+  it with every change to that node (`ConnectorChange.ExpectedVersion`). An `Optimistic` binding guards
+  its write with that version, so a change made by anyone between this transaction's read and its
+  commit fails the commit with a version conflict. The commit-time before-image stays, for
+  compensation only.
+- **External writes execute immediately; no atomic transaction spans systems we do not control.** A
+  write to an external binding is executed at the source when the transaction performs it, under the
+  source's own guarantees (auto-commit, or a per-write source transaction). The source returns what it
+  assigned — keys (SQL serial, REST POST response, …) and new versions — so a created record has its
+  real public id from that moment: nothing is provisional, nothing is rewritten, and other connectors
+  may reference it in the same transaction. Only engine-stored data is transactional: the engine
+  transaction stays serializable and atomic for engine storage, while external effects are visible to
+  others as soon as the source applies them. If the engine transaction aborts, the external writes it
+  already executed are compensated in reverse order, best effort (§6). Sources whose keys the client
+  mints keep TODL minting them. This supersedes deferring external writes to engine commit.
+- **Policy membership compiles by member kind.** In a policy rule, `x in entity.m` (and its `has`
+  form) means: for a relationship member, the entity links through `m` to the node whose id is `x`;
+  for a scalar member, `m` equals `x`. The engine's scope compiler and the runtime policy evaluator
+  implement the same meaning; neither silently never-matches.
+
 ## 12. Invariants to test
 - Repository/engine agreement: for every compiled fixture, `Repository.IsA` /
   `InstancesMatching` equal engine label-scan results, aspects included.
