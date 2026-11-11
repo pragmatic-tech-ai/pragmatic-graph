@@ -79,7 +79,7 @@ export class ScopeValidator
                 ScopeValidator.RequireMembers(index, key, rules.ReadOnlyExact.Create ?? [], ScopeValidator.ErrUnknownReadOnly);
                 ScopeValidator.RequireMembers(index, key, rules.ReadOnlyExact.Update ?? [], ScopeValidator.ErrUnknownReadOnly);
             }
-            for (const predicate of [rules.Create, rules.Update, rules.Delete])
+            for (const predicate of [rules.Create, rules.Update, rules.Delete, rules.Append, rules.AppendTo])
             {
                 if (predicate !== undefined)
                 {

@@ -93,10 +93,10 @@ class RoFx
         return AccessScope.Build({ Default: AccessDefault.Allow, Writes: new Map([[RoFx.Item, { ReadOnly: { Create: new Set(create), Update: new Set(update) } }]]) });
     }
 
-    /** Item nodes may not be updated (ruling F-a: a delete-implied unlink ignores the source's Update rule). */
+    /** Item nodes may not be updated or appended to (ruling F-a: a delete-implied unlink ignores the source's Update and Append rules). */
     public static NoUpdateScope(): AccessScope
     {
-        return AccessScope.Build({ Default: AccessDefault.Allow, Writes: new Map([[RoFx.Item, { Update: FalsePredicate.Instance }]]) });
+        return AccessScope.Build({ Default: AccessDefault.Allow, Writes: new Map([[RoFx.Item, { Update: FalsePredicate.Instance, Append: FalsePredicate.Instance }]]) });
     }
 
     /** Item's owner and assignee read-only, and Item nodes may not be deleted. */
@@ -216,13 +216,13 @@ describe('read-only write members (R92)', () =>
         {
             reader.dispose();
         }
-        // An explicit unlink from the same source is still an update, and refused.
+        // An explicit unlink from the same source is still an append, and refused.
         const t = await fx.Engine.Begin(RoFx.NoUpdateScope());
         try
         {
             t.Unlink(RoFx.K, RoFx.Assignee, RoFx.Q);
             t.DetachUnlink(RoFx.K, RoFx.Assignee, RoFx.Q);
-            await assert.rejects(t.Commit(), (e: unknown) => e instanceof AccessError && e.Code === AccessErrorCode.UpdateDenied);
+            await assert.rejects(t.Commit(), (e: unknown) => e instanceof AccessError && e.Code === AccessErrorCode.AppendDenied);
         }
         finally
         {

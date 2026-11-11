@@ -28,6 +28,7 @@ class WriteFx
     private static readonly Dirs: string[] = [];
     public static readonly Secret = 'Secret';
     public static readonly Person = 'Person';
+    public static readonly Ok = 'ok';
     public static readonly Team = 'Team';
     public static readonly Ticket = 'Ticket';
     public static readonly Level = 'level';
@@ -102,6 +103,18 @@ class WriteFx
         const g = await open();
         await g.Upgrade(WriteFx.Description());
         return g;
+    }
+
+    /** Person 'p'; tickets 'open' and 'closed' (unlinked) and 'linked' (closed, about 'p'). */
+    public static SeedLinkFixture(t: GraphTransaction): void
+    {
+        t.CreateNode('p', WriteFx.Person);
+        for (const [id, status] of [['open', WriteFx.Open], ['closed', WriteFx.Closed], ['linked', WriteFx.Closed]] as const)
+        {
+            t.CreateNode(id, WriteFx.Ticket);
+            t.SetProperty(id, WriteFx.Status, status);
+        }
+        t.Link('linked', WriteFx.About, 'p');
     }
 
     /** A System commit (the setup path; never gated). */
@@ -271,9 +284,6 @@ class WriteFx
                 assert.equal(await WriteFx.Value(g, 'open', WriteFx.Status), WriteFx.Closed);
                 // Reopening a closed one is not.
                 WriteFx.Denied(await WriteFx.Try(g, scope, t => t.SetProperty('closed', WriteFx.Status, WriteFx.Open)), AccessErrorCode.UpdateDenied, 'op 0', 'closed', WriteFx.Ticket);
-                // Link and Unlink are updates of their source.
-                WriteFx.Denied(await WriteFx.Try(g, scope, t => t.Link('closed', WriteFx.About, 'p')), AccessErrorCode.UpdateDenied, 'closed');
-                WriteFx.Denied(await WriteFx.Try(g, scope, t => t.Unlink('linked', WriteFx.About, 'p')), AccessErrorCode.UpdateDenied, 'linked');
                 // A link TO a ticket would update its source only; a node created in the batch is exempt.
                 WriteFx.Allowed(await WriteFx.Try(g, scope, t =>
                 {
@@ -397,6 +407,102 @@ class WriteFx
                 await g.dispose();
             });
 
+            it('an Update rule alone no longer governs links', async () =>
+            {
+                const g = await WriteFx.Ready(open);
+                await WriteFx.Setup(g, t => WriteFx.SeedLinkFixture(t));
+                const scope = WriteFx.Writes([[WriteFx.Ticket, { Update: new Compare(WriteFx.Status, CompareOp.Eq, WriteFx.Open) }]]);
+                WriteFx.Allowed(await WriteFx.Try(g, scope, t => t.Link('closed', WriteFx.About, 'p')));
+                WriteFx.Allowed(await WriteFx.Try(g, scope, t => t.Unlink('linked', WriteFx.About, 'p')));
+                WriteFx.Denied(await WriteFx.Try(g, scope, t => t.SetProperty('closed', WriteFx.Status, WriteFx.Open)), AccessErrorCode.UpdateDenied, 'closed');
+                await g.dispose();
+            });
+
+            it('Link and Unlink are governed by the source Append rule', async () =>
+            {
+                const g = await WriteFx.Ready(open);
+                await WriteFx.Setup(g, t => WriteFx.SeedLinkFixture(t));
+                const scope = WriteFx.Writes([[WriteFx.Ticket, { Append: new Compare(WriteFx.Status, CompareOp.Eq, WriteFx.Open) }]]);
+                WriteFx.Denied(await WriteFx.Try(g, scope, t => t.Link('closed', WriteFx.About, 'p')), AccessErrorCode.AppendDenied, 'closed', WriteFx.Ticket);
+                WriteFx.Denied(await WriteFx.Try(g, scope, t => t.Unlink('linked', WriteFx.About, 'p')), AccessErrorCode.AppendDenied, 'linked', WriteFx.Ticket);
+                WriteFx.Allowed(await WriteFx.Try(g, scope, t => t.Link('open', WriteFx.About, 'p')));
+                await g.dispose();
+            });
+
+            it('Link and Unlink need the target AppendTo rule', async () =>
+            {
+                const g = await WriteFx.Ready(open);
+                await WriteFx.Setup(g, t =>
+                {
+                    WriteFx.SeedLinkFixture(t);
+                    t.CreateNode('good', WriteFx.Person);
+                    t.SetProperty('good', WriteFx.Name, WriteFx.Ok);
+                    t.CreateNode('t', WriteFx.Ticket);
+                });
+                const scope = WriteFx.Writes([[WriteFx.Person, { AppendTo: new Compare(WriteFx.Name, CompareOp.Eq, WriteFx.Ok) }]]);
+                WriteFx.Denied(await WriteFx.Try(g, scope, t => t.Link('t', WriteFx.About, 'p')), AccessErrorCode.AppendToDenied, 'op 0', 't');
+                WriteFx.Allowed(await WriteFx.Try(g, scope, t => t.Link('t', WriteFx.About, 'good')));
+                WriteFx.Denied(await WriteFx.Try(g, scope, t => t.Unlink('linked', WriteFx.About, 'p')), AccessErrorCode.AppendToDenied, 'linked');
+                await g.dispose();
+            });
+
+            it('a node the batch created is exempt from Append and AppendTo', async () =>
+            {
+                const g = await WriteFx.Ready(open);
+                const rules = { Create: TruePredicate.Instance, Append: FalsePredicate.Instance, AppendTo: FalsePredicate.Instance };
+                const rows = new Map<string, Predicate>([[WriteFx.Ticket, TruePredicate.Instance], [WriteFx.Person, TruePredicate.Instance]]);
+                const scope = AccessScope.Build({ Default: AccessDefault.Deny, Rows: rows, Writes: new Map([[WriteFx.Ticket, rules], [WriteFx.Person, rules]]) });
+                WriteFx.Allowed(await WriteFx.Try(g, scope, t =>
+                {
+                    t.CreateNode('p', WriteFx.Person);
+                    t.CreateNode('t', WriteFx.Ticket);
+                    t.Link('t', WriteFx.About, 'p');
+                }));
+                await g.dispose();
+            });
+
+            it('delete-implied unlinks ignore Append and AppendTo', async () =>
+            {
+                const g = await WriteFx.Ready(open);
+                await WriteFx.Setup(g, t => WriteFx.SeedLinkFixture(t));
+                const scope = WriteFx.Writes([[WriteFx.Ticket, { Append: FalsePredicate.Instance }], [WriteFx.Person, { AppendTo: FalsePredicate.Instance, Delete: TruePredicate.Instance }]]);
+                WriteFx.Denied(await WriteFx.Try(g, scope, t => t.Unlink('linked', WriteFx.About, 'p')), AccessErrorCode.AppendDenied, 'linked');
+                WriteFx.Allowed(await WriteFx.Try(g, scope, t =>
+                {
+                    t.DetachUnlink('linked', WriteFx.About, 'p');
+                    t.DeleteNode('p');
+                }));
+                await g.dispose();
+            });
+
+            it('Append and AppendTo predicates are validated at Begin', async () =>
+            {
+                const g = await WriteFx.Ready(open);
+                const bad = new Compare('nosuch', CompareOp.Eq, 'x');
+                for (const rules of [{ Append: bad }, { AppendTo: bad }])
+                {
+                    await assert.rejects(g.Begin(WriteFx.Writes([[WriteFx.Ticket, rules]])), (e: unknown) => e instanceof GraphError && e.GraphCode === GraphErrorCode.InvalidArgument && e.message.includes('Ticket.nosuch'));
+                }
+                await g.dispose();
+            });
+
+            it('Append and AppendTo decisions are reads (stale permission conflicts)', async () =>
+            {
+                const g = await WriteFx.Ready(open);
+                await WriteFx.Setup(g, t =>
+                {
+                    t.CreateNode('p', WriteFx.Person);
+                    t.SetProperty('p', WriteFx.Name, WriteFx.Ok);
+                    t.CreateNode('t', WriteFx.Ticket);
+                });
+                const scope = WriteFx.Writes([[WriteFx.Person, { AppendTo: new Compare(WriteFx.Name, CompareOp.Eq, WriteFx.Ok) }]]);
+                const t1 = await g.Begin(scope);
+                t1.Link('t', WriteFx.About, 'p');
+                await WriteFx.Setup(g, t => t.SetProperty('p', WriteFx.Name, 'other'));
+                await assert.rejects(t1.Commit(), (e: unknown) => e instanceof ConflictError);
+                await g.dispose();
+            });
+
             it('seeded nodes read-only via Not(Seeded())', async () =>
             {
                 const g = await WriteFx.Ready(open);
@@ -406,9 +512,9 @@ class WriteFx
                     t.CreateNode('p', WriteFx.Person);
                 });
                 const readOnlySeed = new Not(new Seeded());
-                const scope = WriteFx.Writes([[WriteFx.Team, { Update: readOnlySeed, Delete: readOnlySeed }]]);
+                const scope = WriteFx.Writes([[WriteFx.Team, { Update: readOnlySeed, Append: readOnlySeed, Delete: readOnlySeed }]]);
                 WriteFx.Denied(await WriteFx.Try(g, scope, t => t.SetProperty(WriteFx.SeedTeam, WriteFx.Name, 'x')), AccessErrorCode.UpdateDenied, WriteFx.SeedTeam, WriteFx.Team);
-                WriteFx.Denied(await WriteFx.Try(g, scope, t => t.Link(WriteFx.SeedTeam, WriteFx.Member, 'p')), AccessErrorCode.UpdateDenied, WriteFx.SeedTeam);
+                WriteFx.Denied(await WriteFx.Try(g, scope, t => t.Link(WriteFx.SeedTeam, WriteFx.Member, 'p')), AccessErrorCode.AppendDenied, WriteFx.SeedTeam);
                 WriteFx.Denied(await WriteFx.Try(g, scope, t => t.DeleteNode(WriteFx.SeedTeam)), AccessErrorCode.DeleteDenied, WriteFx.SeedTeam);
                 WriteFx.Allowed(await WriteFx.Try(g, scope, t =>
                 {

@@ -16,6 +16,13 @@ export interface IWriteRules
     readonly Update?: Predicate;
     readonly Delete?: Predicate;
     /**
+     * Link and Unlink: holds on the edge's SOURCE node (pre-batch values), instead of Update, which now governs
+     * SetProperty only (spec section 5, ruling R129). A node the batch created and a delete-implied unlink are exempt.
+     */
+    readonly Append?: Predicate;
+    /** Link and Unlink: holds on the edge's TARGET node (pre-batch values); the same exemptions as Append. */
+    readonly AppendTo?: Predicate;
+    /**
      * Members (properties and relationships) the writer may not set, remove, link or unlink on the instances,
      * per operation (AccessError MemberReadOnly, ruling R92). They stay readable. Values a host places as
      * defaults on a node the batch creates (GraphTransaction.SetDefault) are exempt.
