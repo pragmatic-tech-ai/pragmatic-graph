@@ -1,5 +1,6 @@
 import type { CatalogSnapshot } from '../catalog/CatalogSnapshot.js';
 import { MemberKind } from '../catalog/ValueType.js';
+import type { ConnectorContext } from './ConnectorContext.js';
 import { GraphError, GraphErrorCode } from '../errors/GraphError.js';
 import type { CatalogIndex } from '../txn/CatalogIndex.js';
 import type { PreparedCommit } from '../txn/PreparedCommit.js';
@@ -11,7 +12,6 @@ import { type ConnectorChange, ConnectorChangeSet } from './ConnectorChangeSet.j
 import { ConnectorError, ConnectorPhase } from './ConnectorError.js';
 import { ExternalWriteCheck } from './ExternalWriteCheck.js';
 import { ConnectorResidency, type IExternalConnector } from './FetchContract.js';
-import type { ConnectorContext } from './ConnectorContext.js';
 import type { IConnectorTransaction, IGraphConnector } from './GraphConnector.js';
 
 /** The owner (model, '' for none) and concept a write routes by. */

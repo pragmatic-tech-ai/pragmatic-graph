@@ -1,4 +1,3 @@
-import type { ConnectorContext } from '../ConnectorContext.js';
 import { after, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -7,6 +6,7 @@ import { join } from 'node:path';
 import { AccessDefault, AccessScope } from '../../access/AccessScope.js';
 import { AccessError, AccessErrorCode } from '../../access/AccessError.js';
 import type { CellValue } from '../../columns/CellValue.js';
+import type { ConnectorContext } from '../ConnectorContext.js';
 import { CypherWriteError, CypherWriteErrorCode } from '../../cypher/CypherError.js';
 import { CypherEngine } from '../../cypher/CypherEngine.js';
 import type { CypherResult } from '../../cypher/CypherResult.js';

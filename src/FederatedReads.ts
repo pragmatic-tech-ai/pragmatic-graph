@@ -1,6 +1,7 @@
 import { FetchedNode } from './access/FetchedNode.js';
 import type { ScopeEvaluator } from './access/ScopeEvaluator.js';
 import { MemberKind } from './catalog/ValueType.js';
+import type { ConnectorContext } from './connectors/ConnectorContext.js';
 import type { IFetchedRow } from './connectors/FetchContract.js';
 import { FetchSession } from './connectors/FetchSession.js';
 import type { ConnectorSetup } from './connectors/WriteCoordinator.js';
@@ -9,7 +10,6 @@ import { EdgeDirection } from './format/FormatKeys.js';
 import type { GraphReader, ILinkView, IReadProbe } from './GraphReader.js';
 import type { RecordedReads } from './RecordedReads.js';
 import type { CatalogIndex } from './txn/CatalogIndex.js';
-import type { ConnectorContext } from './connectors/ConnectorContext.js';
 
 /** A stub's identity: the concept and owner model it was created with (ruling R102). */
 export interface IStubIdentity

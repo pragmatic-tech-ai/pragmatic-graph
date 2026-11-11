@@ -1,4 +1,5 @@
 import type { AccessScope } from '../access/AccessScope.js';
+import type { ConnectorContext } from '../connectors/ConnectorContext.js';
 import { FetchSession } from '../connectors/FetchSession.js';
 import { FederatedReads } from '../FederatedReads.js';
 import type { GraphEngine } from '../GraphEngine.js';
@@ -25,7 +26,6 @@ import { ReaderSource } from './ReaderSource.js';
 import { ListValue, MapValue, PathValue } from './StructuredValues.js';
 import type { INodePlacement } from './write/NodePlacement.js';
 import { WriteQueryRunner } from './write/WriteQueryRunner.js';
-import type { ConnectorContext } from '../connectors/ConnectorContext.js';
 import type { IBeginOptions } from '../GraphStore.js';
 
 interface IPageOutcome
@@ -114,16 +114,16 @@ export class CypherEngine
         return LogicalPlanner.Explain(new PlanSource(this.engine.Catalog, scope?.HiddenNames, this.engine.Bindings, external), model, parameters, this.options, paging);
     }
 
-    /**
-     * The source a read runs on (ruling R101): a FederatedSource over the reader with one FetchSession for this query
-     * when the reader's connector setup has External connectors, else the plain ReaderSource. A ConnectorError from any
-     * fetch rejects the read; no partial result is returned.
-     */
     private static BeginOptions(options: ICypherRunOptions): IBeginOptions
     {
         return options.Connector === undefined ? {} : { Connector: options.Connector };
     }
 
+    /**
+     * The source a read runs on (ruling R101): a FederatedSource over the reader with one FetchSession for this query
+     * when the reader's connector setup has External connectors, else the plain ReaderSource. A ConnectorError from any
+     * fetch rejects the read; no partial result is returned.
+     */
     private static ReadSource(reader: GraphReader): ICypherSource
     {
         const base = new ReaderSource(reader);

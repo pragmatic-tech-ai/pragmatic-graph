@@ -16,7 +16,7 @@ class CtxFx
     private static readonly Jira = 'jira';
     public static readonly Wiki = 'wiki';
     private static readonly Ticket = 'Ticket';
-    private static readonly Note = 'Note';
+    public static readonly Note = 'Note';
     private static readonly Title = 'title';
     private static readonly Text = 'text';
     private static readonly Ext = 'ext';
@@ -32,7 +32,7 @@ class CtxFx
     public static readonly ReadTickets = 'MATCH (t:Ticket) RETURN t';
     public static readonly CreateNote = "MATCH (t:Ticket) CREATE (n:Note {text: 'x'})";
 
-    private static readonly Open_: CtxFx[] = [];
+    private static readonly Opened: CtxFx[] = [];
 
     private inFlight = 0;
     /** The most fetches the external fake had running at once. */
@@ -56,13 +56,13 @@ class CtxFx
         const fx = new CtxFx(fixture, external, mirrored, new CypherEngine(fixture.Engine));
         external.Override = request => ({ Rows: [CtxFx.Row(request.Context.Key === CtxFx.Alice ? CtxFx.RowA : CtxFx.RowB)] });
         fx.Interleave();
-        CtxFx.Open_.push(fx);
+        CtxFx.Opened.push(fx);
         return fx;
     }
 
     public static async Close(): Promise<void>
     {
-        await Promise.all(CtxFx.Open_.map(f => f.Fixture.dispose()));
+        await Promise.all(CtxFx.Opened.map(f => f.Fixture.dispose()));
     }
 
     /** Every external fetch yields to the event loop before answering, so concurrent queries really overlap. */
@@ -154,7 +154,7 @@ describe('ConnectorContext (spec section 6)', () =>
         const transaction = await fx.Fixture.Engine.Begin(AccessScope.System, { Connector: ConnectorContext.For(CtxFx.Dave) });
         try
         {
-            transaction.CreateNode(CtxFx.DaveNote, 'Note', { Owner: CtxFx.Wiki });
+            transaction.CreateNode(CtxFx.DaveNote, CtxFx.Note, { Owner: CtxFx.Wiki });
             await transaction.Commit();
         }
         finally

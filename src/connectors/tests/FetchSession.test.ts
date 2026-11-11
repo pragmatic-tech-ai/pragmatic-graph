@@ -22,9 +22,9 @@ import {
     type IFetchedRow,
     type ISchemaDescription,
 } from '../../index.js';
+import { ConnectorContext } from '../ConnectorContext.js';
 import { FetchSession } from '../FetchSession.js';
 import { FakeExternalConnector } from './FakeExternalConnector.js';
-import { ConnectorContext } from '../ConnectorContext.js';
 
 /**
  * Fixtures: Asset { label, weight: Float64, next } with Server { size } and Laptop { ram }; Gadget is an unrelated

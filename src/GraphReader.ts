@@ -6,6 +6,7 @@ import type { MemberDef } from './catalog/CatalogTypes.js';
 import { CatalogSnapshot } from './catalog/CatalogSnapshot.js';
 import { MemberKind } from './catalog/ValueType.js';
 import type { CellValue } from './columns/CellValue.js';
+import type { ConnectorContext } from './connectors/ConnectorContext.js';
 import type { IFetchedRow } from './connectors/FetchContract.js';
 import { GraphError, GraphErrorCode } from './errors/GraphError.js';
 import { EdgeDirection } from './format/FormatKeys.js';
@@ -17,7 +18,6 @@ import { Predicate } from './predicate/Predicate.js';
 import { type IReadNode, RecordedReads } from './RecordedReads.js';
 import { ConflictKeys } from './txn/ConflictKeys.js';
 import type { ReadSet } from './txn/ReadSet.js';
-import type { ConnectorContext } from './connectors/ConnectorContext.js';
 
 /** One row of ScanConcept: the node's public id and the member's value (for a relationship, a target's public id). */
 export interface IScanRow

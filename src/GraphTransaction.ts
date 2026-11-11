@@ -6,6 +6,7 @@ import { ScopeEvaluator } from './access/ScopeEvaluator.js';
 import { WriteGate } from './access/WriteGate.js';
 import type { WriteStage } from './access/WriteStage.js';
 import type { CellValue } from './columns/CellValue.js';
+import type { ConnectorContext } from './connectors/ConnectorContext.js';
 import { type INodeOrigin, type INodeOrigins, WriteCoordinator } from './connectors/WriteCoordinator.js';
 import type { GraphContext, ReadSnapshot } from './GraphContext.js';
 import { GraphError, GraphErrorCode } from './errors/GraphError.js';
@@ -16,7 +17,6 @@ import { ConflictError } from './txn/ConflictError.js';
 import type { ISnapshotHandle } from './txn/ConflictHistory.js';
 import { ReadSet } from './txn/ReadSet.js';
 import { type ICreateNodeOptions, type IDeleteNodeOptions, type LinkOptions, WriteBatch } from './txn/WriteBatch.js';
-import type { ConnectorContext } from './connectors/ConnectorContext.js';
 
 /**
  * An optimistic, serializable read-write transaction. Reads are snapshot reads at Begin and are

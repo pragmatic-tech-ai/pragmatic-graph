@@ -1,6 +1,6 @@
 import type { CellValue } from '../columns/CellValue.js';
-import type { Predicate, PredicateKind } from '../predicate/Predicate.js';
 import type { ConnectorContext } from './ConnectorContext.js';
+import type { Predicate, PredicateKind } from '../predicate/Predicate.js';
 import type { IGraphConnector } from './GraphConnector.js';
 
 /**

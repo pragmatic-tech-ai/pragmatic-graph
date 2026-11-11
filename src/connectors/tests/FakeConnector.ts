@@ -1,5 +1,5 @@
-import type { ConnectorContext } from '../ConnectorContext.js';
 import type { ConnectorChangeSet } from '../ConnectorChangeSet.js';
+import type { ConnectorContext } from '../ConnectorContext.js';
 import type { IConnectorTransaction, IGraphConnector } from '../GraphConnector.js';
 
 /** The calls a FakeConnector can be told to fail or hang in. */

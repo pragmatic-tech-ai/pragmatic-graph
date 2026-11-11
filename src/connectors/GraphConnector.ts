@@ -1,5 +1,5 @@
-import type { ConnectorContext } from './ConnectorContext.js';
 import type { ConnectorChangeSet } from './ConnectorChangeSet.js';
+import type { ConnectorContext } from './ConnectorContext.js';
 import type { ConnectorResidency } from './FetchContract.js';
 
 /**

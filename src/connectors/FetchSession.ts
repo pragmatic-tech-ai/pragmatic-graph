@@ -1,9 +1,9 @@
 import { FetchedNode } from '../access/FetchedNode.js';
 import type { CatalogSnapshot } from '../catalog/CatalogSnapshot.js';
+import type { ConnectorContext } from './ConnectorContext.js';
 import { GraphError, GraphErrorCode } from '../errors/GraphError.js';
 import type { IReadProbe } from '../GraphReader.js';
 import { And, IdIn, Predicate } from '../predicate/Predicate.js';
-import type { ConnectorContext } from './ConnectorContext.js';
 import { ConnectorError, ConnectorPhase } from './ConnectorError.js';
 import type { BindingTable } from './BindingTable.js';
 import type { IExternalConnector, IFetchPage, IFetchRequest, IFetchTarget, IFetchedRow } from './FetchContract.js';
@@ -36,8 +36,9 @@ class UnscopedFetch implements IFetchScope
 /**
  * The reader of external connectors for one query (rulings R98, R99). One session serves one Cypher read or one
  * GraphTransaction, and so one ConnectorContext (spec section 6, ruling R132): every fetch it makes, continuations
- * included, carries that context, and the engine never shares a session, its memo or its fetches between contexts: key lookups and fetched rows are memoised by public id, so a query sees one value per external
- * node, and nothing outlives the session. Resume tokens are used only to drain one fetch page by page.
+ * included, carries that context, and the engine never shares a session, its memo or its fetches between contexts.
+ * Key lookups and fetched rows are memoised by public id, so a query sees one value per external node, and nothing
+ * outlives the session. Resume tokens are used only to drain one fetch page by page.
  *
  * Members (final review C1): every fetch kind (Scan, Lookup, Reverse) asks for BindingTable.FamilyProperties of its
  * target concept, the properties of the whole family hidden ones included. A fetched row's concept IsA the target
