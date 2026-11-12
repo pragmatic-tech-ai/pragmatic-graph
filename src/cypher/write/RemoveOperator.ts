@@ -20,6 +20,8 @@ export class RemoveOperator implements IOperator
                 const id = WriteSupport.RequiredNodeId(row, item.Variable);
                 if (id !== undefined) await this.sink.RemoveProperty(id, item.Property);
             }
+            // Per-row write step (ruling R135 E1): the row's external writes execute before it flows on.
+            await this.sink.EndStep();
             yield row;
         }
     }

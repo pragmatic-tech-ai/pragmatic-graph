@@ -7,12 +7,13 @@ import type { CellValue } from '../../columns/CellValue.js';
 import { ChunkCodecError } from '../../columns/ChunkCodecError.js';
 import { ValueCodec } from '../../columns/ValueCodec.js';
 import { ConnectorError } from '../../connectors/ConnectorError.js';
+import type { IAssignedCreate, IAssignedLink } from '../../connectors/GraphConnector.js';
 import { GraphError } from '../../errors/GraphError.js';
 import { FederatedReads } from '../../FederatedReads.js';
-import type { GraphTransaction } from '../../GraphTransaction.js';
+import type { GraphTransaction, IFetchedView } from '../../GraphTransaction.js';
 import { CommitError, CommitErrorCode } from '../../txn/CommitError.js';
 import { ConflictError } from '../../txn/ConflictError.js';
-import { WriteBatch, WriteOp, type BatchOp, type IExternalTarget } from '../../txn/WriteBatch.js';
+import { WriteBatch, type BatchOp, type IExternalTarget } from '../../txn/WriteBatch.js';
 import { RelDirection } from '../CypherEnums.js';
 import { CypherWriteError, CypherWriteErrorCode } from '../CypherError.js';
 import { CypherNode } from '../CypherNode.js';
@@ -27,11 +28,14 @@ import { OverlayEdge, PendingOverlay } from './PendingOverlay.js';
 /**
  * Where the Cypher write operators write. Every write is checked as the engine would check it (member exists
  * and is a property, the value fits its type, null only for a nullable member), recorded in the PendingOverlay
- * (read-your-writes for the rest of the query, through View) and appended to a pending WriteBatch. Nothing
- * reaches the GraphTransaction until Commit, called once after the mutation pipeline drained without error: it
- * replays the pending writes in order onto the transaction and commits it, mapping engine failures to
- * CypherWriteError with the GraphError as cause (ConflictError → Conflict, AccessError → Denied, CommitError →
- * Invalid, ConnectorError → ConnectorFailed).
+ * (read-your-writes for the rest of the query, through View) and recorded directly on the GraphTransaction as the
+ * mutation pipeline runs (ruling R135 E1). `EndStep`, called per row by the write operators, flushes the ops
+ * recorded since the previous step to their external sources. A source-keyed CREATE (INodePlace.KeyAssigned) goes
+ * through GraphTransaction.CreateAssigned at once, so the created node holds the source-minted id (ruling R136 E4).
+ * Commit flushes the rest and commits the transaction, mapping engine failures to CypherWriteError with the
+ * GraphError as cause (ConflictError → Conflict, AccessError → Denied, CommitError → Invalid, ConnectorError →
+ * ConnectorFailed). The `pending` WriteBatch is kept only as an ordered log of the recorded ops (Steps), for
+ * inspection and to decide whether the query committed anything; it is never replayed.
  *
  * A relationship created to an external node (one whose owner and concept bind to an External connector: fetched by the
  * query, or reached through a stub) carries LinkOptions.ExternalTarget, so the commit creates or reuses its stub (ruling
@@ -57,16 +61,14 @@ export class TransactionSink implements ICypherSink
     private static readonly ConnectorFailed = 'a connector taking part in the write failed';
     private static readonly AlreadyCommitted = 'the write query has already committed';
     private static readonly NoDefaults: ReadonlyMap<string, CellValue> = new Map();
+    private static readonly NoLinks: readonly IAssignedLink[] = [];
 
     public readonly View: OverlaySource;
     public readonly Stats = new CypherWriteStats();
 
     private readonly overlay = new PendingOverlay();
+    /** An ordered log of the ops recorded on the transaction, for inspection (Steps); never replayed. */
     private readonly pending = new WriteBatch();
-    /** Indexes in `pending` of the SetProperty ops that are placement defaults (replayed with SetDefault). */
-    private readonly defaults = new Set<number>();
-    /** Indexes in `pending` of the Unlink ops a DETACH DELETE implies (replayed with DetachUnlink). */
-    private readonly detaches = new Set<number>();
     private readonly catalog: CatalogSnapshot;
     private committed = false;
 
@@ -76,17 +78,32 @@ export class TransactionSink implements ICypherSink
         this.catalog = transaction.Catalog;
     }
 
-    /** The pending writes, in order (nothing has reached the transaction before Commit). */
+    /** The ops recorded on the transaction so far, in order (a source-keyed create executes at once and is not among them). */
     public Steps(): readonly BatchOp[]
     {
         return this.pending.Ops();
     }
 
+    /** Ends the current write step: flushes the ops recorded since the previous step to their external sources (ruling R135 E1). */
+    public async EndStep(): Promise<void>
+    {
+        try
+        {
+            await this.transaction.Flush();
+        }
+        catch (error)
+        {
+            throw TransactionSink.MapCommitError(error);
+        }
+    }
+
     /**
      * Creates a node of the (resolved) concept with the given properties; returns it as the query now sees it. The
-     * placement's Defaults fill the properties the query did not set (ruling R91), checked like query values.
+     * placement's Defaults fill the properties the query did not set (ruling R91), checked like query values. A
+     * source-keyed place (KeyAssigned) goes through GraphTransaction.CreateAssigned at once, carrying the already-placed
+     * outgoing links (ruling R136 E4); any other place is recorded on the transaction, and its links follow in the same step.
      */
-    public CreateNode(concept: string, properties: ReadonlyMap<string, CypherScalar>): CypherNode
+    public async CreateNode(concept: string, properties: ReadonlyMap<string, CypherScalar>, links?: readonly IAssignedLink[]): Promise<CypherNode>
     {
         try
         {
@@ -110,21 +127,62 @@ export class TransactionSink implements ICypherSink
                 placed.set(name, this.Cell(this.Property(concept, name), concept, value));
             }
         }
-        this.pending.CreateNode(place.PublicId, concept, place.Owner === TransactionSink.NoOwner ? undefined : { Owner: place.Owner });
+        if (place.KeyAssigned === true)
+        {
+            return this.CreateAssignedNode(concept, place.Owner, cells, placed, links ?? TransactionSink.NoLinks);
+        }
+        const owner = place.Owner === TransactionSink.NoOwner ? undefined : { Owner: place.Owner };
+        this.pending.CreateNode(place.PublicId, concept, owner);
+        this.transaction.CreateNode(place.PublicId, concept, owner);
         for (const [name, value] of cells)
         {
             this.pending.SetProperty(place.PublicId, name, value);
+            this.transaction.SetProperty(place.PublicId, name, value);
         }
         for (const [name, value] of placed)
         {
-            this.defaults.add(this.pending.Count);
             this.pending.SetProperty(place.PublicId, name, value);
+            this.transaction.SetDefault(place.PublicId, name, value);
             cells.set(name, value);
         }
         const node = new CypherNode(place.PublicId, concept, place.Owner, this.Visible(concept, cells));
         this.overlay.RecordCreate(node);
         this.Stats.NodesCreated++;
         this.Stats.PropertiesSet += cells.size;
+        for (const link of links ?? TransactionSink.NoLinks)
+        {
+            await this.CreateRelationship(place.PublicId, link.Relationship, link.To);
+        }
+        return node;
+    }
+
+    /**
+     * A source-keyed CREATE (ruling R136 E4): runs GraphTransaction.CreateAssigned now, carrying the properties, placement
+     * defaults and the already-placed outgoing links, and returns the created node as the source minted it (its real id).
+     */
+    private async CreateAssignedNode(concept: string, owner: string, cells: ReadonlyMap<string, CellValue>, placed: ReadonlyMap<string, CellValue>, links: readonly IAssignedLink[]): Promise<CypherNode>
+    {
+        const propertiesMap = new Map(cells);
+        for (const [name, value] of placed)
+        {
+            propertiesMap.set(name, value);
+        }
+        const request: IAssignedCreate = { Owner: owner, Concept: concept, Properties: propertiesMap, Links: links };
+        let views: readonly IFetchedView[];
+        try
+        {
+            views = await this.transaction.CreateAssigned([request]);
+        }
+        catch (error)
+        {
+            throw TransactionSink.MapCommitError(error);
+        }
+        const view = views[0]!;
+        const node = new CypherNode(view.PublicId, view.Concept, view.Owner, new Map(view.Properties));
+        this.overlay.RecordCreate(node);
+        this.Stats.NodesCreated++;
+        this.Stats.PropertiesSet += propertiesMap.size;
+        this.Stats.RelationshipsCreated += links.length;
         return node;
     }
 
@@ -133,6 +191,7 @@ export class TransactionSink implements ICypherSink
         const node = await this.Require(publicId);
         const cell = this.Cell(this.Property(node.Concept, member), node.Concept, value);
         this.pending.SetProperty(publicId, member, cell);
+        this.transaction.SetProperty(publicId, member, cell);
         this.overlay.RecordSet(node, member, cell);
         this.Stats.PropertiesSet++;
     }
@@ -171,7 +230,9 @@ export class TransactionSink implements ICypherSink
         const target = await this.Require(to);
         if ((await this.Targets(from, relationship)).includes(to)) return false;
         const external = this.ExternalTarget(target);
-        this.pending.Link(from, relationship, to, external === undefined ? undefined : { ExternalTarget: external });
+        const options = external === undefined ? undefined : { ExternalTarget: external };
+        this.pending.Link(from, relationship, to, options);
+        this.transaction.Link(from, relationship, to, options);
         this.overlay.RecordLink(from, relationship, to);
         this.Stats.RelationshipsCreated++;
         return true;
@@ -187,8 +248,15 @@ export class TransactionSink implements ICypherSink
     private async Unlink(from: string, relationship: string, to: string, detach: boolean): Promise<boolean>
     {
         if (!(await this.Targets(from, relationship)).includes(to)) return false;
-        if (detach) this.detaches.add(this.pending.Count);
         this.pending.Unlink(from, relationship, to);
+        if (detach)
+        {
+            this.transaction.DetachUnlink(from, relationship, to);
+        }
+        else
+        {
+            this.transaction.Unlink(from, relationship, to);
+        }
         this.overlay.RecordUnlink(from, relationship, to);
         this.Stats.RelationshipsDeleted++;
         return true;
@@ -222,57 +290,21 @@ export class TransactionSink implements ICypherSink
         for (const [from, relationship, to] of edges) await this.Unlink(from, relationship, to, true);
         // Strict: hidden edges the query cannot see still fail the commit (NodeHasEdges). DETACH: the engine
         // removes the hidden ones too, and routes their Unlinks to connectors itself (ruling R89).
-        this.pending.DeleteNode(publicId, detach ? undefined : { Strict: true });
+        const options = detach ? undefined : { Strict: true };
+        this.pending.DeleteNode(publicId, options);
+        this.transaction.DeleteNode(publicId, options);
         this.overlay.RecordDelete(publicId);
         this.Stats.NodesDeleted++;
     }
 
-    /** Replays the pending writes onto the transaction and commits it (once); resolves with the commit number. */
+    /** Commits the transaction (once); the writes were recorded on it as the pipeline ran. Resolves with the commit number. */
     public async Commit(): Promise<bigint>
     {
         if (this.committed) throw new CypherWriteError(TransactionSink.AlreadyCommitted);
         this.committed = true;
-        const t = this.transaction;
-        const ops = this.pending.Ops();
-        for (let i = 0; i < ops.length; i++)
-        {
-            const op = ops[i] as BatchOp;
-            switch (op.Op)
-            {
-                case WriteOp.CreateNode:
-                    t.CreateNode(op.PublicId, op.Concept, op.Owner === undefined ? undefined : { Owner: op.Owner });
-                    break;
-                case WriteOp.SetProperty:
-                    if (this.defaults.has(i))
-                    {
-                        t.SetDefault(op.PublicId, op.Member, op.Value);
-                    }
-                    else
-                    {
-                        t.SetProperty(op.PublicId, op.Member, op.Value);
-                    }
-                    break;
-                case WriteOp.DeleteNode:
-                    t.DeleteNode(op.PublicId, op.Strict === true ? { Strict: true } : undefined);
-                    break;
-                case WriteOp.Link:
-                    t.Link(op.From, op.Relationship, op.To, op.Options);
-                    break;
-                case WriteOp.Unlink:
-                    if (this.detaches.has(i))
-                    {
-                        t.DetachUnlink(op.From, op.Relationship, op.To);
-                    }
-                    else
-                    {
-                        t.Unlink(op.From, op.Relationship, op.To);
-                    }
-                    break;
-            }
-        }
         try
         {
-            return await t.Commit();
+            return await this.transaction.Commit();
         }
         catch (error)
         {
@@ -374,6 +406,13 @@ export class TransactionSink implements ICypherSink
     public ReadOnlyMembers(publicId: string, concept: string): ReadonlySet<string>
     {
         return this.transaction.ReadOnlyMembers(concept, this.overlay.IsCreated(publicId) ? WriteStage.Create : WriteStage.Update);
+    }
+
+    /** True when the concept is bound to an External connector (ruling R136 E4): its targets are created before it. */
+    public IsExternalConcept(concept: string): boolean
+    {
+        const setup = FederatedReads.Of(this.transaction).Setup;
+        return setup !== undefined && setup.Bindings.ExternalTargets(concept, this.catalog, setup.External).length > 0;
     }
 
     /** A created node's properties as a reader under the transaction's scope would show them (null for unset). */

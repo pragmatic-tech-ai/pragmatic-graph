@@ -10,7 +10,7 @@ export class CreateOperator implements IOperator
 {
     private readonly creator: PathCreator;
 
-    constructor(private readonly child: IOperator, private readonly clause: CreateClause, source: ICypherSource, sink: ICypherSink, bound: ReadonlySet<string>)
+    constructor(private readonly child: IOperator, private readonly clause: CreateClause, source: ICypherSource, private readonly sink: ICypherSink, bound: ReadonlySet<string>)
     {
         for (const path of clause.Paths)
         {
@@ -26,6 +26,8 @@ export class CreateOperator implements IOperator
         {
             let current = row;
             for (const path of this.clause.Paths) current = await this.creator.Create(current, path);
+            // Per-row write step (ruling R135 E1): the row's external writes execute before it flows on.
+            await this.sink.EndStep();
             yield current;
         }
     }

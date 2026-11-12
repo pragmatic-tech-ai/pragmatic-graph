@@ -27,9 +27,21 @@ export class ExplainSink implements ICypherSink
         return ExplainSink.NoReadOnly;
     }
 
-    public CreateNode(): CypherNode
+    /** An explained plan executes nothing, so concept residency never matters. */
+    public IsExternalConcept(): boolean
     {
-        throw new CypherError(ExplainSink.NoWrites);
+        return false;
+    }
+
+    public CreateNode(): Promise<CypherNode>
+    {
+        return ExplainSink.Refuse();
+    }
+
+    /** An explained plan runs no steps. */
+    public EndStep(): Promise<void>
+    {
+        return Promise.resolve();
     }
 
     public SetProperty(): Promise<void>

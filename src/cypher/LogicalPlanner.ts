@@ -295,7 +295,7 @@ export class LogicalPlanner
             op = new MergeOperator(source, clause, this.source, sink, new SetApplier(sink, this.parameters), matcher, before);
             for (const v of clause.DeclaredVariables()) bound.add(v);
         }
-        else if (clause instanceof SetClause) op = new SetOperator(source, clause, new SetApplier(sink, this.parameters));
+        else if (clause instanceof SetClause) op = new SetOperator(source, clause, new SetApplier(sink, this.parameters), sink);
         else if (clause instanceof DeleteClause) op = new DeleteOperator(source, clause, sink, this.parameters);
         else if (clause instanceof RemoveClause) op = new RemoveOperator(source, clause, sink);
         else throw new CypherSemanticError(LogicalPlanner.WritesNotExecutable);

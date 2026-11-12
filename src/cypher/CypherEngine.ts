@@ -25,7 +25,9 @@ import { PlanSource } from './PlanSource.js';
 import { ReaderSource } from './ReaderSource.js';
 import { ListValue, MapValue, PathValue } from './StructuredValues.js';
 import type { INodePlacement } from './write/NodePlacement.js';
+import { TransactionSink } from './write/TransactionSink.js';
 import { WriteQueryRunner } from './write/WriteQueryRunner.js';
+import type { GraphTransaction } from '../GraphTransaction.js';
 import type { IBeginOptions } from '../GraphStore.js';
 
 interface IPageOutcome
@@ -174,9 +176,30 @@ export class CypherEngine
             // A query that recorded no writes commits nothing (no commit number, no CommitApplied).
             return new CypherResult(outcome.Columns, outcome.Rows, false, false, runner.Stats, runner.Steps().length > 0 ? commit : undefined);
         }
+        catch (error)
+        {
+            // Writes reach the transaction as the pipeline runs (ruling R135 E1): a failure may have executed external
+            // steps, so the transaction is aborted (compensating them) before the mapped error is rethrown. A write
+            // query therefore never drops its transaction at dispose.
+            await CypherEngine.AbortQuietly(transaction);
+            throw TransactionSink.MapCommitError(error);
+        }
         finally
         {
             transaction.dispose();
+        }
+    }
+
+    /** Aborts the transaction when it is still active; an already-ended (committed or compensated) transaction is left as is. */
+    private static async AbortQuietly(transaction: GraphTransaction): Promise<void>
+    {
+        try
+        {
+            await transaction.Abort();
+        }
+        catch
+        {
+            // The transaction already ended (its own commit/flush compensated it), or compensation surfaced on a signal.
         }
     }
 

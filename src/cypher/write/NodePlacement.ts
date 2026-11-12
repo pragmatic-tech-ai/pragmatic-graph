@@ -11,6 +11,11 @@ export interface INodePlace
     readonly PublicId: string;
     readonly Owner: string;
     readonly Defaults?: ReadonlyMap<string, CellValue>;
+    /**
+     * True when the source assigns the key: the place carries `PublicId: ''` and CREATE goes through
+     * GraphTransaction.CreateAssigned, so the created node holds the source-minted id (ruling R136 E4).
+     */
+    readonly KeyAssigned?: true;
 }
 
 /**

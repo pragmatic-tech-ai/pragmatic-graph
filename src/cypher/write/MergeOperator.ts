@@ -66,13 +66,19 @@ export class MergeOperator implements IOperator
             this.CheckBound(row);
             const matches: Binding[] = [];
             for await (const match of this.matcher.Build(row).Rows()) matches.push(match);
+            const out: Binding[] = [];
             if (matches.length > 0)
             {
-                for (const match of matches) yield await this.ApplyActions(match, this.clause.OnMatch);
-                continue;
+                for (const match of matches) out.push(await this.ApplyActions(match, this.clause.OnMatch));
             }
-            const created = await this.creator.Create(row, this.clause.Pattern);
-            yield await this.ApplyActions(created, this.clause.OnCreate);
+            else
+            {
+                const created = await this.creator.Create(row, this.clause.Pattern);
+                out.push(await this.ApplyActions(created, this.clause.OnCreate));
+            }
+            // Per-row write step (ruling R135 E1): the row's external writes execute before it flows on.
+            await this.sink.EndStep();
+            for (const o of out) yield o;
         }
     }
 

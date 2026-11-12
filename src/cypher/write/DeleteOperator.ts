@@ -26,6 +26,8 @@ export class DeleteOperator implements IOperator
                 const id = WriteSupport.NodeId(WriteSupport.Eval(target, row, this.parameters));
                 if (id !== undefined) await this.sink.DeleteNode(id, this.clause.Detach);
             }
+            // Per-row write step (ruling R135 E1): the row's external writes execute before it flows on.
+            await this.sink.EndStep();
             yield row;
         }
     }

@@ -33,10 +33,11 @@ export interface IWriteQueryRows
 /**
  * Runs one write query on a caller-owned GraphTransaction, in two steps. Run plans the query over the
  * transaction's snapshot plus the query's own writes (OverlaySource), drains the whole mutation pipeline (never
- * paged or truncated), then runs the final projection over the drained rows, still through the overlay; nothing
- * has reached the transaction yet, so any error leaves it untouched (the caller disposes it). Commit then hands
- * the pending writes to the transaction and commits it, exactly once (TransactionSink.Commit). Between the two,
- * Source reads the graph as the result sees it (e.g. to load result nodes' links).
+ * paged or truncated), then runs the final projection over the drained rows, still through the overlay. Writes
+ * are recorded on the transaction as the pipeline runs and each per-row step flushes its external ops at once
+ * (ruling R135 E1), so a Run error may have already executed external steps: the caller aborts the transaction on
+ * any error (CypherEngine.ExecuteWrite), which compensates them. Commit then commits the transaction, exactly once
+ * (TransactionSink.Commit). Between the two, Source reads the graph as the result sees it (e.g. to load result nodes' links).
  *
  * With External connectors installed the snapshot is read through a FederatedSource over the transaction's own
  * FetchSession (rulings D3, R103), so MATCH ... SET / DELETE reach external nodes and the commit decides those writes
