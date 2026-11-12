@@ -45,7 +45,8 @@ export { ConnectorChangeSet, type ConnectorChange } from './connectors/Connector
 export { ConnectorResidency, type IConnectorCapabilities, type IExternalConnector, type IFetchPage, type IFetchRequest, type IFetchTarget, type IFetchedRow, type RowVersion } from './connectors/FetchContract.js';
 export { BindingTable } from './connectors/BindingTable.js';
 export { ConnectorError, ConnectorPhase } from './connectors/ConnectorError.js';
-export type { IConnectorApplied } from './connectors/ConnectorApplied.js';
+export { ConnectorOutcome, type IConnectorApplied } from './connectors/ConnectorApplied.js';
+export { TransactionDroppedError } from './txn/TransactionDroppedError.js';
 export { FetchSession, type IFetchedEntry, type IFetchScope } from './connectors/FetchSession.js';
 
 // Predicate language and node-local evaluation.

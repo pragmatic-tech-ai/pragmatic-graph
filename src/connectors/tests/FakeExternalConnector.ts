@@ -39,7 +39,21 @@ export class FakeExternalConnector implements IExternalConnector
     public CommitCalls = 0;
     public UndoCalls = 0;
     public RevertCalls = 0;
+    /** When false, the transaction it returns exposes no Undo: compensation uses Revert (ruling R137 E6). */
+    public SupportsUndo = true;
+    /** Shared between connectors to observe cross-connector compensation order; each Undo appends this connector's name. */
+    public UndoOrder: string[] | undefined;
+    /** As UndoOrder, for Revert. */
+    public RevertOrder: string[] | undefined;
+    /** When set, Undo rejects with it. */
+    public UndoFailure: unknown;
+    /** When set, Revert rejects with it. */
+    public RevertFailure: unknown;
+    /** When true, Undo waits until ReleaseUndo() (to test the compensation deadline / late reverts). */
+    public HoldUndo = false;
     private steps = 0;
+    private releaseUndo: () => void = () => undefined;
+    private readonly undoHeld: Promise<void>;
 
     public constructor(
         public readonly Name: string,
@@ -49,12 +63,50 @@ export class FakeExternalConnector implements IExternalConnector
         public readonly Order?: string[],
     )
     {
+        this.undoHeld = new Promise<void>(resolve => { this.releaseUndo = resolve; });
+    }
+
+    /** Ends the hold of a HoldUndo Undo (and of any later one). */
+    public ReleaseUndo(): void
+    {
+        this.releaseUndo();
     }
 
     public Begin(context: ConnectorContext): Promise<IConnectorTransaction>
     {
         this.Contexts.push(context);
-        return Promise.resolve(new FakeExternalTransaction(this));
+        const txn = new FakeExternalTransaction(this);
+        if (!this.SupportsUndo)
+        {
+            (txn as { Undo?: unknown }).Undo = undefined;
+        }
+        return Promise.resolve(txn);
+    }
+
+    /** @internal Runs a scripted Undo: records its order, waits when held, then fails when configured. */
+    public async RunUndo(): Promise<void>
+    {
+        this.UndoCalls++;
+        this.UndoOrder?.push(this.Name);
+        if (this.HoldUndo)
+        {
+            await this.undoHeld;
+        }
+        if (this.UndoFailure !== undefined)
+        {
+            throw this.UndoFailure;
+        }
+    }
+
+    /** @internal Runs a scripted Revert: records its order, then fails when configured. */
+    public async RunRevert(): Promise<void>
+    {
+        this.RevertCalls++;
+        this.RevertOrder?.push(this.Name);
+        if (this.RevertFailure !== undefined)
+        {
+            throw this.RevertFailure;
+        }
     }
 
     /** @internal Advances and returns the next 1-based step number; records the connector in the shared order. */
@@ -111,8 +163,7 @@ class FakeExternalTransaction implements IConnectorTransaction
 
     public Undo(): Promise<void>
     {
-        this.owner.UndoCalls++;
-        return Promise.resolve();
+        return this.owner.RunUndo();
     }
 
     public Commit(): Promise<void>
@@ -123,7 +174,6 @@ class FakeExternalTransaction implements IConnectorTransaction
 
     public Revert(): Promise<void>
     {
-        this.owner.RevertCalls++;
-        return Promise.resolve();
+        return this.owner.RunRevert();
     }
 }

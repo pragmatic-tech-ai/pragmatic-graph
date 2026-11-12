@@ -16,6 +16,7 @@ import type { ISchemaDescription } from './schema/SchemaDescription.js';
 import { Committer, type IUpgradeCommit } from './txn/Committer.js';
 import type { ICommitApplied } from './txn/LogEntry.js';
 import type { ISignal } from './txn/Signal.js';
+import type { TransactionDroppedError } from './txn/TransactionDroppedError.js';
 
 /** Where a GraphEngine keeps its graph. */
 export enum StorageKind
@@ -85,6 +86,11 @@ export class GraphEngine
      * writes that never reach engine storage. Subscribe-only; a throwing subscriber never affects the commit.
      */
     public readonly ConnectorApplied: ISignal<IConnectorApplied>;
+    /**
+     * Raised once per dropped transaction (disposed with executed external writes, never committed or aborted), after
+     * its compensation settles (ruling R137 E6): the operator's hook when a transaction leaks. Subscribe-only.
+     */
+    public readonly TransactionDropped: ISignal<TransactionDroppedError>;
 
     private version: string;
     private catalog: CatalogSnapshot;
@@ -103,6 +109,7 @@ export class GraphEngine
         this.CommitApplied = store.CommitApplied;
         this.ConnectorRevertFailed = store.ConnectorRevertFailed;
         this.ConnectorApplied = store.ConnectorApplied;
+        this.TransactionDropped = store.TransactionDropped;
         this.version = description.Version;
         this.catalog = result.Catalog;
     }

@@ -6,7 +6,8 @@ import type { PreparedCommit } from '../txn/PreparedCommit.js';
 import type { Signal } from '../txn/Signal.js';
 import { type BatchOp, WriteBatch } from '../txn/WriteBatch.js';
 import { BindingTable } from './BindingTable.js';
-import type { IConnectorApplied } from './ConnectorApplied.js';
+import { Compensator, type IBegunConnector, type ICompensation, type IExecutedStep, type IHungCall } from './Compensator.js';
+import { ConnectorOutcome, type IConnectorApplied } from './ConnectorApplied.js';
 import { type ConnectorChange, ConnectorChangeSet } from './ConnectorChangeSet.js';
 import { ConnectorError, ConnectorPhase } from './ConnectorError.js';
 import { ConnectorResidency, type IExternalConnector, type RowVersion } from './FetchContract.js';
@@ -162,29 +163,6 @@ export class ConnectorSetup
     }
 }
 
-/** One external write step the transaction executed, in execution order, for the Compensator to undo (Task 2.2). */
-export interface IExecutedStep
-{
-    readonly Step: number;
-    readonly Connector: string;
-    readonly Txn: IConnectorTransaction;
-    readonly Changes: ConnectorChangeSet;
-}
-
-/** The connector call in flight when the connector phase timed out. */
-interface IHungCall
-{
-    readonly Connector: IGraphConnector;
-    readonly Phase: ConnectorPhase;
-    /** The call; for Begin it resolves with the transaction to revert. */
-    readonly Call: Promise<unknown>;
-    /** The transaction that began, for Apply and Commit. */
-    readonly Txn: IConnectorTransaction | undefined;
-}
-
-/** How a revert ended: undefined when it succeeded, else its error (boxed, so a thrown `undefined` still counts). */
-type RevertOutcome = { readonly Error: unknown } | undefined;
-
 /**
  * Write-through of one GraphTransaction (spec §6, rulings R72, R135). With External connectors installed, writes
  * execute in steps: `Step` runs a step's External change sets now (the connector is begun at its first step and kept
@@ -193,25 +171,30 @@ type RevertOutcome = { readonly Error: unknown } | undefined;
  * dropping before-images, no remote effect) → Finalize (engine). Calls run one at a time, never inside a store.Write.
  * One deadline (the setup's timeout) bounds each step, and bounds Prepare / every connector call / the reverts of
  * Run, each from its own start. On any failure or the timeout the prepared commit is aborted and every connector that
- * began is reverted, in reverse order of Begin (committed ones too: compensation); the caller then gets a
- * ConnectorError, its phase Write for a failed step. On success ConnectorApplied is raised once, after the engine
- * commit when there is one (a throwing subscriber is ignored). Compensation by connector Undo and the dropped-
- * transaction path consume the step log; that is Task 2.2.
+ * began is compensated, in reverse order (Mirrored reverted in reverse Begin order, then the external step log walked
+ * in reverse with Undo, ruling R137 E6, via the Compensator); the caller then gets a ConnectorError, its phase Write
+ * for a failed step. ConnectorApplied is raised once, at the transaction's end, carrying the outcome (Committed on a
+ * successful commit, else Compensated / CompensationFailed; a throwing subscriber is ignored). Compensation is driven
+ * by Compensate, called from the GraphTransaction on a failed step, a commit failure, an Abort or a drop.
  */
 export class WriteCoordinator
 {
     private static readonly ErrTimedOut = 'Write-through timed out after ms: ';
-    private static readonly ErrReverts = 'The write-through failed and reverting a connector failed too';
     private static readonly TimedOut: unique symbol = Symbol('TimedOut');
     private static readonly NoExternal: ReadonlySet<string> = new Set();
 
-    private began: { readonly Connector: IGraphConnector; readonly Txn: IConnectorTransaction }[] = [];
     /** The External connector transactions begun so far, kept for the transaction's life (ruling R135 E2). */
     private readonly externalTxns = new Map<string, IConnectorTransaction>();
-    /** The External steps executed, in order, for Task 2.2's compensation to undo. */
+    /** The External steps executed, in order, for the Compensator to undo (ruling R137 E6). */
     private readonly log: IExecutedStep[] = [];
+    /** The Mirrored connector transactions begun at Commit, in Begin order, for the Compensator to revert. */
+    private readonly mirroredBegun: IBegunConnector[] = [];
     /** Per participating connector, the concepts its changes touched, for ConnectorApplied. */
     private readonly participated = new Map<string, Set<string>>();
+    /** Set once compensation has run: ConnectorApplied and the connector reverts happen exactly once (ruling R138 E7). */
+    private compensated = false;
+    private lastOutcome: ConnectorOutcome = ConnectorOutcome.Compensated;
+    private appliedRaised = false;
     private expired = false;
     private deadline: Promise<typeof WriteCoordinator.TimedOut> = new Promise(() => undefined);
     private timer: ReturnType<typeof setTimeout> | undefined;
@@ -253,13 +236,19 @@ export class WriteCoordinator
         return { Sets: ordered, Engine: engine };
     }
 
-    /** The External steps executed so far, in order (Task 2.2 compensation consumes them). */
+    /** The External steps executed so far, in order (the Compensator consumes them; ruling R137 E6). */
     public get Steps(): readonly IExecutedStep[]
     {
         return this.log;
     }
 
-    /** True once at least one connector (External or Mirrored) took part: whether Run raises ConnectorApplied. */
+    /** The number of external steps executed: the dropped-transaction error's Steps (ruling R137 E6). */
+    public get ExecutedSteps(): number
+    {
+        return this.log.length;
+    }
+
+    /** True once at least one connector (External or Mirrored) took part: whether the end raises ConnectorApplied. */
     public get Participated(): boolean
     {
         return this.participated.size > 0;
@@ -267,9 +256,10 @@ export class WriteCoordinator
 
     /**
      * Executes a step's External change sets now (ruling R135 E2), one connector at a time in name order. A connector
-     * is begun at its first step and reused after; each Apply reports what the source assigned (ignored until the
-     * version ledger, E5). On any failure or the timeout every begun connector is reverted and a ConnectorError of
-     * phase Write is thrown.
+     * is begun at its first step and reused after; each step is logged (before its Apply, so the connector has recorded
+     * for Undo whatever it applies) and each Apply reports what the source assigned (ignored until the version ledger,
+     * E5). On any failure or the timeout a ConnectorError of phase Write is thrown; the GraphTransaction then calls
+     * Compensate (ruling R137 E6). This method does not compensate or revert on its own.
      */
     public async Step(external: ReadonlyMap<string, ConnectorChangeSet>, stepNumber: number): Promise<void>
     {
@@ -288,16 +278,16 @@ export class WriteCoordinator
                 {
                     txn = await this.Call(connector, ConnectorPhase.Write, undefined, () => connector.Begin(this.context));
                     this.externalTxns.set(name, txn);
-                    this.began.push({ Connector: connector, Txn: txn });
                 }
                 const applyTxn = txn;
+                // Logged before Apply: a partial Apply throws after recording its applied ops for Undo (ruling R136 E3).
+                this.RecordExternal(stepNumber, connector, changes, applyTxn);
                 await this.Call(connector, ConnectorPhase.Write, applyTxn, () => applyTxn.Apply(changes));
-                this.RecordExternal(stepNumber, name, changes, applyTxn);
             }
         }
         catch (error)
         {
-            throw await this.Failed(error instanceof ConnectorError ? error : new ConnectorError(this.current.Connector, ConnectorPhase.Write, error));
+            throw error instanceof ConnectorError ? error : new ConnectorError(this.current.Connector, ConnectorPhase.Write, error);
         }
         finally
         {
@@ -306,10 +296,32 @@ export class WriteCoordinator
     }
 
     /**
+     * Compensates the transaction's executed connector work after `failure` (undefined for a deliberate Abort): reverts
+     * the Mirrored connectors in reverse Begin order, then walks the external step log in reverse (Undo, else Revert),
+     * via the Compensator, bounded by the setup's timeout from the failure (ruling R137 E6). Raises ConnectorApplied
+     * once, with the outcome. Idempotent (runs the connector work once). Resolves with the error the caller should
+     * throw and the outcome; never rejects.
+     */
+    public async Compensate(failure: unknown): Promise<ICompensation>
+    {
+        if (this.compensated)
+        {
+            return { Error: failure, Outcome: this.lastOutcome };
+        }
+        this.compensated = true;
+        const result = await new Compensator(this.setup, this.lateFailures).Run(this.log, this.mirroredBegun, failure, this.hung);
+        this.lastOutcome = result.Outcome;
+        this.RaiseApplied(result.Outcome, undefined);
+        return result;
+    }
+
+    /**
      * Commits the transaction's write-through (its External steps already executed): Prepare the engine batch, run the
      * Mirrored connectors, finalize the External connectors, then finalize engine storage. With `unchanged` (the engine
      * part is empty, controller ruling P13) the prepared commit only guards the engine reads during the connector phase
-     * and is released, not finalized; Run resolves with `unchanged`. On success ConnectorApplied is raised once.
+     * and is released, not finalized; Run resolves with `unchanged`. On success ConnectorApplied is raised once, with
+     * Outcome Committed. On a failure Run aborts the prepared commit and throws the failure; the GraphTransaction then
+     * calls Compensate (ruling R137 E6). It never compensates on its own.
      */
     public async Run(prepare: () => Promise<PreparedCommit>, mirrored: ReadonlyMap<string, readonly ConnectorChange[]>, unchanged?: bigint): Promise<bigint>
     {
@@ -317,7 +329,7 @@ export class WriteCoordinator
         try
         {
             const commit = await this.Drive(prepare, mirrored, unchanged);
-            this.RaiseApplied(unchanged === undefined ? commit : undefined);
+            this.RaiseApplied(ConnectorOutcome.Committed, unchanged === undefined ? commit : undefined);
             return commit;
         }
         finally
@@ -328,6 +340,7 @@ export class WriteCoordinator
 
     private async Drive(prepare: () => Promise<PreparedCommit>, mirrored: ReadonlyMap<string, readonly ConnectorChange[]>, unchanged: bigint | undefined): Promise<bigint>
     {
+        // Prepare's own rejection (OCC conflict) propagates: the GraphTransaction compensates the executed steps.
         const prepared = await this.Prepared(prepare);
         try
         {
@@ -337,7 +350,7 @@ export class WriteCoordinator
             {
                 const connector = this.setup.Connectors.get(name)!;
                 const txn = await this.Call(connector, ConnectorPhase.Begin, undefined, () => connector.Begin(this.context));
-                this.began.push({ Connector: connector, Txn: txn });
+                this.mirroredBegun.push({ Connector: connector, Txn: txn });
                 mirroredTxns.set(name, txn);
             }
             for (const name of mirroredNames)
@@ -364,19 +377,19 @@ export class WriteCoordinator
         catch (error)
         {
             prepared.Abort();
-            throw await this.Failed(error instanceof ConnectorError ? error : new ConnectorError(this.current.Connector, this.current.Phase, error));
+            throw error instanceof ConnectorError ? error : new ConnectorError(this.current.Connector, this.current.Phase, error);
         }
         if (unchanged !== undefined)
         {
             // Nothing for engine storage: the reservation guarded the engine reads until the connectors committed, and
-            // it must still hold now, as Finalize would require; else every connector is compensated.
+            // it must still hold now, as Finalize would require; else the GraphTransaction compensates.
             try
             {
                 prepared.Release();
             }
             catch (error)
             {
-                throw await this.Failed(new ConnectorError(BindingTable.EngineStorage, ConnectorPhase.Finalize, error));
+                throw new ConnectorError(BindingTable.EngineStorage, ConnectorPhase.Finalize, error);
             }
             return unchanged;
         }
@@ -386,23 +399,30 @@ export class WriteCoordinator
         }
         catch (error)
         {
-            throw await this.Failed(new ConnectorError(BindingTable.EngineStorage, ConnectorPhase.Finalize, error));
+            throw new ConnectorError(BindingTable.EngineStorage, ConnectorPhase.Finalize, error);
         }
     }
 
-    /** ConnectorApplied for a successful write-through: per connector (name order), the distinct concepts it touched, sorted. */
-    private RaiseApplied(commit: bigint | undefined): void
+    /**
+     * ConnectorApplied, once per transaction at its end (ruling R138 E7): per connector (name order), the distinct
+     * concepts it touched, sorted, and the Outcome. Raised only when a connector took part. A throwing subscriber is
+     * ignored.
+     */
+    private RaiseApplied(outcome: ConnectorOutcome, commit: bigint | undefined): void
     {
-        if (this.participated.size === 0)
+        if (this.participated.size === 0 || this.appliedRaised)
         {
             return;
         }
+        this.appliedRaised = true;
         const connectors = new Map<string, readonly string[]>();
         for (const name of [...this.participated.keys()].sort())
         {
             connectors.set(name, Object.freeze([...this.participated.get(name)!].sort()));
         }
-        const applied: IConnectorApplied = commit === undefined ? { Connectors: connectors } : { Commit: commit, Connectors: connectors };
+        const applied: IConnectorApplied = commit === undefined
+            ? { Connectors: connectors, Outcome: outcome }
+            : { Commit: commit, Connectors: connectors, Outcome: outcome };
         try
         {
             this.applied.Raise(Object.freeze(applied));
@@ -413,11 +433,11 @@ export class WriteCoordinator
         }
     }
 
-    /** Records an executed External step: its concepts (for ConnectorApplied) and the step log (for Task 2.2). */
-    private RecordExternal(step: number, name: string, changes: ConnectorChangeSet, txn: IConnectorTransaction): void
+    /** Records an executed External step: its concepts (for ConnectorApplied) and the step log (for the Compensator). */
+    private RecordExternal(step: number, connector: IGraphConnector, changes: ConnectorChangeSet, txn: IConnectorTransaction): void
     {
-        this.AddConcepts(name, changes);
-        this.log.push({ Step: step, Connector: name, Txn: txn, Changes: changes });
+        this.AddConcepts(connector.Name, changes);
+        this.log.push({ Step: step, Connector: connector, Txn: txn });
     }
 
     private AddConcepts(name: string, changes: ConnectorChangeSet): void
@@ -510,104 +530,5 @@ export class WriteCoordinator
     private Timeout(connector: string, phase: ConnectorPhase): ConnectorError
     {
         return new ConnectorError(connector, phase, new GraphError(GraphErrorCode.ConnectorFailed, WriteCoordinator.ErrTimedOut + this.setup.TimeoutMs));
-    }
-
-    /**
-     * Reverts every connector that began, in reverse order (a hung one later, once its call returns),
-     * and returns the error to throw: `failure`, its cause wrapped with the revert errors when any.
-     * Reverts are awaited only until the deadline; the rest start at once and finish on the late path.
-     */
-    private async Failed(failure: ConnectorError): Promise<ConnectorError>
-    {
-        const hung = this.hung;
-        if (hung !== undefined)
-        {
-            void this.RevertLate(hung);
-        }
-        const errors: unknown[] = [];
-        for (const { Connector, Txn } of [...this.began].reverse())
-        {
-            if (hung !== undefined && hung.Connector === Connector)
-            {
-                continue;
-            }
-            const outcome = WriteCoordinator.Revert(Txn);
-            if (this.expired)
-            {
-                this.ReportLate(Connector, failure.Phase, outcome);
-                continue;
-            }
-            const result = await Promise.race([outcome, this.deadline]);
-            if (result === WriteCoordinator.TimedOut)
-            {
-                this.ReportLate(Connector, failure.Phase, outcome);
-            }
-            else if (result !== undefined)
-            {
-                errors.push(result.Error);
-            }
-        }
-        if (errors.length === 0)
-        {
-            return failure;
-        }
-        return new ConnectorError(failure.Connector, failure.Phase, new AggregateError([failure.cause, ...errors], WriteCoordinator.ErrReverts));
-    }
-
-    /** Starts the transaction's Revert; never rejects (a throw, synchronous or not, becomes the outcome). */
-    private static async Revert(txn: IConnectorTransaction): Promise<RevertOutcome>
-    {
-        try
-        {
-            await txn.Revert();
-            return undefined;
-        }
-        catch (error)
-        {
-            return { Error: error };
-        }
-    }
-
-    /** Waits for the hung call, then reverts its connector's transaction on the late path. */
-    private async RevertLate(hung: IHungCall): Promise<void>
-    {
-        let txn = hung.Txn;
-        try
-        {
-            const value = await hung.Call;
-            if (hung.Phase === ConnectorPhase.Begin)
-            {
-                txn = value as IConnectorTransaction;
-            }
-        }
-        catch
-        {
-            // The call's own failure is moot: the caller already has the timeout. A failed Begin began nothing.
-        }
-        if (txn !== undefined)
-        {
-            this.ReportLate(hung.Connector, hung.Phase, WriteCoordinator.Revert(txn));
-        }
-    }
-
-    /** Raises a late revert's failure on lateFailures once it settles. */
-    private ReportLate(connector: IGraphConnector, phase: ConnectorPhase, outcome: Promise<RevertOutcome>): void
-    {
-        void outcome.then(result =>
-        {
-            if (result === undefined)
-            {
-                return;
-            }
-            try
-            {
-                this.lateFailures.Raise(new ConnectorError(connector.Name, phase, result.Error));
-            }
-            catch
-            {
-                // A throwing subscriber has nowhere to report to on this detached path (Signal aggregates handler
-                // errors).
-            }
-        });
     }
 }

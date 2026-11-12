@@ -21,6 +21,7 @@ import { CommitLog } from './txn/CommitLog.js';
 import { Committer, type ICommitApplied, type IUpgradeCommit } from './txn/Committer.js';
 import type { ISchemaDescription } from './schema/SchemaDescription.js';
 import { type ISignal, SignalView } from './txn/Signal.js';
+import type { TransactionDroppedError } from './txn/TransactionDroppedError.js';
 
 /** Options of GraphStore.BeginRead and Begin. */
 export interface IBeginOptions
@@ -61,6 +62,11 @@ export class GraphStore
      * committed and after the engine commit, when there is one, is durable (ruling R103). Subscribe-only.
      */
     public readonly ConnectorApplied: ISignal<IConnectorApplied>;
+    /**
+     * Raised once per dropped transaction (a transaction disposed with executed external writes and never committed or
+     * aborted), after its compensation settles (ruling R137 E6). Subscribe-only.
+     */
+    public readonly TransactionDropped: ISignal<TransactionDroppedError>;
 
     private disposing: Promise<void> | undefined;
 
@@ -69,6 +75,7 @@ export class GraphStore
         this.CommitApplied = new SignalView(context.Committer.CommitApplied);
         this.ConnectorRevertFailed = new SignalView(context.ConnectorRevertFailed);
         this.ConnectorApplied = new SignalView(context.ConnectorApplied);
+        this.TransactionDropped = new SignalView(context.TransactionDropped);
         GraphContext.Register(this, context);
     }
 
@@ -306,9 +313,12 @@ export class GraphStore
     private async Teardown(): Promise<void>
     {
         await this.context.Committer.dispose();
-        this.context.DisposeReaders();
+        // Transactions with executed external writes are dropped (compensated, TransactionDropped raised) before the
+        // signals close, so their notifications are delivered (ruling R137 E6).
+        await this.context.DropReaders();
         this.context.ConnectorRevertFailed.dispose();
         this.context.ConnectorApplied.dispose();
+        this.context.TransactionDropped.dispose();
         await this.context.Store.dispose();
     }
 }

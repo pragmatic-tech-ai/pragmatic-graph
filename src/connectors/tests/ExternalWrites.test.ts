@@ -30,7 +30,7 @@ import type { ICommitApplied } from '../../txn/LogEntry.js';
 import { type BatchOp, WriteBatch, WriteOp } from '../../txn/WriteBatch.js';
 import type { ConnectorChange } from '../ConnectorChangeSet.js';
 import { BindingTable } from '../BindingTable.js';
-import type { IConnectorApplied } from '../ConnectorApplied.js';
+import { ConnectorOutcome, type IConnectorApplied } from '../ConnectorApplied.js';
 import { ConnectorError, ConnectorPhase } from '../ConnectorError.js';
 import type { IFetchedRow, RowVersion } from '../FetchContract.js';
 import type { IConnectorTransaction } from '../GraphConnector.js';
@@ -786,7 +786,9 @@ class ExternalWritesSuite
                     assert.ok(error instanceof ConnectorError && error.Connector === BindingTable.EngineStorage && error.Phase === ConnectorPhase.Finalize, String(error));
                     assert.ok(error.cause instanceof ConflictError, String(error.cause));
                     assert.ok(fx.Connector.Log.includes(ExtFx.ExtRevert), fx.Connector.Log.join());
-                    assert.equal(fx.Pushed.length, 0);
+                    // The executed external step is compensated and reported once, at the transaction's end (ruling R138 E7).
+                    assert.equal(fx.Pushed.length, 1);
+                    assert.equal(fx.Pushed[0]!.Outcome, ConnectorOutcome.Compensated);
                 }
                 finally
                 {
@@ -806,7 +808,9 @@ class ExternalWritesSuite
                     assert.ok(error instanceof ConnectorError && error.Connector === BindingTable.EngineStorage && error.Phase === ConnectorPhase.Finalize, String(error));
                     assert.ok(error.cause instanceof ConflictError, String(error.cause));
                     assert.ok(fx.Connector.Log.includes(ExtFx.ExtRevert), fx.Connector.Log.join());
-                    assert.equal(fx.Pushed.length, 0);
+                    // The executed external step is compensated and reported once, at the transaction's end (ruling R138 E7).
+                    assert.equal(fx.Pushed.length, 1);
+                    assert.equal(fx.Pushed[0]!.Outcome, ConnectorOutcome.Compensated);
                 }
                 finally
                 {
@@ -814,7 +818,7 @@ class ExternalWritesSuite
                 }
             });
 
-            it('failed write-through raises no ConnectorApplied', async () =>
+            it('failed write-through is reported as Compensated; a gate refusal raises nothing', async () =>
             {
                 const fx = await ExtFx.Open(storage());
                 try
@@ -825,10 +829,13 @@ class ExternalWritesSuite
                         await ExtFx.Fetch(t, ExtFx.X);
                         t.SetProperty(ExtFx.X, ExtFx.State, ExtFx.DoneState);
                     }));
+                    // The executed step is compensated and reported once (ruling R138 E7).
+                    assert.equal(fx.Pushed.length, 1);
+                    assert.equal(fx.Pushed[0]!.Outcome, ConnectorOutcome.Compensated);
                     fx.Connector.Writes.FailAt = undefined;
-                    // A gate refusal never reaches the connectors either.
+                    // A gate refusal never reaches the connectors, so it raises nothing.
                     await ExtFx.Rejection(fx.Commit(ExternalWritesSuite.OpenOnly, async t => t.SetProperty(ExtFx.X, ExtFx.State, ExtFx.DoneState)));
-                    assert.equal(fx.Pushed.length, 0);
+                    assert.equal(fx.Pushed.length, 1);
                 }
                 finally
                 {

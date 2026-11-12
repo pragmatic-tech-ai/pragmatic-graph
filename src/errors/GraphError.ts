@@ -39,6 +39,11 @@ export enum GraphErrorCode
     ConnectorFailed = 13,
     /** A Cypher query failed to parse, plan or run (CypherError; its Code gives the Cypher category). */
     QueryFailed = 14,
+    /**
+     * A transaction that had executed at least one immediate external write was disposed without a successful Commit
+     * or an Abort: it is compensated and fails loudly (TransactionDroppedError, ruling R137 E6).
+     */
+    TransactionDropped = 15,
 }
 
 /** Base class of every error the engine raises on purpose. `cause` carries an underlying error when there is one. */

@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import type { AccessScope } from './access/AccessScope.js';
 import { AccessError } from './access/AccessError.js';
 import { WriteExemptions } from './access/WriteExemptions.js';
@@ -19,6 +20,7 @@ import { CommitErrorRedactor } from './txn/CommitErrorRedactor.js';
 import { ConflictError } from './txn/ConflictError.js';
 import type { ISnapshotHandle } from './txn/ConflictHistory.js';
 import { ReadSet } from './txn/ReadSet.js';
+import { TransactionDroppedError } from './txn/TransactionDroppedError.js';
 import { type ICreateNodeOptions, type IDeleteNodeOptions, type LinkOptions, WriteBatch } from './txn/WriteBatch.js';
 
 /**
@@ -77,10 +79,15 @@ export class GraphTransaction extends GraphReader
     /** The empty read-only set (no member is read-only). */
     private static readonly NoReadOnly: ReadonlySet<string> = new Set();
 
+    /** A UUID assigned at Begin; the TransactionDroppedError that reports a dropped transaction carries it (R137 E6). */
+    public readonly Id: string = randomUUID();
+
     private readonly batch = new WriteBatch();
     /** The batch ops SetDefault and DetachUnlink recorded. */
     private readonly exempt = new WriteExemptions();
     private committing = false;
+    /** Set once the transaction reached a terminal state (committed, aborted, compensated or dropped). */
+    private ended = false;
 
     /** The engine's part of every step routed so far, concatenated: what Commit prepares (ruling R135 E2). */
     private readonly engineBatch = new WriteBatch();
@@ -198,7 +205,40 @@ export class GraphTransaction extends GraphReader
     public async Flush(): Promise<void>
     {
         this.RequireActive();
-        await this.FlushStep();
+        try
+        {
+            await this.FlushStep();
+        }
+        catch (error)
+        {
+            // Any step failure (connector throw, version conflict, timeout, gate denial after earlier steps) compensates
+            // the executed steps and ends the transaction (ruling R137 E6); later calls are GraphError Disposed.
+            throw await this.CompensateAndEnd(error);
+        }
+    }
+
+    /**
+     * Aborts the transaction (ruling R137 E6): compensates the external steps it executed, in reverse order (Mirrored
+     * reverted first in reverse Begin order, then the step log walked in reverse), raises ConnectorApplied with
+     * Outcome Compensated (or CompensationFailed), and ends it. Resolves whatever compensation's outcome; a failed
+     * compensation surfaces on ConnectorRevertFailed, not as a rejection here.
+     */
+    public async Abort(): Promise<void>
+    {
+        this.RequireActive();
+        this.ended = true;
+        this.committing = true;
+        try
+        {
+            if (this.coordinator !== undefined)
+            {
+                await this.coordinator.Compensate(undefined);
+            }
+        }
+        finally
+        {
+            super.dispose();
+        }
     }
 
     /**
@@ -240,13 +280,16 @@ export class GraphTransaction extends GraphReader
         }
         catch (error)
         {
-            // Under a read-restricting scope commit errors are reduced to "something conflicts" (security S2, R131).
-            throw this.Scope.ReadsUnrestricted ? error : CommitErrorRedactor.RedactAny(error);
+            // A commit failure with external steps already executed compensates them (ruling R137 E6). Under a
+            // read-restricting scope commit errors are then reduced to "something conflicts" (security S2, R131).
+            const mapped = await this.CompensateAndEnd(error);
+            throw this.Scope.ReadsUnrestricted ? mapped : CommitErrorRedactor.RedactAny(mapped);
         }
         finally
         {
-            // Only now: the registered snapshot must pin conflict history until the batch was validated.
-            this.dispose();
+            // Only now: the registered snapshot must pin conflict history until the batch was validated. The internal,
+            // non-throwing end: a committed or compensated-by-failure transaction is never dropped (ruling R137 E6).
+            this.End();
         }
     }
 
@@ -312,7 +355,6 @@ export class GraphTransaction extends GraphReader
         }
         this.EnsureRouter(setup);
         const from = this.flushedCount;
-        this.flushedCount = ops.length;
         // The write gate runs per step, over this step's ops, before any connector call (ruling R135 E2).
         await this.Authorize(from);
         const step = await this.router!.Route(ops.slice(from));
@@ -337,6 +379,8 @@ export class GraphTransaction extends GraphReader
             this.stepNumber++;
             await this.coordinator!.Step(step.External, this.stepNumber);
         }
+        // Advanced only after the whole step succeeded: a failed step leaves no ops marked flushed (ruling R137 E6).
+        this.flushedCount = ops.length;
     }
 
     /** Creates the persistent router and coordinator on the first step; both serve this transaction only (ruling E11). */
@@ -391,6 +435,115 @@ export class GraphTransaction extends GraphReader
         // A transaction's snapshot always carries a registration (GraphStore.Begin opens it with register = true).
         const registered = (this.snapshot.Handle as ISnapshotHandle).Commit;
         return this.snapshot.Commit <= this.context.Committer.LastCommit() ? this.snapshot.Commit : registered;
+    }
+
+    /**
+     * Ends the transaction (ruling R137 E6). Not dropped (committed, aborted, already ended, or no external step
+     * executed): disposes and resolves. Dropped (external steps executed, never committed or aborted): compensates,
+     * raises ConnectorApplied with the outcome and GraphEngine.TransactionDropped, then rejects with
+     * TransactionDroppedError, its Outcome set. Also [Symbol.asyncDispose]. This is the primary teardown path.
+     */
+    public async DisposeAsync(): Promise<void>
+    {
+        if (this.ended || this.ExecutedSteps === 0)
+        {
+            this.End();
+            return;
+        }
+        this.ended = true;
+        const steps = this.ExecutedSteps;
+        const outcome = (await this.coordinator!.Compensate(undefined)).Outcome;
+        super.dispose();
+        const error = new TransactionDroppedError(this.Id, steps, Promise.resolve(outcome), outcome);
+        this.RaiseDropped(error);
+        throw error;
+    }
+
+    public [Symbol.asyncDispose](): Promise<void>
+    {
+        return this.DisposeAsync();
+    }
+
+    /**
+     * Releases the transaction (ruling R137 E6). Not dropped: as GraphReader.dispose, and does not throw. Dropped:
+     * marks the transaction ended, starts the same compensation detached, and throws synchronously a
+     * TransactionDroppedError whose Outcome is undefined and whose Compensation settles later; ConnectorApplied and
+     * GraphEngine.TransactionDropped are raised when compensation completes.
+     */
+    public override dispose(): void
+    {
+        if (this.ended || this.ExecutedSteps === 0)
+        {
+            this.End();
+            return;
+        }
+        this.ended = true;
+        const steps = this.ExecutedSteps;
+        const compensation = this.coordinator!.Compensate(undefined).then(r => r.Outcome);
+        super.dispose();
+        const error = new TransactionDroppedError(this.Id, steps, compensation, undefined);
+        void compensation.then(() => this.RaiseDropped(error), () => this.RaiseDropped(error));
+        throw error;
+    }
+
+    /**
+     * @internal Ends a still-open transaction at store dispose (ruling R137 E6): as the dropped path, but it compensates
+     * and raises TransactionDropped without throwing, so store shutdown finishes.
+     */
+    public async Drop(): Promise<void>
+    {
+        if (this.ended || this.ExecutedSteps === 0)
+        {
+            this.End();
+            return;
+        }
+        this.ended = true;
+        const steps = this.ExecutedSteps;
+        const outcome = (await this.coordinator!.Compensate(undefined)).Outcome;
+        super.dispose();
+        this.RaiseDropped(new TransactionDroppedError(this.Id, steps, Promise.resolve(outcome), outcome));
+    }
+
+    /** The number of external steps this transaction executed (ruling R137 E6). */
+    private get ExecutedSteps(): number
+    {
+        return this.coordinator?.ExecutedSteps ?? 0;
+    }
+
+    /** Compensates the executed steps (when a connector took part) and ends the transaction; returns the error to throw. */
+    private async CompensateAndEnd(error: unknown): Promise<unknown>
+    {
+        this.ended = true;
+        this.committing = true;
+        let mapped = error;
+        if (this.coordinator !== undefined)
+        {
+            // Compensate reverts whatever began (a no-op when nothing did) and raises ConnectorApplied only when a
+            // connector actually took part (ruling R137 E6, R138 E7).
+            mapped = (await this.coordinator.Compensate(error)).Error;
+        }
+        super.dispose();
+        return mapped;
+    }
+
+    /** The internal, non-throwing end used by Commit and the not-dropped teardown paths. */
+    private End(): void
+    {
+        this.ended = true;
+        super.dispose();
+    }
+
+    /** Raises GraphEngine.TransactionDropped once per dropped transaction; a throwing subscriber is ignored. */
+    private RaiseDropped(error: TransactionDroppedError): void
+    {
+        try
+        {
+            this.context.TransactionDropped.Raise(error);
+        }
+        catch
+        {
+            // A throwing subscriber cannot un-drop the transaction; Signal already ran (and aggregated) every handler.
+        }
     }
 
     private RequireActive(): void

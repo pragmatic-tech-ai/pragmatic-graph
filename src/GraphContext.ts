@@ -18,11 +18,17 @@ import { CommitLog } from './txn/CommitLog.js';
 import { Committer } from './txn/Committer.js';
 import type { ISnapshotHandle } from './txn/ConflictHistory.js';
 import { Signal } from './txn/Signal.js';
+import type { TransactionDroppedError } from './txn/TransactionDroppedError.js';
 
 /** Something the GraphStore must end when it is disposed (open readers and transactions). */
 export interface IGraphDisposable
 {
     dispose(): void;
+    /**
+     * A transaction's drop-at-store-dispose path (ruling R137 E6): compensates its executed external steps and raises
+     * TransactionDropped without throwing. Absent on plain readers, which are ended with dispose().
+     */
+    Drop?(): Promise<void>;
 }
 
 /**
@@ -78,6 +84,8 @@ export class GraphContext
     public readonly ConnectorRevertFailed = new Signal<ConnectorError>();
     /** Raised once per successful write-through, after every participating connector committed (ruling R103). */
     public readonly ConnectorApplied = new Signal<IConnectorApplied>();
+    /** Raised once per dropped transaction, after its compensation settles (ruling R137 E6). */
+    public readonly TransactionDropped = new Signal<TransactionDroppedError>();
 
     private readonly open = new Set<IGraphDisposable>();
     /**
@@ -185,11 +193,23 @@ export class GraphContext
         this.open.delete(reader);
     }
 
-    public DisposeReaders(): void
+    /**
+     * Ends every open reader and transaction at store dispose (ruling R137 E6): a transaction with executed external
+     * steps is dropped (compensated, TransactionDropped raised) through its Drop path, each on its own connector
+     * transactions in its own reverse step order (ruling E11); a plain reader is disposed. Never throws.
+     */
+    public async DropReaders(): Promise<void>
     {
         for (const reader of [...this.open])
         {
-            reader.dispose();
+            if (reader.Drop !== undefined)
+            {
+                await reader.Drop();
+            }
+            else
+            {
+                reader.dispose();
+            }
         }
     }
 
