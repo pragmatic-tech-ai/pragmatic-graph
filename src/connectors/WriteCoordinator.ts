@@ -10,8 +10,9 @@ import { Compensator, type IBegunConnector, type ICompensation, type IExecutedSt
 import { ConnectorOutcome, type IConnectorApplied } from './ConnectorApplied.js';
 import { type ConnectorChange, ConnectorChangeSet } from './ConnectorChangeSet.js';
 import { ConnectorError, ConnectorPhase } from './ConnectorError.js';
+import { VersionLedger } from './FetchSession.js';
 import { ConnectorResidency, type IExternalConnector, type RowVersion } from './FetchContract.js';
-import type { IConnectorTransaction, IGraphConnector } from './GraphConnector.js';
+import type { IAssignedCreate, IAssignedOutcome, IConnectorApplyResult, IConnectorTransaction, IGraphConnector } from './GraphConnector.js';
 import { type IRoutedStep, StepRouter } from './StepRouter.js';
 
 /** The owner (model, '' for none) and concept a write routes by. */
@@ -180,6 +181,7 @@ export class ConnectorSetup
 export class WriteCoordinator
 {
     private static readonly ErrTimedOut = 'Write-through timed out after ms: ';
+    private static readonly ErrNoCreate = 'The connector does not implement source-keyed creates (Create): ';
     private static readonly TimedOut: unique symbol = Symbol('TimedOut');
     private static readonly NoExternal: ReadonlySet<string> = new Set();
 
@@ -202,7 +204,7 @@ export class WriteCoordinator
     /** The connector call last started, for wrapping a non-connector error should one ever escape. */
     private current: { readonly Connector: string; readonly Phase: ConnectorPhase } = { Connector: BindingTable.EngineStorage, Phase: ConnectorPhase.Prepare };
 
-    public constructor(private readonly setup: ConnectorSetup, private readonly lateFailures: Signal<ConnectorError>, private readonly applied: Signal<IConnectorApplied>, private readonly context: ConnectorContext)
+    public constructor(private readonly setup: ConnectorSetup, private readonly lateFailures: Signal<ConnectorError>, private readonly applied: Signal<IConnectorApplied>, private readonly context: ConnectorContext, private readonly ledger: VersionLedger = new VersionLedger())
     {
     }
 
@@ -282,7 +284,8 @@ export class WriteCoordinator
                 const applyTxn = txn;
                 // Logged before Apply: a partial Apply throws after recording its applied ops for Undo (ruling R136 E3).
                 this.RecordExternal(stepNumber, connector, changes, applyTxn);
-                await this.Call(connector, ConnectorPhase.Write, applyTxn, () => applyTxn.Apply(changes));
+                const result = await this.Call(connector, ConnectorPhase.Write, applyTxn, () => applyTxn.Apply(changes));
+                this.Report(result);
             }
         }
         catch (error)
@@ -292,6 +295,57 @@ export class WriteCoordinator
         finally
         {
             this.Disarm();
+        }
+    }
+
+    /**
+     * Executes one connector's source-keyed creates as a single step (ruling R136 E4), one Create call for `name`.
+     * The connector is begun at its first step and reused. The step is logged (before the call, so the connector has
+     * recorded its inserts for Undo) and resolves with one outcome per request, index-aligned. A connector that does
+     * not implement Create refuses with ConnectorError(name, Write, GraphError Unsupported). On any failure or the
+     * timeout a ConnectorError of phase Write is thrown; the GraphTransaction then calls Compensate (ruling R137 E6).
+     */
+    public async Create(name: string, requests: readonly IAssignedCreate[], stepNumber: number): Promise<readonly IAssignedOutcome[]>
+    {
+        this.Arm();
+        try
+        {
+            const connector = this.setup.Connectors.get(name)!;
+            let txn = this.externalTxns.get(name);
+            if (txn === undefined)
+            {
+                txn = await this.Call(connector, ConnectorPhase.Write, undefined, () => connector.Begin(this.context));
+                this.externalTxns.set(name, txn);
+            }
+            const createTxn = txn;
+            if (createTxn.Create === undefined)
+            {
+                throw new ConnectorError(name, ConnectorPhase.Write, new GraphError(GraphErrorCode.Unsupported, WriteCoordinator.ErrNoCreate + name));
+            }
+            // Logged before Create: a throw after partial apply still undoes exactly what applied (ruling R136 E4).
+            this.RecordCreate(stepNumber, connector, requests, createTxn);
+            return await this.Call(connector, ConnectorPhase.Write, createTxn, () => createTxn.Create!(requests));
+        }
+        catch (error)
+        {
+            throw error instanceof ConnectorError ? error : new ConnectorError(this.current.Connector, ConnectorPhase.Write, error);
+        }
+        finally
+        {
+            this.Disarm();
+        }
+    }
+
+    /** Feeds an Apply's reported versions into the ledger (ruling R137 E5): the next change to each id is guarded with it. */
+    private Report(result: IConnectorApplyResult | void): void
+    {
+        if (result === undefined || result === null || result.Versions === undefined)
+        {
+            return;
+        }
+        for (const [id, version] of result.Versions)
+        {
+            this.ledger.Reported(id, version);
         }
     }
 
@@ -359,7 +413,7 @@ export class WriteCoordinator
                 const txn = mirroredTxns.get(name)!;
                 const set = new ConnectorChangeSet(mirrored.get(name)!);
                 await this.Call(connector, ConnectorPhase.Apply, txn, () => txn.Apply(set));
-                this.AddConcepts(name, set);
+                this.AddConcepts(name, set.Changes.map(c => c.Concept));
             }
             for (const name of mirroredNames)
             {
@@ -436,21 +490,28 @@ export class WriteCoordinator
     /** Records an executed External step: its concepts (for ConnectorApplied) and the step log (for the Compensator). */
     private RecordExternal(step: number, connector: IGraphConnector, changes: ConnectorChangeSet, txn: IConnectorTransaction): void
     {
-        this.AddConcepts(connector.Name, changes);
+        this.AddConcepts(connector.Name, changes.Changes.map(c => c.Concept));
         this.log.push({ Step: step, Connector: connector, Txn: txn });
     }
 
-    private AddConcepts(name: string, changes: ConnectorChangeSet): void
+    /** Records an executed source-keyed create step (ruling R136 E4): its request concepts and the step log. */
+    private RecordCreate(step: number, connector: IGraphConnector, requests: readonly IAssignedCreate[], txn: IConnectorTransaction): void
     {
-        let concepts = this.participated.get(name);
-        if (concepts === undefined)
+        this.AddConcepts(connector.Name, requests.map(r => r.Concept));
+        this.log.push({ Step: step, Connector: connector, Txn: txn });
+    }
+
+    private AddConcepts(name: string, concepts: readonly string[]): void
+    {
+        let set = this.participated.get(name);
+        if (set === undefined)
         {
-            concepts = new Set<string>();
-            this.participated.set(name, concepts);
+            set = new Set<string>();
+            this.participated.set(name, set);
         }
-        for (const c of changes.Changes)
+        for (const c of concepts)
         {
-            concepts.add(c.Concept);
+            set.add(c);
         }
     }
 

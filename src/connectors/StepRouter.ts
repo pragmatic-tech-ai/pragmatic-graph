@@ -5,6 +5,7 @@ import { type BatchOp, type IUnlinkOp, WriteOp } from '../txn/WriteBatch.js';
 import { BindingTable } from './BindingTable.js';
 import { type ConnectorChange, ConnectorChangeSet } from './ConnectorChangeSet.js';
 import { ExternalWriteCheck } from './ExternalWriteCheck.js';
+import { VersionLedger } from './FetchSession.js';
 import type { IIncidentEdge, INodeOrigin, INodeOrigins } from './WriteCoordinator.js';
 
 /**
@@ -132,7 +133,7 @@ export class ChangeRouter
     /** The ids a CreateNode created so far: their later changes carry no ExpectedVersion (R119 V2). */
     private readonly createdHere = new Set<string>();
 
-    public constructor(private readonly table: BindingTable, private readonly index: CatalogIndex, private readonly origins: INodeOrigins, private readonly external: ReadonlySet<string>)
+    public constructor(private readonly table: BindingTable, private readonly index: CatalogIndex, private readonly origins: INodeOrigins, private readonly external: ReadonlySet<string>, private readonly ledger: VersionLedger)
     {
     }
 
@@ -155,6 +156,12 @@ export class ChangeRouter
         this.createdHere.add(publicId);
     }
 
+    /** True when a CreateNode (or a source-assigned create) of the id ran in this transaction (ruling R136 E4). */
+    public IsCreated(publicId: string): boolean
+    {
+        return this.createdHere.has(publicId);
+    }
+
     /** The id's latest origin: its CreateNode earlier, else the snapshot's node (looked up once). */
     public async Origin(publicId: string): Promise<INodeOrigin | undefined>
     {
@@ -167,9 +174,10 @@ export class ChangeRouter
 
     /**
      * Adds the op to the change set of the connector its origin binds to; none when engine-only or found nowhere. On an
-     * External connector the change carries the fetched version of `routingId` (the written node, or a Link / Unlink's
-     * source) as ExpectedVersion, unless a step created that id earlier (ruling R119 V2); the key is never added
-     * without a version, and Mirrored connectors never get one.
+     * External connector the change carries the ExpectedVersion of `routingId` (the written node, or a Link / Unlink's
+     * source) the VersionLedger gives (ruling R137 E5): the version this transaction's own latest step reported for it,
+     * else the fetched one (R119 V1) unless a step created it earlier and the source has reported none yet (R119 V2);
+     * the key is never added without a version, and Mirrored connectors never get one.
      */
     public Emit(op: BatchOp, origin: INodeOrigin | undefined, routingId: string): void
     {
@@ -188,7 +196,9 @@ export class ChangeRouter
             changes = [];
             this.grouped.set(name as string, changes);
         }
-        const version = this.external.has(name as string) && !this.createdHere.has(routingId) ? this.origins.Version(routingId) : undefined;
+        const version = this.external.has(name as string)
+            ? this.ledger.Expected(routingId, this.origins.Version(routingId), this.createdHere.has(routingId))
+            : undefined;
         changes.push((version === undefined
             ? { ...op, Owner: origin.Owner, Concept: origin.Concept }
             : { ...op, Owner: origin.Owner, Concept: origin.Concept, ExpectedVersion: version }) as ConnectorChange);
@@ -235,9 +245,9 @@ export class StepRouter
     private readonly edges: BatchEdges;
     private readonly check: ExternalWriteCheck;
 
-    public constructor(private readonly table: BindingTable, private readonly index: CatalogIndex, origins: INodeOrigins, private readonly external: ReadonlySet<string>)
+    public constructor(private readonly table: BindingTable, private readonly index: CatalogIndex, origins: INodeOrigins, private readonly external: ReadonlySet<string>, ledger: VersionLedger = new VersionLedger())
     {
-        this.router = new ChangeRouter(table, index, origins, external);
+        this.router = new ChangeRouter(table, index, origins, external, ledger);
         this.edges = new BatchEdges(index, origins);
         this.check = new ExternalWriteCheck(index);
     }
@@ -380,6 +390,12 @@ export class StepRouter
         this.router.Created(publicId, origin);
         this.edges.Created(publicId);
         this.check.Assigned(publicId, origin.Concept);
+    }
+
+    /** True when the transaction created the id (a CreateNode or a source-assigned create); its re-create is a duplicate. */
+    public IsCreated(publicId: string): boolean
+    {
+        return this.router.IsCreated(publicId);
     }
 
     /** Splits the step's grouped change sets into External (execute now) and Mirrored (stage), each name-ordered. */

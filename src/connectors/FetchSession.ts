@@ -6,7 +6,7 @@ import type { IReadProbe } from '../GraphReader.js';
 import { And, IdIn, Predicate } from '../predicate/Predicate.js';
 import { ConnectorError, ConnectorPhase } from './ConnectorError.js';
 import type { BindingTable } from './BindingTable.js';
-import type { IExternalConnector, IFetchPage, IFetchRequest, IFetchTarget, IFetchedRow } from './FetchContract.js';
+import type { IExternalConnector, IFetchPage, IFetchRequest, IFetchTarget, IFetchedRow, RowVersion } from './FetchContract.js';
 
 /** A row a session fetched and the model it was fetched for (FetchSession.Known, FetchSession.Lookup). */
 export interface IFetchedEntry
@@ -229,7 +229,7 @@ export class FetchSession
                 {
                     continue;
                 }
-                yield onlyIds === undefined ? this.Remember(target, row) : row;
+                yield onlyIds === undefined ? this.Keep(target, row) : row;
             }
             resume = page.Resume;
         }
@@ -237,10 +237,23 @@ export class FetchSession
     }
 
     /**
+     * Records a row the transaction created at the source (ruling R136 E4), so its commit decides later ops on that id
+     * against it (R103) and `Fetch` returns it (R30). First-wins, as a fetched row: a created id has no prior memo entry.
+     */
+    public Remember(row: IFetchedRow, model: string): void
+    {
+        if (!this.memo.has(row.PublicId))
+        {
+            this.ClearMisses(row.PublicId);
+            this.memo.set(row.PublicId, { Row: row, Model: model });
+        }
+    }
+
+    /**
      * The row to use for a scanned row: the session's entry when it serves the target, else the scanned row itself. The
      * first row of an id is recorded (clearing the id's recorded misses); a later one never replaces it (D3).
      */
-    private Remember(target: IFetchTarget, row: IFetchedRow): IFetchedRow
+    private Keep(target: IFetchTarget, row: IFetchedRow): IFetchedRow
     {
         const entry = this.memo.get(row.PublicId);
         if (entry !== undefined)
@@ -302,5 +315,38 @@ export class FetchSession
             throw new GraphError(GraphErrorCode.InvalidArgument, FetchSession.ErrUnknownConnector + target.Connector);
         }
         return connector;
+    }
+}
+
+/**
+ * The expected version of the next change to each external id, for one GraphTransaction (ruling R137 E5). It keeps the
+ * versions this transaction's own steps reported (IConnectorApplyResult.Versions, or a source-assigned create's row
+ * Version) apart from the read memo's fetched versions (R119 V1). The expected version of a change is: the one this
+ * transaction's own latest step reported for the id; else the fetched one; else none. A reported version supersedes
+ * V2's "created by this transaction carries none" rule (a node created at step 1 and updated at step 3 is guarded with
+ * step 1's reported version). One ledger belongs to one transaction and never guards another's write (ruling R138 E11).
+ */
+export class VersionLedger
+{
+    private readonly reported = new Map<string, RowVersion>();
+
+    /** Records the version a step reported for the id; the next change to it is guarded with this. */
+    public Reported(publicId: string, version: RowVersion): void
+    {
+        this.reported.set(publicId, version);
+    }
+
+    /**
+     * The expected version of the next change to `publicId`: the latest reported one; else the fetched one (R119 V1)
+     * unless the transaction created the id and the source has reported no version for it yet (R119 V2); else none.
+     */
+    public Expected(publicId: string, fetched: RowVersion | undefined, createdHere: boolean): RowVersion | undefined
+    {
+        const reported = this.reported.get(publicId);
+        if (reported !== undefined)
+        {
+            return reported;
+        }
+        return createdHere ? undefined : fetched;
     }
 }

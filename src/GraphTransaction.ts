@@ -1,17 +1,23 @@
 import { randomUUID } from 'node:crypto';
 import type { AccessScope } from './access/AccessScope.js';
 import { AccessError } from './access/AccessError.js';
+import type { CatalogSnapshot } from './catalog/CatalogSnapshot.js';
 import { WriteExemptions } from './access/WriteExemptions.js';
-import type { FetchedNode } from './access/FetchedNode.js';
 import { WriteGate } from './access/WriteGate.js';
 import type { WriteStage } from './access/WriteStage.js';
 import type { CellValue } from './columns/CellValue.js';
+import { FetchedNode } from './access/FetchedNode.js';
+import { BindingTable } from './connectors/BindingTable.js';
 import type { ConnectorChange } from './connectors/ConnectorChangeSet.js';
+import { ConnectorError, ConnectorPhase } from './connectors/ConnectorError.js';
 import type { ConnectorContext } from './connectors/ConnectorContext.js';
-import type { RowVersion } from './connectors/FetchContract.js';
+import { VersionLedger } from './connectors/FetchSession.js';
+import type { IFetchedRow, RowVersion } from './connectors/FetchContract.js';
+import type { IAssignedCreate, IAssignedOutcome } from './connectors/GraphConnector.js';
 import { StepRouter } from './connectors/StepRouter.js';
 import { TransactionFetch } from './connectors/TransactionFetch.js';
 import { type ConnectorSetup, type INodeOrigin, type INodeOrigins, WriteCoordinator } from './connectors/WriteCoordinator.js';
+import { CommitError, CommitErrorCode } from './txn/CommitError.js';
 import type { GraphContext, ReadSnapshot } from './GraphContext.js';
 import { GraphError, GraphErrorCode } from './errors/GraphError.js';
 import { FederatedReads } from './FederatedReads.js';
@@ -76,6 +82,14 @@ export class GraphTransaction extends GraphReader
     private static readonly ErrFinished = 'Transaction has already committed or been disposed';
     private static readonly ErrSchema = 'The schema changed after the transaction began: catalog version ';
     private static readonly ErrSchemaNow = ', now ';
+    private static readonly ErrNoConnectors = 'CreateAssigned needs an external connector binding, and the store has no connectors installed';
+    private static readonly ErrAssignedEngineOnly = 'CreateAssigned was asked to create a node that is not bound to an external connector: ';
+    private static readonly ErrAssignedConcept = 'A source-assigned create returned a row of the wrong concept: ';
+    private static readonly ErrAssignedDuplicate = 'A source-assigned create returned a public id that is already in use: ';
+    private static readonly ErrOutcomeCount = 'A connector returned a different number of create outcomes than requests';
+    private static readonly ErrNoRow = 'A source-assigned create outcome carried neither a row nor an error';
+    /** The synthetic public id a CreateAssigned pre-flight check gives each request (the key is not yet known). */
+    private static readonly AssignedProbe = '\u0001assigned\u0001';
     /** The empty read-only set (no member is read-only). */
     private static readonly NoReadOnly: ReadonlySet<string> = new Set();
 
@@ -96,6 +110,8 @@ export class GraphTransaction extends GraphReader
     /** The persistent per-transaction router and write-through coordinator (created at the first step). */
     private router: StepRouter | undefined;
     private coordinator: WriteCoordinator | undefined;
+    /** The transaction's version ledger (ruling R137 E5): shared by the router (read) and the coordinator (reported). */
+    private ledger: VersionLedger | undefined;
     /** How many recorded ops have been routed into a step. */
     private flushedCount = 0;
     /** The number of external steps executed, assigned to each step for the step log. */
@@ -196,6 +212,172 @@ export class GraphTransaction extends GraphReader
     }
 
     /**
+     * Creates nodes whose keys the source assigns (ruling R136 E4), index-aligned with `requests`. It flushes the ops
+     * recorded since the previous step, checks every request (R29; the gate's Create rules judged hypothetically; the
+     * scope's Hidden and ReadOnly.Create members over the Properties and Links; the AppendTo of every existing link
+     * target; the external schema checks), then groups the requests by binding connector and calls each connector's
+     * Create once, in name order, as its own step. Each returned row is validated (FetchedNode.Validated); its concept
+     * must be the request's, its id valid and neither a stored engine node's nor one the transaction created. A failed
+     * check, an Error outcome, an outcome count that does not match, or an invalid row fails the step as ConnectorError
+     * Write; the connector's Undo of that step compensates exactly the requests that produced a row, and the transaction
+     * compensates and ends (ruling R137 E6). On success each row is remembered in the session and in the router as
+     * created by this transaction (so later ops on its id route External and carry its Version as ExpectedVersion), and
+     * the returned view carries the real public id, the id member and source defaults, and the Version.
+     */
+    public async CreateAssigned(requests: readonly IAssignedCreate[]): Promise<readonly IFetchedView[]>
+    {
+        this.RequireActive();
+        try
+        {
+            return await this.AssignedCreates(requests);
+        }
+        catch (error)
+        {
+            throw await this.CompensateAndEnd(error);
+        }
+    }
+
+    /** The body of CreateAssigned (ruling R136 E4), its failures compensated and the transaction ended by CreateAssigned. */
+    private async AssignedCreates(requests: readonly IAssignedCreate[]): Promise<readonly IFetchedView[]>
+    {
+        const setup = this.context.Connectors;
+        if (setup === undefined)
+        {
+            throw new GraphError(GraphErrorCode.Unsupported, GraphTransaction.ErrNoConnectors);
+        }
+        // Step 1: flush the ops recorded since the previous step.
+        await this.FlushStep();
+        this.EnsureRouter(setup);
+        const catalog = this.snapshot.Index.Catalog;
+        // Step 2: check every request before any connector call.
+        await this.CheckAssigned(requests, setup);
+        // Step 3: group by binding connector; one Create call per connector, in name order, each its own step.
+        const groups = this.GroupAssigned(requests, setup, catalog);
+        const accepted: { readonly Row: IFetchedRow; readonly Model: string; readonly Index: number }[] = [];
+        for (const name of [...groups.keys()].sort())
+        {
+            const group = groups.get(name)!;
+            this.stepNumber++;
+            // Step 4/5: call Create, then map outcome i back to request i; a count mismatch is a connector error.
+            const outcomes = await this.coordinator!.Create(name, group.map(g => g.Request), this.stepNumber);
+            if (outcomes.length !== group.length)
+            {
+                throw new ConnectorError(name, ConnectorPhase.Write, new GraphError(GraphErrorCode.Internal, GraphTransaction.ErrOutcomeCount));
+            }
+            for (let k = 0; k < group.length; k++)
+            {
+                const member = group[k]!;
+                accepted.push({ Row: await this.ValidateAssigned(name, member.Request, outcomes[k]!), Model: member.Request.Owner, Index: member.Index });
+            }
+        }
+        // Register and build views only once every row passed, so a failed step registers nothing (it is compensated).
+        const session = FederatedReads.Of(this).Session;
+        const views = new Array<IFetchedView>(requests.length);
+        for (const a of accepted)
+        {
+            this.router!.Created(a.Row.PublicId, { Owner: a.Model, Concept: a.Row.Concept });
+            session?.Remember(a.Row, a.Model);
+            if (a.Row.Version !== undefined)
+            {
+                this.ledger!.Reported(a.Row.PublicId, a.Row.Version);
+            }
+            views[a.Index] = await this.AssignedView(a.Row, a.Model);
+        }
+        return views;
+    }
+
+    /**
+     * Checks every create request before any connector call (ruling R136 E4 step 2), over a synthetic batch whose
+     * placeholder ids stand in until the source assigns the real ones: the gate's Create rules, Hidden, ReadOnly.Create
+     * and the AppendTo of every existing link target (skipped when the scope restricts no write), then R29 and the
+     * external schema checks on the properties and links (through a throwaway StepRouter, which runs ExternalWriteCheck).
+     */
+    private async CheckAssigned(requests: readonly IAssignedCreate[], setup: ConnectorSetup): Promise<void>
+    {
+        const synth = new WriteBatch();
+        requests.forEach((request, index) =>
+        {
+            const id = GraphTransaction.AssignedProbe + index;
+            synth.CreateNode(id, request.Concept, { Owner: request.Owner });
+            for (const [member, value] of request.Properties)
+            {
+                synth.SetProperty(id, member, value);
+            }
+            for (const link of request.Links)
+            {
+                synth.Link(id, link.Relationship, link.To);
+            }
+        });
+        if (!this.Scope.WritesUnrestricted)
+        {
+            await WriteGate.Check(this.WriteEvaluator(), synth, this.snapshot.Index.Catalog, WriteExemptions.None(), id => this.FetchedRow(id));
+        }
+        await new StepRouter(setup.Bindings, this.snapshot.Index, this.RoutingOrigins(), setup.External, new VersionLedger()).Route(synth.Ops());
+    }
+
+    /** Groups the requests by the connector their (Owner, Concept) binds to; a request bound to no connector is refused. */
+    private GroupAssigned(requests: readonly IAssignedCreate[], setup: ConnectorSetup, catalog: CatalogSnapshot): Map<string, { readonly Request: IAssignedCreate; readonly Index: number }[]>
+    {
+        const groups = new Map<string, { readonly Request: IAssignedCreate; readonly Index: number }[]>();
+        requests.forEach((request, index) =>
+        {
+            const name = setup.Bindings.Resolve(request.Owner, request.Concept, catalog);
+            if (name === undefined || BindingTable.IsEngineOnly(name))
+            {
+                throw new ConnectorError(name ?? BindingTable.EngineStorage, ConnectorPhase.Write, new GraphError(GraphErrorCode.Unsupported, GraphTransaction.ErrAssignedEngineOnly + request.Concept));
+            }
+            let group = groups.get(name);
+            if (group === undefined)
+            {
+                group = [];
+                groups.set(name, group);
+            }
+            group.push({ Request: request, Index: index });
+        });
+        return groups;
+    }
+
+    /** Validates one create outcome (ruling R136 E4): an Error fails the step, and the row must pass FetchedNode.Validated, be of the request's concept, and own an id no engine node or earlier create holds. */
+    private async ValidateAssigned(connector: string, request: IAssignedCreate, outcome: IAssignedOutcome): Promise<IFetchedRow>
+    {
+        if (outcome.Error !== undefined || outcome.Row === undefined)
+        {
+            throw new ConnectorError(connector, ConnectorPhase.Write, outcome.Error ?? new GraphError(GraphErrorCode.Internal, GraphTransaction.ErrNoRow));
+        }
+        let row: IFetchedRow;
+        try
+        {
+            row = FetchedNode.Validated(this.snapshot.Index.Catalog, outcome.Row);
+        }
+        catch (cause)
+        {
+            throw new ConnectorError(connector, ConnectorPhase.Write, cause);
+        }
+        if (row.Concept !== request.Concept)
+        {
+            throw new ConnectorError(connector, ConnectorPhase.Write, new GraphError(GraphErrorCode.SchemaViolation, GraphTransaction.ErrAssignedConcept + row.Concept));
+        }
+        if ((await FederatedReads.Of(this).StoredNonStub(row.PublicId)) || this.router!.IsCreated(row.PublicId))
+        {
+            throw new ConnectorError(connector, ConnectorPhase.Write, new CommitError(CommitErrorCode.DuplicatePublicId, GraphTransaction.ErrAssignedDuplicate + row.PublicId));
+        }
+        return row;
+    }
+
+    /** The view of a source-assigned created row: its real public id, scoped properties, External true and the Version. */
+    private async AssignedView(row: IFetchedRow, model: string): Promise<IFetchedView>
+    {
+        return {
+            PublicId: row.PublicId,
+            Concept: row.Concept,
+            Owner: model,
+            Properties: await this.ScopedProperties(row.Concept, def => row.Values.get(def.Name)),
+            External: true,
+            ...(row.Version === undefined ? {} : { Version: row.Version }),
+        };
+    }
+
+    /**
      * Executes, as one write step, the ops recorded since the previous step (ruling R135 E1): the step's writes to
      * External connectors run now (routed one connector at a time in name order), its Mirrored writes stage until
      * Commit, and its engine ops join the transaction's engine batch. The write gate and R29 are judged over the
@@ -254,7 +436,9 @@ export class GraphTransaction extends GraphReader
         try
         {
             const began = this.RequireCatalog();
-            if (this.batch.Count === 0)
+            // A transaction that executed external steps (CreateAssigned, Flush) still finalizes them, even when it
+            // recorded nothing in its engine batch (ruling R136 E4, P13): only a truly empty transaction short-circuits.
+            if (this.batch.Count === 0 && this.ExecutedSteps === 0)
             {
                 return this.SnapshotCommit;
             }
@@ -383,20 +567,26 @@ export class GraphTransaction extends GraphReader
         this.flushedCount = ops.length;
     }
 
-    /** Creates the persistent router and coordinator on the first step; both serve this transaction only (ruling E11). */
+    /** Creates the persistent router, coordinator and version ledger on the first step; all serve this transaction only (ruling E11). */
     private EnsureRouter(setup: ConnectorSetup): void
     {
         if (this.router !== undefined)
         {
             return;
         }
-        const origins: INodeOrigins = {
+        this.ledger = new VersionLedger();
+        this.router = new StepRouter(setup.Bindings, this.snapshot.Index, this.RoutingOrigins(), setup.External, this.ledger);
+        this.coordinator = new WriteCoordinator(setup, this.context.ConnectorRevertFailed, this.context.ConnectorApplied, this.Connector, this.ledger);
+    }
+
+    /** Where routing looks up the nodes a step does not create: the snapshot, else the rows the transaction fetched. */
+    private RoutingOrigins(): INodeOrigins
+    {
+        return {
             Origin: id => this.RoutingOrigin(id),
             Edges: id => this.NodeEdges(id),
             Version: id => FederatedReads.Of(this).OpenSession?.Known(id)?.Row.Version,
         };
-        this.router = new StepRouter(setup.Bindings, this.snapshot.Index, origins, setup.External);
-        this.coordinator = new WriteCoordinator(setup, this.context.ConnectorRevertFailed, this.context.ConnectorApplied, this.Connector);
     }
 
     /** The row this transaction's FetchSession holds for the id, as a FetchedNode of its model; undefined when none. */

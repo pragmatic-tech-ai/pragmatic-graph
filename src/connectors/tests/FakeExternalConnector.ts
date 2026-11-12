@@ -41,6 +41,20 @@ export class FakeExternalConnector implements IExternalConnector
     public RevertCalls = 0;
     /** When false, the transaction it returns exposes no Undo: compensation uses Revert (ruling R137 E6). */
     public SupportsUndo = true;
+    /** When false, the transaction it returns exposes no Create: CreateAssigned refuses with Unsupported (ruling R136 E4). */
+    public SupportsCreate = true;
+    /** Scripted outcomes a Create call returns, index-aligned with the requests; undefined rejects with Failure. */
+    public CreateOutcomes: readonly IAssignedOutcome[] | undefined;
+    /** When set, Create rejects with it (the whole call failed; the connector logged whatever it applied for Undo). */
+    public CreateThrows: unknown;
+    /** The requests of every Create call, in call order. */
+    public readonly CreateCalls: IAssignedCreate[][] = [];
+    /** Public ids of the rows this connector created and still holds (a Row outcome), across its Create steps. */
+    public readonly Inserted: string[] = [];
+    /** Public ids an Undo removed, in removal order (the connector removes exactly the rows it created, ruling R136 E4). */
+    public readonly Removed: string[] = [];
+    /** Per external step, the ids to remove on its Undo (a Create step's created rows; an Apply step's is empty). */
+    private readonly stepInserts: string[][] = [];
     /** Shared between connectors to observe cross-connector compensation order; each Undo appends this connector's name. */
     public UndoOrder: string[] | undefined;
     /** As UndoOrder, for Revert. */
@@ -80,14 +94,43 @@ export class FakeExternalConnector implements IExternalConnector
         {
             (txn as { Undo?: unknown }).Undo = undefined;
         }
+        if (!this.SupportsCreate)
+        {
+            (txn as { Create?: unknown }).Create = undefined;
+        }
         return Promise.resolve(txn);
     }
 
-    /** @internal Runs a scripted Undo: records its order, waits when held, then fails when configured. */
+    /** @internal Runs a scripted Create: logs the call and the ids it created (for Undo), then throws or returns the outcomes. */
+    public RunCreate(requests: readonly IAssignedCreate[]): Promise<readonly IAssignedOutcome[]>
+    {
+        this.NextStep();
+        this.CreateCalls.push([...requests]);
+        if (this.CreateThrows !== undefined)
+        {
+            return Promise.reject(this.CreateThrows);
+        }
+        const outcomes = this.CreateOutcomes;
+        if (outcomes === undefined)
+        {
+            return Promise.reject(this.Failure);
+        }
+        const ids = outcomes.filter(o => o.Row !== undefined).map(o => o.Row!.PublicId);
+        this.stepInserts.push(ids);
+        this.Inserted.push(...ids);
+        return Promise.resolve(outcomes);
+    }
+
+    /** @internal Runs a scripted Undo: records its order, removes the latest step's created rows, waits when held, then fails when configured. */
     public async RunUndo(): Promise<void>
     {
         this.UndoCalls++;
         this.UndoOrder?.push(this.Name);
+        const inserts = this.stepInserts.pop();
+        if (inserts !== undefined)
+        {
+            this.Removed.push(...inserts);
+        }
         if (this.HoldUndo)
         {
             await this.undoHeld;
@@ -156,9 +199,9 @@ class FakeExternalTransaction implements IConnectorTransaction
         return Promise.resolve(this.owner.Versions === undefined ? undefined : { Versions: this.owner.Versions });
     }
 
-    public Create(_requests: readonly IAssignedCreate[]): Promise<readonly IAssignedOutcome[]>
+    public Create(requests: readonly IAssignedCreate[]): Promise<readonly IAssignedOutcome[]>
     {
-        return Promise.reject(this.owner.Failure);
+        return this.owner.RunCreate(requests);
     }
 
     public Undo(): Promise<void>
