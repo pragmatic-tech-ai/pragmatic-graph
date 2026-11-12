@@ -1,4 +1,5 @@
 import type { Binding } from '../Binding.js';
+import { WriteMode } from '../CypherEnums.js';
 import type { DeleteClause } from '../CypherQueryModel.js';
 import type { CypherValue } from '../CypherValue.js';
 import type { IOperator } from '../operators/IOperator.js';
@@ -13,6 +14,7 @@ export class DeleteOperator implements IOperator
         private readonly clause: DeleteClause,
         private readonly sink: ICypherSink,
         private readonly parameters: ReadonlyMap<string, CypherValue>,
+        private readonly mode: WriteMode = WriteMode.PerRow,
     )
     {
     }
@@ -27,7 +29,7 @@ export class DeleteOperator implements IOperator
                 if (id !== undefined) await this.sink.DeleteNode(id, this.clause.Detach);
             }
             // Per-row write step (ruling R135 E1): the row's external writes execute before it flows on.
-            await this.sink.EndStep();
+            if (this.mode === WriteMode.PerRow) await this.sink.EndStep();
             yield row;
         }
     }
@@ -35,5 +37,10 @@ export class DeleteOperator implements IOperator
     public Inputs(): readonly IOperator[]
     {
         return [this.child];
+    }
+
+    public Details(): readonly string[]
+    {
+        return [WriteSupport.ModeLabel(this.mode)];
     }
 }

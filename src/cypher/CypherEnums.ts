@@ -17,3 +17,8 @@ export enum ComparisonOp { Eq, Neq, Lt, Lte, Gt, Gte }
 export enum BooleanOp { And, Or, Not }
 
 export enum ArithmeticOp { Add, Sub, Mul, Div, Mod }
+
+// How a write clause reaches its external connectors (ruling R140 E10). PerRow: one flushed step per input row.
+// Batched: the clause's writes for every input row go in one step (a batched stage, or one Apply), when no later
+// clause depends on the rows it writes.
+export enum WriteMode { PerRow = 1, Batched = 2 }

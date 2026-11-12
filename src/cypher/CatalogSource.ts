@@ -9,6 +9,7 @@ import type { RelDirection } from './CypherEnums.js';
 import type { CypherNode } from './CypherNode.js';
 import type { ICypherSource, IExpandRow } from './CypherSource.js';
 import { LabelResolver } from './LabelResolver.js';
+import { WriteDependencyAnalysis } from './write/WriteDependencyAnalysis.js';
 
 /**
  * The plan-time half of an ICypherSource, answered from one catalog snapshot and the scope's hidden member names alone:
@@ -85,6 +86,11 @@ export abstract class CatalogSource implements ICypherSource
     public IsA(node: CypherNode, label: string): boolean
     {
         return this.catalog.IsA(node.Concept, this.labels.Resolve(label));
+    }
+
+    public WriteDependencies(): WriteDependencyAnalysis
+    {
+        return new WriteDependencyAnalysis(this.catalog, concept => this.bindings.MayResolveExternal(concept, this.catalog, this.external));
     }
 
     public IndexFor(label: string, member: string): string | undefined

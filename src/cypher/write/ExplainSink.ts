@@ -38,6 +38,11 @@ export class ExplainSink implements ICypherSink
         return ExplainSink.Refuse();
     }
 
+    public CreateNodes(): Promise<readonly CypherNode[]>
+    {
+        return ExplainSink.Refuse();
+    }
+
     /** An explained plan runs no steps. */
     public EndStep(): Promise<void>
     {

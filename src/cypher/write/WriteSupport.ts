@@ -1,4 +1,5 @@
 import { Binding, EvalContext } from '../Binding.js';
+import { WriteMode } from '../CypherEnums.js';
 import { CypherSemanticError } from '../CypherError.js';
 import { NodeValue, NullValue, type CypherValue } from '../CypherValue.js';
 import type { Expression } from '../Expression.js';
@@ -6,6 +7,15 @@ import type { Expression } from '../Expression.js';
 /** Shared helpers and messages of the write operators. */
 export class WriteSupport
 {
+    private static readonly PerRowLabel = 'PerRow';
+    private static readonly BatchedLabel = 'Batched';
+
+    /** How OperatorPrinter shows a write operator's mode (ruling R140 E10). */
+    public static ModeLabel(mode: WriteMode): string
+    {
+        return mode === WriteMode.Batched ? WriteSupport.BatchedLabel : WriteSupport.PerRowLabel;
+    }
+
     public static readonly NotANode = 'write target is not a node';
     public static readonly UnboundVariable = 'variable not bound';
     public static readonly LabelRequired = 'a created node requires a label';

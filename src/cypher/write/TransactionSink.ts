@@ -20,8 +20,8 @@ import { CypherNode } from '../CypherNode.js';
 import type { ICypherSource } from '../CypherSource.js';
 import type { CypherScalar } from '../CypherValue.js';
 import { CypherWriteStats } from './CypherWriteStats.js';
-import type { ICypherSink } from './CypherSink.js';
-import type { INodePlacement } from './NodePlacement.js';
+import type { ICypherSink, IStagedCreate } from './CypherSink.js';
+import type { INodePlace, INodePlacement } from './NodePlacement.js';
 import { OverlaySource } from './OverlaySource.js';
 import { OverlayEdge, PendingOverlay } from './PendingOverlay.js';
 
@@ -131,6 +131,16 @@ export class TransactionSink implements ICypherSink
         {
             return this.CreateAssignedNode(concept, place.Owner, cells, placed, links ?? TransactionSink.NoLinks);
         }
+        return this.RecordCreate(concept, place, cells, placed, links ?? TransactionSink.NoLinks);
+    }
+
+    /**
+     * Records a client-keyed (or engine) create on the transaction (ruling R135 E1): the CreateNode, the query's
+     * properties and the placement defaults, then its outgoing links; returns the node as the query now sees it. The
+     * records flush with the step (per row, or a batched clause's one closing flush).
+     */
+    private async RecordCreate(concept: string, place: INodePlace, cells: Map<string, CellValue>, placed: ReadonlyMap<string, CellValue>, links: readonly IAssignedLink[]): Promise<CypherNode>
+    {
         const owner = place.Owner === TransactionSink.NoOwner ? undefined : { Owner: place.Owner };
         this.pending.CreateNode(place.PublicId, concept, owner);
         this.transaction.CreateNode(place.PublicId, concept, owner);
@@ -149,11 +159,85 @@ export class TransactionSink implements ICypherSink
         this.overlay.RecordCreate(node);
         this.Stats.NodesCreated++;
         this.Stats.PropertiesSet += cells.size;
-        for (const link of links ?? TransactionSink.NoLinks)
+        for (const link of links)
         {
             await this.CreateRelationship(place.PublicId, link.Relationship, link.To);
         }
         return node;
+    }
+
+    /**
+     * Creates every node of one batched CREATE stage in a single step (ruling R140 E10), index-aligned with `stage`:
+     * source-keyed places go through one GraphTransaction.CreateAssigned (one Create call per connector, in name
+     * order), client-keyed and engine places are recorded then flushed once as this stage's step.
+     */
+    public async CreateNodes(stage: readonly IStagedCreate[]): Promise<readonly CypherNode[]>
+    {
+        const result = new Array<CypherNode>(stage.length);
+        const assigned: { readonly Index: number; readonly Request: IAssignedCreate }[] = [];
+        let recorded = false;
+        for (let i = 0; i < stage.length; i++)
+        {
+            const sc = stage[i]!;
+            try
+            {
+                this.catalog.RequireInstantiable(sc.Concept);
+            }
+            catch (error)
+            {
+                throw TransactionSink.Wrap(error, TransactionSink.NotInstantiable + sc.Concept);
+            }
+            const cells = new Map<string, CellValue>();
+            for (const [name, value] of sc.Properties)
+            {
+                cells.set(name, this.Cell(this.Property(sc.Concept, name), sc.Concept, value));
+            }
+            const place = this.placement.Place(sc.Concept, cells);
+            const placed = new Map<string, CellValue>();
+            for (const [name, value] of place.Defaults ?? TransactionSink.NoDefaults)
+            {
+                if (!cells.has(name)) placed.set(name, this.Cell(this.Property(sc.Concept, name), sc.Concept, value));
+            }
+            if (place.KeyAssigned === true)
+            {
+                const properties = new Map(cells);
+                for (const [name, value] of placed) properties.set(name, value);
+                assigned.push({ Index: i, Request: { Owner: place.Owner, Concept: sc.Concept, Properties: properties, Links: sc.Links } });
+            }
+            else
+            {
+                result[i] = await this.RecordCreate(sc.Concept, place, cells, placed, sc.Links);
+                recorded = true;
+            }
+        }
+        if (assigned.length > 0)
+        {
+            // CreateAssigned flushes any client/engine records above first, then runs the source-keyed creates as steps.
+            let views: readonly IFetchedView[];
+            try
+            {
+                views = await this.transaction.CreateAssigned(assigned.map(a => a.Request));
+            }
+            catch (error)
+            {
+                throw TransactionSink.MapCommitError(error);
+            }
+            for (let k = 0; k < assigned.length; k++)
+            {
+                const view = views[k]!;
+                const node = new CypherNode(view.PublicId, view.Concept, view.Owner, new Map(view.Properties));
+                this.overlay.RecordCreate(node);
+                this.Stats.NodesCreated++;
+                this.Stats.PropertiesSet += assigned[k]!.Request.Properties.size;
+                this.Stats.RelationshipsCreated += assigned[k]!.Request.Links.length;
+                result[assigned[k]!.Index] = node;
+            }
+        }
+        else if (recorded)
+        {
+            await this.EndStep();
+        }
+        return result;
     }
 
     /**
@@ -412,7 +496,7 @@ export class TransactionSink implements ICypherSink
     public IsExternalConcept(concept: string): boolean
     {
         const setup = FederatedReads.Of(this.transaction).Setup;
-        return setup !== undefined && setup.Bindings.ExternalTargets(concept, this.catalog, setup.External).length > 0;
+        return setup !== undefined && setup.Bindings.MayResolveExternal(concept, this.catalog, setup.External);
     }
 
     /** A created node's properties as a reader under the transaction's scope would show them (null for unset). */

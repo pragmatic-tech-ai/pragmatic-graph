@@ -1,4 +1,5 @@
 import type { Binding } from '../Binding.js';
+import { WriteMode } from '../CypherEnums.js';
 import { CypherSemanticError } from '../CypherError.js';
 import type { MergeClause, SetItem } from '../CypherQueryModel.js';
 import type { ICypherSource } from '../CypherSource.js';
@@ -30,6 +31,7 @@ export class MergeOperator implements IOperator
         // The MERGE pattern compiled as a match over one input row (its bound variables fixed).
         private readonly matcher: IOptionalPlan,
         bound: ReadonlySet<string>,
+        private readonly mode: WriteMode = WriteMode.PerRow,
     )
     {
         MergeOperator.Validate(clause.Pattern, bound);
@@ -77,7 +79,7 @@ export class MergeOperator implements IOperator
                 out.push(await this.ApplyActions(created, this.clause.OnCreate));
             }
             // Per-row write step (ruling R135 E1): the row's external writes execute before it flows on.
-            await this.sink.EndStep();
+            if (this.mode === WriteMode.PerRow) await this.sink.EndStep();
             for (const o of out) yield o;
         }
     }
@@ -85,6 +87,11 @@ export class MergeOperator implements IOperator
     public Inputs(): readonly IOperator[]
     {
         return [this.child];
+    }
+
+    public Details(): readonly string[]
+    {
+        return [WriteSupport.ModeLabel(this.mode)];
     }
 
     private CheckBound(row: Binding): void

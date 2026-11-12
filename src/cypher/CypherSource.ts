@@ -4,6 +4,7 @@ import type { ILinkView, IReadProbe } from '../GraphReader.js';
 import type { Predicate } from '../predicate/Predicate.js';
 import type { RelDirection } from './CypherEnums.js';
 import type { CypherNode } from './CypherNode.js';
+import type { WriteDependencyAnalysis } from './write/WriteDependencyAnalysis.js';
 
 /** One step of an expand: the relationship walked and the fully loaded node at its far end. */
 export interface IExpandRow
@@ -72,4 +73,9 @@ export interface ICypherSource
      * ScanLabel.
      */
     SeekEqual(label: string, member: string, value: CellValue, probe?: IReadProbe, hint?: Predicate): AsyncIterable<CypherNode> | undefined;
+    /**
+     * The cross-row write-batching dependency analysis over this source's catalog and external bindings (ruling R140
+     * E10). Plan-time metadata: nothing is read.
+     */
+    WriteDependencies(): WriteDependencyAnalysis;
 }

@@ -10,6 +10,7 @@ import { NodeValue, NullValue, type CypherValue } from '../CypherValue.js';
 import { BooleanExpression, Comparison, Literal, PropertyAccess } from '../Expression.js';
 import { ListValue, MapValue, PathValue } from '../StructuredValues.js';
 import type { PendingOverlay } from './PendingOverlay.js';
+import type { WriteDependencyAnalysis } from './WriteDependencyAnalysis.js';
 
 /**
  * The graph as one write query sees it: the transaction's snapshot (`base`, a ReaderSource over the
@@ -44,6 +45,11 @@ export class OverlaySource implements ICypherSource
     public IsA(node: CypherNode, label: string): boolean
     {
         return !this.overlay.IsDeleted(node.PublicId) && this.base.IsA(node, label);
+    }
+
+    public WriteDependencies(): WriteDependencyAnalysis
+    {
+        return this.base.WriteDependencies();
     }
 
     /** The hint goes to the base untouched: a created node is never fetched, and every node still passes the filters. */

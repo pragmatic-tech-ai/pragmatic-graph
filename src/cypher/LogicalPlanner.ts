@@ -1,5 +1,5 @@
 import { Binding, EvalContext } from './Binding.js';
-import { ComparisonOp } from './CypherEnums.js';
+import { ComparisonOp, WriteMode } from './CypherEnums.js';
 import { CypherSemanticError } from './CypherError.js';
 import {
     CreateClause, DeleteClause, MatchClause, MergeClause, RemoveClause, SetClause, SortItem, UnwindClause, WritingClause,
@@ -39,9 +39,11 @@ import { Skip } from './operators/Skip.js';
 import { Sort } from './operators/Sort.js';
 import { Unwind } from './operators/Unwind.js';
 import { VarLengthExpand } from './operators/VarLengthExpand.js';
+import { BatchedWriteOperator } from './write/BatchedWriteOperator.js';
 import { CreateOperator } from './write/CreateOperator.js';
 import { DeleteOperator } from './write/DeleteOperator.js';
 import { EagerBarrier } from './write/EagerBarrier.js';
+import { WriteDependencyAnalysis } from './write/WriteDependencyAnalysis.js';
 import { MergeOperator } from './write/MergeOperator.js';
 import { RemoveOperator } from './write/RemoveOperator.js';
 import { SetApplier } from './write/SetApplier.js';
@@ -104,6 +106,8 @@ export class LogicalPlanner
 
     private readonly maxVarLength: number;
     private readonly strictWithScope: boolean;
+    /** Per write clause, the mode WriteDependencyAnalysis chose (ruling R140 E10); empty until PlanForWrite runs. */
+    private writeModes: ReadonlyMap<WritingClause, WriteMode> = new Map();
 
     constructor(
         private readonly source: ICypherSource,
@@ -173,6 +177,7 @@ export class LogicalPlanner
      */
     public PlanForWrite(model: CypherQueryModel): IWritePlan
     {
+        this.writeModes = this.WriteModes(model);
         let inScope = new Set<string>();
         const everBound = new Set<string>();
         let op: IOperator | undefined = undefined;
@@ -199,6 +204,20 @@ export class LogicalPlanner
     public ProjectOver(source: IOperator, projection: ProjectionClause): IOperator
     {
         return this.buildProjection(source, projection, this.ensureOrder);
+    }
+
+    // Runs the cross-row batching analysis over the source's catalog and external bindings (ruling R140 E10) and maps
+    // each write clause to its mode; a clause absent from the analysis (engine-only, moot) stays per-row.
+    private WriteModes(model: CypherQueryModel): ReadonlyMap<WritingClause, WriteMode>
+    {
+        const modes = this.source.WriteDependencies().Modes(model);
+        const byClause = new Map<WritingClause, WriteMode>();
+        for (const [clause, index] of WriteDependencyAnalysis.WriteIndices(model))
+        {
+            const mode = modes.get(index);
+            if (mode !== undefined) byClause.set(clause, mode);
+        }
+        return byClause;
     }
 
     // Planner-internal entry for OptionalMatchPlan (TypeScript has no friend access); not part of the planner API.
@@ -282,22 +301,25 @@ export class LogicalPlanner
         if (sink === undefined) throw new CypherSemanticError(LogicalPlanner.WritesNotExecutable);
         const view = sink.View;
         const source = input === undefined ? new SingleRow() : input instanceof EagerBarrier ? input : new EagerBarrier(input, view, this.cancel);
+        const mode = this.writeModes.get(clause) ?? WriteMode.PerRow;
         let op: IOperator;
         if (clause instanceof CreateClause)
         {
-            op = new CreateOperator(source, clause, this.source, sink, bound);
+            op = mode === WriteMode.Batched
+                ? new BatchedWriteOperator(source, clause, this.source, sink, new Set<string>(bound))
+                : new CreateOperator(source, clause, this.source, sink, bound);
             for (const v of clause.DeclaredVariables()) bound.add(v);
         }
         else if (clause instanceof MergeClause)
         {
             const before = new Set<string>(bound);
             const matcher = new OptionalMatchPlan(this, new MatchClause([clause.Pattern], undefined, false), before);
-            op = new MergeOperator(source, clause, this.source, sink, new SetApplier(sink, this.parameters), matcher, before);
+            op = new MergeOperator(source, clause, this.source, sink, new SetApplier(sink, this.parameters), matcher, before, mode);
             for (const v of clause.DeclaredVariables()) bound.add(v);
         }
-        else if (clause instanceof SetClause) op = new SetOperator(source, clause, new SetApplier(sink, this.parameters), sink);
-        else if (clause instanceof DeleteClause) op = new DeleteOperator(source, clause, sink, this.parameters);
-        else if (clause instanceof RemoveClause) op = new RemoveOperator(source, clause, sink);
+        else if (clause instanceof SetClause) op = new SetOperator(source, clause, new SetApplier(sink, this.parameters), sink, mode);
+        else if (clause instanceof DeleteClause) op = new DeleteOperator(source, clause, sink, this.parameters, mode);
+        else if (clause instanceof RemoveClause) op = new RemoveOperator(source, clause, sink, mode);
         else throw new CypherSemanticError(LogicalPlanner.WritesNotExecutable);
         return new EagerBarrier(op, view, this.cancel);
     }
