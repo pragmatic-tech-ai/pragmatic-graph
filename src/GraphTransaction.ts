@@ -92,7 +92,6 @@ export class GraphTransaction extends GraphReader
     private static readonly AssignedProbe = '\u0001assigned\u0001';
     /** The empty read-only set (no member is read-only). */
     private static readonly NoReadOnly: ReadonlySet<string> = new Set();
-    private static readonly NoVersions: ReadonlyMap<string, RowVersion> = Object.freeze(new Map<string, RowVersion>());
 
     /** A UUID assigned at Begin; the TransactionDroppedError that reports a dropped transaction carries it (R137 E6). */
     public readonly Id: string = randomUUID();
@@ -446,7 +445,9 @@ export class GraphTransaction extends GraphReader
      */
     public CommittedVersions(): ReadonlyMap<string, RowVersion>
     {
-        return this.ledger?.Committed() ?? GraphTransaction.NoVersions;
+        // A fresh map every call (never a shared instance): a frozen Map still accepts .set, so a shared empty
+        // sentinel a caller cast to Map could corrupt. Only called once per commit, so the allocation is cheap.
+        return this.ledger?.Committed() ?? new Map<string, RowVersion>();
     }
 
     /**
