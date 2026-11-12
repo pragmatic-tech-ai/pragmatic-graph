@@ -40,7 +40,7 @@ export { PublicIdTooLongError } from './identity/PublicIdIndex.js';
 export { FormatVersionMismatchError } from './format/FormatMeta.js';
 
 // Connectors: bindings and the write-through contract (spec §5, ruling R72).
-export type { IConnectorTransaction, IGraphConnector } from './connectors/GraphConnector.js';
+export type { IAssignedCreate, IAssignedLink, IAssignedOutcome, IConnectorApplyResult, IConnectorTransaction, IGraphConnector } from './connectors/GraphConnector.js';
 export { ConnectorChangeSet, type ConnectorChange } from './connectors/ConnectorChangeSet.js';
 export { ConnectorResidency, type IConnectorCapabilities, type IExternalConnector, type IFetchPage, type IFetchRequest, type IFetchTarget, type IFetchedRow, type RowVersion } from './connectors/FetchContract.js';
 export { BindingTable } from './connectors/BindingTable.js';

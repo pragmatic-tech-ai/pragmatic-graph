@@ -81,6 +81,17 @@ export class ExternalWriteCheck
     }
 
     /**
+     * Registers an external node a source-keyed create minted (ruling R136 E4): it is live for later steps and a
+     * re-create of its id is DuplicatePublicId. Its members are already the source's row, so R29 never re-judges it
+     * (Finish is passed only the ids CreateNode created).
+     */
+    public Assigned(publicId: string, concept: string): void
+    {
+        this.deleted.delete(publicId);
+        this.created.set(publicId, { Concept: concept, Set: new Set() });
+    }
+
+    /**
      * An engine-source Link to an id the batch deleted: UnknownNode when the target is external (its stub went with the
      * delete, and a link must not re-create it). An engine target is the engine's to reject.
      */
@@ -142,11 +153,19 @@ export class ExternalWriteCheck
         this.Relationship(op.From, source, op.Relationship);
     }
 
-    /** R29 on every external node the batch created and did not delete again. */
-    public Finish(): void
+    /**
+     * R29 on the external nodes `created` in this step that are still live: a create must reach the source with every
+     * required member set within its own step (ruling R135 E1). An id in `created` the step deleted again is skipped.
+     */
+    public Finish(created: ReadonlySet<string>): void
     {
-        for (const [publicId, node] of this.created)
+        for (const publicId of created)
         {
+            const node = this.created.get(publicId);
+            if (node === undefined)
+            {
+                continue;
+            }
             for (const m of this.index.Catalog.EffectiveMembers(node.Concept))
             {
                 if (m.Kind === MemberKind.Property && !m.Nullable && !node.Set.has(m.Name))

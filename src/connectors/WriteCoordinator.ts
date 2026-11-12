@@ -1,18 +1,17 @@
 import type { CatalogSnapshot } from '../catalog/CatalogSnapshot.js';
-import { MemberKind } from '../catalog/ValueType.js';
 import type { ConnectorContext } from './ConnectorContext.js';
 import { GraphError, GraphErrorCode } from '../errors/GraphError.js';
 import type { CatalogIndex } from '../txn/CatalogIndex.js';
 import type { PreparedCommit } from '../txn/PreparedCommit.js';
 import type { Signal } from '../txn/Signal.js';
-import { type BatchOp, type IUnlinkOp, WriteBatch, WriteOp } from '../txn/WriteBatch.js';
+import { type BatchOp, WriteBatch } from '../txn/WriteBatch.js';
 import { BindingTable } from './BindingTable.js';
 import type { IConnectorApplied } from './ConnectorApplied.js';
 import { type ConnectorChange, ConnectorChangeSet } from './ConnectorChangeSet.js';
 import { ConnectorError, ConnectorPhase } from './ConnectorError.js';
-import { ExternalWriteCheck } from './ExternalWriteCheck.js';
 import { ConnectorResidency, type IExternalConnector, type RowVersion } from './FetchContract.js';
 import type { IConnectorTransaction, IGraphConnector } from './GraphConnector.js';
+import { type IRoutedStep, StepRouter } from './StepRouter.js';
 
 /** The owner (model, '' for none) and concept a write routes by. */
 export interface INodeOrigin
@@ -23,7 +22,7 @@ export interface INodeOrigin
     readonly Fetched?: boolean;
 }
 
-/** What WriteCoordinator.Route makes of one batch. */
+/** What WriteCoordinator.Route makes of one batch (the one-shot form of a single step). */
 export interface IRoutedBatch
 {
     /** Per participating connector, its change set (in batch op order), keyed in connector-name order. */
@@ -56,199 +55,6 @@ export interface INodeOrigins
      * A self-loop appears in both directions.
      */
     Edges(publicId: string): Promise<readonly IIncidentEdge[]>;
-}
-
-/**
- * The snapshot's edges as the batch has changed them so far, for routing the edges a plain DeleteNode
- * removes (ruling R89). A detached id is one whose stored edges no longer apply: the batch deleted it
- * (its edges went with it) or created it (a create that succeeds had no live node of that id).
- */
-class BatchEdges
-{
-    private static readonly Separator = '\u0000';
-
-    private readonly detached = new Set<string>();
-    private readonly removed = new Set<string>();
-    /** The batch's links still standing, by edge key, in batch order (Map keeps insertion order). */
-    private readonly added = new Map<string, IIncidentEdge>();
-
-    public constructor(private readonly index: CatalogIndex, private readonly origins: INodeOrigins)
-    {
-    }
-
-    public Created(publicId: string): void
-    {
-        this.detached.add(publicId);
-    }
-
-    public Linked(edge: IIncidentEdge): void
-    {
-        const key = BatchEdges.Key(edge);
-        // A link re-added after an unlink moves to the end, as the batch order of its latest Link.
-        this.added.delete(key);
-        this.added.set(key, { From: edge.From, Relationship: edge.Relationship, To: edge.To });
-    }
-
-    public Unlinked(edge: IIncidentEdge): void
-    {
-        const key = BatchEdges.Key(edge);
-        if (!this.added.delete(key))
-        {
-            this.removed.add(key);
-        }
-    }
-
-    /**
-     * Removes the node from the overlay and returns the edges it had at this point of the batch, when
-     * `concept` is given (a plain delete of a node of that concept): outgoing before incoming, by
-     * relationship declaration order, then stored edges in stored order before the batch's links in batch
-     * order; each edge once. A strict delete passes no concept: it removes no edges.
-     */
-    public async Deleted(publicId: string, concept: string | undefined): Promise<IIncidentEdge[]>
-    {
-        const edges = concept === undefined ? [] : await this.Incident(publicId, concept);
-        for (const [key, e] of this.added)
-        {
-            if (e.From === publicId || e.To === publicId)
-            {
-                this.added.delete(key);
-            }
-        }
-        this.detached.add(publicId);
-        return edges;
-    }
-
-    private async Incident(publicId: string, concept: string): Promise<IIncidentEdge[]>
-    {
-        const definition = this.index.Catalog.Definition(concept);
-        if (definition === undefined || definition.IsAspect)
-        {
-            // Not a node the engine can hold: the batch fails at Prepare.
-            return [];
-        }
-        const candidates: IIncidentEdge[] = [];
-        if (!this.detached.has(publicId))
-        {
-            for (const e of await this.origins.Edges(publicId))
-            {
-                if (!this.removed.has(BatchEdges.Key(e)) && !this.detached.has(e.From) && !this.detached.has(e.To))
-                {
-                    candidates.push(e);
-                }
-            }
-        }
-        for (const e of this.added.values())
-        {
-            if (e.From === publicId || e.To === publicId)
-            {
-                candidates.push(e);
-            }
-        }
-        const outgoing = this.index.Catalog.EffectiveMembers(concept).filter(m => m.Kind === MemberKind.Relationship).map(m => m.Name);
-        const incoming = this.index.IncomingRelationships(concept).map(m => m.Name);
-        const seen = new Set<string>();
-        const ranked: { readonly Edge: IIncidentEdge; readonly Rank: number; readonly At: number }[] = [];
-        for (const e of candidates)
-        {
-            const key = BatchEdges.Key(e);
-            if (seen.has(key))
-            {
-                continue;
-            }
-            seen.add(key);
-            const rank = e.From === publicId ? BatchEdges.Rank(outgoing, e.Relationship) : outgoing.length + 1 + BatchEdges.Rank(incoming, e.Relationship);
-            ranked.push({ Edge: e, Rank: rank, At: ranked.length });
-        }
-        return ranked.sort((p, q) => p.Rank - q.Rank || p.At - q.At).map(r => r.Edge);
-    }
-
-    /** Position of the relationship name; an unknown one (an op the engine rejects at Prepare) sorts last. */
-    private static Rank(names: readonly string[], name: string): number
-    {
-        const at = names.indexOf(name);
-        return at >= 0 ? at : names.length;
-    }
-
-    private static Key(edge: IIncidentEdge): string
-    {
-        return edge.From + BatchEdges.Separator + edge.Relationship + BatchEdges.Separator + edge.To;
-    }
-}
-
-/** Groups one batch's changes by connector (WriteCoordinator.Route). */
-class ChangeRouter
-{
-    private readonly known = new Map<string, INodeOrigin | undefined>();
-    private readonly grouped = new Map<string, ConnectorChange[]>();
-    /** The ids a CreateNode of this batch created so far: their later changes carry no ExpectedVersion (R119 V2). */
-    private readonly createdHere = new Set<string>();
-
-    public constructor(private readonly table: BindingTable, private readonly index: CatalogIndex, private readonly origins: INodeOrigins, private readonly external: ReadonlySet<string>)
-    {
-    }
-
-    /** True when the origin binds to an External connector: the node's data lives only there (ruling R103). */
-    public IsExternal(origin: INodeOrigin | undefined): origin is INodeOrigin
-    {
-        return origin !== undefined && this.external.size > 0 && this.table.IsStub(origin.Owner, origin.Concept, this.index.Catalog, this.external);
-    }
-
-    /** Records the origin a CreateNode gives its id for the batch's later ops. */
-    public Created(publicId: string, origin: INodeOrigin): void
-    {
-        this.known.set(publicId, origin);
-        this.createdHere.add(publicId);
-    }
-
-    /** The id's latest origin: its CreateNode earlier in the batch, else the snapshot's node (looked up once). */
-    public async Origin(publicId: string): Promise<INodeOrigin | undefined>
-    {
-        if (!this.known.has(publicId))
-        {
-            this.known.set(publicId, await this.origins.Origin(publicId));
-        }
-        return this.known.get(publicId);
-    }
-
-    /**
-     * Adds the op to the change set of the connector its origin binds to; none when engine-only or found nowhere. On an
-     * External connector the change carries the fetched version of `routingId` (the written node, or a Link / Unlink's
-     * source) as ExpectedVersion, unless the batch created that id earlier (ruling R119 V2); the key is never added
-     * without a version, and Mirrored connectors never get one.
-     */
-    public Emit(op: BatchOp, origin: INodeOrigin | undefined, routingId: string): void
-    {
-        if (origin === undefined)
-        {
-            return;
-        }
-        const name = this.table.Resolve(origin.Owner, origin.Concept, this.index.Catalog);
-        if (BindingTable.IsEngineOnly(name))
-        {
-            return;
-        }
-        let changes = this.grouped.get(name as string);
-        if (changes === undefined)
-        {
-            changes = [];
-            this.grouped.set(name as string, changes);
-        }
-        const version = this.external.has(name as string) && !this.createdHere.has(routingId) ? this.origins.Version(routingId) : undefined;
-        changes.push((version === undefined
-            ? { ...op, Owner: origin.Owner, Concept: origin.Concept }
-            : { ...op, Owner: origin.Owner, Concept: origin.Concept, ExpectedVersion: version }) as ConnectorChange);
-    }
-
-    /** The change sets, keyed in connector-name order. */
-    public Sets(): ReadonlyMap<string, ConnectorChangeSet>
-    {
-        const sets = new Map<string, ConnectorChangeSet>();
-        for (const name of [...this.grouped.keys()].sort())
-        {
-            sets.set(name, new ConnectorChangeSet(this.grouped.get(name)!));
-        }
-        return sets;
-    }
 }
 
 /** The connectors installed on a store, by name, with the bindings that route to them (GraphContext.SetConnectors). */
@@ -356,6 +162,15 @@ export class ConnectorSetup
     }
 }
 
+/** One external write step the transaction executed, in execution order, for the Compensator to undo (Task 2.2). */
+export interface IExecutedStep
+{
+    readonly Step: number;
+    readonly Connector: string;
+    readonly Txn: IConnectorTransaction;
+    readonly Changes: ConnectorChangeSet;
+}
+
 /** The connector call in flight when the connector phase timed out. */
 interface IHungCall
 {
@@ -371,30 +186,32 @@ interface IHungCall
 type RevertOutcome = { readonly Error: unknown } | undefined;
 
 /**
- * Write-through of one transaction (spec §6, ruling R72). Route groups the batch's ops by the connector
- * that holds each node's binding; Run then drives: Prepare (engine) → Begin each participant (sorted by
- * name) → Apply each → Commit each → Finalize (engine). Calls run one at a time, never inside a
- * store.Write. One deadline (the setup's timeout, from the start of Prepare) bounds Prepare, every
- * connector call and the reverts. On any failure or the timeout the prepared commit is aborted and every
- * connector that began is reverted, in reverse order of Begin (committed ones too: compensation); the
- * caller then gets a ConnectorError. A timeout during Prepare is ConnectorError (engine, Prepare) and the
- * commit is aborted once Prepare returns. Past the deadline nothing more is awaited: a call still hanging
- * is reverted once it returns, reverts still pending (or not yet started, which then start at once)
- * finish on that late path, and their failures are raised on `lateFailures`. An engine rejection at
- * Prepare is rethrown as-is (no connector began).
+ * Write-through of one GraphTransaction (spec §6, rulings R72, R135). With External connectors installed, writes
+ * execute in steps: `Step` runs a step's External change sets now (the connector is begun at its first step and kept
+ * for the transaction's life, ruling R135 E2), while Mirrored change sets stage. `Run` then commits at the end:
+ * Prepare (engine) → each Mirrored connector Begin/Apply/Commit → each begun External connector Commit (finalize,
+ * dropping before-images, no remote effect) → Finalize (engine). Calls run one at a time, never inside a store.Write.
+ * One deadline (the setup's timeout) bounds each step, and bounds Prepare / every connector call / the reverts of
+ * Run, each from its own start. On any failure or the timeout the prepared commit is aborted and every connector that
+ * began is reverted, in reverse order of Begin (committed ones too: compensation); the caller then gets a
+ * ConnectorError, its phase Write for a failed step. On success ConnectorApplied is raised once, after the engine
+ * commit when there is one (a throwing subscriber is ignored). Compensation by connector Undo and the dropped-
+ * transaction path consume the step log; that is Task 2.2.
  */
 export class WriteCoordinator
 {
     private static readonly ErrTimedOut = 'Write-through timed out after ms: ';
     private static readonly ErrReverts = 'The write-through failed and reverting a connector failed too';
     private static readonly TimedOut: unique symbol = Symbol('TimedOut');
-    /** The owner of a node created without one (as GraphReader.OwnerOf reports it). */
-    private static readonly NoOwner = '';
     private static readonly NoExternal: ReadonlySet<string> = new Set();
-    private static readonly ErrSeedOnly = 'A seed-only SetOwner op cannot be routed to connectors: ';
-    private static readonly ErrUnhandled = 'Unhandled batch op kind: ';
 
     private began: { readonly Connector: IGraphConnector; readonly Txn: IConnectorTransaction }[] = [];
+    /** The External connector transactions begun so far, kept for the transaction's life (ruling R135 E2). */
+    private readonly externalTxns = new Map<string, IConnectorTransaction>();
+    /** The External steps executed, in order, for Task 2.2's compensation to undo. */
+    private readonly log: IExecutedStep[] = [];
+    /** Per participating connector, the concepts its changes touched, for ConnectorApplied. */
+    private readonly participated = new Map<string, Set<string>>();
     private expired = false;
     private deadline: Promise<typeof WriteCoordinator.TimedOut> = new Promise(() => undefined);
     private timer: ReturnType<typeof setTimeout> | undefined;
@@ -407,223 +224,141 @@ export class WriteCoordinator
     }
 
     /**
-     * Per participating connector, its change set (in batch op order), keyed in connector-name order, and the engine's
-     * part of the batch. CreateNode / SetProperty / DeleteNode route by the node's owner and concept, Link / Unlink by the
-     * source node's. An op routes by the latest CreateNode of its id earlier in the batch, else by the
-     * node in the snapshot (`origins`, each id looked up once). DeleteNode does not change an id's
-     * origin: an op on a deleted, not re-created id routes like the deleted node (the engine rejects it at
-     * Prepare anyway, before any connector begins); a re-created id routes by its new CreateNode. A node
-     * found nowhere routes nowhere (the engine rejects the op at Prepare).
-     *
-     * A plain (non-strict) DeleteNode is preceded by one Unlink per edge it removes (ruling R89): every
-     * edge of the node in the snapshot as the batch's earlier ops left it (`origins.Edges`, unscoped, so
-     * edges the writer's scope hides as well), each routed by its source node exactly like an explicit
-     * Unlink, to whichever connector that binds to. A strict DeleteNode removes no edges and gets none.
-     *
-     * Writes to external nodes (ruling R103, `external` the installed External connectors): an op whose node (a Link /
-     * Unlink: its source) binds to an External connector is that connector's change only and is left out of Engine, so
-     * nothing external is written to KV. Such a node is the CreateNode's (owner, concept), a stored stub, or a row the
-     * transaction fetched (`origins`). Its ops are checked as the engine checks its own (ExternalWriteCheck: CommitError
-     * before any connector begins). A plain DeleteNode of an external node puts one Unlink per engine edge into its stub
-     * (the edges as the batch's earlier ops left them) into Engine, each also routed by its source as R89 routes them;
-     * the last one removes the stub (R102). A strict one fails with NodeHasEdges while any engine edge remains.
+     * Per participating connector (External and Mirrored alike), its change set and the engine's part of the batch,
+     * routed as one step through a fresh StepRouter (the one-shot form for callers that do not drive steps, e.g. tests).
+     * See StepRouter for the routing rules (R89, R103).
      */
     public static async Route(batch: WriteBatch, table: BindingTable, index: CatalogIndex, origins: INodeOrigins, external: ReadonlySet<string> = WriteCoordinator.NoExternal): Promise<IRoutedBatch>
     {
-        const router = new ChangeRouter(table, index, origins, external);
-        const edges = new BatchEdges(index, origins);
-        const check = new ExternalWriteCheck(index);
+        const step = await new StepRouter(table, index, origins, external).Route(batch.Ops());
         const engine = new WriteBatch();
-        for (const op of batch.Ops())
+        for (const op of step.Engine)
         {
-            switch (op.Op)
-            {
-                case WriteOp.CreateNode:
-                {
-                    const origin = { Owner: op.Owner ?? WriteCoordinator.NoOwner, Concept: op.Concept };
-                    // The id's latest origin, the batch's own creates included, so an in-batch collision is caught too.
-                    const prior = await router.Origin(op.PublicId);
-                    if (router.IsExternal(origin))
-                    {
-                        check.Created(op, prior !== undefined && prior.Fetched !== true && !router.IsExternal(prior));
-                    }
-                    else
-                    {
-                        check.EngineCreated(op.PublicId);
-                        engine.Append(op);
-                    }
-                    router.Created(op.PublicId, origin);
-                    edges.Created(op.PublicId);
-                    router.Emit(op, origin, op.PublicId);
-                    break;
-                }
-                case WriteOp.DeleteNode:
-                {
-                    const origin = await router.Origin(op.PublicId);
-                    const outside = router.IsExternal(origin);
-                    const strict = op.Strict === true;
-                    // An external node's engine edges are removed op by op here; the engine removes an engine node's itself.
-                    const concept = strict && !outside ? undefined : origin?.Concept;
-                    const removed: IUnlinkOp[] = [];
-                    for (const edge of await edges.Deleted(op.PublicId, concept))
-                    {
-                        const unlink: IUnlinkOp = { Op: WriteOp.Unlink, From: edge.From, Relationship: edge.Relationship, To: edge.To };
-                        const source = await router.Origin(edge.From);
-                        if (outside && !router.IsExternal(source))
-                        {
-                            removed.push(unlink);
-                        }
-                        if (!strict)
-                        {
-                            router.Emit(unlink, source, edge.From);
-                        }
-                    }
-                    if (outside)
-                    {
-                        check.DeletedExternal(op.PublicId, strict, removed.length);
-                        removed.forEach(unlink => engine.Append(unlink));
-                    }
-                    else
-                    {
-                        check.Deleted(op.PublicId);
-                        engine.Append(op);
-                    }
-                    router.Emit(op, origin, op.PublicId);
-                    break;
-                }
-                case WriteOp.Link:
-                {
-                    edges.Linked(op);
-                    const source = await router.Origin(op.From);
-                    if (router.IsExternal(source))
-                    {
-                        check.Link(op, source, await router.Origin(op.To));
-                    }
-                    else
-                    {
-                        // An external target the batch deleted has no stub to link to: it must not be re-created.
-                        if (check.IsDeleted(op.To))
-                        {
-                            check.EngineLink(op, router.IsExternal(await router.Origin(op.To)));
-                        }
-                        engine.Append(op);
-                    }
-                    router.Emit(op, source, op.From);
-                    break;
-                }
-                case WriteOp.Unlink:
-                {
-                    edges.Unlinked(op);
-                    const source = await router.Origin(op.From);
-                    if (router.IsExternal(source))
-                    {
-                        check.Unlink(op, source);
-                    }
-                    else
-                    {
-                        engine.Append(op);
-                    }
-                    router.Emit(op, source, op.From);
-                    break;
-                }
-                case WriteOp.SetProperty:
-                {
-                    const origin = await router.Origin(op.PublicId);
-                    if (router.IsExternal(origin))
-                    {
-                        check.SetProperty(op, origin);
-                    }
-                    else
-                    {
-                        engine.Append(op);
-                    }
-                    router.Emit(op, origin, op.PublicId);
-                    break;
-                }
-                case WriteOp.SetOwner:
-                    // Seed synchronization only (ruling R90), and seed sync is never routed.
-                    throw new GraphError(GraphErrorCode.Internal, WriteCoordinator.ErrSeedOnly + op.PublicId);
-                default:
-                    return WriteCoordinator.Unhandled(op);
-            }
+            engine.Append(op);
         }
-        check.Finish();
-        return { Sets: router.Sets(), Engine: engine };
+        const sets = new Map<string, ConnectorChangeSet>();
+        for (const [name, set] of step.External)
+        {
+            sets.set(name, set);
+        }
+        for (const [name, changes] of step.Mirrored)
+        {
+            sets.set(name, new ConnectorChangeSet(changes));
+        }
+        const ordered = new Map<string, ConnectorChangeSet>();
+        for (const name of [...sets.keys()].sort())
+        {
+            ordered.set(name, sets.get(name)!);
+        }
+        return { Sets: ordered, Engine: engine };
     }
 
-    /** Compile-time exhaustiveness: every BatchOp kind has a case in Route. */
-    private static Unhandled(op: never): never
+    /** The External steps executed so far, in order (Task 2.2 compensation consumes them). */
+    public get Steps(): readonly IExecutedStep[]
     {
-        throw new GraphError(GraphErrorCode.Internal, WriteCoordinator.ErrUnhandled + String((op as BatchOp).Op));
+        return this.log;
+    }
+
+    /** True once at least one connector (External or Mirrored) took part: whether Run raises ConnectorApplied. */
+    public get Participated(): boolean
+    {
+        return this.participated.size > 0;
     }
 
     /**
-     * Runs the write-through of `sets` (from Route, non-empty); resolves with the engine's commit number. With `unchanged`
-     * (the engine part of the batch is empty, controller ruling P13) the prepared commit only guards the engine reads
-     * during the connector phase: once every connector committed it is released, not finalized (PreparedCommit.Release, which
-     * fails where Finalize would: then every connector is reverted, as for a failed Finalize), and Run resolves with
-     * `unchanged` (no engine commit, no log entry, no CommitApplied). On success ConnectorApplied is raised once, after
-     * the engine commit when there is one (a throwing subscriber is ignored).
+     * Executes a step's External change sets now (ruling R135 E2), one connector at a time in name order. A connector
+     * is begun at its first step and reused after; each Apply reports what the source assigned (ignored until the
+     * version ledger, E5). On any failure or the timeout every begun connector is reverted and a ConnectorError of
+     * phase Write is thrown.
      */
-    public async Run(prepare: () => Promise<PreparedCommit>, sets: ReadonlyMap<string, ConnectorChangeSet>, unchanged?: bigint): Promise<bigint>
+    public async Step(external: ReadonlyMap<string, ConnectorChangeSet>, stepNumber: number): Promise<void>
     {
-        this.deadline = new Promise(resolve =>
+        if (external.size === 0)
         {
-            this.timer = setTimeout(() =>
-            {
-                this.expired = true;
-                resolve(WriteCoordinator.TimedOut);
-            }, this.setup.TimeoutMs);
-        });
+            return;
+        }
+        this.Arm();
         try
         {
-            const commit = await this.Drive(prepare, sets, unchanged);
-            this.RaiseApplied(sets, unchanged === undefined ? commit : undefined);
+            for (const [name, changes] of external)
+            {
+                const connector = this.setup.Connectors.get(name)!;
+                let txn = this.externalTxns.get(name);
+                if (txn === undefined)
+                {
+                    txn = await this.Call(connector, ConnectorPhase.Write, undefined, () => connector.Begin(this.context));
+                    this.externalTxns.set(name, txn);
+                    this.began.push({ Connector: connector, Txn: txn });
+                }
+                const applyTxn = txn;
+                await this.Call(connector, ConnectorPhase.Write, applyTxn, () => applyTxn.Apply(changes));
+                this.RecordExternal(stepNumber, name, changes, applyTxn);
+            }
+        }
+        catch (error)
+        {
+            throw await this.Failed(error instanceof ConnectorError ? error : new ConnectorError(this.current.Connector, ConnectorPhase.Write, error));
+        }
+        finally
+        {
+            this.Disarm();
+        }
+    }
+
+    /**
+     * Commits the transaction's write-through (its External steps already executed): Prepare the engine batch, run the
+     * Mirrored connectors, finalize the External connectors, then finalize engine storage. With `unchanged` (the engine
+     * part is empty, controller ruling P13) the prepared commit only guards the engine reads during the connector phase
+     * and is released, not finalized; Run resolves with `unchanged`. On success ConnectorApplied is raised once.
+     */
+    public async Run(prepare: () => Promise<PreparedCommit>, mirrored: ReadonlyMap<string, readonly ConnectorChange[]>, unchanged?: bigint): Promise<bigint>
+    {
+        this.Arm();
+        try
+        {
+            const commit = await this.Drive(prepare, mirrored, unchanged);
+            this.RaiseApplied(unchanged === undefined ? commit : undefined);
             return commit;
         }
         finally
         {
-            clearTimeout(this.timer);
+            this.Disarm();
         }
     }
 
-    /** ConnectorApplied for a successful write-through: per connector, the distinct concepts of its change set, sorted. */
-    private RaiseApplied(sets: ReadonlyMap<string, ConnectorChangeSet>, commit: bigint | undefined): void
-    {
-        const connectors = new Map<string, readonly string[]>();
-        for (const [name, set] of sets)
-        {
-            connectors.set(name, Object.freeze([...new Set(set.Changes.map(c => c.Concept))].sort()));
-        }
-        const applied: IConnectorApplied = commit === undefined ? { Connectors: connectors } : { Commit: commit, Connectors: connectors };
-        try
-        {
-            this.applied.Raise(Object.freeze(applied));
-        }
-        catch
-        {
-            // Subscriber failures cannot undo the connectors' commits; Signal already ran every handler.
-        }
-    }
-
-    private async Drive(prepare: () => Promise<PreparedCommit>, sets: ReadonlyMap<string, ConnectorChangeSet>, unchanged: bigint | undefined): Promise<bigint>
+    private async Drive(prepare: () => Promise<PreparedCommit>, mirrored: ReadonlyMap<string, readonly ConnectorChange[]>, unchanged: bigint | undefined): Promise<bigint>
     {
         const prepared = await this.Prepared(prepare);
         try
         {
-            const participants = [...sets.keys()].map(name => this.setup.Connectors.get(name)!);
-            for (const connector of participants)
+            const mirroredNames = [...mirrored.keys()].sort();
+            const mirroredTxns = new Map<string, IConnectorTransaction>();
+            for (const name of mirroredNames)
             {
+                const connector = this.setup.Connectors.get(name)!;
                 const txn = await this.Call(connector, ConnectorPhase.Begin, undefined, () => connector.Begin(this.context));
                 this.began.push({ Connector: connector, Txn: txn });
+                mirroredTxns.set(name, txn);
             }
-            for (const { Connector, Txn } of this.began)
+            for (const name of mirroredNames)
             {
-                await this.Call(Connector, ConnectorPhase.Apply, Txn, () => Txn.Apply(sets.get(Connector.Name)!));
+                const connector = this.setup.Connectors.get(name)!;
+                const txn = mirroredTxns.get(name)!;
+                const set = new ConnectorChangeSet(mirrored.get(name)!);
+                await this.Call(connector, ConnectorPhase.Apply, txn, () => txn.Apply(set));
+                this.AddConcepts(name, set);
             }
-            for (const { Connector, Txn } of this.began)
+            for (const name of mirroredNames)
             {
-                await this.Call(Connector, ConnectorPhase.Commit, Txn, () => Txn.Commit());
+                const connector = this.setup.Connectors.get(name)!;
+                const txn = mirroredTxns.get(name)!;
+                await this.Call(connector, ConnectorPhase.Commit, txn, () => txn.Commit());
+            }
+            // External finalize: drop before-images, no remote effect, in begin order.
+            for (const [name, txn] of this.externalTxns)
+            {
+                const connector = this.setup.Connectors.get(name)!;
+                await this.Call(connector, ConnectorPhase.Commit, txn, () => txn.Commit());
             }
         }
         catch (error)
@@ -653,6 +388,70 @@ export class WriteCoordinator
         {
             throw await this.Failed(new ConnectorError(BindingTable.EngineStorage, ConnectorPhase.Finalize, error));
         }
+    }
+
+    /** ConnectorApplied for a successful write-through: per connector (name order), the distinct concepts it touched, sorted. */
+    private RaiseApplied(commit: bigint | undefined): void
+    {
+        if (this.participated.size === 0)
+        {
+            return;
+        }
+        const connectors = new Map<string, readonly string[]>();
+        for (const name of [...this.participated.keys()].sort())
+        {
+            connectors.set(name, Object.freeze([...this.participated.get(name)!].sort()));
+        }
+        const applied: IConnectorApplied = commit === undefined ? { Connectors: connectors } : { Commit: commit, Connectors: connectors };
+        try
+        {
+            this.applied.Raise(Object.freeze(applied));
+        }
+        catch
+        {
+            // Subscriber failures cannot undo the connectors' commits; Signal already ran every handler.
+        }
+    }
+
+    /** Records an executed External step: its concepts (for ConnectorApplied) and the step log (for Task 2.2). */
+    private RecordExternal(step: number, name: string, changes: ConnectorChangeSet, txn: IConnectorTransaction): void
+    {
+        this.AddConcepts(name, changes);
+        this.log.push({ Step: step, Connector: name, Txn: txn, Changes: changes });
+    }
+
+    private AddConcepts(name: string, changes: ConnectorChangeSet): void
+    {
+        let concepts = this.participated.get(name);
+        if (concepts === undefined)
+        {
+            concepts = new Set<string>();
+            this.participated.set(name, concepts);
+        }
+        for (const c of changes.Changes)
+        {
+            concepts.add(c.Concept);
+        }
+    }
+
+    /** Arms a fresh deadline (the setup's timeout) for a step or for Run; resets the per-window state. */
+    private Arm(): void
+    {
+        this.expired = false;
+        this.hung = undefined;
+        this.deadline = new Promise(resolve =>
+        {
+            this.timer = setTimeout(() =>
+            {
+                this.expired = true;
+                resolve(WriteCoordinator.TimedOut);
+            }, this.setup.TimeoutMs);
+        });
+    }
+
+    private Disarm(): void
+    {
+        clearTimeout(this.timer);
     }
 
     /**

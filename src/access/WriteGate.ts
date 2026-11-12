@@ -304,16 +304,19 @@ export class WriteGate
         batch: WriteBatch,
         catalog: CatalogSnapshot,
         exempt: WriteExemptions = WriteExemptions.None(),
-        fetched?: (publicId: string) => Promise<FetchedNode | undefined>): Promise<void>
+        fetched?: (publicId: string) => Promise<FetchedNode | undefined>,
+        from = 0): Promise<void>
     {
         const gate = new WriteGate(evaluator, catalog, exempt, fetched);
         const ops = batch.Ops();
+        // The whole batch resolves (a step's op may address a node an earlier step created), but only the ops from
+        // `from` are judged: earlier steps were checked at their own flush (ruling R135 E2, incremental gate).
         gate.Resolve(ops);
-        for (let i = 0; i < ops.length; i++)
+        for (let i = from; i < ops.length; i++)
         {
             await gate.CheckOp(i, ops[i] as BatchOp);
         }
-        gate.CheckCreatedEdges();
+        gate.CheckCreatedEdges(from);
     }
 
     /** First pass: which ops address nodes the batch creates, and those nodes' end-of-batch values. */
@@ -432,10 +435,15 @@ export class WriteGate
      * stored edge node with an unset member is invisible, so the create is the only point a half-edge could be written
      * on purpose; a delete-implied unlink in the batch also leaves the member unset.
      */
-    private CheckCreatedEdges(): void
+    private CheckCreatedEdges(from: number): void
     {
         for (const node of this.created)
         {
+            // Edge nodes created in an earlier step were completed and checked at that step's flush (R135 E2).
+            if (node.Index < from)
+            {
+                continue;
+            }
             const endpoints = node.Known && !node.Deleted ? this.evaluator.EndpointsOf(node.Concept) : undefined;
             if (endpoints === undefined)
             {

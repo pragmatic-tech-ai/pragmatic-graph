@@ -15,6 +15,8 @@ export enum ConnectorPhase
     Prepare = 'Prepare',
     /** A Fetch from an external connector failed. */
     Fetch = 'Fetch',
+    /** An immediate external write step, or a source-keyed create, that failed (Wave 2, ruling R135). */
+    Write = 'Write',
 }
 
 /**

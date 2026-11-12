@@ -5,10 +5,12 @@ import type { FetchedNode } from './access/FetchedNode.js';
 import { WriteGate } from './access/WriteGate.js';
 import type { WriteStage } from './access/WriteStage.js';
 import type { CellValue } from './columns/CellValue.js';
+import type { ConnectorChange } from './connectors/ConnectorChangeSet.js';
 import type { ConnectorContext } from './connectors/ConnectorContext.js';
 import type { RowVersion } from './connectors/FetchContract.js';
+import { StepRouter } from './connectors/StepRouter.js';
 import { TransactionFetch } from './connectors/TransactionFetch.js';
-import { type INodeOrigin, type INodeOrigins, WriteCoordinator } from './connectors/WriteCoordinator.js';
+import { type ConnectorSetup, type INodeOrigin, type INodeOrigins, WriteCoordinator } from './connectors/WriteCoordinator.js';
 import type { GraphContext, ReadSnapshot } from './GraphContext.js';
 import { GraphError, GraphErrorCode } from './errors/GraphError.js';
 import { FederatedReads } from './FederatedReads.js';
@@ -79,6 +81,18 @@ export class GraphTransaction extends GraphReader
     /** The batch ops SetDefault and DetachUnlink recorded. */
     private readonly exempt = new WriteExemptions();
     private committing = false;
+
+    /** The engine's part of every step routed so far, concatenated: what Commit prepares (ruling R135 E2). */
+    private readonly engineBatch = new WriteBatch();
+    /** Per Mirrored connector, its changes staged across the steps, committed at Commit (name order at Run). */
+    private readonly mirrored = new Map<string, ConnectorChange[]>();
+    /** The persistent per-transaction router and write-through coordinator (created at the first step). */
+    private router: StepRouter | undefined;
+    private coordinator: WriteCoordinator | undefined;
+    /** How many recorded ops have been routed into a step. */
+    private flushedCount = 0;
+    /** The number of external steps executed, assigned to each step for the step log. */
+    private stepNumber = 0;
 
     /** @internal Created by GraphStore.Begin. */
     public constructor(context: GraphContext, snapshot: ReadSnapshot, scope: AccessScope, connector: ConnectorContext)
@@ -175,6 +189,19 @@ export class GraphTransaction extends GraphReader
     }
 
     /**
+     * Executes, as one write step, the ops recorded since the previous step (ruling R135 E1): the step's writes to
+     * External connectors run now (routed one connector at a time in name order), its Mirrored writes stage until
+     * Commit, and its engine ops join the transaction's engine batch. The write gate and R29 are judged over the
+     * step, before any connector call; a denial or a connector failure fails the step. A caller that wants a prior
+     * API call's external effect calls Flush after it; a writer that only commits never needs it.
+     */
+    public async Flush(): Promise<void>
+    {
+        this.RequireActive();
+        await this.FlushStep();
+    }
+
+    /**
      * Commits the recorded writes; resolves with the commit number. Ends the transaction. A
      * transaction that recorded no writes commits nothing: after the schema check it resolves with its
      * SnapshotCommit, consumes no commit number and raises no CommitApplied (its reads need no
@@ -191,31 +218,25 @@ export class GraphTransaction extends GraphReader
             {
                 return this.SnapshotCommit;
             }
-            await this.Authorize();
             // Read together: the committer rejects the batch if the setup it was routed with is replaced (R77).
             const setup = this.context.Connectors;
             const generation = this.context.Committer.BindingGeneration;
-            if (setup !== undefined)
+            if (setup === undefined)
             {
-                // Routing reads the snapshot unscoped and records it like any read (rulings R72, R89); a node that is not
-                // stored routes by the row this transaction fetched (R103), and a fetched row's version is its changes'
-                // ExpectedVersion (R119 V2).
-                const origins: INodeOrigins = {
-                    Origin: id => this.RoutingOrigin(id),
-                    Edges: id => this.NodeEdges(id),
-                    Version: id => FederatedReads.Of(this).OpenSession?.Known(id)?.Row.Version,
-                };
-                const routed = await WriteCoordinator.Route(this.batch, setup.Bindings, this.snapshot.Index, origins, setup.External);
-                if (routed.Sets.size > 0)
-                {
-                    const prepare = () => this.context.Committer.Prepare(routed.Engine, this.Reads, this.ValidationCommit(), began, setup.TimeoutMs, generation);
-                    // An all-external write makes no engine commit (controller ruling P13): it answers like an empty batch.
-                    const unchanged = routed.Engine.Count === 0 ? this.SnapshotCommit : undefined;
-                    return await new WriteCoordinator(setup, this.context.ConnectorRevertFailed, this.context.ConnectorApplied, this.Connector).Run(prepare, routed.Sets, unchanged);
-                }
-                return await this.context.Committer.Submit(routed.Engine, this.Reads, this.ValidationCommit(), began, generation);
+                await this.Authorize(0);
+                return await this.context.Committer.Submit(this.batch, this.Reads, this.ValidationCommit(), began, generation);
             }
-            return await this.context.Committer.Submit(this.batch, this.Reads, this.ValidationCommit(), began, generation);
+            // The final flush executes the remaining external ops as the last step, before anything else (R135 E1).
+            await this.FlushStep();
+            if (this.coordinator === undefined || (!this.coordinator.Participated && this.mirrored.size === 0))
+            {
+                // No connector took part: a plain engine submit of the routed engine ops.
+                return await this.context.Committer.Submit(this.engineBatch, this.Reads, this.ValidationCommit(), began, generation);
+            }
+            const prepare = () => this.context.Committer.Prepare(this.engineBatch, this.Reads, this.ValidationCommit(), began, setup.TimeoutMs, generation);
+            // An all-external write makes no engine commit (controller ruling P13): it answers like an empty batch.
+            const unchanged = this.engineBatch.Count === 0 ? this.SnapshotCommit : undefined;
+            return await this.coordinator.Run(prepare, this.mirrored, unchanged);
         }
         catch (error)
         {
@@ -251,7 +272,7 @@ export class GraphTransaction extends GraphReader
      * denial decided on reads a later commit changed is a ConflictError instead (ruling R70): a retry may
      * be allowed. A scope that restricts nothing (System) skips it at no cost.
      */
-    private async Authorize(): Promise<void>
+    private async Authorize(from: number): Promise<void>
     {
         if (this.Scope.WritesUnrestricted)
         {
@@ -259,7 +280,7 @@ export class GraphTransaction extends GraphReader
         }
         try
         {
-            await WriteGate.Check(this.WriteEvaluator(), this.batch, this.snapshot.Index.Catalog, this.exempt, id => this.FetchedRow(id));
+            await WriteGate.Check(this.WriteEvaluator(), this.batch, this.snapshot.Index.Catalog, this.exempt, id => this.FetchedRow(id), from);
         }
         catch (error)
         {
@@ -269,6 +290,69 @@ export class GraphTransaction extends GraphReader
             }
             throw error;
         }
+    }
+
+    /**
+     * Routes and executes the ops recorded since the previous step (ruling R135 E2). Routing reads the snapshot
+     * unscoped and records it like any read (rulings R72, R89); a node that is not stored routes by the row this
+     * transaction fetched (R103), and a fetched row's version is its changes' ExpectedVersion (R119 V2). Nothing to
+     * route (no connectors installed, or every op already flushed) is a no-op.
+     */
+    private async FlushStep(): Promise<void>
+    {
+        const setup = this.context.Connectors;
+        if (setup === undefined)
+        {
+            return;
+        }
+        const ops = this.batch.Ops();
+        if (this.flushedCount >= ops.length)
+        {
+            return;
+        }
+        this.EnsureRouter(setup);
+        const from = this.flushedCount;
+        this.flushedCount = ops.length;
+        // The write gate runs per step, over this step's ops, before any connector call (ruling R135 E2).
+        await this.Authorize(from);
+        const step = await this.router!.Route(ops.slice(from));
+        for (const op of step.Engine)
+        {
+            this.engineBatch.Append(op);
+        }
+        for (const [name, changes] of step.Mirrored)
+        {
+            const existing = this.mirrored.get(name);
+            if (existing === undefined)
+            {
+                this.mirrored.set(name, [...changes]);
+            }
+            else
+            {
+                existing.push(...changes);
+            }
+        }
+        if (step.External.size > 0)
+        {
+            this.stepNumber++;
+            await this.coordinator!.Step(step.External, this.stepNumber);
+        }
+    }
+
+    /** Creates the persistent router and coordinator on the first step; both serve this transaction only (ruling E11). */
+    private EnsureRouter(setup: ConnectorSetup): void
+    {
+        if (this.router !== undefined)
+        {
+            return;
+        }
+        const origins: INodeOrigins = {
+            Origin: id => this.RoutingOrigin(id),
+            Edges: id => this.NodeEdges(id),
+            Version: id => FederatedReads.Of(this).OpenSession?.Known(id)?.Row.Version,
+        };
+        this.router = new StepRouter(setup.Bindings, this.snapshot.Index, origins, setup.External);
+        this.coordinator = new WriteCoordinator(setup, this.context.ConnectorRevertFailed, this.context.ConnectorApplied, this.Connector);
     }
 
     /** The row this transaction's FetchSession holds for the id, as a FetchedNode of its model; undefined when none. */

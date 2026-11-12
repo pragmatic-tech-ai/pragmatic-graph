@@ -908,7 +908,8 @@ class ExternalWritesSuite
                     const error = await ExtFx.Rejection(fx.Run('MATCH (a:Team {name: \'core\'}), (t:Ticket {id: \'x\'}) SET t.state = \'done\' CREATE (a)-[:assigned]->(t)'));
                     assert.ok(error instanceof CypherWriteError && error.WriteCode === CypherWriteErrorCode.ConnectorFailed, String(error));
                     const cause = error.cause;
-                    assert.ok(cause instanceof ConnectorError && cause.Connector === ExtFx.Ext && cause.Phase === ConnectorPhase.Apply, String(cause));
+                    // An external connector's writes execute at their step now (ruling R135), so a failed Apply is phase Write.
+                    assert.ok(cause instanceof ConnectorError && cause.Connector === ExtFx.Ext && cause.Phase === ConnectorPhase.Write, String(cause));
                     assert.ok(fx.Connector.Log.includes(ExtFx.ExtRevert));
                     assert.equal(await fx.LastCommit(), commit);
                     assert.equal(await fx.StoredOwner(ExtFx.X), undefined);
