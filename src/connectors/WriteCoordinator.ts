@@ -171,7 +171,9 @@ export class ConnectorSetup
  * Prepare (engine) → each Mirrored connector Begin/Apply/Commit → Finalize (engine) → each begun External connector
  * Commit (finalize, dropping before-images, no remote effect). The engine commits BEFORE external finalize so a failed
  * Finalize/Release still leaves the external step log intact for compensation (ruling R137 E6); external finalize, being
- * remote-effect-free, runs last and infallibly. Calls run one at a time, never inside a store.Write.
+ * remote-effect-free, runs last and best-effort (a failure after the engine committed is raised on
+ * ConnectorRevertFailed, never compensated — the transaction stays Committed). Calls run one at a time, never inside a
+ * store.Write.
  * One deadline (the setup's timeout) bounds each step, and bounds Prepare / every connector call / the reverts of
  * Run, each from its own start. On any failure or the timeout the prepared commit is aborted and every connector that
  * began is compensated, in reverse order (Mirrored reverted in reverse Begin order, then the external step log walked
@@ -464,16 +466,44 @@ export class WriteCoordinator
     }
 
     /**
-     * Finalizes every begun External connector in Begin order, after the engine has committed (ruling R136 E3): each
-     * Commit drops that connector's before-images with no remote effect. Run only on the success path, so the external
-     * step log stays intact for compensation whenever the engine commit itself fails (ruling R137 E6).
+     * Finalizes every begun External connector in Begin order, after the engine has DURABLY committed (ruling R136 E3):
+     * each Commit drops that connector's before-images with no remote effect. Run only on the success path, so the
+     * external step log stays intact for compensation whenever the engine commit itself fails (ruling R137 E6).
+     *
+     * Best-effort and non-fatal: the engine is already committed (its commit number is the transaction's result), so a
+     * finalize that throws — a connector breaking the E3 "infallible, no remote effect" contract — must NOT compensate
+     * and must NOT flip the outcome away from Committed (that would be the mirror of the compensation bug, undoing the
+     * external rows while the engine rows stay committed). The failure is surfaced on ConnectorRevertFailed (the
+     * post-commit connector-problem signal) and the connector's before-images are left undropped; the transaction still
+     * reports Committed. These finalizes are NOT raced against the write-through deadline — it is irrelevant once the
+     * engine has committed (a large engine commit may already have expired it).
      */
     private async FinalizeExternal(): Promise<void>
     {
         for (const [name, txn] of this.externalTxns)
         {
             const connector = this.setup.Connectors.get(name)!;
-            await this.Call(connector, ConnectorPhase.Commit, txn, () => txn.Commit());
+            try
+            {
+                await txn.Commit();
+            }
+            catch (error)
+            {
+                this.RaiseLate(connector, ConnectorPhase.Commit, error);
+            }
+        }
+    }
+
+    /** Raises a non-fatal post-commit connector failure on ConnectorRevertFailed; a throwing subscriber is ignored. */
+    private RaiseLate(connector: IGraphConnector, phase: ConnectorPhase, error: unknown): void
+    {
+        try
+        {
+            this.lateFailures.Raise(new ConnectorError(connector.Name, phase, error));
+        }
+        catch
+        {
+            // A throwing subscriber has nowhere to report to; the engine is already durably committed.
         }
     }
 

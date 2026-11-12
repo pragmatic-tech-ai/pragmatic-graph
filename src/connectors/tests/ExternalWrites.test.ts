@@ -831,7 +831,9 @@ class ExternalWritesSuite
                 const fx = await ExtFx.Open(storage());
                 try
                 {
-                    fx.Connector.Writes.FailAt = FakeStep.Commit;
+                    // The failable external phase is the immediate write (Apply): a finalize (Commit) failure is
+                    // post-commit, best-effort and stays Committed (ruling R136 E3), so it would not compensate.
+                    fx.Connector.Writes.FailAt = FakeStep.Apply;
                     await ExtFx.Rejection(fx.Commit(AccessScope.System, async t =>
                     {
                         await ExtFx.Fetch(t, ExtFx.X);

@@ -359,6 +359,45 @@ class CompensationSuite
                 }
             });
 
+            it('external finalize failure after a successful engine commit stays Committed', async () =>
+            {
+                const fx = await CompFx.Open(storage());
+                const finalizeFailure = new GraphError(GraphErrorCode.ConnectorFailed, 'external finalize failed');
+                fx.ConnA.CommitFailure = finalizeFailure;
+                const t = await fx.Begin();
+                try
+                {
+                    // The engine commit succeeds, THEN the external finalize (drop before-images) throws. Finalize is
+                    // post-commit and remote-effect-free (ruling R136 E3): it must stay Committed, never compensate -
+                    // the mirror of the Finalize-before-external-finalize bug.
+                    CompFx.External(t, CompFx.ModelA, 'na');
+                    t.CreateNode('e1', CompFx.Item);
+                    t.SetProperty('e1', CompFx.Id, 'e1');
+                    await t.Flush();
+                    const commit = await t.Commit();
+                    assert.equal(typeof commit, 'bigint');
+                    assert.equal(await fx.Exists('e1'), true, 'the engine stayed committed');
+                    // The finalize was attempted and failed, but nothing was undone (no compensation ran).
+                    assert.equal(fx.ConnA.CommitCalls, 1);
+                    assert.equal(fx.ConnA.UndoCalls, 0);
+                    assert.equal(fx.ConnA.Live.has('na'), true, 'the external write was not undone');
+                    // Reported Committed with its commit number, NOT Compensated.
+                    assert.equal(fx.Applied.length, 1);
+                    assert.equal(fx.Applied[0]!.Outcome, ConnectorOutcome.Committed);
+                    assert.equal(fx.Applied[0]!.Commit, commit);
+                    // The failure surfaced on the non-fatal post-commit signal, not as a thrown compensating error.
+                    assert.equal(fx.RevertFailed.length, 1);
+                    assert.equal(fx.RevertFailed[0]!.Connector, CompFx.A);
+                    assert.equal(fx.RevertFailed[0]!.Phase, ConnectorPhase.Commit);
+                    assert.equal(fx.RevertFailed[0]!.cause, finalizeFailure);
+                }
+                finally
+                {
+                    t.dispose();
+                    await fx.dispose();
+                }
+            });
+
             it('step failure compensates earlier steps', async () =>
             {
                 const fx = await CompFx.Open(storage());

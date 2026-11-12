@@ -40,6 +40,8 @@ export class FakeExternalConnector implements IExternalConnector
     public CommitCalls = 0;
     public UndoCalls = 0;
     public RevertCalls = 0;
+    /** When set, the finalize (Commit) rejects with it WITHOUT dropping before-images (a connector breaking E3). */
+    public CommitFailure: unknown;
     /**
      * The rows this connector wrote (by CreateNode public id) that it still holds: an Undo that still has its
      * before-images removes them, but a Commit (finalize) drops those before-images first, so a later Undo cannot
@@ -240,8 +242,13 @@ class FakeExternalTransaction implements IConnectorTransaction
 
     public Commit(): Promise<void>
     {
-        this.finalized = true;
         this.owner.CommitCalls++;
+        if (this.owner.CommitFailure !== undefined)
+        {
+            // Finalize failed: before-images are NOT dropped (finalized stays false), so the row remains undoable.
+            return Promise.reject(this.owner.CommitFailure);
+        }
+        this.finalized = true;
         return Promise.resolve();
     }
 
