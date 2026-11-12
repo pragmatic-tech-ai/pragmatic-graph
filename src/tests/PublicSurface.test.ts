@@ -1,8 +1,8 @@
 import { describe, test } from 'node:test';
 import assert from 'node:assert/strict';
 import * as Root from '../index.js';
-import { ConnectorError, ConnectorPhase, ConnectorResidency, FetchSession, Cypher, GraphStore } from '../index.js';
-import type { IConnectorApplied, IConnectorCapabilities, IExternalConnector, IFetchedEntry, IFetchedRow, IFetchedView, IFetchKey, IFetchPage, IFetchRequest, IFetchScope, IFetchTarget, RowVersion } from '../index.js';
+import { ConnectorError, ConnectorOutcome, ConnectorPhase, ConnectorResidency, FetchSession, Cypher, GraphErrorCode, GraphStore, GraphTransaction, StepRouter, TransactionDroppedError, WriteMode } from '../index.js';
+import type { IAssignedLink, IAssignedOutcome, IConnectorApplied, IConnectorApplyResult, IConnectorCapabilities, IExternalConnector, IFetchedEntry, IFetchedRow, IFetchedView, IFetchKey, IFetchPage, IFetchRequest, IFetchScope, IFetchTarget, RowVersion } from '../index.js';
 
 /** The external-bindings read contract a host needs, and the internals that must stay out of the package entry (ruling P12). */
 class Surface
@@ -15,6 +15,9 @@ class Surface
 
 // Compile-time: the type-only contract exports exist.
 export type ContractTypes = [IConnectorApplied, IConnectorCapabilities, IExternalConnector, IFetchedEntry, IFetchedRow, IFetchedView, IFetchKey, IFetchPage, IFetchRequest, IFetchScope, IFetchTarget, RowVersion];
+
+// Compile-time: the Wave 2 immediate-write type-only contract exports exist.
+export type Wave2ContractTypes = [IAssignedLink, IAssignedOutcome, IConnectorApplyResult];
 
 describe('public surface: external bindings', () =>
 {
@@ -38,6 +41,28 @@ describe('public surface: external bindings', () =>
         assert.equal(key.PublicId, 'a');
         assert.equal(view.External, true);
         assert.equal(Object.getOwnPropertyDescriptor(ConnectorError.prototype, 'IsConflict')?.get !== undefined, true);
+    });
+
+    test('public surface exports wave 2', () =>
+    {
+        // Value exports reachable at the package root.
+        for (const name of ['ConnectorOutcome', 'StepRouter', 'TransactionDroppedError', 'WriteMode', 'GraphTransaction'])
+        {
+            assert.ok(name in Root, name);
+        }
+        assert.equal(ConnectorPhase.Write, 'Write');
+        assert.equal(GraphErrorCode.TransactionDropped, 15);
+        assert.equal(typeof TransactionDroppedError, 'function');
+        assert.equal(typeof StepRouter, 'function');
+        assert.equal(ConnectorOutcome.Committed, 1);
+        // WriteMode is reachable both at the root and through the Cypher namespace.
+        assert.equal(WriteMode.PerRow, 1);
+        assert.equal(Root.WriteMode.Batched, Cypher.WriteMode.Batched);
+        // The immediate-write transaction verbs (ruling R135).
+        for (const verb of ['Flush', 'Abort', 'CreateAssigned', 'DisposeAsync'])
+        {
+            assert.equal(typeof (GraphTransaction.prototype as unknown as Record<string, unknown>)[verb], 'function', verb);
+        }
     });
 
     test('the federated read channel stays out of the package entry', () =>

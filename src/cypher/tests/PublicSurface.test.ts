@@ -11,7 +11,7 @@ class Surface
         'CypherQuery', 'CypherResult', 'CypherSemanticError', 'CypherSyntaxError', 'CypherTimeout', 'CypherUnparser', 'CypherValue',
         'CypherWriteError', 'CypherWriteErrorCode', 'CypherWriteStats', 'Deadline', 'Expr', 'ExprBuilder', 'Fn', 'GuidPlacement', 'Hops',
         'ListValue', 'MapValue', 'NodeBuilder', 'NodeValue', 'NullValue', 'PathValue', 'Pattern', 'ReferencedLabels', 'RelDirection',
-        'RelValue', 'Return', 'ScalarValue', 'Sort',
+        'RelValue', 'Return', 'ScalarValue', 'Sort', 'WriteMode',
     ];
 
     /** Internals that must not leak, and the TODL-only names retired with GraphQueryAdapter. */

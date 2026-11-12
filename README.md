@@ -53,6 +53,18 @@ Licensed under Apache-2.0. See NOTICE for attribution.
 
 0.4.0 enforces the security S2 rules and is breaking (ruling R134). `IGraphConnector.Begin(context)` now receives the caller's `ConnectorContext`, and every `IFetchRequest` carries one in `Context`. Link and Unlink are judged by the source's `Append` and the target's `AppendTo` rules, not by `Update`, so a scope that restricted links through `Update` must state `Append` and `AppendTo`. `EstimateCount` refuses under a read-restricting scope (Default Deny, or any `Rows`, hidden members or `Endpoints` entry). Under such a scope, commit errors are redacted and say only that something conflicts.
 
+## Upgrading from 0.4.0
+
+0.5.0 makes external writes immediate and is breaking (rulings R135–R140):
+
+- An external connector's `IConnectorTransaction.Apply` now *executes* the change against the external system when the write step is flushed; `Commit` only finalizes what `Apply` already did (it no longer carries the writes).
+- `ICypherSink.CreateNode` is now **async** (returns a `Promise`); callers must await it.
+- Calling the synchronous `dispose()` on a transaction whose external steps were dropped (compensated without a clean commit) **throws**; use `DisposeAsync` for async teardown.
+- `IConnectorApplied.Outcome` is new and **required**: `ConnectorOutcome` (`Committed` / `Compensated` / `CompensationFailed`).
+- A Cypher write's external effects are now visible **before** its commit — later clauses in the same query read them.
+
+**Mirrored connectors are source-compatible**: their changes still stage until commit and no interface they implement changed.
+
 ## External bindings
 
 A binding can name a connector that is the source of truth for a concept instead of mirroring the engine's data. A connector's `Residency` is `Mirrored` (the default: the engine stores the data and writes through to the connector) or `External` (`IExternalConnector`: the engine stores no property data and reads the connector on demand). An External connector provides `Capabilities` and `Fetch(IFetchRequest): Promise<IFetchPage>`; it cannot be the `DefaultConnector`. Failures surface as `ConnectorError` with `ConnectorPhase.Fetch`.
@@ -62,6 +74,10 @@ Push-down is advisory. `IFetchRequest.Predicate` carries the access scope and th
 When an engine node links to an external node, the engine stores a stub: an identity-only node (public id, concept, owner, no property cells). A link to a stub resolves through the connector, and a dangling one reads as absent. Access scopes fail closed over fetched rows: a `Related` rule that goes Out to an external target is always Unknown, so it never admits a row by itself.
 
 Writes to external nodes go to the connector only. The engine does not compare versions itself: a fetched row may carry a `Version` (`RowVersion`, a string, number or bigint), and a write to a node fetched in the same transaction carries it to the connector as `ConnectorChange.ExpectedVersion`; the connector guards and reports a stale version by throwing `ConflictError` (`ConnectorError.IsConflict`).
+
+**Immediate external writes.** External writes execute as the transaction runs, not only at commit. A `GraphTransaction` splits each change into *write steps*: the `StepRouter` groups a step's ops by the connector that owns each node (`IRoutedStep`), and the External steps are applied to their connectors as soon as the step is flushed, so a Cypher write's external effects are visible before its commit (later clauses read them). `GraphTransaction.Flush` forces the pending step out; `Abort` ends the transaction and compensates (reverts) every external step already applied; `DisposeAsync` is the async teardown — calling the sync `dispose()` on a transaction whose external steps were dropped throws, because a drop must be observed. For source-assigned keys, `GraphTransaction.CreateAssigned(requests)` asks a connector to mint nodes and returns their assigned views. Mirrored connectors are unchanged: their changes still stage until commit.
+
+**Compensation and outcomes.** If a write step or the commit fails, the engine compensates every external step it already applied; a transaction that was compensated but could not be fully reverted leaves the dropped state loudly (`TransactionDroppedError`, `GraphErrorCode.TransactionDropped`). Every connector call that fails reports `ConnectorPhase.Write`. `GraphEngine.ConnectorApplied` (`IConnectorApplied`) now carries an `Outcome` (`ConnectorOutcome`: `Committed`, `Compensated` or `CompensationFailed`) describing how the transaction's connector participation ended.
 
 `GraphTransaction.Fetch(keys)` fetches external (or engine) nodes by public id under the transaction's access scope, returning `IFetchedView`s (`External`, `Version`) in key order; an `IFetchKey` can give the `Concept` and `Owner` needed to locate an id the engine has no stored node for. In Cypher, `elementId(n)` returns a node's public id, and `WHERE elementId(n) = x` or `IN $ids` seeks by id. `GraphEngine.ConnectorApplied` (`IConnectorApplied`) fires once per successful write-through of an engine transaction, for Mirrored and External connectors alike, after every participating connector committed (and after the engine commit when the batch had engine ops). It carries the `Commit` (when there was one) and, per connector name, the concepts touched. It never reports changes made inside an external system on its own: external data has no changefeed.
 

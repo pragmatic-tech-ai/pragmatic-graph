@@ -48,6 +48,9 @@ export { ConnectorError, ConnectorPhase } from './connectors/ConnectorError.js';
 export { ConnectorOutcome, type IConnectorApplied } from './connectors/ConnectorApplied.js';
 export { TransactionDroppedError } from './txn/TransactionDroppedError.js';
 export { FetchSession, type IFetchedEntry, type IFetchScope } from './connectors/FetchSession.js';
+export { StepRouter, type IRoutedStep } from './connectors/StepRouter.js';
+// The write-routing mode for Cypher external writes (ruling R140 E10); also reachable via the Cypher namespace.
+export { WriteMode } from './cypher/CypherEnums.js';
 
 // Predicate language and node-local evaluation.
 export { And, Compare, CompareOp, ConceptIs, FalsePredicate, IdIn, In, IsNull, Not, Or, OwnerIs, Predicate, PredicateKind, Reachable, Related, Seeded, TruePredicate, type IPathStep } from './predicate/Predicate.js';
