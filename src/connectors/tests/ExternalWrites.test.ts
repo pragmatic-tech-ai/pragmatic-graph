@@ -43,6 +43,8 @@ class TicketSystem extends FakeExternalConnector
 {
     public readonly Log: string[] = [];
     public readonly Writes: FakeConnector;
+    /** When set, every Apply reports these source versions. */
+    public Reported: ReadonlyMap<string, RowVersion> | undefined;
 
     public constructor(name: string, rows: readonly IFetchedRow[])
     {
@@ -50,9 +52,18 @@ class TicketSystem extends FakeExternalConnector
         this.Writes = new FakeConnector(name, this.Log);
     }
 
-    public override Begin(context: ConnectorContext): Promise<IConnectorTransaction>
+    public override async Begin(context: ConnectorContext): Promise<IConnectorTransaction>
     {
-        return this.Writes.Begin(context);
+        const inner = await this.Writes.Begin(context);
+        return {
+            Apply: async changes =>
+            {
+                await inner.Apply(changes);
+                return this.Reported === undefined ? undefined : { Versions: this.Reported };
+            },
+            Commit: () => inner.Commit(),
+            Revert: () => inner.Revert(),
+        };
     }
 
     /** Every change the connector was asked to apply, flattened. */
@@ -119,6 +130,7 @@ class ExtFx
     public static readonly NoOwner = '';
     /** x's row version at the connector (R119 V1). */
     public static readonly V1 = 'v1';
+    public static readonly V2 = 'v2';
     public static readonly ExpectedVersionKey = 'ExpectedVersion';
     public static readonly Target = Object.freeze({ Concept: ExtFx.Ticket, Owner: ExtFx.Jira });
     private static readonly Space = ' ';
@@ -443,6 +455,44 @@ class ExternalWritesSuite
                 {
                     await fx.Run('MATCH (t:Ticket {id: \'x\'}) SET t.state = \'done\'');
                     assert.deepEqual(fx.Connector.Changes().map(c => c.ExpectedVersion), [ExtFx.V1]);
+                }
+                finally
+                {
+                    await fx.dispose();
+                }
+            });
+
+            it('CommittedVersions echoes the versions the source reported, as a copy', async () =>
+            {
+                const fx = await ExtFx.Open(storage());
+                try
+                {
+                    fx.Connector.Reported = new Map<string, RowVersion>([[ExtFx.X, ExtFx.V2]]);
+                    const t = await fx.Engine.Begin(AccessScope.System);
+                    try
+                    {
+                        await ExtFx.Fetch(t, ExtFx.X);
+                        t.SetProperty(ExtFx.X, ExtFx.State, ExtFx.DoneState);
+                        await t.Commit();
+                        const first = t.CommittedVersions() as Map<string, RowVersion>;
+                        assert.deepEqual([...first], [[ExtFx.X, ExtFx.V2]]);
+                        first.set(ExtFx.Locked, ExtFx.V1);
+                        assert.deepEqual([...t.CommittedVersions()], [[ExtFx.X, ExtFx.V2]]);
+                    }
+                    finally
+                    {
+                        t.dispose();
+                    }
+                    const empty = await fx.Engine.Begin(AccessScope.System);
+                    try
+                    {
+                        await empty.Commit();
+                        assert.equal(empty.CommittedVersions().size, 0);
+                    }
+                    finally
+                    {
+                        empty.dispose();
+                    }
                 }
                 finally
                 {

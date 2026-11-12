@@ -92,6 +92,7 @@ export class GraphTransaction extends GraphReader
     private static readonly AssignedProbe = '\u0001assigned\u0001';
     /** The empty read-only set (no member is read-only). */
     private static readonly NoReadOnly: ReadonlySet<string> = new Set();
+    private static readonly NoVersions: ReadonlyMap<string, RowVersion> = Object.freeze(new Map<string, RowVersion>());
 
     /** A UUID assigned at Begin; the TransactionDroppedError that reports a dropped transaction carries it (R137 E6). */
     public readonly Id: string = randomUUID();
@@ -437,6 +438,15 @@ export class GraphTransaction extends GraphReader
         {
             super.dispose();
         }
+    }
+
+    /**
+     * The source version each committed external write reported, keyed by public id: the expected version of that row's
+     * next change. Valid after Commit(); empty when the transaction wrote nothing externally. Always a copy.
+     */
+    public CommittedVersions(): ReadonlyMap<string, RowVersion>
+    {
+        return this.ledger?.Committed() ?? GraphTransaction.NoVersions;
     }
 
     /**

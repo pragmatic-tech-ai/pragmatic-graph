@@ -336,6 +336,12 @@ export class VersionLedger
         this.reported.set(publicId, version);
     }
 
+    /** A copy of every version reported so far, keyed by public id; never the live map. */
+    public Committed(): ReadonlyMap<string, RowVersion>
+    {
+        return new Map(this.reported);
+    }
+
     /**
      * The expected version of the next change to `publicId`: the latest reported one; else the fetched one (R119 V1)
      * unless the transaction created the id and the source has reported no version for it yet (R119 V2); else none.
