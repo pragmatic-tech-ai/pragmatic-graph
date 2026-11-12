@@ -270,6 +270,9 @@ export class WriteGate
     private static readonly ErrUnlinkedTo = 'the batch creates the edge node without linking its To member';
     private static readonly ErrSeedOnly = 'an owner change is recorded by seed synchronization only';
     private static readonly NoOwner = '';
+    /** The op index a synthetic created node (one the transaction created outside this batch) carries; it is never an op. */
+    private static readonly AssignedIndex = -1;
+    private static readonly NoCreated: ReadonlyMap<string, string> = new Map();
     private static readonly AccessDenied = 'Access denied: op ';
     private static readonly Open = ' (';
     private static readonly Close = ')';
@@ -290,7 +293,8 @@ export class WriteGate
         private readonly evaluator: ScopeEvaluator,
         private readonly catalog: CatalogSnapshot,
         private readonly exempt: WriteExemptions,
-        private readonly fetched: ((publicId: string) => Promise<FetchedNode | undefined>) | undefined)
+        private readonly fetched: ((publicId: string) => Promise<FetchedNode | undefined>) | undefined,
+        private readonly externalCreated: ReadonlyMap<string, string>)
     {
     }
 
@@ -298,6 +302,10 @@ export class WriteGate
      * Throws AccessError for the first op of `batch` the evaluator's scope does not allow; `exempt` as WriteExemptions.
      * `fetched`: the row the transaction fetched for an external public id (its stub attached), undefined when it
      * fetched none; without it every external node reads as not fetched.
+     * `externalCreated`: public id -> concept of the nodes the transaction created outside this batch (CreateAssigned,
+     * ruling R136 E4). An op on such a node gets the same created-node exemption the gate gives a node a CreateNode op
+     * of the batch creates (no visibility, Update/Append/AppendTo/Delete or ReadOnly.Update check; a visible
+     * Link/Unlink target), because its Create rules and ReadOnly.Create were already judged when it was created.
      */
     public static async Check(
         evaluator: ScopeEvaluator,
@@ -305,9 +313,10 @@ export class WriteGate
         catalog: CatalogSnapshot,
         exempt: WriteExemptions = WriteExemptions.None(),
         fetched?: (publicId: string) => Promise<FetchedNode | undefined>,
-        from = 0): Promise<void>
+        from = 0,
+        externalCreated: ReadonlyMap<string, string> = WriteGate.NoCreated): Promise<void>
     {
-        const gate = new WriteGate(evaluator, catalog, exempt, fetched);
+        const gate = new WriteGate(evaluator, catalog, exempt, fetched, externalCreated);
         const ops = batch.Ops();
         // The whole batch resolves (a step's op may address a node an earlier step created), but only the ops from
         // `from` are judged: earlier steps were checked at their own flush (ruling R135 E2, incremental gate).
@@ -323,6 +332,13 @@ export class WriteGate
     private Resolve(ops: readonly BatchOp[]): void
     {
         const live = new Map<string, CreatedNode>();
+        // Nodes the transaction created outside this batch (CreateAssigned) are live and exempt from here on, as if a
+        // CreateNode op had created them (ruling R136 E4). They are not added to `this.created`, so CheckCreatedEdges and
+        // CheckCreate never re-judge them (their Create rules ran at CreateAssigned).
+        for (const [publicId, concept] of this.externalCreated)
+        {
+            live.set(publicId, new CreatedNode(WriteGate.AssignedIndex, publicId, concept, WriteGate.NoOwner, this.catalog));
+        }
         for (const op of ops)
         {
             switch (op.Op)

@@ -312,7 +312,23 @@ export class GraphTransaction extends GraphReader
         {
             await WriteGate.Check(this.WriteEvaluator(), synth, this.snapshot.Index.Catalog, WriteExemptions.None(), id => this.FetchedRow(id));
         }
-        await new StepRouter(setup.Bindings, this.snapshot.Index, this.RoutingOrigins(), setup.External, new VersionLedger()).Route(synth.Ops());
+        await new StepRouter(setup.Bindings, this.snapshot.Index, this.PreflightOrigins(), setup.External, new VersionLedger()).Route(synth.Ops());
+    }
+
+    /**
+     * The routing origins for the CreateAssigned pre-flight (ruling R136 E4 step 2). A synthetic placeholder id resolves
+     * to nothing, recording no read of it into the transaction's ReadSet (it never names a real node); every other id
+     * (a real link target) delegates to RoutingOrigins and is recorded as usual.
+     */
+    private PreflightOrigins(): INodeOrigins
+    {
+        const base = this.RoutingOrigins();
+        const probe = GraphTransaction.AssignedProbe;
+        return {
+            Origin: id => id.startsWith(probe) ? Promise.resolve(undefined) : base.Origin(id),
+            Edges: id => id.startsWith(probe) ? Promise.resolve([]) : base.Edges(id),
+            Version: id => id.startsWith(probe) ? undefined : base.Version(id),
+        };
     }
 
     /** Groups the requests by the connector their (Owner, Concept) binds to; a request bound to no connector is refused. */
@@ -507,7 +523,8 @@ export class GraphTransaction extends GraphReader
         }
         try
         {
-            await WriteGate.Check(this.WriteEvaluator(), this.batch, this.snapshot.Index.Catalog, this.exempt, id => this.FetchedRow(id), from);
+            // Nodes created outside the batch (CreateAssigned) get the gate's created-node exemption (ruling R136 E4).
+            await WriteGate.Check(this.WriteEvaluator(), this.batch, this.snapshot.Index.Catalog, this.exempt, id => this.FetchedRow(id), from, this.router?.CreatedConcepts());
         }
         catch (error)
         {

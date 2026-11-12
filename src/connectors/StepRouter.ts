@@ -162,6 +162,17 @@ export class ChangeRouter
         return this.createdHere.has(publicId);
     }
 
+    /** Public id -> concept of every node this transaction created (for the write gate's created-node exemption, R136 E4). */
+    public CreatedConcepts(): ReadonlyMap<string, string>
+    {
+        const out = new Map<string, string>();
+        for (const publicId of this.createdHere)
+        {
+            out.set(publicId, this.known.get(publicId)!.Concept);
+        }
+        return out;
+    }
+
     /** The id's latest origin: its CreateNode earlier, else the snapshot's node (looked up once). */
     public async Origin(publicId: string): Promise<INodeOrigin | undefined>
     {
@@ -396,6 +407,12 @@ export class StepRouter
     public IsCreated(publicId: string): boolean
     {
         return this.router.IsCreated(publicId);
+    }
+
+    /** Public id -> concept of every node this transaction created, for the write gate's created-node exemption (R136 E4). */
+    public CreatedConcepts(): ReadonlyMap<string, string>
+    {
+        return this.router.CreatedConcepts();
     }
 
     /** Splits the step's grouped change sets into External (execute now) and Mirrored (stage), each name-ordered. */

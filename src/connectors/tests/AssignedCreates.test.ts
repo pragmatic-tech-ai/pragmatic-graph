@@ -3,8 +3,9 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { AccessScope } from '../../access/AccessScope.js';
+import { AccessDefault, AccessScope } from '../../access/AccessScope.js';
 import type { CellValue } from '../../columns/CellValue.js';
+import { Compare, CompareOp, Predicate } from '../../predicate/Predicate.js';
 import { CypherFixture } from '../../cypher/tests/CypherFixture.js';
 import { FederatedReads } from '../../FederatedReads.js';
 import { EdgeDirection } from '../../format/FormatKeys.js';
@@ -105,9 +106,9 @@ class AssignFx
         };
     }
 
-    public Begin(): Promise<GraphTransaction>
+    public Begin(scope: AccessScope = AccessScope.System): Promise<GraphTransaction>
     {
-        return this.Engine.Begin(AccessScope.System);
+        return this.Engine.Begin(scope);
     }
 
     /** Fetches the external Order into the transaction's FetchSession, as a MATCH would. */
@@ -141,6 +142,17 @@ type StorageFactory = () => IEngineStorage;
 
 class AssignedCreatesSuite
 {
+    /**
+     * A read-restricting scope (a Rows entry) whose Update and Delete rules deny every existing Order (Predicate.False):
+     * a SetProperty or DeleteNode on a node treated as existing would be refused, but a node this transaction created is
+     * exempt (ruling R136 E4). Create is allowed (no Create rule, Default Allow).
+     */
+    private static readonly LockExisting = AccessScope.Build({
+        Default: AccessDefault.Allow,
+        Rows: new Map<string, Predicate>([[AssignFx.Order, new Compare(AssignFx.Id, CompareOp.Lt, 1000n)]]),
+        Writes: new Map([[AssignFx.Order, { Update: Predicate.False, Delete: Predicate.False }]]),
+    });
+
     public static Register(name: string, storage: StorageFactory): void
     {
         describe(`Source-assigned creates (${name})`, () =>
@@ -380,6 +392,30 @@ class AssignedCreatesSuite
                     assert.equal(fx.A.UndoCalls, 1);
                     // The fake removed exactly the two rows it created.
                     assert.deepEqual([...fx.A.Removed].sort(), ['ord1', 'ord3']);
+                }
+                finally
+                {
+                    t.dispose();
+                    await fx.dispose();
+                }
+            });
+
+            it('later ops on an assigned create are exempt from existing-node write rules', async () =>
+            {
+                const fx = await AssignFx.Open(storage());
+                // id 5 is admitted by the scope's Rows, so the only thing that would deny the later ops is the
+                // Update/Delete rule; a created node must be exempt from both (ruling R136 E4).
+                fx.A.CreateOutcomes = [{ Row: AssignFx.Row('ord1', AssignFx.Order, new Map<string, CellValue>([[AssignFx.Id, 5n]]), 1) }];
+                const t = await fx.Begin(AssignedCreatesSuite.LockExisting);
+                try
+                {
+                    await t.CreateAssigned([AssignFx.Request(AssignFx.ModelA)]);
+                    // Both would be denied (UpdateDenied / DeleteDenied) if the created id took the existing-node path.
+                    t.SetProperty('ord1', AssignFx.Total, 9n);
+                    await t.Flush();
+                    t.DeleteNode('ord1');
+                    await t.Commit();
+                    assert.ok(fx.A.Executed.length >= 1);
                 }
                 finally
                 {
