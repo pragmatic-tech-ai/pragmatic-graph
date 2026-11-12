@@ -151,6 +151,8 @@ export class WriteDependencyAnalysis
             return false;
         }
         if (clause instanceof MatchClause) return !this.Overlaps(clause.Paths, labels);
+        // E10 rule 3 names a later MERGE's match part too: its pattern reads by label exactly as a MATCH does.
+        if (clause instanceof MergeClause) return !this.Overlaps([clause.Pattern], labels);
         return true;
     }
 

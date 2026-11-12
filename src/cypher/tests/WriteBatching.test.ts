@@ -64,7 +64,8 @@ class SerialConnector implements IExternalConnector
     }
 
     /** @internal Assigns a serial key per applied request, holds it for Undo, and reports one outcome per request. */
-    public RunCreate(requests: readonly IAssignedCreate[], context: string, step: string[]): Promise<readonly IAssignedOutcome[]> {
+    public RunCreate(requests: readonly IAssignedCreate[], context: string, step: string[]): Promise<readonly IAssignedOutcome[]>
+    {
         this.CreateCalls.push([...requests]);
         const failAt = this.FailRequestAt ?? (context === this.FailContext ? 0 : undefined);
         const created = this.CreatedByContext.get(context) ?? [];
@@ -392,6 +393,20 @@ for (const kind of [StorageKind.Memory, StorageKind.Lmdb])
                 const plan = fx.Explain('UNWIND [1,2] AS i CREATE (o:Order) WITH collect(o) AS os RETURN size(os)');
                 assert.match(plan, /PerRow/);
                 assert.doesNotMatch(plan, /Batched/);
+            }
+            finally
+            {
+                await fx.dispose();
+            }
+        });
+
+        it('later MERGE over the written label forces per-row', async () =>
+        {
+            const fx = await BatchFx.Open(kind);
+            try
+            {
+                // E10 rule 3: the later MERGE's match part reads Order by label, overlapping the created Order.
+                assert.match(fx.Explain('UNWIND [1,2] AS i CREATE (:Order {total: 1}) MERGE (o:Order {total: 1})'), /CreateOperator\n\s*PerRow/);
             }
             finally
             {
