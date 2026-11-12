@@ -1,4 +1,5 @@
 import { ConnectorResidency, type IConnectorCapabilities, type IExternalConnector, type IFetchPage, type IFetchRequest, type IFetchedRow, type RowVersion } from '../FetchContract.js';
+import { WriteOp } from '../../txn/WriteBatch.js';
 import type { ConnectorContext } from '../ConnectorContext.js';
 import type { ConnectorChangeSet } from '../ConnectorChangeSet.js';
 import type { IAssignedCreate, IAssignedOutcome, IConnectorApplyResult, IConnectorTransaction } from '../GraphConnector.js';
@@ -39,6 +40,13 @@ export class FakeExternalConnector implements IExternalConnector
     public CommitCalls = 0;
     public UndoCalls = 0;
     public RevertCalls = 0;
+    /**
+     * The rows this connector wrote (by CreateNode public id) that it still holds: an Undo that still has its
+     * before-images removes them, but a Commit (finalize) drops those before-images first, so a later Undo cannot
+     * (ruling R136 E3). The engine must therefore finalize external connectors AFTER its own commit; when Finalize fails
+     * before external finalize, compensation empties this set.
+     */
+    public readonly Live = new Set<string>();
     /** When false, the transaction it returns exposes no Undo: compensation uses Revert (ruling R137 E6). */
     public SupportsUndo = true;
     /** When false, the transaction it returns exposes no Create: CreateAssigned refuses with Unsupported (ruling R136 E4). */
@@ -121,8 +129,12 @@ export class FakeExternalConnector implements IExternalConnector
         return Promise.resolve(outcomes);
     }
 
-    /** @internal Runs a scripted Undo: records its order, removes the latest step's created rows, waits when held, then fails when configured. */
-    public async RunUndo(): Promise<void>
+    /**
+     * @internal Runs a scripted Undo: records its order, removes the latest step's created rows, restores the rows the
+     * transaction still has before-images for (`restore`; empty once it finalized, ruling R136 E3), waits when held,
+     * then fails when configured.
+     */
+    public async RunUndo(restore: readonly string[]): Promise<void>
     {
         this.UndoCalls++;
         this.UndoOrder?.push(this.Name);
@@ -130,6 +142,10 @@ export class FakeExternalConnector implements IExternalConnector
         if (inserts !== undefined)
         {
             this.Removed.push(...inserts);
+        }
+        for (const id of restore)
+        {
+            this.Live.delete(id);
         }
         if (this.HoldUndo)
         {
@@ -184,6 +200,10 @@ export class FakeExternalConnector implements IExternalConnector
 /** The executing connector transaction a FakeExternalConnector hands back: every step runs at once. */
 class FakeExternalTransaction implements IConnectorTransaction
 {
+    /** The rows this transaction wrote and still has before-images for; emptied when it finalizes (ruling R136 E3). */
+    private readonly applied: string[] = [];
+    private finalized = false;
+
     public constructor(private readonly owner: FakeExternalConnector)
     {
     }
@@ -196,6 +216,14 @@ class FakeExternalTransaction implements IConnectorTransaction
             return Promise.reject(this.owner.Failure);
         }
         this.owner.Executed.push({ Step: step, Changes: changes });
+        for (const change of changes.Changes)
+        {
+            if (change.Op === WriteOp.CreateNode)
+            {
+                this.applied.push(change.PublicId);
+                this.owner.Live.add(change.PublicId);
+            }
+        }
         return Promise.resolve(this.owner.Versions === undefined ? undefined : { Versions: this.owner.Versions });
     }
 
@@ -206,11 +234,13 @@ class FakeExternalTransaction implements IConnectorTransaction
 
     public Undo(): Promise<void>
     {
-        return this.owner.RunUndo();
+        // A finalized transaction dropped its before-images: it can no longer restore what it wrote (ruling R136 E3).
+        return this.owner.RunUndo(this.finalized ? [] : this.applied);
     }
 
     public Commit(): Promise<void>
     {
+        this.finalized = true;
         this.owner.CommitCalls++;
         return Promise.resolve();
     }

@@ -191,10 +191,16 @@ class ExtFx
         };
     }
 
-    /** An all-external write of x whose connector Commit runs `during` first (a concurrent change in the connector phase). */
+    /**
+     * An all-external write of x whose connector Apply runs `during` first: a concurrent change in the connector phase,
+     * i.e. while the immediate external write executes (ruling R135), before the engine prepares. Under the E6 reorder
+     * the engine commits (here: Releases, P13) BEFORE finalizing the external connector, so a change that lands during
+     * external finalize serializes after the engine released and no longer conflicts; a change during the write phase is
+     * still caught — at Prepare — and the executed external step is compensated.
+     */
     public async ExternalWriteDuring(during: () => Promise<void>): Promise<unknown>
     {
-        this.Connector.Writes.OnCommit = during;
+        this.Connector.Writes.OnApply = during;
         try
         {
             return await ExtFx.Rejection(this.Commit(AccessScope.System, async t =>
@@ -205,7 +211,7 @@ class ExtFx
         }
         finally
         {
-            this.Connector.Writes.OnCommit = undefined;
+            this.Connector.Writes.OnApply = undefined;
         }
     }
 
@@ -783,8 +789,9 @@ class ExternalWritesSuite
                 try
                 {
                     const error = await fx.ExternalWriteDuring(async () => { await fx.Engine.Upgrade(ExtFx.Description(true)); });
-                    assert.ok(error instanceof ConnectorError && error.Connector === BindingTable.EngineStorage && error.Phase === ConnectorPhase.Finalize, String(error));
-                    assert.ok(error.cause instanceof ConflictError, String(error.cause));
+                    // The upgrade changed the catalog version mid-write: Prepare rejects with ConflictError (the engine
+                    // commits before external finalize now, ruling R137 E6).
+                    assert.ok(error instanceof ConflictError, String(error));
                     assert.ok(fx.Connector.Log.includes(ExtFx.ExtRevert), fx.Connector.Log.join());
                     // The executed external step is compensated and reported once, at the transaction's end (ruling R138 E7).
                     assert.equal(fx.Pushed.length, 1);
@@ -805,8 +812,9 @@ class ExternalWritesSuite
                     const setup = EngineInternals.Context(store).Connectors!;
                     // Another connector object under the same name routes differently (R77): the generation changes.
                     const error = await fx.ExternalWriteDuring(async () => store.SetConnectors(setup.Bindings, [new TicketSystem(ExtFx.Ext, [])], setup.TimeoutMs));
-                    assert.ok(error instanceof ConnectorError && error.Connector === BindingTable.EngineStorage && error.Phase === ConnectorPhase.Finalize, String(error));
-                    assert.ok(error.cause instanceof ConflictError, String(error.cause));
+                    // The replaced setup bumped the binding generation mid-write: Prepare rejects with ConflictError (the
+                    // engine commits before external finalize now, ruling R137 E6).
+                    assert.ok(error instanceof ConflictError, String(error));
                     assert.ok(fx.Connector.Log.includes(ExtFx.ExtRevert), fx.Connector.Log.join());
                     // The executed external step is compensated and reported once, at the transaction's end (ruling R138 E7).
                     assert.equal(fx.Pushed.length, 1);
@@ -933,7 +941,10 @@ class ExternalWritesSuite
                 const fx = await ExtFx.Open(storage());
                 try
                 {
-                    fx.Connector.Writes.FailAt = FakeStep.Commit;
+                    // The external connector's failable phase is its immediate write (Apply, phase Write): the engine
+                    // commits before external finalize now, and external finalize only drops before-images, no remote
+                    // effect (rulings R135, R136 E3, R137 E6). A failed external write happens before the engine commits.
+                    fx.Connector.Writes.FailAt = FakeStep.Apply;
                     const commit = await fx.LastCommit();
                     const error = await ExtFx.Rejection(fx.Commit(AccessScope.System, async t =>
                     {
@@ -944,7 +955,7 @@ class ExternalWritesSuite
                         t.SetProperty(ExtFx.X, ExtFx.State, ExtFx.DoneState);
                         t.SetProperty(ExtFx.B, ExtFx.Name, ExtFx.Core);
                     }));
-                    assert.ok(error instanceof ConnectorError && error.Phase === ConnectorPhase.Commit, String(error));
+                    assert.ok(error instanceof ConnectorError && error.Phase === ConnectorPhase.Write, String(error));
                     assert.ok(fx.Connector.Log.includes(ExtFx.ExtRevert));
                     assert.equal(await fx.LastCommit(), commit);
                     assert.equal(await fx.StoredOwner(ExtFx.C2), undefined);

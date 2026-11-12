@@ -168,8 +168,10 @@ export class ConnectorSetup
  * Write-through of one GraphTransaction (spec §6, rulings R72, R135). With External connectors installed, writes
  * execute in steps: `Step` runs a step's External change sets now (the connector is begun at its first step and kept
  * for the transaction's life, ruling R135 E2), while Mirrored change sets stage. `Run` then commits at the end:
- * Prepare (engine) → each Mirrored connector Begin/Apply/Commit → each begun External connector Commit (finalize,
- * dropping before-images, no remote effect) → Finalize (engine). Calls run one at a time, never inside a store.Write.
+ * Prepare (engine) → each Mirrored connector Begin/Apply/Commit → Finalize (engine) → each begun External connector
+ * Commit (finalize, dropping before-images, no remote effect). The engine commits BEFORE external finalize so a failed
+ * Finalize/Release still leaves the external step log intact for compensation (ruling R137 E6); external finalize, being
+ * remote-effect-free, runs last and infallibly. Calls run one at a time, never inside a store.Write.
  * One deadline (the setup's timeout) bounds each step, and bounds Prepare / every connector call / the reverts of
  * Run, each from its own start. On any failure or the timeout the prepared commit is aborted and every connector that
  * began is compensated, in reverse order (Mirrored reverted in reverse Begin order, then the external step log walked
@@ -371,7 +373,7 @@ export class WriteCoordinator
 
     /**
      * Commits the transaction's write-through (its External steps already executed): Prepare the engine batch, run the
-     * Mirrored connectors, finalize the External connectors, then finalize engine storage. With `unchanged` (the engine
+     * Mirrored connectors, finalize engine storage, then finalize the External connectors. With `unchanged` (the engine
      * part is empty, controller ruling P13) the prepared commit only guards the engine reads during the connector phase
      * and is released, not finalized; Run resolves with `unchanged`. On success ConnectorApplied is raised once, with
      * Outcome Committed. On a failure Run aborts the prepared commit and throws the failure; the GraphTransaction then
@@ -421,18 +423,18 @@ export class WriteCoordinator
                 const txn = mirroredTxns.get(name)!;
                 await this.Call(connector, ConnectorPhase.Commit, txn, () => txn.Commit());
             }
-            // External finalize: drop before-images, no remote effect, in begin order.
-            for (const [name, txn] of this.externalTxns)
-            {
-                const connector = this.setup.Connectors.get(name)!;
-                await this.Call(connector, ConnectorPhase.Commit, txn, () => txn.Commit());
-            }
         }
         catch (error)
         {
             prepared.Abort();
             throw error instanceof ConnectorError ? error : new ConnectorError(this.current.Connector, this.current.Phase, error);
         }
+        // The engine commits (Finalize) or releases (the unchanged, all-external path) FIRST: either can still fail
+        // (storage trouble, disposal, reservation expiry, a schema / binding change since Prepare) and, when it does,
+        // the external step log must still be intact so the GraphTransaction's compensation undoes the executed external
+        // writes (ruling R137 E6). External finalize only then runs — after a SUCCESSFUL engine commit, so it is never
+        // routed into the prepared.Abort() above (the engine is committed and must not be aborted). It drops the
+        // connectors' before-images with no remote effect (ruling R136 E3), so it is effectively infallible and safe last.
         if (unchanged !== undefined)
         {
             // Nothing for engine storage: the reservation guarded the engine reads until the connectors committed, and
@@ -445,15 +447,33 @@ export class WriteCoordinator
             {
                 throw new ConnectorError(BindingTable.EngineStorage, ConnectorPhase.Finalize, error);
             }
+            await this.FinalizeExternal();
             return unchanged;
         }
+        let commit: bigint;
         try
         {
-            return await prepared.Finalize();
+            commit = await prepared.Finalize();
         }
         catch (error)
         {
             throw new ConnectorError(BindingTable.EngineStorage, ConnectorPhase.Finalize, error);
+        }
+        await this.FinalizeExternal();
+        return commit;
+    }
+
+    /**
+     * Finalizes every begun External connector in Begin order, after the engine has committed (ruling R136 E3): each
+     * Commit drops that connector's before-images with no remote effect. Run only on the success path, so the external
+     * step log stays intact for compensation whenever the engine commit itself fails (ruling R137 E6).
+     */
+    private async FinalizeExternal(): Promise<void>
+    {
+        for (const [name, txn] of this.externalTxns)
+        {
+            const connector = this.setup.Connectors.get(name)!;
+            await this.Call(connector, ConnectorPhase.Commit, txn, () => txn.Commit());
         }
     }
 

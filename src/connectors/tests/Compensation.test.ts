@@ -6,12 +6,15 @@ import { join } from 'node:path';
 import { AccessScope } from '../../access/AccessScope.js';
 import type { CellValue } from '../../columns/CellValue.js';
 import { CypherFixture } from '../../cypher/tests/CypherFixture.js';
-import { GraphErrorCode } from '../../errors/GraphError.js';
+import { GraphError, GraphErrorCode } from '../../errors/GraphError.js';
 import { GraphEngine, type IEngineStorage, StorageKind } from '../../GraphEngine.js';
 import type { GraphTransaction } from '../../GraphTransaction.js';
 import type { ISchemaDescription } from '../../schema/SchemaDescription.js';
+import { EngineInternals } from '../../tests/EngineInternals.js';
 import { ConflictError } from '../../txn/ConflictError.js';
+import type { PreparedCommit } from '../../txn/PreparedCommit.js';
 import { TransactionDroppedError } from '../../txn/TransactionDroppedError.js';
+import { BindingTable } from '../BindingTable.js';
 import { ConnectorContext } from '../ConnectorContext.js';
 import { ConnectorOutcome, type IConnectorApplied } from '../ConnectorApplied.js';
 import { ConnectorError, ConnectorPhase } from '../ConnectorError.js';
@@ -157,6 +160,49 @@ class CompFx
         }
     }
 
+    public async Exists(id: string): Promise<boolean>
+    {
+        const r = await this.Engine.BeginRead(AccessScope.System);
+        try
+        {
+            return (await r.ConceptOf(id)) !== undefined;
+        }
+        finally
+        {
+            r.dispose();
+        }
+    }
+
+    /**
+     * Makes the next write-through's engine Finalize reject with `failure` (storage trouble after the connectors
+     * committed), through the committer's Prepare seam: the real prepared commit is returned with its Finalize
+     * replaced, Abort and Release left intact (mirrors how WriteThrough forces a Prepare failure).
+     */
+    public FailFinalize(failure: unknown): void
+    {
+        const committer = EngineInternals.Committer(EngineInternals.Store(this.Engine));
+        const real = committer.Prepare.bind(committer);
+        committer.Prepare = (...args: Parameters<typeof committer.Prepare>): Promise<PreparedCommit> =>
+            real(...args).then(prepared =>
+            {
+                (prepared as { Finalize: () => Promise<bigint> }).Finalize = () => Promise.reject(failure);
+                return prepared;
+            });
+    }
+
+    /** As FailFinalize, but for the all-external P13 path: the engine Release throws instead (reservation trouble). */
+    public FailRelease(failure: unknown): void
+    {
+        const committer = EngineInternals.Committer(EngineInternals.Store(this.Engine));
+        const real = committer.Prepare.bind(committer);
+        committer.Prepare = (...args: Parameters<typeof committer.Prepare>): Promise<PreparedCommit> =>
+            real(...args).then(prepared =>
+            {
+                (prepared as { Release: () => void }).Release = () => { throw failure; };
+                return prepared;
+            });
+    }
+
     public static async Rejection(work: Promise<unknown>): Promise<unknown>
     {
         try
@@ -235,6 +281,74 @@ class CompensationSuite
                     assert.equal(fx.ConnA.UndoCalls, 1);
                     assert.equal(fx.ConnB.UndoCalls, 1);
                     assert.equal(await fx.StateOf('e1'), CompFx.Other);
+                    assert.equal(fx.Applied.length, 1);
+                    assert.equal(fx.Applied[0]!.Outcome, ConnectorOutcome.Compensated);
+                }
+                finally
+                {
+                    t.dispose();
+                    await fx.dispose();
+                }
+            });
+
+            it('engine Finalize failure after external steps compensates the external writes', async () =>
+            {
+                const fx = await CompFx.Open(storage());
+                const failure = new GraphError(GraphErrorCode.Corrupt, 'engine finalize failed');
+                fx.FailFinalize(failure);
+                const t = await fx.Begin();
+                try
+                {
+                    // An external write (to be compensated by Undo) alongside an engine-stored write (rolled back when
+                    // Finalize fails): the engine must commit before finalizing the external connector, so a failed
+                    // Finalize leaves the external step log intact to undo (ruling R137 E6).
+                    CompFx.External(t, CompFx.ModelA, 'na');
+                    t.CreateNode('e1', CompFx.Item);
+                    t.SetProperty('e1', CompFx.Id, 'e1');
+                    await t.Flush();
+                    assert.equal(fx.ConnA.Live.has('na'), true, 'the external row was written');
+                    const error = await CompFx.Rejection(t.Commit());
+                    assert.ok(error instanceof ConnectorError, String(error));
+                    assert.equal(error.Connector, BindingTable.EngineStorage);
+                    assert.equal(error.Phase, ConnectorPhase.Finalize);
+                    assert.equal(error.cause, failure);
+                    // The external connector was NOT finalized before the engine committed, so its Undo could restore.
+                    assert.equal(fx.ConnA.CommitCalls, 0);
+                    assert.equal(fx.ConnA.UndoCalls, 1);
+                    assert.equal(fx.ConnA.Live.size, 0, 'the external write was undone (the fake table is restored)');
+                    assert.equal(await fx.Exists('e1'), false, 'the engine rolled back');
+                    // Compensated is now truthful: the external rows really are gone.
+                    assert.equal(fx.Applied.length, 1);
+                    assert.equal(fx.Applied[0]!.Outcome, ConnectorOutcome.Compensated);
+                }
+                finally
+                {
+                    t.dispose();
+                    await fx.dispose();
+                }
+            });
+
+            it('all-external engine Release failure compensates the external writes', async () =>
+            {
+                const fx = await CompFx.Open(storage());
+                const failure = new GraphError(GraphErrorCode.Corrupt, 'engine release failed');
+                fx.FailRelease(failure);
+                const t = await fx.Begin();
+                try
+                {
+                    // An all-external write-through makes no engine commit (P13): it Releases the reservation. A failed
+                    // Release must still leave the external step log intact to undo (ruling R137 E6).
+                    CompFx.External(t, CompFx.ModelA, 'na');
+                    await t.Flush();
+                    assert.equal(fx.ConnA.Live.has('na'), true, 'the external row was written');
+                    const error = await CompFx.Rejection(t.Commit());
+                    assert.ok(error instanceof ConnectorError, String(error));
+                    assert.equal(error.Connector, BindingTable.EngineStorage);
+                    assert.equal(error.Phase, ConnectorPhase.Finalize);
+                    assert.equal(error.cause, failure);
+                    assert.equal(fx.ConnA.CommitCalls, 0);
+                    assert.equal(fx.ConnA.UndoCalls, 1);
+                    assert.equal(fx.ConnA.Live.size, 0, 'the external write was undone (the fake table is restored)');
                     assert.equal(fx.Applied.length, 1);
                     assert.equal(fx.Applied[0]!.Outcome, ConnectorOutcome.Compensated);
                 }

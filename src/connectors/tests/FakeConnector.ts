@@ -28,6 +28,7 @@ export class FakeConnector implements IGraphConnector
     public readonly Contexts: ConnectorContext[] = [];
     public FailAt: FakeStep | undefined;
     public HangAt: FakeStep | undefined;
+    public OnApply: (() => Promise<void>) | undefined;
     public OnCommit: (() => Promise<void>) | undefined;
     public readonly Reverted: Promise<void>;
     public Failure: Error;
@@ -92,6 +93,7 @@ class FakeConnectorTransaction implements IConnectorTransaction
     {
         this.owner.Applied.push(changes);
         await this.owner.Step(FakeStep.Apply);
+        await this.owner.OnApply?.();
     }
 
     public async Commit(): Promise<void>
